@@ -523,3 +523,64 @@ func TestБюджетЗондовОграничен(t *testing.T) {
 		t.Fatalf("зондов %d, а бюджет восемь; журнал:\n%s", n, r.log)
 	}
 }
+
+func TestБлокПоАдресуНеТратитЗондыНаИмя(t *testing.T) {
+	// Первый и самый дешёвый вопрос: решает имя или адрес. Сегодня его
+	// отсутствие стоило трёх зондов на цель, которую невозможно пробить в
+	// принципе — коробка там сбрасывает любое соединение к адресу.
+	//
+	// Зонд отвечает «нет соединения»: транспорт не встаёт вовсе, значит дело
+	// ниже TLS, и работа с именем не поможет никогда.
+	r := newRig(t)
+	r.probe.script = []probe.Result{{Outcome: probe.OutcomeNoConnect}}
+
+	r.say("hello www.instagram.com")
+	r.say("rst")
+	r.pump(20)
+
+	if n := r.probe.count(); n != 1 {
+		t.Fatalf("зондов %d, а хватало одного вопроса; журнал:\n%s", n, r.log)
+	}
+	if !strings.Contains(r.log.String(), "спрашиваю: по имени или по адресу") {
+		t.Fatalf("вопрос не задан:\n%s", r.log)
+	}
+	if !strings.Contains(r.log.String(), "ниже TLS") {
+		t.Fatalf("ответ не истолкован:\n%s", r.log)
+	}
+	if n := len(r.store.Catalog().Boxes); n != 0 {
+		t.Fatalf("непробиваемая цель записана: коробок %d", n)
+	}
+}
+
+func TestВопросПредшествуетКандидатам(t *testing.T) {
+	// Вопрос задаётся ДО того, как тратить попытки: его ответ меняет выбор.
+	// Ответ «решает имя» открывает дорогу кандидатам.
+	r := newRig(t)
+	r.probe.script = []probe.Result{
+		{Outcome: probe.OutcomeExchange, Bytes: 200, SeenTypes: 1 << (21 - 20)}, // ответ на вопрос
+		ok(), // проверка кандидата
+	}
+
+	r.say("hello linkedin.com")
+	r.say("rst")
+	r.pump(20)
+
+	logs := r.log.String()
+	qi := strings.Index(logs, "спрашиваю: по имени или по адресу")
+	ci := strings.Index(logs, "пробую plan-")
+	if qi < 0 {
+		t.Fatalf("вопрос не задан:\n%s", logs)
+	}
+	if ci < 0 {
+		t.Fatalf("до кандидатов дело не дошло:\n%s", logs)
+	}
+	if qi > ci {
+		t.Fatalf("кандидат пошёл раньше вопроса:\n%s", logs)
+	}
+	if !strings.Contains(logs, "решает имя") {
+		t.Fatalf("ответ «решает имя» не записан:\n%s", logs)
+	}
+	if box, _, _ := r.store.Catalog().Lookup("linkedin.com", ""); box == nil {
+		t.Fatalf("после верного ответа решение не найдено:\n%s", logs)
+	}
+}

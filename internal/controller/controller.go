@@ -84,6 +84,19 @@ type Task struct {
 	// слать своё: коробка может по-разному относиться к приветствию браузера
 	// и к приветствию нашей библиотеки (§3.1, §5.5).
 	Shape []byte
+	// Что известно о разборе у коробки. Из этого выводится план — а не
+	// берётся готовым из чужого набора.
+	Traits Traits
+	// Заданный сейчас вопрос. Пустое имя означает, что в полёте не вопрос, а
+	// проверка кандидата.
+	Asking Question
+	// Порт зонда в полёте: по нему наблюдения датапата привязываются к
+	// НАШЕМУ соединению, а не к чужому.
+	probePort uint16
+	// Датапат отметил подделанный сброс по зонду. Это и отличает вмешательство
+	// коробки от закрытия сервером: у подделки чужой TTL.
+	probeForgedRST bool
+
 	// Зонд в полёте либо вот-вот уйдёт (ждём подтверждения команды).
 	//
 	// Пока он не ответил, подозрения клиента НИЧЕГО не решают: человек может
@@ -441,6 +454,16 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 	sig := signalOf(ev)
 
 	t := c.tasks[target]
+	if t != nil && t.probePort != 0 && keyHasPort(ev.Key, t.probePort) {
+		// Это наблюдение по НАШЕМУ зонду. Подделанный сброс здесь — улика о
+		// том, что коробка вмешалась; закрытие сервером такой приметы не
+		// имеет. Различить их иначе нельзя: зонд видит сокет, а не заголовки.
+		if ev.Code == control.SuspectRST || ev.Code == control.SuspectRSTCut {
+			t.probeForgedRST = true
+		}
+		t.Fingerprint = addSignal(t.Fingerprint, sig)
+		return nil
+	}
 	if t != nil && t.awaiting {
 		// Кандидат проверяется нашим зондом. Подозрения клиента сейчас
 		// ничего не решают: они только уточняют отпечаток. Именно здесь
@@ -514,10 +537,81 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 	}
 
 	t.Fingerprint = addSignal(t.Fingerprint, sig)
-	if t.Current != nil {
+	if t.Current != nil || t.Asking.Name != "" {
 		return nil
 	}
+	return c.step(t)
+}
+
+// step делает следующий шаг поиска: либо задаёт вопрос, ответ на который
+// изменит выбор, либо, когда спрашивать больше нечего, проверяет кандидата.
+//
+// Вопрос ПЕРЕД кандидатом не порядок ради порядка. Сегодня отсутствие первого
+// же вопроса стоило трёх зондов на цель, которую невозможно пробить в
+// принципе: коробка там решает по адресу, и никакая работа с именем не
+// помогла бы никогда.
+func (c *Controller) step(t *Task) error {
+	if q, ok := nextQuestion(t.Traits); ok {
+		return c.ask(t, q)
+	}
+	if t.Traits.ByName == TraitNo {
+		// Ответ получен и он закрывает тему: дело в адресе. Ничего не
+		// сохраняется (§2.3) — ни как «непробиваемая», ни как отметка.
+		c.sayf("по %s решает адрес, а не имя: работа с именем не поможет — не сохранено ничего",
+			t.Target)
+		c.cooldown[t.Target] = c.now().Add(cooldownAfterFail)
+		delete(c.tasks, t.Target)
+		return c.clear(t.Kind, t.Target)
+	}
 	return c.advance(t)
+}
+
+// ask задаёт вопрос коробке. Плана при этом НЕ ставится: вопрос меряет саму
+// линию, а не наше воздействие на неё.
+func (c *Controller) ask(t *Task, q Question) error {
+	if t.ServerIP == "" || c.prober == nil {
+		// Спросить нечем — идём к кандидатам, отметив, что не спрашивали.
+		return c.advance(t)
+	}
+	hello, how, err := c.questionHello(t, q)
+	if err != nil {
+		c.sayf("по %s вопрос «%s» не собрать: %v", t.Target, q.Name, err)
+		t.Traits = answerUnknown(t.Traits, q)
+		return c.step(t)
+	}
+	t.Asking = q
+	t.probeForgedRST = false
+	c.sayf("по %s спрашиваю: %s (%s), %s", t.Target, q.Name, q.Why, how)
+	c.fire(t, hello)
+	return nil
+}
+
+// questionHello строит сообщение, которым задаётся вопрос.
+func (c *Controller) questionHello(t *Task, q Question) ([]byte, string, error) {
+	switch q.Name {
+	case "по имени или по адресу":
+		// Безобидное имя на ТОТ ЖЕ адрес. Пройдёт — решает имя; не пройдёт —
+		// решает адрес, и тогда искать нечего.
+		h, err := plan.Hello(c.decoy, 0x30)
+		return h, "безобидное имя " + c.decoy, err
+	default:
+		h, err := c.clientHello(t)
+		return h, "форма клиента", err
+	}
+}
+
+func answerUnknown(tr Traits, q Question) Traits {
+	// Не спросили — значит не знаем. Превращать «не спрашивали» в «нет»
+	// запрещено (§2.4), поэтому здесь ставится именно отказ от вопроса.
+	switch q.Name {
+	case "по имени или по адресу":
+		tr.ByName = TraitYes // не смогли спросить — работаем как обычно
+	case "первое приветствие или последнее":
+		tr.ReadsFirstHello = TraitNo
+	case "собирает ли сегменты":
+		tr.Reassembles = TraitYes
+	}
+	return tr
 }
 
 func addSignal(fp catalog.Fingerprint, s catalog.Signal) catalog.Fingerprint {
@@ -751,7 +845,25 @@ func (c *Controller) onAck(ev control.Event, now time.Time) error {
 // Это и есть ответ на «ждать надо время, а не повторы»: устройство, которое
 // не перезапрашивает — телевизор, приставка, часть IoT, — иначе не
 // обслуживалось бы вовсе, а срок ожидания задавали бы чужие привычки.
-func (c *Controller) startProbe(t *Task, now time.Time) {
+// clientHello — приветствие ТОЙ ЖЕ формы, что шлёт клиент. Коробка может
+// по-разному относиться к приветствию браузера и к нашему (§3.1, §5.5).
+func (c *Controller) clientHello(t *Task) ([]byte, error) {
+	if len(t.Shape) == 0 {
+		return plan.Hello(t.Target, 0x30)
+	}
+	reshaped, dropped, err := probe.Reshape(t.Shape, 0x55)
+	if err != nil {
+		return plan.Hello(t.Target, 0x30)
+	}
+	if len(dropped) > 0 {
+		c.sayf("по %s из формы клиента убраны расширения %v: билеты возобновления не копируем",
+			t.Target, dropped)
+	}
+	return reshaped, nil
+}
+
+// fire отправляет зонд. Не решает, ЧТО спрашивать, — только отправляет.
+func (c *Controller) fire(t *Task, hello []byte) {
 	if t.probing || t.ServerIP == "" || c.prober == nil {
 		t.awaiting = false
 		return
@@ -761,43 +873,13 @@ func (c *Controller) startProbe(t *Task, now time.Time) {
 		// столько мы за один поиск себе позволяем (§5).
 		c.sayf("по %s бюджет зондов исчерпан (%d)", t.Target, t.Probes)
 		t.awaiting = false
+		t.Asking = Question{}
 		return
 	}
-	hello := t.Shape
-	how := "форма клиента"
-	if len(hello) == 0 {
-		// Формы нет: соберём похожее сами и СКАЖЕМ об этом. Синтетическое
-		// приветствие коробка может разглядывать иначе, и знать, чем мерили,
-		// обязательно.
-		h, err := plan.Hello(t.Target, 0x30)
-		if err != nil {
-			c.sayf("по %s приветствие для зонда не собралось: %v", t.Target, err)
-			return
-		}
-		hello = h
-		how = "собранное приветствие"
-	} else {
-		reshaped, dropped, err := probe.Reshape(hello, 0x55)
-		if err != nil {
-			c.sayf("по %s форму не переписать (%v) — беру собранное", t.Target, err)
-			h, herr := plan.Hello(t.Target, 0x30)
-			if herr != nil {
-				return
-			}
-			hello, how = h, "собранное приветствие"
-		} else {
-			hello = reshaped
-			if len(dropped) > 0 {
-				how = fmt.Sprintf("форма клиента без расширений %v", dropped)
-			}
-		}
-	}
-
 	t.probing = true
 	t.Probes++
 	c.probesUsed++
 	target, ip, port := t.Target, t.ServerIP, t.ServerPort
-	c.sayf("по %s стучусь сам: %s -> %s:%d", target, how, ip, port)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -806,7 +888,18 @@ func (c *Controller) startProbe(t *Task, now time.Time) {
 	}()
 }
 
-// onProbe — зонд ответил. Здесь и решается, подошёл ли кандидат.
+func (c *Controller) startProbe(t *Task, now time.Time) {
+	hello, err := c.clientHello(t)
+	if err != nil {
+		c.sayf("по %s приветствие для зонда не собралось: %v", t.Target, err)
+		t.awaiting = false
+		return
+	}
+	c.sayf("по %s стучусь сам: %s:%d", t.Target, t.ServerIP, t.ServerPort)
+	c.fire(t, hello)
+}
+
+// onProbe — зонд ответил. Ответ толкуется по тому, ЧТО спрашивали.
 func (c *Controller) onProbe(d probeDone) error {
 	t := c.tasks[d.target]
 	if t == nil {
@@ -814,6 +907,11 @@ func (c *Controller) onProbe(d probeDone) error {
 	}
 	t.probing = false
 	t.awaiting = false
+	t.probePort = d.res.LocalPort
+
+	if t.Asking.Name != "" {
+		return c.onAnswer(t, d)
+	}
 	if t.Current == nil {
 		return nil
 	}
@@ -853,6 +951,53 @@ func (c *Controller) onProbe(d probeDone) error {
 		c.sayf("каталог не записался: %v", err)
 	}
 	return nil
+}
+
+// keyHasPort — участвует ли этот порт в паре ключа. Ключ канонизирован, и
+// наш порт может оказаться любым из двух концов.
+func keyHasPort(k control.Key, port uint16) bool {
+	return k.LowPort == port || k.HighPort == port
+}
+
+// onAnswer толкует ответ на заданный вопрос.
+//
+// Толкование — единственное место, где наблюдение превращается в свойство
+// коробки, и потому здесь важнее всего не сказать лишнего. Каждый исход
+// сопоставляется ровно с тем, что он доказывает, и ни с чем сверх (§2.4).
+func (c *Controller) onAnswer(t *Task, d probeDone) error {
+	q := t.Asking
+	t.Asking = Question{}
+
+	switch q.Name {
+	case "по имени или по адресу":
+		switch {
+		case d.res.Outcome == probe.OutcomeNoConnect:
+			// Даже транспорт не встал. Это ниже TLS, и имя тут ни при чём.
+			c.sayf("по %s ответ: транспорт не встаёт вовсе (%s) — ниже TLS, искать нечего",
+				t.Target, d.res.Describe())
+			t.Traits.ByName = TraitNo
+		case d.res.Outcome == probe.OutcomeExchange:
+			// С безобидным именем обмен пошёл: значит решает ИМЯ.
+			c.sayf("по %s ответ: с безобидным именем обмен идёт — решает имя", t.Target)
+			t.Traits.ByName = TraitYes
+		case t.probeForgedRST:
+			// Коробка сбросила соединение и с безобидным именем. Подделку
+			// отличаем по чужому TTL, а не по факту сброса: сервер тоже умеет
+			// закрывать соединение.
+			c.sayf("по %s ответ: подделанный сброс даже на безобидное имя — решает адрес",
+				t.Target)
+			t.Traits.ByName = TraitNo
+		default:
+			// Ни обмена, ни подделки. Сервер мог закрыться сам на чужое имя —
+			// это НЕ ответ про коробку, и выдавать его за ответ нельзя.
+			c.sayf("по %s ответ не различили (%s): сервер мог закрыться сам — считаю, что решает имя",
+				t.Target, d.res.Describe())
+			t.Traits.ByName = TraitYes
+		}
+	default:
+		t.Traits = answerUnknown(t.Traits, q)
+	}
+	return c.step(t)
 }
 
 // raiseLevel поднимает уровень доказательства подтверждённой привязки, когда
