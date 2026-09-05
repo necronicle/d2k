@@ -10,6 +10,7 @@ struct d2k_journal {
     size_t         n;      /* сколько занято, пока кольцо не заполнилось */
     size_t         head;   /* куда писать следующую */
     uint64_t       dropped;
+    uint64_t       added;
 };
 
 d2k_journal *d2k_journal_new(size_t cap) {
@@ -37,10 +38,24 @@ void d2k_journal_free(d2k_journal *j) {
     free(j);
 }
 
+const char *d2k_suspect_text(uint8_t code) {
+    switch (code) {
+    case D2K_SUSPECT_RST:     return "сброс в ответ на приветствие";
+    case D2K_SUSPECT_REPEAT:  return "приветствие повторено";
+    case D2K_SUSPECT_SILENT:  return "ответа на приветствие не было";
+    case D2K_SUSPECT_RST_CUT: return "снят чужой сброс в ответ на приветствие";
+    default:                  return "подозрение без кода";
+    }
+}
+
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                     uint8_t kind, const uint8_t *name, size_t name_len,
-                     const char *note) {
-    if (!j || j->cap == 0) {
+                     uint8_t kind, uint8_t code,
+                     const uint8_t *name, size_t name_len, const char *note) {
+    if (!j) {
+        return;
+    }
+    j->added++;
+    if (j->cap == 0) {
         return;
     }
     if (j->n == j->cap) {
@@ -54,7 +69,8 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
         e->key = *key;
     }
     e->kind = kind;
-    e->note = note;
+    e->code = code;
+    e->note = note ? note : (kind == D2K_JRN_SUSPECT ? d2k_suspect_text(code) : NULL);
 
     if (name && name_len) {
         size_t take = name_len > D2K_JRN_NAME_MAX ? D2K_JRN_NAME_MAX : name_len;
@@ -92,4 +108,8 @@ const d2k_jrn_entry *d2k_journal_at(const d2k_journal *j, size_t i) {
 
 uint64_t d2k_journal_dropped(const d2k_journal *j) {
     return j ? j->dropped : 0;
+}
+
+uint64_t d2k_journal_added(const d2k_journal *j) {
+    return j ? j->added : 0;
 }

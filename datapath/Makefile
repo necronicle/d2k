@@ -13,22 +13,22 @@ ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c journal.c plans.c
+SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h plan_internal.h
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched test_journal test_plans
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched test_journal test_plans test_ctl
 
-.PHONY: all check san d2kd-aarch64 test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans test-ctl cross clean
 
-all: planlab
+all: planlab ctlprobe
 
 plan_parse.o: plan_parse.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -53,6 +53,12 @@ journal.o: journal.c $(HDR)
 
 plans.o: plans.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+ctl.o: ctl.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_ctl: test_ctl.c ctl.o journal.o track.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o journal.o track.o $(LDFLAGS)
 
 test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_plans.c plans.o plan_parse.o plan_apply.o $(LDFLAGS)
@@ -93,6 +99,12 @@ test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o $(HDR)
 planlab: planlab.c plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ planlab.c plan_parse.o plan_apply.o $(LDFLAGS)
 
+# Стенд управляющего сокета: тот же разбор команд и та же сессия, что в d2kd,
+# но пакеты собираются на месте. Нужен, чтобы Go-клиент проверялся против
+# настоящего C-сервера, а не против представления о нём.
+ctlprobe: ctlprobe.c $(SRC:.c=.o) $(HDR)
+	$(CC) $(CFLAGS) -o $@ ctlprobe.c $(SRC:.c=.o) $(LDFLAGS)
+
 test-parse: test_plan_parse
 	./test_plan_parse
 
@@ -123,6 +135,9 @@ test-journal: test_journal
 test-plans: test_plans
 	./test_plans
 
+test-ctl: test_ctl
+	./test_ctl
+
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
@@ -136,6 +151,21 @@ san:
 		/tmp/d2k-san-$$t; \
 	done
 	@echo "санитайзеры: все проверки прошли"
+
+# Тот же набор ЧУЖИМ компилятором. Не роскошь: локально всё собирает clang, а
+# CI — gcc, и они расходятся. gcc ловит sign-compare там, где clang молчит, и
+# из-за этого КАЖДЫЙ прогон CI был красным с первого коммита, пока локальный
+# гейт горел зелёным. Компиляция без запуска: цель тут — предупреждения, а
+# исполняются те же тесты обычной целью check.
+#
+# Берётся кросс-компилятор под mipsel, потому что это настоящий gcc и он уже
+# нужен для переносимости. Переопределяется через GCC=.
+GCC ?= mipsel-unknown-linux-gnu-gcc
+gcc-warn:
+	@for f in $(SRC) $(LINUXSRC) $(DAEMON) planlab.c ctlprobe.c $(TESTS:=.c); do \
+		$(GCC) $(CFLAGS) -c -o /tmp/d2k-gccwarn.o $$f || exit 1; \
+	done
+	@echo "чужой компилятор: предупреждений нет"
 
 # Переносимость проверяется компиляцией под целевые арки. Запускать там нечего
 # и не нужно: ловим порядок байт, выравнивание и ширину типов.
@@ -163,7 +193,7 @@ d2kd-aarch64:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans
+check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans test-ctl
 
 clean:
-	rm -f *.o $(TESTS) planlab
+	rm -f *.o $(TESTS) planlab ctlprobe

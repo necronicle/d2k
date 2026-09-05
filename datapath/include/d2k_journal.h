@@ -30,6 +30,17 @@
  * держат запись в пределах одной строки вывода. */
 #define D2K_JRN_NAME_MAX 63
 
+/* Коды причин подозрения. Код, а не строка: контроллер обязан РАЗЛИЧАТЬ
+ * причины — они ведут к разным следующим шагам, — а сравнивать поведение по
+ * человеческому тексту значит сломать логику при первой правке формулировки.
+ * Текст выводится из кода, а не наоборот: источник истины один. */
+#define D2K_SUSPECT_RST      1  /* сброс в ответ на приветствие */
+#define D2K_SUSPECT_REPEAT   2  /* приветствие повторено */
+#define D2K_SUSPECT_SILENT   3  /* ответа на приветствие не было */
+#define D2K_SUSPECT_RST_CUT  4  /* чужой сброс снят защитой */
+
+const char *d2k_suspect_text(uint8_t code);
+
 enum {
     D2K_JRN_HELLO_SNI = 1,     /* приветствие TLS с именем */
     D2K_JRN_HELLO_NONAME,      /* приветствие TLS без имени — нормально (§5.3) */
@@ -44,6 +55,8 @@ typedef struct {
     uint64_t at_ns;
     d2k_key  key;
     uint8_t  kind;
+    /* Для D2K_JRN_SUSPECT — код причины. Для остального ноль. */
+    uint8_t  code;
     uint8_t  name_len;
     char     name[D2K_JRN_NAME_MAX + 1];
     /* Строковый литерал причины. Владения нет и не нужно: причины приходят
@@ -61,8 +74,8 @@ void         d2k_journal_free(d2k_journal *j);
 /* name/name_len — имя цели, если оно есть. Обрезается молча: обрезка здесь
  * не потеря данных, а объявленное свойство. */
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                     uint8_t kind, const uint8_t *name, size_t name_len,
-                     const char *note);
+                     uint8_t kind, uint8_t code,
+                     const uint8_t *name, size_t name_len, const char *note);
 
 /* Записи от старой к новой. i от 0 до d2k_journal_count()-1. */
 size_t               d2k_journal_count(const d2k_journal *j);
@@ -70,5 +83,11 @@ const d2k_jrn_entry *d2k_journal_at(const d2k_journal *j, size_t i);
 
 /* Сколько записей затёрто по кругу. */
 uint64_t d2k_journal_dropped(const d2k_journal *j);
+
+/* Сколько записей добавлено ЗА ВСЁ ВРЕМЯ. Нужно тому, кто вычитывает журнал
+ * порциями: разница с прошлым разом говорит, сколько появилось нового, а если
+ * нового больше, чем вмещает кольцо, — сколько он пропустил. Без этого счётчика
+ * «журнал полон» и «ничего не происходило» для читателя неразличимы. */
+uint64_t d2k_journal_added(const d2k_journal *j);
 
 #endif /* D2K_JOURNAL_H */

@@ -24,7 +24,13 @@ $GO vet ./...
 echo "== датапат: сборка и тесты =="
 make -C datapath clean
 make -C datapath check
-make -C datapath planlab
+make -C datapath planlab ctlprobe
+
+echo "== датапат: чужой компилятор =="
+# Локально всё собирает clang, а CI — gcc. Они расходятся: gcc ловит
+# sign-compare там, где clang молчит. Пока этого шага не было, гейт горел
+# зелёным при КАЖДОМ красном прогоне CI.
+make -C datapath gcc-warn
 
 echo "== датапат: санитайзеры =="
 make -C datapath san

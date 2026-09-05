@@ -27,6 +27,8 @@
 
 #include <poll.h>
 
+#include "d2k_ctl.h"
+#include "d2k_ctlsrv.h"
 #include "d2k_journal.h"
 #include "d2k_nfq.h"
 #include "d2k_nl.h"
@@ -166,6 +168,7 @@ static void usage(void) {
         "  --copy-range N     сколько байт пакета брать у ядра (1600)\n"
         "  --sched-slots N    сколько отложенных пакетов держать (128)\n"
         "  --journal N        глубина диагностического журнала, 0 — без него (256)\n"
+        "  --control PATH     управляющий сокет для контроллера\n"
         "  --idle SEC         молчащий поток забывается через (120)\n"
         "  --log FILE         писать вывод сюда вместо stdout\n"
         "  --stats SEC        период печати сводки, 0 — не печатать (10)\n"
@@ -228,6 +231,8 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
         printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));
     }
+    printf("планов по целям %zu из %zu\n",
+           d2k_session_plan_count(s), d2k_session_plan_capacity(s));
     for (size_t i = 0; i < n_reasons; i++) {
         printf("  пропуск «%s»: %" PRIu64 "\n", reasons[i].text, reasons[i].n);
     }
@@ -290,6 +295,7 @@ int main(int argc, char **argv) {
     int have_queue = 0;
     const char *plan_path = NULL;
     const char *log_path = NULL;
+    const char *ctl_path = NULL;
     int mode = MODE_OBSERVE;
     uint32_t mark = 0;
     uint32_t flows = 2048, qlen = 1024, copy_range = MAX_PKT;
@@ -304,6 +310,7 @@ int main(int argc, char **argv) {
         if (strcmp(a, "--queue") == 0)            { NEEDV(); if (arg_u32(v, &queue)) goto badval; have_queue = 1; }
         else if (strcmp(a, "--plan") == 0)        { NEEDV(); plan_path = v; }
         else if (strcmp(a, "--log") == 0)         { NEEDV(); log_path = v; }
+        else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
         else if (strcmp(a, "--queue-len") == 0)   { NEEDV(); if (arg_u32(v, &qlen)) goto badval; }
@@ -401,16 +408,10 @@ int main(int argc, char **argv) {
             d2k_plan_free(plan);
             return 1;
         }
-        uint32_t limits = d2k_raw_limits(raw);
-        uint8_t used = d2k_plan_poison_used(plan);
-        if ((used & D2K_POISON_IPID_ZERO) && (limits & D2K_RAW_CANT_IPID)) {
-            /* Ядро переписывает нулевой идентификатор IP, значит на провод
-               уйдёт не то, что описывает план. Отправить «почти то же самое»
-               нельзя: §2.5. */
-            fprintf(stderr,
-                "план просит нулевой идентификатор IP, а сырой сокет им не "
-                "распоряжается: ядро подставит свой. Такой план не "
-                "активируется — исполненное разошлось бы с измеренным.\n");
+        char why[200];
+        if (plan && !d2k_plan_fits(plan, d2k_raw_limits(raw), why, sizeof why)) {
+            fprintf(stderr, "план не активируется: %s.\n"
+                            "Исполненное разошлось бы с измеренным (§2.5).\n", why);
             d2k_raw_close(raw);
             d2k_plan_free(plan);
             return 1;
@@ -434,10 +435,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    d2k_ctl *ctl = NULL;
+    if (ctl_path) {
+        ctl = d2k_ctl_open(ctl_path, err, sizeof err);
+        if (!ctl) {
+            fprintf(stderr, "управляющий сокет: %s\n", err);
+            d2k_nfq_close(q);
+            d2k_raw_close(raw);
+            d2k_plan_free(plan);
+            return 1;
+        }
+    }
+
     d2k_session *sess = d2k_session_new(flows, journal);
     d2k_sched   *sched = d2k_sched_new(slots, copy_range);
     if (!sess || !sched) {
         fprintf(stderr, "не хватило памяти на состояние\n");
+        d2k_ctl_close(ctl);
         d2k_sched_free(sched);
         d2k_session_free(sess);
         d2k_nfq_close(q);
@@ -466,6 +480,12 @@ int main(int argc, char **argv) {
                "выпущен.\n");
     }
     fflush(stdout);
+
+    d2k_ctlsrv cx;
+    memset(&cx, 0, sizeof cx);
+    cx.sess = sess;
+    cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
+    uint64_t events_seen = 0;
 
     static uint8_t rbuf[RECV_BUF];
     static uint8_t obuf[OUT_BUF];
@@ -497,15 +517,44 @@ int main(int argc, char **argv) {
             timeout_ms = (d > 200) ? 200 : (int)d;
         }
 
-        struct pollfd pfd;
-        pfd.fd = d2k_nfq_fd(q);
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, timeout_ms);
+        struct pollfd pfd[3];
+        nfds_t nfd = 0;
+        pfd[nfd].fd = d2k_nfq_fd(q);
+        pfd[nfd].events = POLLIN;
+        pfd[nfd].revents = 0;
+        const nfds_t iq = nfd++;
+
+        nfds_t il = (nfds_t)-1, ip = (nfds_t)-1;
+        if (ctl) {
+            pfd[nfd].fd = d2k_ctl_listen_fd(ctl);
+            pfd[nfd].events = POLLIN;
+            pfd[nfd].revents = 0;
+            il = nfd++;
+            int p = d2k_ctl_peer_fd(ctl);
+            if (p >= 0) {
+                pfd[nfd].fd = p;
+                pfd[nfd].events = POLLIN;
+                pfd[nfd].revents = 0;
+                ip = nfd++;
+            }
+        }
+
+        int pr = poll(pfd, nfd, timeout_ms);
         if (pr < 0 && errno != EINTR) {
             st.recv_err++;
         }
 
-        if (pr > 0 && (pfd.revents & POLLIN)) {
+        if (ctl) {
+            if (il != (nfds_t)-1 && (pfd[il].revents & POLLIN)) {
+                d2k_ctl_accept(ctl);
+            }
+            if (ip != (nfds_t)-1 && (pfd[ip].revents & (POLLIN | POLLHUP))) {
+                d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);
+            }
+            d2k_ctl_flush(ctl);
+        }
+
+        if (pr > 0 && (pfd[iq].revents & POLLIN)) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
@@ -630,6 +679,9 @@ int main(int argc, char **argv) {
             d2k_session_expire(sess, t, idle_ns);
             next_expire = t + NS_PER_S;
         }
+        if (ctl) {
+            d2k_ctlsrv_pump(ctl, sess, &events_seen);
+        }
         if (next_stats && t >= next_stats) {
             print_stats(sess, sched, q, raw, t - start);
             next_stats = t + (uint64_t)stats_s * NS_PER_S;
@@ -640,6 +692,7 @@ int main(int argc, char **argv) {
     print_stats(sess, sched, q, raw, now_ns() - start);
     print_journal(sess, start);
 
+    d2k_ctl_close(ctl);
     d2k_sched_free(sched);
     d2k_session_free(sess);
     d2k_nfq_close(q);
