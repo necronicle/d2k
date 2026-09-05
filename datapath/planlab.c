@@ -195,6 +195,12 @@ int main(int argc, char **argv) {
             printf("emit %s %u %u ttl=%u poison=%02x ",
                    a.v[i].kind == D2K_EMIT_PAYLOAD ? "payload" : "fake",
                    a.v[i].delay_us, a.v[i].seq, a.v[i].ttl, a.v[i].poison);
+            /* Приставка печатается вместе с нагрузкой: на проводе это ОДИН
+               сегмент, и эталон, показывающий только вторую половину, врёт о
+               том, что уйдёт. Перекрытие без неё неотличимо от плана без
+               перекрытия — только по сдвинутому номеру, а это не то, что
+               надо проверять глазами. */
+            print_hex(a.v[i].pre, a.v[i].pre_len);
             print_hex(a.v[i].bytes, a.v[i].len);
             printf("\n");
         }
