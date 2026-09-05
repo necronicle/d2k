@@ -20,8 +20,10 @@ static int fails;
 
 static d2k_key mk(uint16_t port) {
     d2k_key k;
-    memset(&k, 0, sizeof k);
-    memcpy(&k.src_port, &port, 2);
+    uint8_t s[4] = {192, 168, 1, 67}, d[4] = {1, 2, 3, 4};
+    uint8_t sp[2], dp[2] = {0x01, 0xbb};
+    memcpy(sp, &port, 2);
+    d2k_key_make(&k, s, d, sp, dp);
     return k;
 }
 

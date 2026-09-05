@@ -34,7 +34,10 @@ enum {
     D2K_JRN_HELLO_SNI = 1,     /* приветствие TLS с именем */
     D2K_JRN_HELLO_NONAME,      /* приветствие TLS без имени — нормально (§5.3) */
     D2K_JRN_PLAN_APPLIED,      /* план применён */
-    D2K_JRN_PLAN_REFUSED       /* план не применён, причина в note */
+    D2K_JRN_PLAN_REFUSED,      /* план не применён, причина в note */
+    /* Подозрение на сбой. Именно подозрение: §2.4 запрещает превращать
+     * наблюдение в диагноз. Что именно замечено — в note. */
+    D2K_JRN_SUSPECT
 };
 
 typedef struct {

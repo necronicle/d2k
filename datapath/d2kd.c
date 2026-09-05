@@ -47,6 +47,54 @@
 static volatile sig_atomic_t stop_flag;
 static void on_signal(int sig) { (void)sig; stop_flag = 1; }
 
+/* Собственная цена. Читается у ядра, а не оценивается: §10 требует CPU и RSS
+   как метрики, а «на глаз не тормозит» метрикой не является.
+   /proc/self/stat: поля 14 и 15 — utime и stime в тиках.
+   /proc/self/statm: поле 2 — резидентные страницы. */
+static void self_cost(uint64_t *cpu_ms, uint64_t *rss_kb) {
+    *cpu_ms = 0;
+    *rss_kb = 0;
+
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (f) {
+        char buf[1024];
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        /* Имя процесса в скобках может содержать пробелы; поля считаем после
+           последней закрывающей скобки. */
+        char *p = strrchr(buf, ')');
+        if (p) {
+            int field = 2;
+            unsigned long ut = 0, stime = 0;
+            for (p++; *p; ) {
+                while (*p == ' ') { p++; }
+                if (!*p) { break; }
+                field++;
+                unsigned long v = strtoul(p, &p, 10);
+                if (field == 14) { ut = v; }
+                if (field == 15) { stime = v; break; }
+            }
+            long hz = sysconf(_SC_CLK_TCK);
+            if (hz > 0) {
+                *cpu_ms = (uint64_t)(ut + stime) * 1000u / (uint64_t)hz;
+            }
+        }
+    }
+
+    f = fopen("/proc/self/statm", "r");
+    if (f) {
+        unsigned long total = 0, resident = 0;
+        if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+            long pg = sysconf(_SC_PAGESIZE);
+            if (pg > 0) {
+                *rss_kb = (uint64_t)resident * (uint64_t)pg / 1024u;
+            }
+        }
+        fclose(f);
+    }
+}
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -140,7 +188,15 @@ static int arg_u32(const char *v, uint32_t *out) {
 
 static void print_stats(const d2k_session *s, const d2k_sched *sched,
                         const d2k_nfq *q, const d2k_raw *r, uint64_t run_ns) {
-    printf("--- d2kd, %" PRIu64 " с ---\n", run_ns / NS_PER_S);
+    uint64_t cpu_ms = 0, rss_kb = 0;
+    self_cost(&cpu_ms, &rss_kb);
+    uint64_t secs = run_ns / NS_PER_S;
+    printf("--- d2kd, %" PRIu64 " с; процессор %" PRIu64 " мс (%" PRIu64
+           ",%" PRIu64 " %%), RSS %" PRIu64 " КиБ ---\n",
+           secs, cpu_ms,
+           secs ? cpu_ms / (secs * 10) : 0,
+           secs ? (cpu_ms * 10 / secs) % 100 : 0,
+           rss_kb);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
@@ -152,8 +208,10 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     printf("потоков %zu из %zu, отказов таблицы %" PRIu64 "\n",
            d2k_session_flows(s), d2k_session_capacity(s),
            d2k_session_refusals(s));
-    printf("узнано приветствий %" PRIu64 ", из них с именем %" PRIu64 "\n",
-           d2k_session_hellos(s), d2k_session_with_sni(s));
+    printf("узнано приветствий %" PRIu64 ", из них с именем %" PRIu64
+           ", подозрений %" PRIu64 "\n",
+           d2k_session_hellos(s), d2k_session_with_sni(s),
+           d2k_session_suspects(s));
     printf("в очереди отправки %zu, отказов расписания %" PRIu64 "\n",
            d2k_sched_count(sched), d2k_sched_refusals(sched));
     printf("обрезано %" PRIu64 ", без нагрузки %" PRIu64
@@ -186,6 +244,7 @@ static const char *jrn_kind(uint8_t k) {
     case D2K_JRN_HELLO_NONAME:  return "приветствие без имени";
     case D2K_JRN_PLAN_APPLIED:  return "план применён";
     case D2K_JRN_PLAN_REFUSED:  return "план не применён";
+    case D2K_JRN_SUSPECT:       return "подозрение:";
     default:                    return "?";
     }
 }
@@ -206,12 +265,15 @@ static void print_journal(const d2k_session *s, uint64_t start) {
         if (!e) {
             continue;
         }
-        const uint8_t *sa = (const uint8_t *)&e->key.src_ip;
-        const uint8_t *da = (const uint8_t *)&e->key.dst_ip;
-        printf("  %6" PRIu64 " мс  %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u  %s%s%s%s\n",
+        /* Ключ канонизирован: «низкая» и «высокая» стороны, а не источник и
+           назначение. Печатается как пара, через тире, чтобы стрелка не врала
+           о направлении. */
+        const uint8_t *la = (const uint8_t *)&e->key.low_ip;
+        const uint8_t *ha = (const uint8_t *)&e->key.high_ip;
+        printf("  %6" PRIu64 " мс  %u.%u.%u.%u:%u - %u.%u.%u.%u:%u  %s%s%s%s\n",
                (e->at_ns - start) / NS_PER_MS,
-               sa[0], sa[1], sa[2], sa[3], port_of(&e->key.src_port),
-               da[0], da[1], da[2], da[3], port_of(&e->key.dst_port),
+               la[0], la[1], la[2], la[3], port_of(&e->key.low_port),
+               ha[0], ha[1], ha[2], ha[3], port_of(&e->key.high_port),
                jrn_kind(e->kind),
                e->name_len ? " " : "", e->name_len ? e->name : "",
                e->note ? e->note : "");

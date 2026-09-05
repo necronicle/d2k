@@ -15,6 +15,32 @@
 
 #include "d2k_track.h"
 
+int d2k_key_make(d2k_key *k, const uint8_t *src_ip4, const uint8_t *dst_ip4,
+                 const uint8_t *src_port_be, const uint8_t *dst_port_be) {
+    if (!k) {
+        return 0;
+    }
+    /* Сравниваем шесть байт «адрес+порт» как они лежат в заголовке. Сравнение
+       байтов одинаково на любой арке; сравнение чисел зависело бы от порядка
+       байт хозяина, и на big-endian mips канон получился бы другим. */
+    uint8_t a[6], b[6];
+    memcpy(a, src_ip4, 4);
+    memcpy(a + 4, src_port_be, 2);
+    memcpy(b, dst_ip4, 4);
+    memcpy(b + 4, dst_port_be, 2);
+
+    int src_is_low = memcmp(a, b, 6) <= 0;
+    const uint8_t *lo = src_is_low ? a : b;
+    const uint8_t *hi = src_is_low ? b : a;
+
+    memset(k, 0, sizeof *k);
+    memcpy(&k->low_ip, lo, 4);
+    memcpy(&k->low_port, lo + 4, 2);
+    memcpy(&k->high_ip, hi, 4);
+    memcpy(&k->high_port, hi + 4, 2);
+    return src_is_low;
+}
+
 enum { SLOT_FREE = 0, SLOT_USED = 1 };
 
 struct d2k_table {
@@ -34,8 +60,10 @@ static size_t round_pow2(size_t n) {
 }
 
 static int key_eq(const d2k_key *a, const d2k_key *b) {
-    return a->src_ip == b->src_ip && a->dst_ip == b->dst_ip &&
-           a->src_port == b->src_port && a->dst_port == b->dst_port;
+    /* Побайтово: ключ канонизирован и заполняется целиком через memset, так
+       что дырок выравнивания в нём нет, а сравнение полями пришлось бы
+       править при каждом изменении структуры. */
+    return memcmp(a, b, sizeof *a) == 0;
 }
 
 /* FNV-1a по байтам ключа. Ключ читается как байты, а не как числа: порядок
@@ -173,7 +201,9 @@ void d2k_track_remove(d2k_table *t, const d2k_key *k) {
     }
 }
 
-size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns) {
+size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns,
+                        void (*on_expire)(void *ctx, const d2k_flow *f),
+                        void *ctx) {
     if (!t) {
         return 0;
     }
@@ -188,6 +218,12 @@ size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns) {
         while (t->state[s] == SLOT_USED &&
                now_ns >= t->slots[s].last_ns &&
                now_ns - t->slots[s].last_ns >= idle_ns) {
+            if (on_expire) {
+                /* До освобождения: это единственный момент, когда поток виден
+                   целиком. «Приветствие было, ответа не пришло» становится
+                   известно только здесь. */
+                on_expire(ctx, &t->slots[s]);
+            }
             remove_at(t, s);
             freed++;
         }

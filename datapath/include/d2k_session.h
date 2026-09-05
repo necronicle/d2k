@@ -83,6 +83,10 @@ uint64_t d2k_session_refusals(const d2k_session *s);
 uint64_t d2k_session_hellos(const d2k_session *s);
 uint64_t d2k_session_with_sni(const d2k_session *s);
 
+/* Сколько потоков вызвали подозрение. Подозрение — наблюдение, а не
+ * диагноз, и на диск оно не идёт: §2.3, §2.4. */
+uint64_t d2k_session_suspects(const d2k_session *s);
+
 const d2k_journal *d2k_session_journal(const d2k_session *s);
 
 #endif /* D2K_SESSION_H */

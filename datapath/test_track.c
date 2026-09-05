@@ -20,14 +20,20 @@ static int fails;
 
 static d2k_key mk(uint16_t port) {
     d2k_key k;
-    memset(&k, 0, sizeof k);
     uint8_t s[4] = {192, 168, 1, 67}, d[4] = {1, 2, 3, 4};
-    memcpy(&k.src_ip, s, 4);
-    memcpy(&k.dst_ip, d, 4);
-    memcpy(&k.src_port, &port, 2);
-    uint8_t dp[2] = {0x01, 0xbb};
-    memcpy(&k.dst_port, dp, 2);
+    uint8_t sp[2], dp[2] = {0x01, 0xbb};
+    memcpy(sp, &port, 2);
+    d2k_key_make(&k, s, d, sp, dp);
     return k;
+}
+
+static int expired_with_hello;
+static void count_expired(void *ctx, const d2k_flow *f) {
+    int *n = ctx;
+    (*n)++;
+    if (f->saw_hello) {
+        expired_with_hello++;
+    }
 }
 
 int main(void) {
@@ -48,6 +54,55 @@ int main(void) {
     CHECK(d2k_track_count(t) == 1, "повторный запрос завёл дубликат");
     CHECK(f2->first_ns == 1000 && f2->last_ns == 2000,
           "времена первого и последнего касания не обновляются как надо");
+
+    /* --- канон: обе стороны соединения дают ОДИН ключ ---------------------
+     * Без этого ответное направление завело бы второй поток, и план мог бы
+     * примениться к одному соединению дважды.                               */
+    {
+        uint8_t c1[4] = {192, 168, 1, 67}, c2[4] = {1, 2, 3, 4};
+        uint8_t p1[2] = {0xc0, 0x00}, p2[2] = {0x01, 0xbb};
+        d2k_key out_key, in_key;
+        int out_low = d2k_key_make(&out_key, c1, c2, p1, p2);
+        int in_low  = d2k_key_make(&in_key,  c2, c1, p2, p1);
+        CHECK(memcmp(&out_key, &in_key, sizeof out_key) == 0,
+              "прямое и обратное направления дали разные ключи");
+        CHECK(out_low != in_low,
+              "признак «источник — низкая сторона» одинаков для обеих сторон");
+
+        d2k_table *s = d2k_track_new(16);
+        d2k_flow *a1 = d2k_track_get(s, &out_key, 100);
+        d2k_flow *a2 = d2k_track_get(s, &in_key, 200);
+        CHECK(a1 == a2, "стороны одного соединения попали в разные потоки");
+        CHECK(d2k_track_count(s) == 1, "одно соединение заняло две ячейки");
+        d2k_track_free(s);
+    }
+
+    /* --- обратный вызов при истечении --------------------------------------
+     * «Приветствие было, ответа не пришло» становится известно только в
+     * момент забвения потока. Если вызов не случится, подозрение по молчанию
+     * не заметит никто.                                                      */
+    {
+        d2k_table *s = d2k_track_new(16);
+        d2k_key k1 = mk(4001), k2 = mk(4002);
+        d2k_flow *f = d2k_track_get(s, &k1, 1000);
+        f->saw_hello = 1;
+        d2k_track_get(s, &k2, 1000);
+
+        int seen_total = 0;
+        /* Сперва без обратного вызова: NULL не должен ронять уборку. */
+        d2k_track_expire(s, 1000 + 99999, 60000, NULL, NULL);
+        CHECK(d2k_track_count(s) == 0, "истечение без вызова не освободило потоки");
+
+        /* Теперь с вызовом. */
+        d2k_flow *g = d2k_track_get(s, &k1, 5000);
+        g->saw_hello = 1;
+        d2k_track_get(s, &k2, 5000);
+        d2k_track_expire(s, 5000 + 99999, 60000, count_expired, &seen_total);
+        CHECK(seen_total == 2, "обратный вызов случился не для каждого потока");
+        CHECK(expired_with_hello == 1,
+              "признаки потока в обратном вызове потеряны");
+        d2k_track_free(s);
+    }
 
     /* --- поиск без заведения --------------------------------------------- */
     d2k_key nope = mk(9999);
@@ -73,14 +128,14 @@ int main(void) {
 
     /* --- истечение и повторное использование ячеек ------------------------ */
     size_t before = d2k_track_count(t);
-    size_t freed = d2k_track_expire(t, 3000 + 60000, 60000);
+    size_t freed = d2k_track_expire(t, 3000 + 60000, 60000, NULL, NULL);
     CHECK(freed > 0, "ничего не освободилось, хотя все потоки молчат дольше срока");
     CHECK(d2k_track_count(t) == before - freed, "счётчик после истечения неверен");
 
     /* Время, ушедшее назад, не должно сносить таблицу: вычитание беззнаковое. */
     {
         size_t was = d2k_track_count(t);
-        d2k_track_expire(t, 1, 1);
+        d2k_track_expire(t, 1, 1, NULL, NULL);
         CHECK(d2k_track_count(t) == was,
               "истечение со временем назад снесло потоки — беззнаковое вычитание");
     }

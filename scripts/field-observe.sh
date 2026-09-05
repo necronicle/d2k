@@ -34,32 +34,60 @@ DUR=${D2K_DUR:-60}
 PORTS=${D2K_PORTS:-443}
 MODE=${D2K_MODE:-observe}
 CONNBYTES=${D2K_CONNBYTES:-0:8}
+# Снимать ли аппаратный офлоад. Этап 0 показал, что первые пакеты КАЖДОГО
+# направления доходят до очереди и без этого: железо забирает поток не сразу.
+# Значит для наблюдения за установкой соединения де-оффлоад может быть не
+# нужен — а он стоит 66 % процессора на полном окне. Проверяется замером.
+PPE=${D2K_PPE:-1}
+# Ставить ли зеркальное правило на обратное направление. Оно нужно, чтобы
+# видеть сброс цензора: улику, которую в прямом направлении не видно вовсе.
+# В PREROUTING обратный NAT ещё не отработал и адрес клиента там не виден,
+# поэтому FORWARD.
+REV=${D2K_REV:-0}
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TOKEN="d2k$$"
+# Путь к сокету мультиплексора ограничен ~104 байтами (sockaddr_un), а
+# TMPDIR на маке длинный. Каталог короткий и имя сокета короткое.
+SCRATCH=$(mktemp -d "/tmp/d2kf.XXXXXX")
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOCAL_LOG="$REPO/docs/field/raw/observe-$STAMP.log"
 
+# Все команды идут по ОДНОМУ соединению. Дюжина отдельных подключений подряд
+# упирается в предел неаутентифицированных сессий dropbear, и очередная
+# команда получает «Permission denied» на верном пароле.
+MUX="-o ControlMaster=auto -o ControlPath=$SCRATCH/m -o ControlPersist=180"
+
 if [ -n "${D2K_SSH_PASS:-}" ]; then
-    SSH="sshpass -p $D2K_SSH_PASS ssh -n -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
-    SSH_IN="sshpass -p $D2K_SSH_PASS ssh -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
+    SSH="sshpass -p $D2K_SSH_PASS ssh -n $MUX -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
+    SSH_IN="sshpass -p $D2K_SSH_PASS ssh $MUX -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
 else
-    SSH="ssh -n -p $SSH_PORT root@$ROUTER"
-    SSH_IN="ssh -p $SSH_PORT root@$ROUTER"
+    SSH="ssh -n $MUX -p $SSH_PORT root@$ROUTER"
+    SSH_IN="ssh $MUX -p $SSH_PORT root@$ROUTER"
 fi
 
 say() { printf '%s\n' "$*" >&2; }
 
 # Снимает ВСЕ правила с нашим жетоном и гасит службу. Идемпотентно.
 teardown() {
+    # Обе цепочки: правило обратного направления живёт в FORWARD, и уборка,
+    # смотрящая только в POSTROUTING, оставила бы его висеть.
     $SSH "
-        iptables -t mangle -S POSTROUTING 2>/dev/null | grep -- '--comment $TOKEN' |
-        sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
+        for ch in POSTROUTING FORWARD; do
+            iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
+            sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
+        done
         [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
-        echo \"остаток правил с жетоном: \$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--comment $TOKEN')\"
+        echo \"остаток правил с жетоном: \$(iptables -t mangle -S 2>/dev/null | grep -c -- '--comment $TOKEN')\"
     " >&2 || true
 }
-trap 'teardown' EXIT INT TERM
+cleanup() {
+    teardown
+    # shellcheck disable=SC2086  # MUX — набор ключей, разворачивается намеренно
+    ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+    rm -rf "$SCRATCH"
+}
+trap 'cleanup' EXIT INT TERM
 
 say "== сборка =="
 make -C "$REPO/datapath" d2kd-aarch64 >/dev/null
@@ -85,17 +113,24 @@ say "== правила, жетон $TOKEN =="
 # ОДНО направление — то, что в нём написано; обратное остаётся в железе.
 $SSH "
 set -e
-iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
+if [ $PPE = 1 ]; then
+    iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
+fi
 iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
-iptables -t mangle -S POSTROUTING | grep -c -- '--comment $TOKEN'
-" | sed 's/^/  правил поставлено: /' >&2
+if [ $REV = 1 ]; then
+    iptables -t mangle -I FORWARD -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+fi
+echo \"POSTROUTING=\$(iptables -t mangle -S POSTROUTING | grep -c -- '--comment $TOKEN') FORWARD=\$(iptables -t mangle -S FORWARD | grep -c -- '--comment $TOKEN')\"
+" | sed 's/^/  правил: /' >&2
 
 # Сторож на случай, если управляющая сторона умрёт: снимает ТОЛЬКО свои
 # правила и только по своему жетону.
 $SSH "
 ( sleep $((DUR + 60))
-  iptables -t mangle -S POSTROUTING 2>/dev/null | grep -- '--comment $TOKEN' |
-  sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
+  for ch in POSTROUTING FORWARD; do
+    iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
+    sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
+  done
   [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
   rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid
 ) >/dev/null 2>&1 &
@@ -136,6 +171,9 @@ $SSH "cat /tmp/d2kd.$TOKEN.out 2>/dev/null" > "$LOCAL_LOG" || true
 teardown
 $SSH "rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid /tmp/d2kd.$TOKEN.out; ls /tmp/d2kd.* 2>/dev/null || echo '  на роутере чисто'" >&2
 trap - EXIT
+# shellcheck disable=SC2086  # MUX — набор ключей, разворачивается намеренно
+ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+rm -rf "$SCRATCH"
 
 say "== вывод: $LOCAL_LOG =="
 cat "$LOCAL_LOG"

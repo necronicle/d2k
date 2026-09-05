@@ -26,6 +26,7 @@ struct d2k_session {
     uint64_t     applied;
     uint64_t     hellos;
     uint64_t     with_sni;
+    uint64_t     suspects;
 };
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
@@ -72,6 +73,33 @@ static uint16_t rd16(const uint8_t *p) {
 static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                    const char *why) {
     d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, NULL, 0, why);
+}
+
+/* Подозрение. Отмечается ОДИН раз на поток: три улики об одном соединении
+   выглядели бы как три соединения, а это разные факты.
+   Слово «подозрение» выбрано вместо «блокировки» намеренно: §2.4 запрещает
+   превращать наблюдение в диагноз, а §2.3 — сохранять отрицательный результат
+   вообще. Отсюда ничего не пишется на диск. */
+static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                    d2k_flow *fl, const char *what) {
+    if (fl->suspected) {
+        return;
+    }
+    fl->suspected = 1;
+    s->suspects++;
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, NULL, 0, what);
+}
+
+/* Зовётся при забвении потока по молчанию. Приветствие ушло, ответа с той
+   стороны не было ни одного — и узнать это можно только здесь, в конце. */
+static void on_flow_expire(void *ctx, const d2k_flow *f) {
+    d2k_session *s = ctx;
+    if (!f->saw_hello || f->rev_after_hello > 0 || f->suspected) {
+        return;
+    }
+    s->suspects++;
+    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, NULL, 0,
+                    "ответа на приветствие не было");
 }
 
 static uint32_t rd32(const uint8_t *p) {
@@ -127,11 +155,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     d2k_key key;
-    memset(&key, 0, sizeof key);
-    memcpy(&key.src_ip, pkt + 12, 4);
-    memcpy(&key.dst_ip, pkt + 16, 4);
-    memcpy(&key.src_port, t + 0, 2);
-    memcpy(&key.dst_port, t + 2, 2);
+    int src_is_low = d2k_key_make(&key, pkt + 12, pkt + 16, t + 0, t + 2);
 
     uint8_t flags = t[13];
     const int fin = (flags & 0x01) != 0;
@@ -148,8 +172,28 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
 
-    fl->out_pkts++;
-    fl->out_bytes += total;
+    /* Направление: совпадает ли сторона этого пакета с той, что открыла
+       поток. «Прямое» — та же сторона, «обратное» — противоположная. */
+    if (fl->fwd_pkts == 0 && fl->rev_pkts == 0) {
+        fl->init_low = src_is_low;
+    }
+    const int fwd = (src_is_low == fl->init_low);
+
+    /* Снимок ДО учёта этого пакета. Сам сброс — тоже пакет с обратной
+       стороны, и, посчитав его первым, проверка «ответов не было» не сработала
+       бы никогда: счётчик к моменту проверки уже единица. */
+    const uint32_t rev_before = fl->rev_after_hello;
+
+    if (fwd) {
+        fl->fwd_pkts++;
+        fl->fwd_bytes += total;
+    } else {
+        fl->rev_pkts++;
+        fl->rev_bytes += total;
+        if (fl->saw_hello) {
+            fl->rev_after_hello++;
+        }
+    }
     if (syn && !ack) {
         fl->saw_syn = 1;
     }
@@ -157,8 +201,17 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->saw_synack = 1;
     }
 
-    /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания. */
+    /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.
+       Но сперва посмотреть, не улика ли это. */
     if (rst || fin) {
+        if (rst && !fwd && fl->saw_hello && rev_before == 0) {
+            /* Сброс пришёл с той стороны, куда ушло приветствие, и никаких
+               других ответов оттуда не было. Это НАБЛЮДЕНИЕ, а не диагноз:
+               §2.4 запрещает выводить из него устройство механизма. Сервер
+               мог и правда закрыть соединение. */
+            fl->saw_rev_rst = 1;
+            suspect(s, now_ns, &key, fl, "сброс в ответ на приветствие");
+        }
         d2k_track_remove(s->flows, &key);
         out->skipped = rst ? "соединение сброшено" : "соединение закрывается";
         return 0;
@@ -170,6 +223,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "нет полезной нагрузки";
         return 0;
     }
+    const uint32_t in_seq = rd32(t + 4);
 
     /* --- узнавание протокола -------------------------------------------
      * Стоит ДО всего, что связано с планом, и это не перестановка ради
@@ -186,11 +240,22 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
      * вправе считать, что снаружи стоит connbytes. */
     d2k_tls_info tls;
     memset(&tls, 0, sizeof tls);
-    if (!fl->saw_hello && fl->out_pkts <= D2K_HELLO_WINDOW) {
+    /* Повтор приветствия: тот же номер последовательности с той же стороны.
+       Клиент повторяет, когда ответа нет, — самая дешёвая улика из доступных,
+       и видна она в направлении, которое и так наблюдается. */
+    if (fwd && fl->saw_hello && in_seq == fl->hello_seq) {
+        fl->hello_repeats++;
+        if (fl->hello_repeats >= 2) {
+            suspect(s, now_ns, &key, fl, "приветствие повторено");
+        }
+    }
+
+    if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW) {
         d2k_tls_parse(pkt + payload_off, payload_len, &tls);
         if (tls.is_client_hello) {
             fl->saw_hello = 1;
             fl->had_sni = tls.have_sni ? 1 : 0;
+            fl->hello_seq = in_seq;
             s->hellos++;
             if (tls.have_sni) {
                 s->with_sni++;
@@ -233,7 +298,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     memset(&in, 0, sizeof in);
     in.payload = pkt + payload_off;
     in.payload_len = payload_len;
-    in.seq = rd32(t + 4);
+    in.seq = in_seq;
     in.have_sni = tls.have_sni;
     in.sni_off = tls.sni_off;
     in.sni_len = tls.sni_len;
@@ -252,10 +317,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* --- сборка на провод ----------------------------------------------- */
     d2k_conn c;
     memset(&c, 0, sizeof c);
-    c.src_ip = key.src_ip;
-    c.dst_ip = key.dst_ip;
-    c.src_port = key.src_port;
-    c.dst_port = key.dst_port;
+    /* Из пакета, а не из ключа: ключ канонизирован, и «низкая» сторона может
+       оказаться сервером. Собранный по нему пакет полетел бы задом наперёд. */
+    memcpy(&c.src_ip, pkt + 12, 4);
+    memcpy(&c.dst_ip, pkt + 16, 4);
+    memcpy(&c.src_port, t + 0, 2);
+    memcpy(&c.dst_port, t + 2, 2);
     c.ack = rd32(t + 8);
     c.window = rd16(t + 14);
     c.ttl = pkt[8];
@@ -315,7 +382,8 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 }
 
 size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
-    return s ? d2k_track_expire(s->flows, now_ns, idle_ns) : 0;
+    return s ? d2k_track_expire(s->flows, now_ns, idle_ns,
+                                on_flow_expire, s) : 0;
 }
 
 size_t d2k_session_flows(const d2k_session *s) {
@@ -340,6 +408,10 @@ uint64_t d2k_session_hellos(const d2k_session *s) {
 
 uint64_t d2k_session_with_sni(const d2k_session *s) {
     return s ? s->with_sni : 0;
+}
+
+uint64_t d2k_session_suspects(const d2k_session *s) {
+    return s ? s->suspects : 0;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

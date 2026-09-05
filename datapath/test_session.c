@@ -90,6 +90,32 @@ static size_t build_hello(uint8_t *out) {
     return o;
 }
 
+/* Тот же поток, но со стороны сервера: концы поменяны местами. */
+static size_t build_rev_pkt(uint8_t *o, uint16_t client_port, uint8_t flags,
+                            const uint8_t *pay, size_t paylen) {
+    size_t total = 20 + 20 + paylen;
+    memset(o, 0, 40);
+    o[0] = 0x45;
+    wr16(o + 2, (uint16_t)total);
+    wr16(o + 4, 0x2000);
+    o[8] = 64;
+    o[9] = 6;
+    uint8_t s[4] = {1, 2, 3, 4}, d[4] = {192, 168, 1, 67};
+    memcpy(o + 12, s, 4);
+    memcpy(o + 16, d, 4);
+    wr16(o + 20, 443);
+    wr16(o + 22, client_port);
+    wr32(o + 24, 5000);
+    wr32(o + 28, 1001);
+    o[32] = 0x50;
+    o[33] = flags;
+    wr16(o + 34, 64240);
+    if (paylen) {
+        memcpy(o + 40, pay, paylen);
+    }
+    return total;
+}
+
 int main(void) {
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
@@ -175,6 +201,67 @@ int main(void) {
         CHECK(r.verdict == D2K_VERDICT_ACCEPT,
               "ничего не выпустив, оригинал обязаны пропустить");
         CHECK(r.skipped != NULL, "нехватка буфера не объяснена");
+    }
+
+    /* --- подозрения ---------------------------------------------------------
+     * Три улики, доступные в направлении, которое и так наблюдается, плюс
+     * одна, доступная только в момент забвения потока. Все три — НАБЛЮДЕНИЯ:
+     * §2.4 запрещает выводить из них устройство механизма, и ни одна на диск
+     * не идёт (§2.3).                                                       */
+    {
+        d2k_session *z = d2k_session_new(64, 64);
+
+        /* 1. Сброс в ответ на приветствие. */
+        n = build_pkt(pkt, 41000, 0x18, hello, hlen);
+        d2k_session_packet(z, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 0, "приветствие само по себе — подозрение");
+        n = build_rev_pkt(pkt, 41000, 0x14, NULL, 0);   /* RST|ACK от сервера */
+        d2k_session_packet(z, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 1, "сброс после приветствия не замечен");
+
+        /* Сброс БЕЗ предшествующего приветствия подозрением не является:
+           соединение могло закрыться по любой причине. */
+        n = build_pkt(pkt, 41001, 0x02, NULL, 0);       /* SYN */
+        d2k_session_packet(z, pkt, n, 3000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, 41001, 0x14, NULL, 0);
+        d2k_session_packet(z, pkt, n, 3100, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 1, "сброс без приветствия сочтён подозрением");
+
+        /* 2. Повтор приветствия. Один повтор — ещё не улика: пакет мог
+           потеряться на линии. */
+        n = build_pkt(pkt, 41002, 0x18, hello, hlen);
+        d2k_session_packet(z, pkt, n, 4000, buf, sizeof buf, &r);
+        d2k_session_packet(z, pkt, n, 4500, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 1, "один повтор уже объявлен подозрением");
+        d2k_session_packet(z, pkt, n, 5000, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 2, "два повтора не замечены");
+
+        /* Тот же поток дальше не должен множить подозрения. */
+        d2k_session_packet(z, pkt, n, 5500, buf, sizeof buf, &r);
+        CHECK(d2k_session_suspects(z) == 2, "подозрение отмечено по одному потоку дважды");
+
+        /* 3. Ответа не было вовсе — видно только при забвении потока. */
+        n = build_pkt(pkt, 41003, 0x18, hello, hlen);
+        d2k_session_packet(z, pkt, n, 6000, buf, sizeof buf, &r);
+        uint64_t before = d2k_session_suspects(z);
+        d2k_session_expire(z, 6000 + 100000, 50000);
+        CHECK(d2k_session_suspects(z) > before,
+              "молчание в ответ на приветствие не замечено при уборке");
+
+        /* Поток, на приветствие которого ответили, подозрения не вызывает. */
+        d2k_session *w = d2k_session_new(64, 64);
+        n = build_pkt(pkt, 41004, 0x18, hello, hlen);
+        d2k_session_packet(w, pkt, n, 1000, buf, sizeof buf, &r);
+        {
+            uint8_t data[8] = {0x16, 0x03, 0x03, 0, 3, 2, 0, 0};
+            n = build_rev_pkt(pkt, 41004, 0x18, data, sizeof data);
+            d2k_session_packet(w, pkt, n, 1100, buf, sizeof buf, &r);
+        }
+        d2k_session_expire(w, 1100 + 100000, 50000);
+        CHECK(d2k_session_suspects(w) == 0,
+              "поток с ответом на приветствие сочтён подозрительным");
+        d2k_session_free(w);
+        d2k_session_free(z);
     }
 
     d2k_session_free(s);
