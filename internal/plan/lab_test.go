@@ -1,12 +1,38 @@
 package plan
 
 import (
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// Обновление эталонов флагом — стандартный приём, но опасный: эталон, снятый
+// не глядя, подтверждает сам себя. Пользоваться только вместе с чтением
+// получившегося файла.
+var update = flag.Bool("update", false, "перезаписать эталонные файлы")
+
+// checkGolden сверяет вывод с эталоном либо перезаписывает его.
+func checkGolden(t *testing.T, name, got string) {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("эталон %s перезаписан — прочитайте его глазами", name)
+		return
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("вывод разошёлся с эталоном:\n--- эталон ---\n%s--- получено ---\n%s", want, got)
+	}
+}
 
 // runLab гоняет ТОТ ЖЕ исполнитель, что пойдёт в датапат. Отдельной
 // реализации преобразований на Go нет и быть не должно: §2.5 документа
@@ -67,11 +93,7 @@ const сценарийОдинПакет = "pkt 1000 10 8 " +
 	"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n"
 
 func TestЭталонФальшивкаПередКусками(t *testing.T) {
-	got := runLab(t, readFixture(t, "fake_before.plan"), сценарийОдинПакет)
-	want := readFixture(t, "fake_before.golden")
-	if got != want {
-		t.Errorf("вывод разошёлся с эталоном:\n--- эталон ---\n%s--- получено ---\n%s", want, got)
-	}
+	checkGolden(t, "fake_before.golden", runLab(t, readFixture(t, "fake_before.plan"), сценарийОдинПакет))
 }
 
 // Расхождение кодов записей между Go и C — самая дорогая ошибка этой связки:
