@@ -39,6 +39,7 @@ func usage(w *os.File) {
   status               что программа делает прямо сейчас
   plan <подкоманда>    перевод плана между текстовой и канонической формой
   control              контроллер: связь датапата и каталога коробок
+  volume -target H:P   проба на блокировку по объёму соединения
   serve [-log FILE]    запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
@@ -73,6 +74,9 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "control":
 		return cmdControl(args[1:], out, errOut)
+
+	case "volume":
+		return cmdVolume(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(args[1:], out, errOut)

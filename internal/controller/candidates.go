@@ -130,7 +130,7 @@ func wrap(p plan.Plan, proto string) (catalog.Plan, error) {
 //
 // Ни один отказ отсюда не попадает на диск (§2.3): лестница строится заново
 // при каждом поиске.
-func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
+func generate(fp catalog.Fingerprint, decoy, passing string) ([]Candidate, error) {
 	sawRST, sawQuiet, sawVolume := false, false, false
 	for _, s := range fp.Signals {
 		switch s.Kind {
@@ -188,6 +188,17 @@ func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
 	// Замер донора: результат одинаков и с одним видом разреза, и с другим;
 	// несущая часть — имя в приманке. Значит и перебирать надо имена.
 	if sawVolume {
+		// Имя уже подобрано активной пробой — перебирать нечего. Проба
+		// проверила его на этой самой цели и подтвердила повтором; ставить
+		// вслед за ней ещё пятнадцать кандидатов значило бы не доверять
+		// собственному измерению и заново тратить время человека.
+		if passing != "" {
+			p, err := fakePlan(passing, 3, 2, 78000, sawRST)
+			if err != nil {
+				return nil, err
+			}
+			return []Candidate{{Source: "имя " + passing, Plan: p, Decoy: passing}}, nil
+		}
 		names := decoyNames()
 		if len(names) > maxDecoyTries {
 			names = names[:maxDecoyTries]

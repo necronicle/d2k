@@ -28,6 +28,7 @@ import (
 	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/plan"
 	"github.com/necronicle/d2k/internal/probe"
+	"github.com/necronicle/d2k/internal/volume"
 )
 
 type rig struct {
@@ -42,6 +43,41 @@ type rig struct {
 	clock time.Time
 	path  string
 	probe *fakeProber
+	vol   *fakeVolume
+}
+
+// fakeVolume — проба на объём по сценарию. Настоящая уходит в сеть на десятки
+// секунд, а проверять надо правила, а не чужую линию.
+type fakeVolume struct {
+	mu      sync.Mutex
+	verdict volume.ScanVerdict
+	name    string
+	cutKB   int
+	tried   int
+	calls   int
+	names   []string
+}
+
+func (f *fakeVolume) Scan(_ context.Context, t volume.Target, names []string, _ volume.ScanOptions) volume.ScanResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.names = names
+	return volume.ScanResult{
+		Target: t, Verdict: f.verdict, Name: f.name, CutAtKB: f.cutKB, Tried: f.tried,
+	}
+}
+
+func (f *fakeVolume) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeVolume) set(v volume.ScanVerdict, name string, cutKB int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verdict, f.name, f.cutKB = v, name, cutKB
 }
 
 // fakeProber отвечает на зонды по сценарию. В сеть проверки не ходят: вердикт
@@ -200,9 +236,13 @@ func newRig(t *testing.T) *rig {
 		clock: time.Date(2026, 9, 5, 21, 0, 0, 0, time.UTC),
 	}
 	r.probe = &fakeProber{}
+	r.vol = &fakeVolume{verdict: volume.ScanNoBlock}
 	r.ctrl = controller.New(conn, store, log)
 	r.ctrl.SetClock(func() time.Time { return r.clock })
 	r.ctrl.SetProber(r.probe)
+	// Проба на объём по умолчанию говорит «блока нет»: проверка не должна
+	// ходить в сеть и не должна зависеть от политики чужой линии.
+	r.ctrl.SetVolumeProber(r.vol)
 
 	t.Cleanup(func() {
 		_ = conn.Close()

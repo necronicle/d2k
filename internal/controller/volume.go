@@ -49,7 +49,16 @@ type flowKey struct {
 
 // seenFlow — что известно о живом потоке.
 type seenFlow struct {
-	inBytes int64
+	// bytes — объём в ОБЕ стороны.
+	//
+	// Считать только входящие неверно. Замер 06.09.2026: накачка одним лишь
+	// исходящим объёмом рвёт поток на 15-23 КБ, притом что входящих за весь
+	// сеанс меньше двух килобайт. Донор наблюдал обрыв и на чистой отдаче
+	// (hetzner.com, 15994 байта раз за разом). Какой именно счёт ведёт
+	// коробка — суммарный или любой из двух — здесь не измерено, и потому
+	// берётся сумма: она срабатывает в обоих случаях, а раздельный счёт
+	// пропускал бы один из них.
+	bytes int64
 	// state — последнее состояние, в котором ядро его видело. Именно оно
 	// отличает обрыв от честно отданного документа.
 	state string
@@ -111,7 +120,7 @@ func (c *Controller) pollVolume(now time.Time) {
 		m := map[flowKey]seenFlow{}
 		for _, f := range flows {
 			m[flowKey{dstIP: f.DstIP, srcPort: f.SrcPort}] = seenFlow{
-				inBytes: f.InBytes, state: f.State,
+				bytes: f.InBytes + f.OutBytes, state: f.State,
 			}
 		}
 		seen[target] = m
@@ -142,10 +151,10 @@ func (c *Controller) pollVolume(now time.Time) {
 				w.closed++
 				continue
 			}
-			if last.inBytes < volumeBandLow || last.inBytes > volumeBandHigh {
+			if last.bytes < volumeBandLow || last.bytes > volumeBandHigh {
 				continue
 			}
-			w.samples = append(w.samples, last.inBytes)
+			w.samples = append(w.samples, last.bytes)
 			if len(w.samples) > volumeSamplesKept {
 				w.samples = w.samples[len(w.samples)-volumeSamplesKept:]
 			}
@@ -163,8 +172,8 @@ func (c *Controller) pollVolume(now time.Time) {
 		// может — счётчик ядра видит то, чего не видит окно наблюдения.
 		if t := c.tasks[target]; t != nil && t.Current != nil && t.VolumeCutAt > 0 {
 			for _, f := range w.live {
-				if f.inBytes > t.VolumeCutAt*2 {
-					c.onVolumePassed(t, f.inBytes, now)
+				if f.bytes > t.VolumeCutAt*2 {
+					c.onVolumePassed(t, f.bytes, now)
 					break
 				}
 			}
@@ -198,14 +207,18 @@ func (w *volumeWatch) cut() (int64, int, bool) {
 	return bestAt, best, best >= volumeSamplesNeeded
 }
 
-// onVolumeCut — измерение состоялось: потоки к цели раз за разом кончаются на
-// одном объёме.
+// onVolumeCut — потоки к цели раз за разом кончаются на одном объёме.
 //
-// Это НАБЛЮДЕНИЕ, а не приговор (§2.4): сайт мог просто отдавать документ
-// одного размера. Отличать одно от другого будет проверка — подстановка
-// проходящего имени и сравнение объёма с измеренным.
+// Это ПОВОД СПРОСИТЬ, а не ответ (§2.4). Сайт мог отдавать документ одного
+// размера; окно видимости датапата к тому же меряется первыми пакетами, и
+// здоровая крупная загрузка выглядит отсюда так же, как обрыв. Мой прежний
+// вывод «обрыв по объёму» прямо из этих счётчиков однажды объявил блокировкой
+// одну и ту же страницу ошибки, отданную трижды.
+//
+// Поэтому наблюдение только заводит поиск, а вердикт выносит активная проба на
+// своей мишени и своим объёмом.
 func (c *Controller) onVolumeCut(target string, at int64, n int, now time.Time) {
-	c.sayf("по %s потоки кончаются на %d байтах, %d раз подряд — похоже на обрыв по объёму",
+	c.sayf("по %s потоки кончаются на %d байтах, %d раз подряд — спрашиваю пробой",
 		target, at, n)
 	t := c.tasks[target]
 	if t == nil {
@@ -237,14 +250,8 @@ func (c *Controller) onVolumeCut(target string, at int64, n int, now time.Time) 
 	// попытку человека на то, что уже измерено. §3.5: следующий вопрос
 	// задаётся, когда его ответ способен изменить выбор; этот не способен.
 	t.Traits.ByName = TraitYes
-	t.Traits.VolumeCut = true
-	t.Fingerprint = addSignal(t.Fingerprint, catalog.Signal{
-		Kind: "volume", TTL: 0, Seen: 1,
-		// Объём кладём в поле идентификатора: он и есть примета этой коробки
-		// на этой линии, и по нему две коробки различаются.
-		IPID: uint16(at / 1024),
-	})
-	c.sayf("  примета: обрыв по объёму около %d КиБ", at/1024)
+	// Примета коробки здесь НЕ заводится: наблюдение ещё не вердикт. Её
+	// заведёт проба, если подтвердит обрыв (см. onVolumeScan).
 	if t.Current == nil && t.Asking.Name == "" {
 		if err := c.step(t); err != nil {
 			c.sayf("по %s шаг поиска не удался: %v", target, err)

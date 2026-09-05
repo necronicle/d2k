@@ -106,6 +106,9 @@ type Task struct {
 	// не проверив толком ни одного.
 	probing  bool
 	awaiting bool
+	// scanning — идёт подбор имени по объёму. Он долгий, и второй такой же
+	// поверх первого только удвоил бы нагрузку на линию.
+	scanning bool
 	// Сколько раз зондировали. §10 требует считать стоимость зондов на цель.
 	Probes int
 	// Объём, на котором потоки к этой цели кончаются раз за разом. Ноль —
@@ -137,6 +140,13 @@ type Controller struct {
 	// в каком получил, поэтому очередь ожидающих — обычная FIFO.
 	pendingAcks []string
 	results     chan probeDone
+
+	// Подбор имени по объёму: своя проба, свой канал ответов.
+	volProber  VolumeProber
+	volResults chan volumeScanDone
+	// nameHits — сколько раз имя уже проводило объём на этой линии. Только в
+	// памяти: это ускоритель порядка перебора, а не знание о цели.
+	nameHits map[string]int
 
 	// Наблюдение за объёмом: обрыв, который не виден в окне первых пакетов.
 	volume   map[string]*volumeWatch
@@ -178,6 +188,10 @@ func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 		cooldown: map[string]time.Time{},
 		volume:   map[string]*volumeWatch{},
 		ctPath:   conntrack.DefaultPath,
+
+		volProber:  liveVolumeProber{},
+		volResults: make(chan volumeScanDone, 8),
+		nameHits:   map[string]int{},
 	}
 }
 
@@ -313,6 +327,10 @@ func (c *Controller) Run() error {
 			if err := c.onProbe(r); err != nil {
 				return err
 			}
+		case r := <-c.volResults:
+			if err := c.onVolumeScan(r); err != nil {
+				return err
+			}
 		case <-tick.C:
 			c.pollVolume(c.now())
 		case err := <-fail:
@@ -332,6 +350,10 @@ func (c *Controller) Pump() error {
 		select {
 		case r := <-c.results:
 			if err := c.onProbe(r); err != nil {
+				return err
+			}
+		case r := <-c.volResults:
+			if err := c.onVolumeScan(r); err != nil {
 				return err
 			}
 		default:
@@ -583,6 +605,11 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 // помогла бы никогда.
 func (c *Controller) step(t *Task) error {
 	if q, ok := nextQuestion(t.Traits); ok {
+		if q.Name == questionVolume {
+			// Этот вопрос задаётся не пакетным зондом, а накачкой объёма:
+			// прибор другой, потому что и вопрос про другое.
+			return c.askVolume(t)
+		}
 		return c.ask(t, q)
 	}
 	if t.Traits.ByName == TraitNo {
@@ -755,7 +782,7 @@ func (c *Controller) buildQueue(t *Task) ([]Candidate, error) {
 	}
 	known := len(out)
 
-	gen, err := generate(t.Fingerprint, c.decoy)
+	gen, err := generate(t.Fingerprint, c.decoy, t.Traits.PassingName)
 	if err != nil {
 		return nil, err
 	}
