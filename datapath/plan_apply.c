@@ -92,6 +92,7 @@ static void emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
     const struct d2k_payload *pl = d2k_find_payload(p, f->payload_id);
     const struct d2k_poison *po = f->poison_id ? d2k_find_poison(p, f->poison_id) : NULL;
     memset(e, 0, sizeof *e);
+    e->kind = D2K_EMIT_FAKE;
     e->delay_us = delay;
     e->seq = seq;
     e->bytes = pl->bytes;
@@ -173,6 +174,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             size_t end = (i < n_pts) ? pts[i] : in->payload_len;
             d2k_emit *e = &v[n++];
             memset(e, 0, sizeof *e);
+            e->kind = D2K_EMIT_PAYLOAD;
             e->delay_us = 0;
             e->seq = in->seq + (uint32_t)start;
             e->bytes = in->payload + start;
@@ -218,6 +220,54 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     out->n = n;
     out->fate = owns_payload ? D2K_ORIG_DROP : D2K_ORIG_PASS;
     return 0;
+}
+
+/* Отмена исполнения на середине.
+ *
+ * Три правила, и все три следуют из одного: коробка уже увидела часть того,
+ * что мы собирались показать, и вернуть это назад нельзя.
+ *
+ * 1. Пока нагрузку не трогали — оригинал отпускается. Он цел, и потерять его
+ *    значило бы оборвать соединение человеку из-за нашей внутренней причины.
+ * 2. Как только ушёл хоть один кусок нагрузки — чистого выхода нет. Отпустить
+ *    оригинал значит послать те же байты дважды, не отпустить — потерять
+ *    остаток. Поток испорчен, и исполнитель сообщает об этом фактом, а не
+ *    выбирает меньшее зло сам: что делать с испорченным потоком — политика
+ *    контроллера.
+ * 3. Любая незавершённая отправка делает исполнение неполным. По нему нельзя
+ *    записывать ни успех, ни неудачу: коробка видела не тот набор пакетов,
+ *    который описывает план, а §2.3 запрещает сохранять неподтверждённое.
+ */
+void d2k_actions_cancel(const d2k_actions *a, size_t emitted, d2k_cancel *out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof *out);
+    if (!a) {
+        out->fate = D2K_ORIG_PASS;
+        return;
+    }
+    if (emitted > a->n) {
+        emitted = a->n;
+    }
+
+    int payload_out = 0;
+    for (size_t i = 0; i < emitted; i++) {
+        if (a->v[i].kind == D2K_EMIT_PAYLOAD) {
+            payload_out = 1;
+            break;
+        }
+    }
+
+    out->partial = (emitted < a->n) ? 1 : 0;
+    out->stream_damaged = (payload_out && emitted < a->n) ? 1 : 0;
+
+    if (payload_out) {
+        /* Байты нагрузки уже на проводе: повторять их нельзя. */
+        out->fate = D2K_ORIG_DROP;
+    } else {
+        out->fate = D2K_ORIG_PASS;
+    }
 }
 
 void d2k_actions_free(d2k_actions *a) {

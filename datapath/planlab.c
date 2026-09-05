@@ -186,7 +186,11 @@ int main(int argc, char **argv) {
         }
 
         for (size_t i = 0; i < a.n; i++) {
-            printf("emit %u %u ttl=%u poison=%02x ",
+            /* Вид посылки печатается намеренно: без него эталон не заметил бы,
+               если фальшивка и кусок нагрузки однажды поменяются местами, — а
+               от этого различия зависит поведение при отмене. */
+            printf("emit %s %u %u ttl=%u poison=%02x ",
+                   a.v[i].kind == D2K_EMIT_PAYLOAD ? "payload" : "fake",
                    a.v[i].delay_us, a.v[i].seq, a.v[i].ttl, a.v[i].poison);
             print_hex(a.v[i].bytes, a.v[i].len);
             printf("\n");
