@@ -86,7 +86,10 @@ cross:
 	done
 	@echo "переносимость: aarch64 и mipsel собираются"
 
-check: test-parse test-apply test-tls test-wire test-track test-session
+# planlab тоже в зависимостях, и это не украшение: он собирается отдельной
+# целью, поэтому однажды check остался зелёным при несобирающейся
+# лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
+check: all test-parse test-apply test-tls test-wire test-track test-session
 
 clean:
 	rm -f *.o test_plan_parse test_plan_apply test_tls test_wire test_track test_session planlab

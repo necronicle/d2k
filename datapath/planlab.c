@@ -21,6 +21,9 @@
 #include <string.h>
 
 #include "d2k_plan.h"
+/* Полное определение потока живёт здесь: d2k_plan.h объявляет тип
+   опережающе, и одного объявления для переменной по значению мало. */
+#include "d2k_track.h"
 
 #define MAX_PAYLOAD 65536
 
