@@ -193,7 +193,10 @@ if [ $LEARN = 1 ]; then
     iptables -t mangle -I OUTPUT -p tcp --dport $PORTS $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     iptables -t mangle -I INPUT -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
-echo \"POSTROUTING=\$(iptables -t mangle -S POSTROUTING | grep -c -- '--comment $TOKEN') FORWARD=\$(iptables -t mangle -S FORWARD | grep -c -- '--comment $TOKEN')\"
+for ch in POSTROUTING FORWARD OUTPUT INPUT; do
+    n=\$(iptables -t mangle -S \$ch 2>/dev/null | grep -c -- '--comment $TOKEN')
+    [ \"\$n\" != 0 ] && printf '%s=%s ' \"\$ch\" \"\$n\"
+done; echo
 " | sed 's/^/  правил: /' >&2
 
 # Сторож на случай, если управляющая сторона умрёт: снимает ТОЛЬКО свои

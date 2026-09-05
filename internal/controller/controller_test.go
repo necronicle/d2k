@@ -398,3 +398,128 @@ func TestОдинПоискНаЦельАНеДесять(t *testing.T) {
 		t.Fatalf("поисков начато %d, а цель одна; журнал:\n%s", n, r.log)
 	}
 }
+
+// slowProber отвечает не сразу: пока он думает, изображаем судорожное
+// обновление страницы.
+type slowProber struct {
+	release chan struct{}
+	res     probe.Result
+	calls   int
+	mu      sync.Mutex
+}
+
+func (s *slowProber) Do(_ context.Context, _ string, _ int, _ []byte) probe.Result {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	<-s.release
+	return s.res
+}
+
+func (s *slowProber) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestСудорожноеОбновлениеНеЖжётКандидатов(t *testing.T) {
+	// Человек жмёт F5 подряд. Каждое нажатие — новое соединение и новое
+	// подозрение. Пока наш зонд проверяет кандидата, эти подозрения не имеют
+	// права ни двигать лестницу, ни начинать второй поиск.
+	r := newRig(t)
+	slow := &slowProber{release: make(chan struct{}), res: ok()}
+	r.ctrl.SetProber(slow)
+
+	r.say("hello linkedin.com")
+	r.say("rst")
+	r.pump(3)
+
+	tasks := r.ctrl.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("поисков %d; журнал:\n%s", len(tasks), r.log)
+	}
+	attempts := tasks[0].Attempts
+
+	// Судорожное обновление, пока зонд в полёте.
+	for i := 0; i < 10; i++ {
+		r.say("hello linkedin.com")
+		r.say("rst")
+	}
+	r.pump(6)
+
+	tasks = r.ctrl.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("обновления развели %d поисков; журнал:\n%s", len(tasks), r.log)
+	}
+	if tasks[0].Attempts != attempts {
+		t.Fatalf("обновления сожгли лестницу: попыток было %d, стало %d;\nжурнал:\n%s",
+			attempts, tasks[0].Attempts, r.log)
+	}
+	if n := slow.count(); n != 1 {
+		t.Fatalf("зондов запущено %d, а должен быть один; журнал:\n%s", n, r.log)
+	}
+	if n := strings.Count(r.log.String(), "начат поиск"); n != 1 {
+		t.Fatalf("поисков начато %d; журнал:\n%s", n, r.log)
+	}
+
+	// Отпускаем зонд: решение обязано найтись.
+	close(slow.release)
+	r.pump(6)
+	if box, _, _ := r.store.Catalog().Lookup("linkedin.com", ""); box == nil {
+		t.Fatalf("после отпущенного зонда решение не найдено; журнал:\n%s", r.log)
+	}
+}
+
+func TestПослеБезуспешногоПоискаЦельОтдыхает(t *testing.T) {
+	// §2.3 разрешает короткий отказ ТОЛЬКО в памяти: десять вкладок,
+	// стучащихся в мёртвый хост, не должны запускать десять поисков подряд.
+	r := newRig(t)
+	r.probe.script = []probe.Result{blocked()}
+
+	r.say("hello rutracker.org")
+	r.say("rst")
+	r.pump(30)
+
+	if !strings.Contains(r.log.String(), "не сохранено ничего") {
+		t.Fatalf("поиск не закончился исчерпанием; журнал:\n%s", r.log)
+	}
+	started := strings.Count(r.log.String(), "начат поиск")
+
+	// Ещё обращения сразу же — нового поиска быть не должно.
+	for i := 0; i < 5; i++ {
+		r.say("hello rutracker.org")
+		r.say("rst")
+	}
+	r.pump(10)
+	if n := strings.Count(r.log.String(), "начат поиск"); n != started {
+		t.Fatalf("отдыхающая цель перезапустила поиск: было %d, стало %d;\nжурнал:\n%s",
+			started, n, r.log)
+	}
+
+	// А когда отдых кончился — можно снова.
+	r.clock = r.clock.Add(5 * time.Minute)
+	r.say("hello rutracker.org")
+	r.say("rst")
+	r.pump(10)
+	if n := strings.Count(r.log.String(), "начат поиск"); n <= started {
+		t.Fatalf("после отдыха поиск не возобновился; журнал:\n%s", r.log)
+	}
+	// И на диске по-прежнему пусто.
+	if n := len(r.store.Catalog().Boxes); n != 0 {
+		t.Fatalf("безуспешные поиски записали %d коробок", n)
+	}
+}
+
+func TestБюджетЗондовОграничен(t *testing.T) {
+	// §5: у измерений есть бюджет, и «сколько получится» бюджетом не является.
+	r := newRig(t)
+	r.probe.script = []probe.Result{blocked()}
+
+	r.say("hello budget.example")
+	r.say("rst")
+	r.pump(40)
+
+	if n := r.probe.count(); n > 8 {
+		t.Fatalf("зондов %d, а бюджет восемь; журнал:\n%s", n, r.log)
+	}
+}

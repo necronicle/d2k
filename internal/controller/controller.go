@@ -32,6 +32,14 @@ const (
 	maxTasks     = 64  // одновременных поисков
 	maxNames     = 512 // потоков, чьё имя цели мы помним
 	taskLifetime = 10 * time.Minute
+	// Сколько цель отдыхает после безуспешного поиска. Только в памяти и
+	// только на этот срок (§2.3): вчерашний отказ завтра не значит ничего, а
+	// десять вкладок, стучащихся в мёртвый хост, не должны запускать десять
+	// поисков подряд.
+	cooldownAfterFail = 2 * time.Minute
+	// Сколько зондов позволено одной цели за поиск. §5: у измерений есть
+	// бюджет, и «сколько получится» бюджетом не является.
+	maxProbesPerTask = 8
 	// Сколько раз кандидат должен доехать до соединения, не дав обмена,
 	// чтобы считаться неподошедшим.
 	//
@@ -76,8 +84,14 @@ type Task struct {
 	// слать своё: коробка может по-разному относиться к приветствию браузера
 	// и к приветствию нашей библиотеки (§3.1, §5.5).
 	Shape []byte
-	// Зонд уже в полёте: второй по той же цели не пускаем.
-	probing bool
+	// Зонд в полёте либо вот-вот уйдёт (ждём подтверждения команды).
+	//
+	// Пока он не ответил, подозрения клиента НИЧЕГО не решают: человек может
+	// судорожно обновлять страницу, и каждое обновление — это подозрение.
+	// Позволь им двигать кандидата — и лестница сгорит за пять нажатий F5,
+	// не проверив толком ни одного.
+	probing  bool
+	awaiting bool
 	// Сколько раз зондировали. §10 требует считать стоимость зондов на цель.
 	Probes int
 }
@@ -107,6 +121,12 @@ type Controller struct {
 	pendingAcks []string
 	results     chan probeDone
 
+	// Цели, по которым поиск недавно закончился ничем. Только в памяти и
+	// только на короткий срок: §2.3 запрещает персистить отказ, но десять
+	// вкладок, стучащихся в мёртвый хост, не должны запускать десять поисков
+	// подряд. Документ это допущение прямо описывает.
+	cooldown map[string]time.Time
+
 	tasks map[string]*Task
 	// Ключ потока → цель. Подозрение и обмен несут только ключ, имя приходит
 	// раньше отдельным событием.
@@ -120,15 +140,16 @@ type Controller struct {
 // New создаёт контроллер.
 func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 	return &Controller{
-		conn:    conn,
-		store:   store,
-		out:     out,
-		now:     time.Now,
-		decoy:   DecoySNI,
-		prober:  probe.New(),
-		tasks:   map[string]*Task{},
-		names:   map[control.Key]string{},
-		results: make(chan probeDone, 32),
+		conn:     conn,
+		store:    store,
+		out:      out,
+		now:      time.Now,
+		decoy:    DecoySNI,
+		prober:   probe.New(),
+		tasks:    map[string]*Task{},
+		names:    map[control.Key]string{},
+		results:  make(chan probeDone, 32),
+		cooldown: map[string]time.Time{},
 	}
 }
 
@@ -343,11 +364,19 @@ func (c *Controller) taskForKey(k control.Key) *Task {
 }
 
 func (c *Controller) expire(now time.Time) {
+	// Отдыхающие цели чистятся здесь же: карта без чистки растёт без
+	// предела, а §5.2 требует пределов на всё.
+	for k, until := range c.cooldown {
+		if now.After(until) {
+			delete(c.cooldown, k)
+		}
+	}
 	for k, t := range c.tasks {
 		if now.Sub(t.Started) > taskLifetime {
 			// Задача закрылась ничем. Ничего не сохраняется: §2.3.
 			c.sayf("поиск по %s закрыт по времени, попыток %d — не сохранено ничего",
 				t.Target, t.Attempts)
+			c.cooldown[t.Target] = now.Add(cooldownAfterFail)
 			delete(c.tasks, k)
 		}
 	}
@@ -404,7 +433,20 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 	sig := signalOf(ev)
 
 	t := c.tasks[target]
+	if t != nil && t.awaiting {
+		// Кандидат проверяется нашим зондом. Подозрения клиента сейчас
+		// ничего не решают: они только уточняют отпечаток. Именно здесь
+		// судорожное обновление страницы перестаёт жечь лестницу кандидатов.
+		t.Fingerprint = addSignal(t.Fingerprint, sig)
+		return nil
+	}
 	if t == nil {
+		if until, ok := c.cooldown[target]; ok && now.Before(until) {
+			// Поиск по этой цели только что кончился ничем. Начинать заново
+			// на каждое обновление страницы значит гонять одну и ту же
+			// лестницу по кругу и мешать самим себе.
+			return nil
+		}
 		if ev.Code == control.SuspectRSTCut {
 			// Снятый сброс бывает только там, где план УЖЕ стоит: снимает его
 			// защита из плана. Начинать по нему поиск значит искать решение
@@ -507,6 +549,7 @@ func (c *Controller) advance(t *Task) error {
 		c.pendingAcks = append(c.pendingAcks, t.Target)
 		t.Current = &cand
 		t.AppliedCount = 0
+		t.awaiting = c.prober != nil && t.ServerIP != ""
 		t.Attempts++
 		c.sayf("по %s пробую %s (%s), попытка %d",
 			t.Target, cand.Plan.ID, cand.Source, t.Attempts)
@@ -515,8 +558,9 @@ func (c *Controller) advance(t *Task) error {
 
 	// Кандидаты кончились. Ничего не сохраняется и ничего не остаётся: §2.3.
 	// Снимаем поставленный план, чтобы цель вернулась к прямому проходу.
-	c.sayf("по %s решения не нашлось, попыток %d — не сохранено ничего",
-		t.Target, t.Attempts)
+	c.sayf("по %s решения не нашлось, попыток %d, зондов %d — не сохранено ничего",
+		t.Target, t.Attempts, t.Probes)
+	c.cooldown[t.Target] = c.now().Add(cooldownAfterFail)
 	if err := c.clear(t.Kind, t.Target); err != nil {
 		return err
 	}
@@ -689,6 +733,14 @@ func (c *Controller) onAck(ev control.Event, now time.Time) error {
 // обслуживалось бы вовсе, а срок ожидания задавали бы чужие привычки.
 func (c *Controller) startProbe(t *Task, now time.Time) {
 	if t.probing || t.ServerIP == "" || c.prober == nil {
+		t.awaiting = false
+		return
+	}
+	if t.Probes >= maxProbesPerTask {
+		// Бюджет кончился. Это не свойство цели и никуда не пишется — просто
+		// столько мы за один поиск себе позволяем (§5).
+		c.sayf("по %s бюджет зондов исчерпан (%d)", t.Target, t.Probes)
+		t.awaiting = false
 		return
 	}
 	hello := t.Shape
@@ -740,6 +792,7 @@ func (c *Controller) onProbe(d probeDone) error {
 		return nil
 	}
 	t.probing = false
+	t.awaiting = false
 	if t.Current == nil {
 		return nil
 	}
