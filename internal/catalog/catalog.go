@@ -78,20 +78,30 @@ type Fingerprint struct {
 	Signals []Signal `json:"signals"`
 }
 
-// find возвращает сигнал того же вида, если он есть.
-func (f Fingerprint) find(kind string) (Signal, bool) {
-	for _, s := range f.Signals {
-		if s.Kind == kind {
-			return s, true
-		}
-	}
-	return Signal{}, false
-}
+// ttlSlack — на сколько TTL приметы может гулять и всё ещё считаться той же.
+//
+// Не вкус: полевой прогон 2026-09-05 дал у одной и той же подделки TTL 126 и
+// 127 в пределах одного часа. Маршрут меняется на хоп, и число прыжков вместе
+// с ним. Сравнивай точно — и каждое дрожание маршрута плодило бы примету, а
+// потом и коробку.
+//
+// Два, а не больше: соседний хоп это ±1, запас на второй. Шире — и два
+// РАЗНЫХ механизма на соседних узлах слились бы в один. Что они при этом
+// одинаково себя ведут, ещё не делает их одним устройством (§3), но модель
+// поведения у них была бы одна, а каталог хранит именно модели.
+const ttlSlack = 2
 
-// sameEvidence — одна ли это примета. Разность TTL сюда НЕ входит: она про
-// пару «коробка и сервер», а не про коробку, и на разных целях разная.
+// sameEvidence — одна ли это примета.
+//
+// Разность TTL сюда НЕ входит: она про пару «коробка и сервер», а не про
+// коробку, и на разных целях разная. TTL сравнивается с допуском, всё
+// остальное — точно: постоянный идентификатор IP и ToS не дрожат.
 func sameEvidence(a, b Signal) bool {
-	return a.TTL == b.TTL && a.IPID == b.IPID && a.ToS == b.ToS
+	d := int(a.TTL) - int(b.TTL)
+	if d < 0 {
+		d = -d
+	}
+	return d <= ttlSlack && a.IPID == b.IPID && a.ToS == b.ToS
 }
 
 // Compatible — можно ли считать, что два отпечатка сняты с одного поведения.
@@ -110,11 +120,23 @@ func (f Fingerprint) Compatible(other Fingerprint) bool {
 	}
 	common := 0
 	for _, s := range other.Signals {
-		t, ok := f.find(s.Kind)
-		if !ok {
+		seen, agreed := false, false
+		for _, t := range f.Signals {
+			if t.Kind != s.Kind {
+				continue
+			}
+			seen = true
+			if sameEvidence(t, s) {
+				agreed = true
+				break
+			}
+		}
+		if !seen {
 			continue
 		}
-		if !sameEvidence(t, s) {
+		if !agreed {
+			// Примета того же вида, но с другими уликами — это противоречие,
+			// а не «пока не встречали».
 			return false
 		}
 		common++
@@ -136,16 +158,16 @@ func (f Fingerprint) Match(other Fingerprint) float64 {
 	}
 	hit := 0
 	for _, s := range other.Signals {
+		// Просматриваются ВСЕ приметы того же вида, а не первая попавшаяся.
+		// Ранняя редакция обрывалась на первой: у коробки лежали приметы с
+		// TTL 127 и 126, наблюдали 126 — и совпадение не находилось, хотя
+		// оно было вторым по списку.
 		for _, t := range f.Signals {
 			if t.Kind != s.Kind {
 				continue
 			}
-			// Для сброса требуется совпадение улик, а не только вида.
-			if s.Kind == "rst" {
-				if t.TTLDelta == s.TTLDelta && t.IPID == s.IPID && t.ToS == s.ToS {
-					hit++
-				}
-				break
+			if s.Kind == "rst" && !sameEvidence(t, s) {
+				continue
 			}
 			hit++
 			break

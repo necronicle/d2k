@@ -443,3 +443,61 @@ func TestДваОдинаковыхОтпечаткаНеДаютДвеОдно�
 		t.Fatalf("коробок %d с именами %v, а отпечаток один", len(c.Boxes), ids)
 	}
 }
+
+func TestДрожаниеTTLНеПлодитКоробки(t *testing.T) {
+	// Полевой прогон 2026-09-05: у одной и той же подделки TTL был то 126, то
+	// 127 в пределах часа. Маршрут меняется на хоп. Сравнивай точно — и
+	// каждое дрожание плодило бы примету, а следом и коробку.
+	c := catalog.New()
+	now := time.Now()
+
+	first, _, err := c.Confirm(fp(126, 54321, 0x88), armPlan("p1"),
+		"name", "a.example", catalog.LevelProtocol, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, created, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
+		"name", "b.example", catalog.LevelProtocol, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || same.ID != first.ID {
+		t.Fatalf("дрожание TTL на единицу завело вторую коробку: %s против %s",
+			same.ID, first.ID)
+	}
+	if n := len(same.Fingerprint.Signals); n != 1 {
+		t.Fatalf("примет %d, а дрожание — это одна и та же примета", n)
+	}
+	// А заметный сдвиг — уже другое место в сети.
+	other, created, err := c.Confirm(fp(64, 54321, 0x88), armPlan("p2"),
+		"name", "c.example", catalog.LevelProtocol, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || other.ID == first.ID {
+		t.Fatal("подделка с совсем другого расстояния слилась с прежней коробкой")
+	}
+}
+
+func TestУзнаваниеСмотритВсеПриметыОдногоВида(t *testing.T) {
+	// Ранняя редакция обрывалась на первой примете того же вида: у коробки
+	// лежали TTL 127 и 126, наблюдали 126 — и совпадение не находилось, хотя
+	// оно было вторым по списку. Из-за этого готовый план узнанной коробки не
+	// предлагался, и поиск шёл с нуля.
+	c := catalog.New()
+	now := time.Now()
+	_, _, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
+		"name", "a.example", catalog.LevelProtocol, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Насильно кладём две приметы: так каталог мог выглядеть до правки
+	// допуска, и узнавание обязано работать и на таких записях.
+	c.Boxes[0].Fingerprint.Signals = []catalog.Signal{
+		{Kind: "rst", TTL: 200, IPID: 54321, ToS: 0x88, Seen: 1},
+		{Kind: "rst", TTL: 127, IPID: 54321, ToS: 0x88, Seen: 1},
+	}
+	if got := c.Candidates(fp(127, 54321, 0x88)); len(got) != 1 {
+		t.Fatalf("кандидатов %d: узнавание не досмотрело список примет", len(got))
+	}
+}

@@ -519,7 +519,13 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 func addSignal(fp catalog.Fingerprint, s catalog.Signal) catalog.Fingerprint {
 	for i := range fp.Signals {
 		x := &fp.Signals[i]
-		if x.Kind == s.Kind && x.TTL == s.TTL && x.IPID == s.IPID && x.ToS == s.ToS {
+		// Допуск по TTL тот же, что в каталоге: иначе задача накопит приметы,
+		// которые каталог потом сочтёт одной.
+		d := int(x.TTL) - int(s.TTL)
+		if d < 0 {
+			d = -d
+		}
+		if x.Kind == s.Kind && d <= 2 && x.IPID == s.IPID && x.ToS == s.ToS {
 			x.Seen += s.Seen
 			return fp
 		}
