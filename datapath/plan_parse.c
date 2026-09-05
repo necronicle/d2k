@@ -134,6 +134,35 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
             return -1;
         }
     }
+
+    /* Фальшивке «между кусками» нужны куски. План, который просит положить её
+       туда, где кусков нет, невыполним — и отвергается здесь, а не
+       приближается размещением «перед всеми». Приблизить неподдерживаемую
+       операцию другой запрещает §2.5. */
+    for (size_t i = 0; i < p->n_fakes; i++) {
+        if (p->fakes[i].placement == PLACE_BETWEEN && p->n_splits == 0) {
+            fail(err, errlen, "фальшивка между кусками, а разрезов нет");
+            return -1;
+        }
+        if (p->fakes[i].placement != PLACE_BEFORE &&
+            p->fakes[i].placement != PLACE_BETWEEN) {
+            fail(err, errlen, "неизвестное размещение фальшивки");
+            return -1;
+        }
+    }
+
+    if (p->order != ORDER_FORWARD && p->order != ORDER_REVERSE) {
+        fail(err, errlen, "неизвестный порядок посылки");
+        return -1;
+    }
+
+    /* Перекрытие объявлено форматом, но исполнителем этой версии ещё не
+       поддержано. Отказ, а не тихое игнорирование: план, часть которого не
+       исполняется, — это не тот план, который измеряли. */
+    if (p->n_seqovls > 0) {
+        fail(err, errlen, "перекрытие этой версией исполнителя не поддержано");
+        return -1;
+    }
     return 0;
 }
 
