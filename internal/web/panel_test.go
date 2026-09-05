@@ -1,7 +1,9 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -238,5 +240,50 @@ func TestИдущийПоискПоказанКакЖивоеСостояние(
 	// ломать вердикт проверки.
 	if !strings.Contains(body, "Поиск не записывается") {
 		t.Fatal("панель не говорит, что неудачный поиск не записывается")
+	}
+}
+
+func TestКороткийКоммитНеОбрываетСтраницу(t *testing.T) {
+	// Срез `slice .Commit 0 12` на коротком коммите обрывает исполнение
+	// шаблона. Поймано на роутере 06.09.2026: сборка со штампом в семь
+	// символов рендерилась до слова «коммит» и обрывалась, а код был 200.
+	// Пустой коммит бага не показывал — он уходил в другую ветку условия.
+	p, err := New(config.Default(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, commit := range []string{"", "030b7d6", "0123456789abcdef0123"} {
+		var buf bytes.Buffer
+		data := struct {
+			S       status.Snapshot
+			K       status.Knowledge
+			Built   int
+			Total   int
+			Working bool
+		}{S: status.Snapshot{Commit: commit}, Total: 6}
+		if err := p.tmpl.Execute(&buf, data); err != nil {
+			t.Fatalf("коммит %q длиной %d: шаблон не исполнился: %v", commit, len(commit), err)
+		}
+		if !strings.Contains(buf.String(), "</html>") {
+			t.Fatalf("коммит %q: страница оборвана на %d байтах", commit, buf.Len())
+		}
+	}
+}
+
+func TestОшибкаШаблонаНеВыдаётсяЗаСтраницу(t *testing.T) {
+	// «200 и половина разметки» — это сломанное, притворившееся рабочим.
+	p, err := New(config.Default(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.tmpl = template.Must(template.New("panel.html").Parse(
+		`<p>начало</p>{{slice .S.Commit 0 12}}<p>конец</p>`))
+	rec := httptest.NewRecorder()
+	p.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("сломанный шаблон отдан как успех, %d байт: %s", rec.Body.Len(), rec.Body.String())
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("код %d, ожидался 500", rec.Code)
 	}
 }

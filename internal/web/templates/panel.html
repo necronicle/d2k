@@ -13,7 +13,7 @@
     <h1>d2k</h1>
     <dl>
       <dt>версия</dt><dd>{{.S.Version}}</dd>
-      <dt>коммит</dt><dd>{{if .S.Commit}}{{slice .S.Commit 0 12}}{{else}}неизвестен{{end}}</dd>
+      <dt>коммит</dt><dd>{{if .S.Commit}}{{printf "%.12s" .S.Commit}}{{else}}неизвестен{{end}}</dd>
       <dt>собрано</dt><dd>{{if .S.Built}}{{.S.Built}}{{else}}неизвестно{{end}}</dd>
       {{if .S.Dirty}}<dd class="dirty">сборка с незакоммиченными правками</dd>{{end}}
     </dl>

@@ -9,6 +9,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -142,11 +143,20 @@ func (p *Panel) page(w http.ResponseWriter, r *http.Request) {
 		Working bool
 	}{S: s, K: p.knowledge(), Built: built, Total: total, Working: s.Working()}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := p.tmpl.Execute(w, data); err != nil {
-		// Заголовки уже ушли, дописывать ошибку в разметку бессмысленно.
+	// Собираем страницу ЦЕЛИКОМ и только потом отдаём.
+	//
+	// Прямая запись в ответ означала, что ошибка на середине шаблона уходит
+	// человеку как «200 и половина страницы». Поймано на роутере 06.09.2026:
+	// срез коммита за границу строки обрывал разметку на слове «коммит», а
+	// браузер показывал пустую панель с кодом успеха. Сломанное не должно
+	// иметь возможности притвориться рабочим.
+	var buf bytes.Buffer
+	if err := p.tmpl.Execute(&buf, data); err != nil {
+		http.Error(w, "страница не собралась: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (p *Panel) apiStatus(w http.ResponseWriter, r *http.Request) {
