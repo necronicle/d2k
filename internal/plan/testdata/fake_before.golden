@@ -1,0 +1,3 @@
+emit fake 0 1000 ttl=3 poison=01 deadbe
+emit fake 78000 1000 ttl=3 poison=01 deadbe
+fate pass

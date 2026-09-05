@@ -1,0 +1,8 @@
+# То же плечо, но приманка — огрызок вместо целого приветствия.
+d2k-plan 1 1
+id 00000000000000000000000000000042
+proto tcp tls
+payload 1 16030100050100000100
+poison 1 ttl=3 badsum
+fake payload=1 poison=1 repeats=2 gap_us=78000 place=before
+order forward

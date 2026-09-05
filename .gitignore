@@ -10,3 +10,6 @@ builds/
 
 # Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
 docs/superpowers/
+datapath/*.o
+datapath/test_plan_*
+datapath/planlab
