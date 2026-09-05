@@ -16,6 +16,7 @@
  *   reply <тип>   ответ сервера с нагрузкой (тип TLS-записи, напр. 22 или 23)
  *   raw <hex>     пропустить произвольную нагрузку как приветствие клиента
  *   plans         напечатать, сколько планов в таблице
+ *   shape         напечатать, поймана ли форма приветствия
  *   quit
  */
 #define _POSIX_C_SOURCE 200809L
@@ -111,6 +112,7 @@ int main(int argc, char **argv) {
     d2k_ctlsrv cx;
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
+    cx.ctl = ctl;
     /* Пределы как у сырого сокета: стенд обязан отвергать те же планы, что и
        служба, иначе он проверял бы не то. */
     cx.send_limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
@@ -212,6 +214,10 @@ int main(int argc, char **argv) {
                 d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
                 printf("rst: вердикт %s\n",
                        r.verdict == D2K_VERDICT_DROP ? "снять" : "пропустить");
+            } else if (strcmp(line, "shape") == 0) {
+                size_t sl = 0;
+                const uint8_t *sh = d2k_session_shape(sess, &sl);
+                printf("shape: %zu байт\n", sh ? sl : (size_t)0);
             } else if (strcmp(line, "plans") == 0) {
                 printf("planов %zu, команд принято %llu, отвергнуто %llu\n",
                        d2k_session_plan_count(sess),

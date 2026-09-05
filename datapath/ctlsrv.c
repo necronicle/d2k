@@ -23,6 +23,26 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t limits, char *why, size_t cap) {
     return 1;
 }
 
+/* Подтверждает команду. Зовётся ровно один раз на команду — иначе
+   контроллер, ждущий подтверждения, дождался бы чужого. */
+static void ack(d2k_ctlsrv *cx, uint16_t type, int ok) {
+    /* Место под ключ потока есть у всех событий одинаково: подтверждение не
+       про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
+    uint8_t body[12 + 3];
+    memset(body, 0, sizeof body);
+    body[12] = (uint8_t)(type >> 8);
+    body[13] = (uint8_t)type;
+    body[14] = ok ? 1 : 0;
+    if (ok) {
+        cx->ok_cmds++;
+    } else {
+        cx->bad_cmds++;
+    }
+    if (cx->ctl) {
+        d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, sizeof body);
+    }
+}
+
 void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len) {
     d2k_ctlsrv *cx = vctx;
     char why[200];
@@ -33,19 +53,19 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     case D2K_CMD_SET_ADDR: {
         size_t hdr = (type == D2K_CMD_SET_NAME) ? (len ? 1u + b[0] : 1u) : 4u;
         if (len < hdr) {
-            cx->bad_cmds++;
+            ack(cx, type, 0);
             return;
         }
         d2k_plan *p = NULL;
         if (d2k_plan_load(b + hdr, len - hdr, &p, why, sizeof why) != 0) {
             fprintf(stderr, "d2kd: план от контроллера не принят: %s\n", why);
-            cx->bad_cmds++;
+            ack(cx, type, 0);
             return;
         }
         if (!d2k_plan_fits(p, cx->send_limits, why, sizeof why)) {
             fprintf(stderr, "d2kd: план от контроллера не активирован: %s\n", why);
             d2k_plan_free(p);
-            cx->bad_cmds++;
+            ack(cx, type, 0);
             return;
         }
         int rc;
@@ -57,32 +77,53 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             rc = d2k_plantab_set_addr(tab, addr, p);
         }
         /* Владение планом перешло таблице в любом случае, включая отказ. */
-        if (rc == 0) { cx->ok_cmds++; } else { cx->bad_cmds++; }
+        ack(cx, type, rc == 0);
         return;
     }
+    case D2K_CMD_ARM_SHAPE:
+        if (len < 1 || len < 1u + b[0]) {
+            ack(cx, type, 0);
+            return;
+        }
+        if (d2k_session_want_shape(cx->sess, b + 1, b[0])) {
+            /* Готово прямо сейчас — отдаём, не дожидаясь следующего
+               приветствия. */
+            size_t slen = 0;
+            const uint8_t *sh = d2k_session_shape(cx->sess, &slen);
+            if (sh && slen > 0 && cx->ctl) {
+                uint8_t body[12 + 2048];
+                memset(body, 0, 12);
+                if (slen <= sizeof body - 12) {
+                    memcpy(body + 12, sh, slen);
+                    d2k_ctl_event(cx->ctl, D2K_EV_SHAPE, body, 12 + slen);
+                }
+            }
+        }
+        ack(cx, type, 1);
+        return;
     case D2K_CMD_DEL_NAME:
         if (len < 1 || len < 1u + b[0]) {
-            cx->bad_cmds++;
+            ack(cx, type, 0);
             return;
         }
         d2k_plantab_del_name(tab, b + 1, b[0]);
-        cx->ok_cmds++;
+        ack(cx, type, 1);
         return;
     case D2K_CMD_DEL_ADDR: {
         if (len < 4) {
-            cx->bad_cmds++;
+            ack(cx, type, 0);
             return;
         }
         uint32_t addr;
         memcpy(&addr, b, 4);
         d2k_plantab_del_addr(tab, addr);
-        cx->ok_cmds++;
+        ack(cx, type, 1);
         return;
     }
     default:
         /* Незнакомая команда — не повод рвать соединение, но и не повод
-           делать вид, что она исполнена. Считаем и продолжаем. */
-        cx->bad_cmds++;
+           делать вид, что она исполнена. Отвечаем отказом и продолжаем. */
+        ack(cx, type, 0);
         return;
     }
 }
@@ -103,7 +144,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         if (!e) {
             continue;
         }
-        uint8_t body[16 + D2K_JRN_NAME_MAX + 8];
+        /* Хватает и на приветствие целиком: форма приезжает сюда же. */
+        uint8_t body[16 + 2048 + 8];
         memcpy(body, &e->key, sizeof e->key);
         size_t n = sizeof e->key;
         uint16_t type = 0;
@@ -136,6 +178,19 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         case D2K_JRN_PLAN_REFUSED:
             type = D2K_EV_REFUSED;
             break;
+        case D2K_JRN_SHAPE: {
+            /* Байты приветствия лежат не в журнале, а в ловушке сессии:
+               запись журнала ограничена, а приветствие бывает в килобайт. */
+            size_t slen = 0;
+            const uint8_t *sh = d2k_session_shape(s, &slen);
+            if (!sh || slen == 0 || n + slen > sizeof body) {
+                continue;
+            }
+            type = D2K_EV_SHAPE;
+            memcpy(body + n, sh, slen);
+            n += slen;
+            break;
+        }
         case D2K_JRN_EXCHANGE:
             type = D2K_EV_EXCHANGE;
             body[n++] = e->code;            /* тип первой TLS-записи */

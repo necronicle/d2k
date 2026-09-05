@@ -11,18 +11,23 @@ package controller_test
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/necronicle/d2k/internal/catalog"
 	"github.com/necronicle/d2k/internal/control"
 	"github.com/necronicle/d2k/internal/controller"
+	"github.com/necronicle/d2k/internal/plan"
+	"github.com/necronicle/d2k/internal/probe"
 )
 
 type rig struct {
@@ -36,7 +41,59 @@ type rig struct {
 	log   *bytes.Buffer
 	clock time.Time
 	path  string
+	probe *fakeProber
 }
+
+// fakeProber отвечает на зонды по сценарию. В сеть проверки не ходят: вердикт
+// теста не должен зависеть от того, что творится на линии.
+type fakeProber struct {
+	mu sync.Mutex
+	// Ответы по очереди; последний повторяется.
+	script []probe.Result
+	calls  int
+	hellos [][]byte
+}
+
+func (f *fakeProber) Do(_ context.Context, _ string, _ int, hello []byte) probe.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.hellos = append(f.hellos, append([]byte(nil), hello...))
+	if len(f.script) == 0 {
+		return probe.Result{Outcome: probe.OutcomeSilence}
+	}
+	if f.calls-1 < len(f.script) {
+		return f.script[f.calls-1]
+	}
+	return f.script[len(f.script)-1]
+}
+
+func (f *fakeProber) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeProber) lastHello() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.hellos) == 0 {
+		return nil
+	}
+	return f.hellos[len(f.hellos)-1]
+}
+
+// ok — зонд прошёл с прикладными данными.
+func ok() probe.Result {
+	return probe.Result{
+		Outcome:   probe.OutcomeExchange,
+		Bytes:     4096,
+		SeenTypes: 1<<(22-20) | 1<<(23-20),
+	}
+}
+
+// blocked — зонд получил сброс.
+func blocked() probe.Result { return probe.Result{Outcome: probe.OutcomeReset} }
 
 func (r *rig) say(line string) string {
 	r.t.Helper()
@@ -49,22 +106,40 @@ func (r *rig) say(line string) string {
 	return r.out.Text()
 }
 
-// pump вычитывает события и скармливает их контроллеру, пока они есть.
-func (r *rig) pump(n int) {
+// pump вычитывает события, скармливает их контроллеру и разбирает ответы
+// зондов, пока не станет тихо.
+//
+// Тихо — это когда и событий нет, и зонды в полёте кончились. Ранняя редакция
+// выходила по первому же отсутствию события и пропускала разбор зонда,
+// который к тому моменту ещё летел.
+func (r *rig) pump(rounds int) {
 	r.t.Helper()
-	for i := 0; i < n; i++ {
-		// Срок короткий: события местные и приходят мгновенно, а ждать
-		// несуществующее по три четверти секунды на каждом вызове —
-		// двадцать секунд прогона на ровном месте.
-		if err := r.conn.SetDeadline(time.Now().Add(120 * time.Millisecond)); err != nil {
-			r.t.Fatal(err)
+	for i := 0; i < rounds; i++ {
+		progressed := false
+		for j := 0; j < 32; j++ {
+			if err := r.conn.SetReadDeadline(time.Now().Add(60 * time.Millisecond)); err != nil {
+				r.t.Fatal(err)
+			}
+			ev, err := r.conn.Next()
+			if err != nil {
+				break
+			}
+			progressed = true
+			if err := r.ctrl.Handle(ev); err != nil {
+				r.t.Fatalf("контроллер не переварил событие: %v", err)
+			}
 		}
-		ev, err := r.conn.Next()
-		if err != nil {
-			return // событий больше нет
+		// Зонды отвечают из своей горутины: даём им долететь и разбираем.
+		time.Sleep(20 * time.Millisecond)
+		before := len(r.ctrl.Tasks())
+		if err := r.ctrl.Pump(); err != nil {
+			r.t.Fatalf("контроллер не переварил зонд: %v", err)
 		}
-		if err := r.ctrl.Handle(ev); err != nil {
-			r.t.Fatalf("контроллер не переварил событие: %v", err)
+		if len(r.ctrl.Tasks()) != before {
+			progressed = true
+		}
+		if !progressed && r.probe.count() > 0 && len(r.ctrl.Tasks()) == 0 {
+			return
 		}
 	}
 }
@@ -124,8 +199,10 @@ func newRig(t *testing.T) *rig {
 		store: store, log: log, path: path,
 		clock: time.Date(2026, 9, 5, 21, 0, 0, 0, time.UTC),
 	}
+	r.probe = &fakeProber{}
 	r.ctrl = controller.New(conn, store, log)
 	r.ctrl.SetClock(func() time.Time { return r.clock })
+	r.ctrl.SetProber(r.probe)
 
 	t.Cleanup(func() {
 		_ = conn.Close()
@@ -140,76 +217,88 @@ func newRig(t *testing.T) *rig {
 	return r
 }
 
-func TestПустаяБазаПревращаетсяВИзученнуюКоробку(t *testing.T) {
-	// Полный сценарий этапа D: пустая база → сбой → поиск → проверка →
-	// сохранение коробки, плана и привязки → применение на следующем
-	// соединении.
+func TestРешениеНаходитсяБезЕдиногоПовтораКлиента(t *testing.T) {
+	// Главное свойство активного поиска. Клиент сходил ОДИН раз и больше не
+	// возвращался — так ведут себя телевизор, приставка и часть IoT. Пассивный
+	// поиск на них не работал бы вовсе, потому что ждал бы повтора, которого
+	// не будет.
 	r := newRig(t)
+	r.probe.script = []probe.Result{blocked(), ok()}
 
-	if len(r.store.Catalog().Boxes) != 0 {
-		t.Fatal("база не пуста при старте")
-	}
-
-	// Соединение с блокировкой: приветствие, затем подделанный сброс.
 	r.say("hello linkedin.com")
 	r.say("rst")
-	r.pump(8)
+	r.pump(10)
 
-	if len(r.ctrl.Tasks()) != 1 {
-		t.Fatalf("поисков %d, а подозрение было одно", len(r.ctrl.Tasks()))
+	if r.probe.count() == 0 {
+		t.Fatalf("контроллер не постучался сам; журнал:\n%s", r.log)
 	}
-	// Коробки пока НЕТ: подозрение само по себе ничего не подтверждает.
-	if len(r.store.Catalog().Boxes) != 0 {
-		t.Fatal("подозрение создало коробку без подтверждённого решения")
-	}
-
-	// Кандидат доехал до соединения, и обмен пошёл с прикладными данными.
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("reply 22")
-	r.say("reply 23")
-	r.pump(8)
-
-	cat := r.store.Catalog()
-	if len(cat.Boxes) != 1 {
-		t.Fatalf("коробок %d, а ждали одну; журнал:\n%s", len(cat.Boxes), r.log)
-	}
-	box, bind, pl := cat.Lookup("linkedin.com", "")
+	box, bind, pl := r.store.Catalog().Lookup("linkedin.com", "")
 	if box == nil || bind == nil || pl == nil {
-		t.Fatalf("привязка не сохранена; журнал:\n%s", r.log)
+		t.Fatalf("решение не найдено после %d зондов; журнал:\n%s",
+			r.probe.count(), r.log)
 	}
-	if bind.Level < catalog.LevelHandshake {
-		t.Fatalf("уровень доказательства %d, а прикладные данные были", bind.Level)
-	}
-	if len(box.Fingerprint.Signals) == 0 {
-		t.Fatal("у коробки нет ни одного признака распознавания")
-	}
-	// Поиск закрыт: он живое состояние, а не история.
 	if len(r.ctrl.Tasks()) != 0 {
-		t.Fatal("после подтверждения поиск остался открытым")
+		t.Fatal("после решения поиск остался открытым")
+	}
+	if !strings.Contains(r.log.String(), "стучусь сам") {
+		t.Fatalf("в журнале нет следа активного зонда:\n%s", r.log)
 	}
 
 	// И запись пережила перезапуск.
+	if _, err := r.store.FlushNow(r.clock); err != nil {
+		t.Fatal(err)
+	}
 	s2, err := catalog.Open(r.path)
 	if err != nil {
 		t.Fatalf("после перезапуска каталог не открылся: %v", err)
 	}
-	if box, _, _ := s2.Catalog().Lookup("linkedin.com", ""); box == nil {
+	if b, _, _ := s2.Catalog().Lookup("linkedin.com", ""); b == nil {
 		t.Fatal("подтверждённая привязка не пережила перезапуск")
 	}
 }
 
-func TestНеудачныйПоискНеОставляетСледов(t *testing.T) {
-	// §2.3 — главное правило. Кандидаты кончились, решения нет: на диске не
-	// должно остаться ничего, ни коробки, ни отметки на цели.
+func TestЗондПовторяетФормуКлиентскогоПриветствия(t *testing.T) {
+	// §3.1 и §5.5: зонд обязан проверять тот же трафик, что у пользователя.
+	// Синтетическое приветствие коробка может разглядывать иначе.
 	r := newRig(t)
+	r.probe.script = []probe.Result{ok()}
 
-	for i := 0; i < 8; i++ {
-		r.say("hello rutracker.org")
-		r.pump(4)
-		r.say("rst")
-		r.pump(6)
+	// Приветствие с приметным набором шифров: если зонд соберёт своё, набора
+	// в нём не будет.
+	hello, err := plan.Hello("marked.example", 0x77)
+	if err != nil {
+		t.Fatal(err)
 	}
+	r.say("raw " + hex.EncodeToString(hello))
+	r.say("rst")
+	r.pump(10)
+
+	sent := r.probe.lastHello()
+	if len(sent) == 0 {
+		t.Fatalf("зонд не пускался; журнал:\n%s", r.log)
+	}
+	if !bytes.Contains(sent, []byte("marked.example")) {
+		t.Fatal("в приветствии зонда нет имени цели")
+	}
+	if !strings.Contains(r.log.String(), "форма клиента") {
+		t.Fatalf("зонд пошёл не с формой клиента:\n%s", r.log)
+	}
+	// Случайное поле обязано отличаться от клиентского: копия не должна быть
+	// буквальным повтором чужого сообщения (§2.6).
+	if bytes.Equal(sent[11:11+32], hello[11:11+32]) {
+		t.Fatal("случайное поле клиента скопировано буквально")
+	}
+}
+
+func TestНеудачныйПоискНеОставляетСледов(t *testing.T) {
+	// §2.3 — главное правило. Все кандидаты отвергнуты: на диске не должно
+	// остаться ничего, ни коробки, ни отметки на цели.
+	r := newRig(t)
+	r.probe.script = []probe.Result{blocked()}
+
+	r.say("hello rutracker.org")
+	r.say("rst")
+	r.pump(30)
 
 	if n := len(r.store.Catalog().Boxes); n != 0 {
 		t.Fatalf("после безуспешного поиска в базе %d коробок; журнал:\n%s", n, r.log)
@@ -217,13 +306,14 @@ func TestНеудачныйПоискНеОставляетСледов(t *testi
 	if _, err := r.store.FlushNow(r.clock); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := os.ReadFile(r.path); err == nil {
-		if strings.Contains(string(b), "rutracker") {
-			t.Fatalf("цель безуспешного поиска попала на диск:\n%s", b)
-		}
+	if b, err := os.ReadFile(r.path); err == nil && strings.Contains(string(b), "rutracker") {
+		t.Fatalf("цель безуспешного поиска попала на диск:\n%s", b)
 	}
 	if !strings.Contains(r.log.String(), "не сохранено ничего") {
 		t.Fatalf("исчерпание кандидатов не отмечено в журнале:\n%s", r.log)
+	}
+	if r.probe.count() < 2 {
+		t.Fatalf("кандидаты перебирались не зондами: зондов %d", r.probe.count())
 	}
 }
 
@@ -231,25 +321,19 @@ func TestУзнаннаяКоробкаНеЗапускаетНовыйПодб�
 	// Этап E: успех готового плана на новой цели не вызывает генератор и не
 	// создаёт дубликат модели.
 	r := newRig(t)
+	r.probe.script = []probe.Result{ok()}
 
-	// Первая цель — учимся.
 	r.say("hello linkedin.com")
 	r.say("rst")
-	r.pump(8)
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("reply 22")
-	r.say("reply 23")
-	r.pump(8)
+	r.pump(10)
 	if len(r.store.Catalog().Boxes) != 1 {
 		t.Fatalf("первая цель не изучена; журнал:\n%s", r.log)
 	}
 
-	// Вторая цель с ТЕМ ЖЕ поведением.
 	r.log.Reset()
 	r.say("hello instagram.com")
 	r.say("rst")
-	r.pump(8)
+	r.pump(10)
 
 	logs := r.log.String()
 	if !strings.Contains(logs, "готовых планов узнанных коробок") {
@@ -258,12 +342,6 @@ func TestУзнаннаяКоробкаНеЗапускаетНовыйПодб�
 	if !strings.Contains(logs, "(коробка ") {
 		t.Fatalf("первым кандидатом пошёл не план коробки:\n%s", logs)
 	}
-
-	r.say("hello instagram.com")
-	r.pump(4)
-	r.say("reply 22")
-	r.say("reply 23")
-	r.pump(8)
 
 	cat := r.store.Catalog()
 	if len(cat.Boxes) != 1 {
@@ -275,108 +353,48 @@ func TestУзнаннаяКоробкаНеЗапускаетНовыйПодб�
 	if len(cat.Boxes[0].Plans) != 1 {
 		t.Fatalf("планов %d, а приём был один и тот же", len(cat.Boxes[0].Plans))
 	}
-	if !strings.Contains(r.log.String(), "повторное использование плана коробки") {
-		t.Fatalf("повторное использование не отмечено как повторное:\n%s", r.log)
+	if !strings.Contains(logs, "повторное использование плана коробки") {
+		t.Fatalf("повторное использование не отмечено как повторное:\n%s", logs)
 	}
 }
 
-func TestОдинПоискНаЦельАНеДесять(t *testing.T) {
-	// §4.1: параллельные открытия браузера присоединяются к одной задаче.
+func TestУровеньДоказательстваЧестен(t *testing.T) {
+	// §4.2: одного ServerHello мало для уровня 3. Зонд, увидевший только
+	// рукопожатие, обязан дать уровень 2, а не 3.
 	r := newRig(t)
-	for i := 0; i < 5; i++ {
-		r.say("hello discord.com")
-		r.say("rst")
-	}
-	r.pump(30)
-	if n := len(r.ctrl.Tasks()); n != 1 {
-		t.Fatalf("поисков по одной цели %d, а должен быть один", n)
-	}
-}
-
-func TestОбменБезПоискаНичегоНеПодтверждает(t *testing.T) {
-	// Обычный трафик идёт всё время. Он не должен ничего записывать.
-	r := newRig(t)
-	r.say("hello ya.ru")
-	r.say("reply 22")
-	r.say("reply 23")
-	r.pump(8)
-	if n := len(r.store.Catalog().Boxes); n != 0 {
-		t.Fatalf("обычный трафик записал %d коробок", n)
-	}
-}
-
-func TestСнятыйСбросНеСчитаетсяПровалом(t *testing.T) {
-	// «Снят чужой сброс» — это защита СРАБОТАЛА, а не план не помог. Первый
-	// полевой прогон споткнулся ровно здесь: контроллер отбросил кандидата в
-	// ту же секунду, когда датапат писал «обмен пошёл».
-	r := newRig(t)
+	r.probe.script = []probe.Result{{
+		Outcome:   probe.OutcomeExchange,
+		Bytes:     1400,
+		SeenTypes: 1 << (22 - 20), // только рукопожатие
+	}}
 
 	r.say("hello linkedin.com")
 	r.say("rst")
-	r.pump(8)
-	tasks := r.ctrl.Tasks()
-	if len(tasks) != 1 {
-		t.Fatalf("поисков %d", len(tasks))
-	}
-	firstTry := tasks[0].Attempts
+	r.pump(10)
 
-	// Кандидат встал; на следующем соединении защита снимает подделку.
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("rst") // защита кандидата снимет его и отметит rst_cut
-	r.pump(6)
-
-	tasks = r.ctrl.Tasks()
-	if len(tasks) != 1 {
-		t.Fatalf("поиск закрылся раньше времени; журнал:\n%s", r.log)
-	}
-	if tasks[0].Attempts != firstTry {
-		t.Fatalf("сработавшая защита сочтена провалом: попыток было %d, стало %d;\nжурнал:\n%s",
-			firstTry, tasks[0].Attempts, r.log)
-	}
-}
-
-func TestУровеньДваПодтверждаетИПотомРастёт(t *testing.T) {
-	// §4.2 запрещает выдавать уровень 2 за уровень 4, а не запрещает его
-	// записывать. Без снятия разгрузки обратного направления прикладных
-	// данных почти не видно, и требование уровня 3 означало бы, что не
-	// записывается вообще ничего.
-	r := newRig(t)
-
-	r.say("hello linkedin.com")
-	r.say("rst")
-	r.pump(8)
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("reply 22") // только ServerHello
-	r.pump(6)
-
-	cat := r.store.Catalog()
-	_, bind, _ := cat.Lookup("linkedin.com", "")
+	_, bind, _ := r.store.Catalog().Lookup("linkedin.com", "")
 	if bind == nil {
 		t.Fatalf("обмен на уровне 2 не подтверждён вовсе; журнал:\n%s", r.log)
 	}
 	if bind.Level != catalog.LevelProtocol {
 		t.Fatalf("уровень записан как %d, а измерен был 2", bind.Level)
 	}
+}
 
-	// Появились прикладные данные — уровень обязан подняться.
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("rst")
-	r.pump(4)
-	r.say("hello linkedin.com")
-	r.pump(4)
-	r.say("reply 22")
-	r.say("reply 23")
-	r.pump(8)
+func TestОдинПоискНаЦельАНеДесять(t *testing.T) {
+	// §4.1: параллельные открытия браузера присоединяются к одной задаче.
+	// Считаем НАЧАТЫЕ поиски, а не живые задачи: при активном зонде задача
+	// закрывается сама, и «ноль живых» ничего не говорит.
+	r := newRig(t)
+	r.probe.script = []probe.Result{blocked()}
 
-	_, bind, _ = r.store.Catalog().Lookup("linkedin.com", "")
-	if bind == nil || bind.Level < catalog.LevelHandshake {
-		lvl := -1
-		if bind != nil {
-			lvl = bind.Level
-		}
-		t.Fatalf("уровень не поднялся при появлении прикладных данных: %d;\nжурнал:\n%s", lvl, r.log)
+	for i := 0; i < 5; i++ {
+		r.say("hello discord.com")
+		r.say("rst")
+	}
+	r.pump(30)
+
+	if n := strings.Count(r.log.String(), "начат поиск"); n != 1 {
+		t.Fatalf("поисков начато %d, а цель одна; журнал:\n%s", n, r.log)
 	}
 }

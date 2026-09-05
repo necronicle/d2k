@@ -36,6 +36,22 @@ struct d2k_session {
     uint64_t     suspects;
     uint64_t     rst_dropped;
     uint64_t     exchanges;
+
+    /* Форма приветствия. Один буфер на всю сессию, и это объявленный предел:
+     * хранить приветствие каждого потока значило бы килобайт на поток.
+     *
+     * last_* — последнее увиденное приветствие, копится всегда.
+     * ready_* — то, что готово к выдаче по запросу. */
+    uint8_t  last_hello[2048];
+    size_t   last_hello_len;
+    uint8_t  last_name[256];
+    size_t   last_name_len;
+
+    int      shape_armed;
+    uint8_t  shape_name[256];
+    size_t   shape_name_len;
+    uint8_t  shape[2048];
+    size_t   shape_len;
 };
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
@@ -73,6 +89,23 @@ void d2k_session_set_plan(d2k_session *s, d2k_plan *p) {
     }
     d2k_plan_free(s->plan);
     s->plan = p;
+}
+
+/* Сравнение имени цели без учёта регистра. Своя функция, а не strncasecmp:
+   тот зависит от локали. */
+static int name_same(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen) {
+    if (alen != blen) {
+        return 0;
+    }
+    for (size_t i = 0; i < alen; i++) {
+        uint8_t x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') { x = (uint8_t)(x - 'A' + 'a'); }
+        if (y >= 'A' && y <= 'Z') { y = (uint8_t)(y - 'A' + 'a'); }
+        if (x != y) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static uint16_t rd16(const uint8_t *p) {
@@ -359,6 +392,31 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW) {
         d2k_tls_parse(pkt + payload_off, payload_len, &tls);
         if (tls.is_client_hello) {
+            /* Последнее приветствие копится всегда: подозрение возникнет на
+               этом же соединении, и просить форму будет уже поздно. Один
+               буфер, объявленный предел. */
+            if (payload_len <= sizeof s->last_hello) {
+                memcpy(s->last_hello, pkt + payload_off, payload_len);
+                s->last_hello_len = payload_len;
+                s->last_name_len = 0;
+                if (tls.have_sni && tls.sni_len <= sizeof s->last_name) {
+                    memcpy(s->last_name, pkt + payload_off + tls.sni_off, tls.sni_len);
+                    s->last_name_len = tls.sni_len;
+                }
+            }
+            /* Взведённая ловушка — на случай, когда в момент запроса
+               подходящего приветствия ещё не было. */
+            if (s->shape_armed && payload_len <= sizeof s->shape &&
+                (s->shape_name_len == 0 ||
+                 (tls.have_sni &&
+                  name_same(pkt + payload_off + tls.sni_off, tls.sni_len,
+                            s->shape_name, s->shape_name_len)))) {
+                memcpy(s->shape, pkt + payload_off, payload_len);
+                s->shape_len = payload_len;
+                s->shape_armed = 0;
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
+                                (uint32_t)payload_len, NULL, NULL, 0, NULL);
+            }
             fl->saw_hello = 1;
             fl->had_sni = tls.have_sni ? 1 : 0;
             fl->hello_seq = in_seq;
@@ -501,6 +559,42 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
     d2k_actions_free(&acts);
     return 0;
+}
+
+int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len) {
+    if (!s) {
+        return 0;
+    }
+    if (len > sizeof s->shape_name) {
+        len = sizeof s->shape_name;
+    }
+    /* Сохранённое подходит — отдаём немедленно. Ждать следующего приветствия
+       значило бы ждать повтора клиента, а подозрение возникло на том же
+       соединении, чьё приветствие только что прошло. */
+    if (s->last_hello_len > 0 &&
+        (len == 0 || name_same(s->last_name, s->last_name_len, name, len))) {
+        memcpy(s->shape, s->last_hello, s->last_hello_len);
+        s->shape_len = s->last_hello_len;
+        s->shape_armed = 0;
+        return 1;
+    }
+    s->shape_armed = 1;
+    s->shape_len = 0;
+    s->shape_name_len = len;
+    if (len) {
+        memcpy(s->shape_name, name, len);
+    }
+    return 0;
+}
+
+const uint8_t *d2k_session_shape(const d2k_session *s, size_t *len) {
+    if (!s || s->shape_len == 0) {
+        return NULL;
+    }
+    if (len) {
+        *len = s->shape_len;
+    }
+    return s->shape;
 }
 
 d2k_plantab *d2k_session_plans(d2k_session *s) {

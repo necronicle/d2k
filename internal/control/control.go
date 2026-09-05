@@ -28,13 +28,16 @@ const (
 	EvRefused  uint16 = 0x0004
 	EvExchange uint16 = 0x0005
 	EvStats    uint16 = 0x0006
+	EvShape    uint16 = 0x0007
+	EvAck      uint16 = 0x0008
 
-	CmdSetName uint16 = 0x0081
-	CmdSetAddr uint16 = 0x0082
-	CmdDelName uint16 = 0x0083
-	CmdDelAddr uint16 = 0x0084
-	CmdClear   uint16 = 0x0085
-	CmdStats   uint16 = 0x0086
+	CmdSetName  uint16 = 0x0081
+	CmdSetAddr  uint16 = 0x0082
+	CmdDelName  uint16 = 0x0083
+	CmdDelAddr  uint16 = 0x0084
+	CmdClear    uint16 = 0x0085
+	CmdStats    uint16 = 0x0086
+	CmdArmShape uint16 = 0x0087
 )
 
 // Коды причин подозрения. Обязаны совпадать с datapath/include/d2k_journal.h.
@@ -121,6 +124,20 @@ type Event struct {
 	// доказательства: 0x16 (рукопожатие) и 0x15 (предупреждение) — разные
 	// вещи, а «ответ пришёл» и «прикладной обмен завершён» тем более.
 	// Различает их тот, кто принимает решение, то есть контроллер.
+	// Для EvAck: какую команду подтверждают и приняли ли её.
+	//
+	// Без подтверждения зонд пришлось бы пускать «через паузу на всякий
+	// случай», а пауза наугад — это гонка, которую не видно, пока она не
+	// проявится на медленной коробке.
+	AckOf uint16
+	AckOK bool
+
+	// Для EvShape: байты наблюдённого приветствия. Зонд обязан повторять
+	// форму пользовательского, а не быть синтетическим: коробка может
+	// по-разному относиться к приветствию браузера и к приветствию нашей
+	// библиотеки (§3.1, §5.5).
+	Shape []byte
+
 	RecordType uint8
 	// Какие типы записей ВСТРЕЧАЛИСЬ в начале пакетов с обратной стороны.
 	// Одного RecordType мало: он всегда 22, потому что первым сервер шлёт
@@ -159,9 +176,15 @@ func Dial(path string) (*Conn, error) {
 
 func (c *Conn) Close() error { return c.c.Close() }
 
-// SetDeadline нужен вызывающему: у датапата нет обязанности что-то прислать,
-// и ждать вечно — значит повесить контроллер на молчащем сокете.
-func (c *Conn) SetDeadline(t time.Time) error { return c.c.SetDeadline(t) }
+// SetReadDeadline нужен вызывающему: у датапата нет обязанности что-то
+// прислать, и ждать вечно — значит повесить контроллер на молчащем сокете.
+//
+// Именно на чтение, а не на всё сразу: истёкший общий срок ломает и
+// последующие КОМАНДЫ, а команда — не ожидание, её срывать незачем.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.c.SetReadDeadline(t) }
+
+// SetWriteDeadline ограничивает отправку команды.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.c.SetWriteDeadline(t) }
 
 func (c *Conn) send(typ uint16, body []byte) error {
 	if len(body)+2 > FrameMax {
@@ -206,6 +229,18 @@ func (c *Conn) DelPlanName(name string) error {
 
 func (c *Conn) DelPlanAddr(ip [4]byte) error { return c.send(CmdDelAddr, ip[:]) }
 
+// WantShape просит у датапата форму приветствия цели.
+//
+// Если он уже видел подходящее — отдаст немедленно. Ждать следующего значило
+// бы ждать повтора клиента, а подозрение возникает на том же соединении, чьё
+// приветствие только что прошло.
+func (c *Conn) WantShape(name string) error {
+	if len(name) > 255 {
+		return fmt.Errorf("имя цели длиной %d байт не годится", len(name))
+	}
+	return c.send(CmdArmShape, append([]byte{byte(len(name))}, name...))
+}
+
 // Next читает одно событие. Возвращает io.EOF, когда датапат закрылся.
 func (c *Conn) Next() (Event, error) {
 	var ev Event
@@ -226,6 +261,9 @@ func (c *Conn) Next() (Event, error) {
 		return ev, err
 	}
 
+	// Подтверждение команды ключа потока не имеет: оно не про поток. Но
+	// место под ключ в кадре есть у всех событий одинаково — так проще и
+	// разбору, и сборке.
 	key, err := parseKey(body)
 	if err != nil {
 		return ev, err
@@ -256,6 +294,14 @@ func (c *Conn) Next() (Event, error) {
 		}
 	case EvRefused:
 		ev.Note = string(rest)
+	case EvShape:
+		ev.Shape = append([]byte(nil), rest...)
+	case EvAck:
+		if len(rest) < 3 {
+			return ev, errors.New("подтверждение без типа команды")
+		}
+		ev.AckOf = binary.BigEndian.Uint16(rest[0:2])
+		ev.AckOK = rest[2] == 1
 	case EvExchange:
 		if len(rest) < 5 {
 			return ev, errors.New("обмен без типа записи и длины")

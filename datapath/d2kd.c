@@ -490,6 +490,7 @@ int main(int argc, char **argv) {
     d2k_ctlsrv cx;
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
+    cx.ctl = ctl;
     cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
     uint64_t events_seen = 0;
 

@@ -12,6 +12,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,8 @@ import (
 
 	"github.com/necronicle/d2k/internal/catalog"
 	"github.com/necronicle/d2k/internal/control"
+	"github.com/necronicle/d2k/internal/plan"
+	"github.com/necronicle/d2k/internal/probe"
 )
 
 // Пределы. §5.2 требует их на всё, и «столько, сколько придёт» пределом не
@@ -63,15 +66,46 @@ type Task struct {
 	// задачи: §2.3 запрещает персистить отказ, а повторять один и тот же
 	// кандидат дважды подряд бессмысленно.
 	tried map[string]bool
+
+	// Адрес цели: по нему стучится зонд. Берётся из ключа потока — той
+	// стороны, у которой порт 443.
+	ServerIP   string
+	ServerPort int
+
+	// Форма приветствия, которую шлёт клиент. Зонд обязан повторять её, а не
+	// слать своё: коробка может по-разному относиться к приветствию браузера
+	// и к приветствию нашей библиотеки (§3.1, §5.5).
+	Shape []byte
+	// Зонд уже в полёте: второй по той же цели не пускаем.
+	probing bool
+	// Сколько раз зондировали. §10 требует считать стоимость зондов на цель.
+	Probes int
+}
+
+// Prober — то, чем контроллер стучится в цель. Интерфейс, а не структура,
+// чтобы проверки не ходили в сеть.
+type Prober interface {
+	Do(ctx context.Context, addr string, port int, hello []byte) probe.Result
+}
+
+type probeDone struct {
+	target string
+	res    probe.Result
 }
 
 // Controller связывает датапат и каталог.
 type Controller struct {
-	conn  *control.Conn
-	store *catalog.Store
-	out   io.Writer
-	now   func() time.Time
-	decoy string
+	conn   *control.Conn
+	store  *catalog.Store
+	out    io.Writer
+	now    func() time.Time
+	decoy  string
+	prober Prober
+
+	// Подтверждения приходят без имени цели: датапат отвечает в том порядке,
+	// в каком получил, поэтому очередь ожидающих — обычная FIFO.
+	pendingAcks []string
+	results     chan probeDone
 
 	tasks map[string]*Task
 	// Ключ потока → цель. Подозрение и обмен несут только ключ, имя приходит
@@ -86,15 +120,21 @@ type Controller struct {
 // New создаёт контроллер.
 func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 	return &Controller{
-		conn:  conn,
-		store: store,
-		out:   out,
-		now:   time.Now,
-		decoy: DecoySNI,
-		tasks: map[string]*Task{},
-		names: map[control.Key]string{},
+		conn:    conn,
+		store:   store,
+		out:     out,
+		now:     time.Now,
+		decoy:   DecoySNI,
+		prober:  probe.New(),
+		tasks:   map[string]*Task{},
+		names:   map[control.Key]string{},
+		results: make(chan probeDone, 32),
 	}
 }
+
+// SetProber подменяет способ стучаться в цель. Нужен проверкам: они не должны
+// ходить в сеть.
+func (c *Controller) SetProber(p Prober) { c.prober = p }
 
 // SetClock нужен тестам: время в решениях не должно зависеть от настенных
 // часов машины, где идёт проверка.
@@ -185,18 +225,55 @@ func parseIP4(s string, out *[4]byte) error {
 	return nil
 }
 
-// Run читает события, пока датапат не закроется.
+// Run читает события и разбирает результаты зондов, пока датапат не закроется.
+//
+// Два источника, а не один: зонд уходит в сеть и отвечает секундами позже, а
+// цикл событий останавливать на это время нельзя — датапат за секунду
+// присылает сотни наблюдений.
 func (c *Controller) Run() error {
+	events := make(chan control.Event, 64)
+	fail := make(chan error, 1)
+	go func() {
+		for {
+			ev, err := c.conn.Next()
+			if err != nil {
+				fail <- err
+				return
+			}
+			events <- ev
+		}
+	}()
+
 	for {
-		ev, err := c.conn.Next()
-		if err != nil {
+		select {
+		case ev := <-events:
+			if err := c.Handle(ev); err != nil {
+				return err
+			}
+		case r := <-c.results:
+			if err := c.onProbe(r); err != nil {
+				return err
+			}
+		case err := <-fail:
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
-		if err := c.Handle(ev); err != nil {
-			return err
+	}
+}
+
+// Pump разбирает готовые результаты зондов, не блокируя. Для проверок,
+// которые зовут Handle напрямую.
+func (c *Controller) Pump() error {
+	for {
+		select {
+		case r := <-c.results:
+			if err := c.onProbe(r); err != nil {
+				return err
+			}
+		default:
+			return nil
 		}
 	}
 }
@@ -209,6 +286,12 @@ func (c *Controller) Handle(ev control.Event) error {
 	switch ev.Type {
 	case control.EvHello:
 		c.remember(ev.Key, ev.Name)
+
+	case control.EvAck:
+		return c.onAck(ev, now)
+
+	case control.EvShape:
+		c.onShape(ev)
 
 	case control.EvApplied:
 		if t := c.taskForKey(ev.Key); t != nil && t.Current != nil {
@@ -333,6 +416,7 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 			c.dropped++
 			return nil
 		}
+		ip, port := serverOf(ev.Key)
 		t = &Task{
 			Target:  target,
 			Kind:    kind,
@@ -340,10 +424,21 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 			Fingerprint: catalog.Fingerprint{
 				Method: catalog.FingerprintMethod,
 			},
-			tried: map[string]bool{},
+			tried:      map[string]bool{},
+			ServerIP:   ip,
+			ServerPort: port,
 		}
 		c.tasks[target] = t
 		c.sayf("подозрение по %s (%s): начат поиск", target, control.SuspectText(ev.Code))
+		// Просим форму приветствия: зонд обязан повторять то, что шлёт
+		// клиент, а не своё. Если не успеет прийти — соберём похожее сами и
+		// скажем об этом.
+		if kind == "name" {
+			if err := c.conn.WantShape(target); err != nil {
+				return err
+			}
+			c.pendingAcks = append(c.pendingAcks, "")
+		}
 	} else if t.Current != nil && t.AppliedCount >= maxSilentTries {
 		c.sayf("по %s кандидат %s применён %d раз без обмена, беру следующий",
 			target, t.Current.Plan.ID, t.AppliedCount)
@@ -406,6 +501,10 @@ func (c *Controller) advance(t *Task) error {
 		if err := c.push(t.Kind, t.Target, tlv); err != nil {
 			return err
 		}
+		// Ждём подтверждения и только потом стучимся. Пускать зонд «через
+		// паузу на всякий случай» — гонка, которую не видно, пока она не
+		// проявится на медленной коробке.
+		c.pendingAcks = append(c.pendingAcks, t.Target)
 		t.Current = &cand
 		t.AppliedCount = 0
 		t.Attempts++
@@ -528,6 +627,155 @@ func (c *Controller) onExchange(ev control.Event, now time.Time) error {
 
 	delete(c.tasks, t.Target)
 	if _, err := c.store.Flush(now); err != nil {
+		c.sayf("каталог не записался: %v", err)
+	}
+	return nil
+}
+
+// serverOf — какая сторона пары сервер. Та, у которой порт 443; если ни у
+// кого, берём высокий конец: ключ канонизирован, выдумывать тут нечего.
+func serverOf(k control.Key) (string, int) {
+	if k.LowPort == 443 {
+		return fmt.Sprintf("%d.%d.%d.%d", k.LowIP[0], k.LowIP[1], k.LowIP[2], k.LowIP[3]), 443
+	}
+	return fmt.Sprintf("%d.%d.%d.%d", k.HighIP[0], k.HighIP[1], k.HighIP[2], k.HighIP[3]),
+		int(k.HighPort)
+}
+
+func (c *Controller) onShape(ev control.Event) {
+	if len(ev.Shape) == 0 {
+		return
+	}
+	// Форма ловится по одной цели за раз, и задача, её заказавшая, — та, у
+	// которой формы ещё нет.
+	for _, t := range c.tasks {
+		if t.Shape == nil {
+			t.Shape = append([]byte(nil), ev.Shape...)
+			c.sayf("по %s поймана форма приветствия: %d байт", t.Target, len(ev.Shape))
+			return
+		}
+	}
+}
+
+// onAck: план встал — можно стучаться.
+func (c *Controller) onAck(ev control.Event, now time.Time) error {
+	if len(c.pendingAcks) == 0 {
+		return nil
+	}
+	target := c.pendingAcks[0]
+	c.pendingAcks = c.pendingAcks[1:]
+	if target == "" {
+		return nil // подтверждение на заказ формы
+	}
+	t := c.tasks[target]
+	if t == nil || t.Current == nil {
+		return nil
+	}
+	if !ev.AckOK {
+		// Датапат отверг план. Это не наблюдение о коробке — это наш
+		// негодный кандидат, и следующий берём немедленно.
+		c.sayf("по %s датапат отверг %s, беру следующий", target, t.Current.Plan.ID)
+		t.Current = nil
+		return c.advance(t)
+	}
+	c.startProbe(t, now)
+	return nil
+}
+
+// startProbe стучится в цель НЕ ДОЖИДАЯСЬ клиента.
+//
+// Это и есть ответ на «ждать надо время, а не повторы»: устройство, которое
+// не перезапрашивает — телевизор, приставка, часть IoT, — иначе не
+// обслуживалось бы вовсе, а срок ожидания задавали бы чужие привычки.
+func (c *Controller) startProbe(t *Task, now time.Time) {
+	if t.probing || t.ServerIP == "" || c.prober == nil {
+		return
+	}
+	hello := t.Shape
+	how := "форма клиента"
+	if len(hello) == 0 {
+		// Формы нет: соберём похожее сами и СКАЖЕМ об этом. Синтетическое
+		// приветствие коробка может разглядывать иначе, и знать, чем мерили,
+		// обязательно.
+		h, err := plan.Hello(t.Target, 0x30)
+		if err != nil {
+			c.sayf("по %s приветствие для зонда не собралось: %v", t.Target, err)
+			return
+		}
+		hello = h
+		how = "собранное приветствие"
+	} else {
+		reshaped, dropped, err := probe.Reshape(hello, 0x55)
+		if err != nil {
+			c.sayf("по %s форму не переписать (%v) — беру собранное", t.Target, err)
+			h, herr := plan.Hello(t.Target, 0x30)
+			if herr != nil {
+				return
+			}
+			hello, how = h, "собранное приветствие"
+		} else {
+			hello = reshaped
+			if len(dropped) > 0 {
+				how = fmt.Sprintf("форма клиента без расширений %v", dropped)
+			}
+		}
+	}
+
+	t.probing = true
+	t.Probes++
+	target, ip, port := t.Target, t.ServerIP, t.ServerPort
+	c.sayf("по %s стучусь сам: %s -> %s:%d", target, how, ip, port)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		res := c.prober.Do(ctx, ip, port, hello)
+		c.results <- probeDone{target: target, res: res}
+	}()
+}
+
+// onProbe — зонд ответил. Здесь и решается, подошёл ли кандидат.
+func (c *Controller) onProbe(d probeDone) error {
+	t := c.tasks[d.target]
+	if t == nil {
+		return nil
+	}
+	t.probing = false
+	if t.Current == nil {
+		return nil
+	}
+	c.sayf("по %s зонд: %s", d.target, d.res.Describe())
+
+	if d.res.Outcome != probe.OutcomeExchange {
+		// Кандидат не подошёл. Это НЕ доказательство свойств коробки (§2.4) и
+		// никуда не записывается.
+		t.Current = nil
+		return c.advance(t)
+	}
+
+	level := catalog.LevelProtocol
+	if d.res.HasAppData() {
+		level = catalog.LevelHandshake
+	}
+	box, created, err := c.store.Catalog().Confirm(
+		t.Fingerprint, t.Current.Plan, t.Kind, t.Target, level, c.now())
+	if err != nil {
+		c.sayf("по %s зонд прошёл, но записать нечего: %v", t.Target, err)
+		return nil
+	}
+	c.store.Touch()
+	c.Confirms++
+
+	what := "коробка " + box.ID
+	if created {
+		what = "заведена коробка " + box.ID
+	} else if t.Current.BoxID != "" {
+		what = "повторное использование плана коробки " + box.ID
+	}
+	c.sayf("по %s решение найдено за %d зонд(ов), уровень %d: %s, план %s",
+		t.Target, t.Probes, level, what, t.Current.Plan.ID)
+
+	delete(c.tasks, t.Target)
+	if _, err := c.store.Flush(c.now()); err != nil {
 		c.sayf("каталог не записался: %v", err)
 	}
 	return nil

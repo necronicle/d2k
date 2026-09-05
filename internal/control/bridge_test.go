@@ -9,6 +9,7 @@ package control_test
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -103,7 +104,7 @@ func dial(t *testing.T, sock string) *control.Conn {
 	if err != nil {
 		t.Fatalf("не подключиться к стенду: %v", err)
 	}
-	if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close() })
@@ -424,4 +425,139 @@ func TestПриманкуGoУзнаётРазборщикC(t *testing.T) {
 		return
 	}
 	t.Fatal("разборщик на C не узнал приветствие, собранное на Go")
+}
+
+func TestФормаПриветствияЛовитсяПоЗапросу(t *testing.T) {
+	// Зонд обязан повторять форму пользовательского приветствия. Значит
+	// датапат должен уметь её отдать — по запросу, а не с каждым
+	// соединением: полкилобайта на каждое приветствие роутера ради того, что
+	// нужно раз в жизни цели.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	// До взведения ловушки формы нет.
+	p.say(t, "hello before.example")
+	if got := p.say(t, "shape"); !strings.Contains(got, "shape: 0 байт") {
+		t.Fatalf("форма поймана без запроса: %q", got)
+	}
+
+	if err := c.WantShape("youtube.com"); err != nil {
+		t.Fatal(err)
+	}
+	// Даём стенду прокрутить цикл и разобрать команду.
+	for i := 0; i < 50; i++ {
+		p.say(t, "hello other.example")
+		if strings.Contains(p.say(t, "shape"), "shape: 0 байт") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Чужая цель ловушку не тратит.
+	if got := p.say(t, "shape"); !strings.Contains(got, "shape: 0 байт") {
+		t.Fatalf("ловушка сработала на чужой цели: %q", got)
+	}
+
+	p.say(t, "hello youtube.com")
+	got := p.say(t, "shape")
+	if strings.Contains(got, "shape: 0 байт") {
+		t.Fatalf("форма не поймана на своей цели: %q", got)
+	}
+
+	// И она обязана доехать до контроллера целиком.
+	var shape []byte
+	for i := 0; i < 12; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			break
+		}
+		if ev.Type == control.EvShape {
+			shape = ev.Shape
+			break
+		}
+	}
+	if len(shape) == 0 {
+		t.Fatal("форма приветствия не доехала до контроллера")
+	}
+	if shape[0] != 0x16 {
+		t.Fatalf("пойманное не похоже на запись рукопожатия: %#02x", shape[0])
+	}
+	if !bytes.Contains(shape, []byte("youtube.com")) {
+		t.Fatal("в пойманной форме нет имени цели")
+	}
+}
+
+func TestКомандаПодтверждается(t *testing.T) {
+	// Без подтверждения зонд пришлось бы пускать «через паузу на всякий
+	// случай», а пауза наугад — гонка, которую не видно, пока она не
+	// проявится на медленной коробке.
+	p, sock := start(t)
+	_ = p
+	c := dial(t, sock)
+
+	src, err := os.ReadFile("../plan/testdata/rzd_arm.plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pl, err := plan.ParseText(string(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlv, err := pl.MarshalTLV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPlanName("linkedin.com", tlv); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 6; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("подтверждение не пришло: %v", err)
+		}
+		if ev.Type != control.EvAck {
+			continue
+		}
+		if ev.AckOf != control.CmdSetName {
+			t.Fatalf("подтверждена команда %#04x, а слали %#04x", ev.AckOf, control.CmdSetName)
+		}
+		if !ev.AckOK {
+			t.Fatal("годная команда отвергнута")
+		}
+		return
+	}
+	t.Fatal("подтверждение не пришло")
+}
+
+func TestНегоднаяКомандаПодтверждаетсяОтказом(t *testing.T) {
+	p, sock := start(t)
+	_ = p
+	c := dial(t, sock)
+
+	// План, который датапат обязан отвергнуть: ipid_zero сырым сокетом
+	// неисполним.
+	pl := plan.Plan{
+		Schema: plan.SchemaCurrent, MinExec: 1, Transport: 6, Proto: 1,
+		Payloads: []plan.Payload{{ID: 1, Bytes: []byte{0xDE, 0xAD}}},
+		Poisons:  []plan.Poison{{ID: 1, Flags: plan.PoisonIPIDZero}},
+		Fakes:    []plan.Fake{{PayloadID: 1, PoisonID: 1, Repeats: 1}},
+	}
+	tlv, _ := pl.MarshalTLV()
+	if err := c.SetPlanName("bad.example", tlv); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("подтверждение не пришло: %v", err)
+		}
+		if ev.Type != control.EvAck {
+			continue
+		}
+		if ev.AckOK {
+			t.Fatal("неисполнимый план подтверждён как принятый")
+		}
+		return
+	}
+	t.Fatal("отказ не подтверждён")
 }
