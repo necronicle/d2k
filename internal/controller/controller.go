@@ -555,9 +555,9 @@ func (c *Controller) step(t *Task) error {
 		return c.ask(t, q)
 	}
 	if t.Traits.ByName == TraitNo {
-		// Ответ получен и он закрывает тему: дело в адресе. Ничего не
-		// сохраняется (§2.3) — ни как «непробиваемая», ни как отметка.
-		c.sayf("по %s решает адрес, а не имя: работа с именем не поможет — не сохранено ничего",
+		// Транспорт не встаёт: работать нечем. Ничего не сохраняется (§2.3) —
+		// ни как «непробиваемая», ни как отметка на цели.
+		c.sayf("по %s транспорт не встаёт — искать нечем, не сохранено ничего",
 			t.Target)
 		c.cooldown[t.Target] = c.now().Add(cooldownAfterFail)
 		delete(c.tasks, t.Target)
@@ -589,11 +589,10 @@ func (c *Controller) ask(t *Task, q Question) error {
 // questionHello строит сообщение, которым задаётся вопрос.
 func (c *Controller) questionHello(t *Task, q Question) ([]byte, string, error) {
 	switch q.Name {
-	case "по имени или по адресу":
-		// Безобидное имя на ТОТ ЖЕ адрес. Пройдёт — решает имя; не пройдёт —
-		// решает адрес, и тогда искать нечего.
-		h, err := plan.Hello(c.decoy, 0x30)
-		return h, "безобидное имя " + c.decoy, err
+	case "встаёт ли транспорт":
+		// Любое имя годится: вопрос про транспорт, а не про имя.
+		h, err := c.clientHello(t)
+		return h, "форма клиента", err
 	default:
 		h, err := c.clientHello(t)
 		return h, "форма клиента", err
@@ -604,7 +603,7 @@ func answerUnknown(tr Traits, q Question) Traits {
 	// Не спросили — значит не знаем. Превращать «не спрашивали» в «нет»
 	// запрещено (§2.4), поэтому здесь ставится именно отказ от вопроса.
 	switch q.Name {
-	case "по имени или по адресу":
+	case "встаёт ли транспорт":
 		tr.ByName = TraitYes // не смогли спросить — работаем как обычно
 	case "первое приветствие или последнее":
 		tr.ReadsFirstHello = TraitNo
@@ -969,29 +968,17 @@ func (c *Controller) onAnswer(t *Task, d probeDone) error {
 	t.Asking = Question{}
 
 	switch q.Name {
-	case "по имени или по адресу":
-		switch {
-		case d.res.Outcome == probe.OutcomeNoConnect:
-			// Даже транспорт не встал. Это ниже TLS, и имя тут ни при чём.
-			c.sayf("по %s ответ: транспорт не встаёт вовсе (%s) — ниже TLS, искать нечего",
+	case "встаёт ли транспорт":
+		if d.res.Outcome == probe.OutcomeNoConnect {
+			// Не встал даже транспорт. Это ниже TLS, и работать с именем
+			// бессмысленно — но утверждать «блокировка по адресу» всё равно
+			// нельзя: сервер мог просто лежать (§2.4). Записываем ровно то,
+			// что видно, и не сохраняем ничего (§2.3).
+			c.sayf("по %s ответ: транспорт не встаёт вовсе (%s) — это ниже TLS",
 				t.Target, d.res.Describe())
 			t.Traits.ByName = TraitNo
-		case d.res.Outcome == probe.OutcomeExchange:
-			// С безобидным именем обмен пошёл: значит решает ИМЯ.
-			c.sayf("по %s ответ: с безобидным именем обмен идёт — решает имя", t.Target)
-			t.Traits.ByName = TraitYes
-		case t.probeForgedRST:
-			// Коробка сбросила соединение и с безобидным именем. Подделку
-			// отличаем по чужому TTL, а не по факту сброса: сервер тоже умеет
-			// закрывать соединение.
-			c.sayf("по %s ответ: подделанный сброс даже на безобидное имя — решает адрес",
-				t.Target)
-			t.Traits.ByName = TraitNo
-		default:
-			// Ни обмена, ни подделки. Сервер мог закрыться сам на чужое имя —
-			// это НЕ ответ про коробку, и выдавать его за ответ нельзя.
-			c.sayf("по %s ответ не различили (%s): сервер мог закрыться сам — считаю, что решает имя",
-				t.Target, d.res.Describe())
+		} else {
+			c.sayf("по %s ответ: транспорт встаёт — дело выше него", t.Target)
 			t.Traits.ByName = TraitYes
 		}
 	default:
