@@ -14,6 +14,7 @@
  *   hello <имя>   пропустить через сессию приветствие с этим именем
  *   rst           сброс с чужим TTL по последнему потоку
  *   reply <тип>   ответ сервера с нагрузкой (тип TLS-записи, напр. 22 или 23)
+ *   raw <hex>     пропустить произвольную нагрузку как приветствие клиента
  *   plans         напечатать, сколько планов в таблице
  *   quit
  */
@@ -164,6 +165,38 @@ int main(int argc, char **argv) {
                 d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
                 printf("hello %s: посылок %zu, пропуск %s\n", line + 6, r.n_out,
                        r.skipped ? r.skipped : "нет");
+            } else if (strncmp(line, "raw ", 4) == 0) {
+                /* Произвольные байты как нагрузка клиента. Нужно, чтобы
+                   проверить приманку, собранную на Go, ТЕМ ЖЕ разборщиком,
+                   что стоит на пакетном пути: сверка двух реализаций на глаз
+                   не проверка. */
+                const char *hex = line + 4;
+                uint8_t pay[1600];
+                size_t pl = 0;
+                while (hex[0] && hex[1] && pl < sizeof pay) {
+                    int hi = -1, lo = -1;
+                    for (int k = 0; k < 2; k++) {
+                        char ch = hex[k];
+                        int v = -1;
+                        if (ch >= '0' && ch <= '9') { v = ch - '0'; }
+                        else if (ch >= 'a' && ch <= 'f') { v = ch - 'a' + 10; }
+                        else if (ch >= 'A' && ch <= 'F') { v = ch - 'A' + 10; }
+                        if (k == 0) { hi = v; } else { lo = v; }
+                    }
+                    if (hi < 0 || lo < 0) { break; }
+                    pay[pl++] = (uint8_t)(hi * 16 + lo);
+                    hex += 2;
+                }
+                port++;
+                size_t sz = build_pkt(pkt, 0, port, 0x02, 64, NULL, 0);
+                d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
+                sz = build_pkt(pkt, 1, port, 0x12, 124, NULL, 0);
+                d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
+                sz = build_pkt(pkt, 0, port, 0x18, 64, pay, pl);
+                d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
+                printf("raw %zu байт: приветствий %llu, с именем %llu\n", pl,
+                       (unsigned long long)d2k_session_hellos(sess),
+                       (unsigned long long)d2k_session_with_sni(sess));
             } else if (strncmp(line, "reply ", 6) == 0) {
                 uint8_t rec[64];
                 memset(rec, 0, sizeof rec);

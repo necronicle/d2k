@@ -9,6 +9,7 @@ package control_test
 
 import (
 	"bufio"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -393,4 +394,34 @@ func TestПрикладныеДанныеОтличаютсяОтРукопож�
 	if !sawAppData {
 		t.Fatal("появление прикладных данных не сообщено: уровень навсегда остался бы вторым")
 	}
+}
+
+func TestПриманкуGoУзнаётРазборщикC(t *testing.T) {
+	// Приманку строит Go, а узнаёт её на проводе разборщик на C. Сверять две
+	// реализации на глаз бессмысленно: расходятся они молча. Здесь
+	// собранное Go приветствие проходит через ТОТ ЖЕ протокольный модуль,
+	// что стоит на пакетном пути.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	hello, err := plan.Hello("disk.rzd.ru", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.say(t, "raw "+hex.EncodeToString(hello))
+
+	for i := 0; i < 4; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие %d: %v", i, err)
+		}
+		if ev.Type != control.EvHello {
+			continue
+		}
+		if ev.Name != "disk.rzd.ru" {
+			t.Fatalf("разборщик на C увидел имя %q, а Go клал disk.rzd.ru", ev.Name)
+		}
+		return
+	}
+	t.Fatal("разборщик на C не узнал приветствие, собранное на Go")
 }
