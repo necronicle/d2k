@@ -47,13 +47,24 @@ type flowKey struct {
 	srcPort int
 }
 
+// seenFlow — что известно о живом потоке.
+type seenFlow struct {
+	inBytes int64
+	// state — последнее состояние, в котором ядро его видело. Именно оно
+	// отличает обрыв от честно отданного документа.
+	state string
+}
+
 // volumeWatch — наблюдение за объёмом по одной цели.
 type volumeWatch struct {
 	target  string
 	dstIP   string
-	live    map[flowKey]int64 // последний виденный объём ответа
-	samples []int64           // объёмы завершившихся потоков
-	told    bool              // об обрыве уже сказали
+	live    map[flowKey]seenFlow
+	samples []int64 // объёмы ОБОРВАВШИХСЯ потоков
+	// closed — сколько потоков закончилось честно. Нужно для сводки: «обрывов
+	// не было» и «мы ничего не видели» — разные утверждения.
+	closed int
+	told   bool
 }
 
 // watchVolume ставит цель под наблюдение. Дешёвая операция: наблюдение
@@ -72,7 +83,7 @@ func (c *Controller) watchVolume(target, dstIP string) {
 		return
 	}
 	c.volume[target] = &volumeWatch{
-		target: target, dstIP: dstIP, live: map[flowKey]int64{},
+		target: target, dstIP: dstIP, live: map[flowKey]seenFlow{},
 	}
 }
 
@@ -85,7 +96,7 @@ func (c *Controller) pollVolume(now time.Time) {
 	if len(c.volume) == 0 {
 		return
 	}
-	seen := map[string]map[flowKey]int64{}
+	seen := map[string]map[flowKey]seenFlow{}
 	for target, w := range c.volume {
 		flows, err := conntrack.Read(c.ctPath, conntrack.Match{DstIP: w.dstIP, DstPort: 443})
 		if err != nil {
@@ -97,25 +108,44 @@ func (c *Controller) pollVolume(now time.Time) {
 			}
 			return
 		}
-		m := map[flowKey]int64{}
+		m := map[flowKey]seenFlow{}
 		for _, f := range flows {
-			m[flowKey{dstIP: f.DstIP, srcPort: f.SrcPort}] = f.InBytes
+			m[flowKey{dstIP: f.DstIP, srcPort: f.SrcPort}] = seenFlow{
+				inBytes: f.InBytes, state: f.State,
+			}
 		}
 		seen[target] = m
 	}
 
 	for target, w := range c.volume {
 		m := seen[target]
-		// Исчезнувшие потоки — завершившиеся.
+		// Исчезнувшие потоки — завершившиеся. Но КАК завершившиеся, вот
+		// вопрос.
+		//
+		// Повторяющегося объёма МАЛО. Сервер, отдающий одну и ту же страницу,
+		// выглядит точно так же: три запроса — три одинаковых числа. Мой
+		// собственный замер на несуществующем имени дал ровно это, и детектор
+		// объявил обрывом честную страницу ошибки.
+		//
+		// Отличает одно от другого то, КАК умер поток. Отданный до конца
+		// документ закрывается по-человечески: сервер шлёт FIN, ядро уводит
+		// запись в FIN_WAIT, TIME_WAIT, CLOSE. Оборванный поток остаётся в
+		// ESTABLISHED и просто протухает по таймауту — закрывать его некому.
+		// Донор ловит то же самое иначе: «обрыв посреди TLS-записи».
 		for k, last := range w.live {
 			if _, still := m[k]; still {
 				continue
 			}
 			delete(w.live, k)
-			if last < volumeBandLow || last > volumeBandHigh {
+			if last.state != "ESTABLISHED" {
+				// Закрылся честно — это не обрыв, сколько бы байт ни было.
+				w.closed++
 				continue
 			}
-			w.samples = append(w.samples, last)
+			if last.inBytes < volumeBandLow || last.inBytes > volumeBandHigh {
+				continue
+			}
+			w.samples = append(w.samples, last.inBytes)
 			if len(w.samples) > volumeSamplesKept {
 				w.samples = w.samples[len(w.samples)-volumeSamplesKept:]
 			}
@@ -132,9 +162,9 @@ func (c *Controller) pollVolume(now time.Time) {
 		// измеренный обрыв, и есть доказательство. Зонда тут нет и быть не
 		// может — счётчик ядра видит то, чего не видит окно наблюдения.
 		if t := c.tasks[target]; t != nil && t.Current != nil && t.VolumeCutAt > 0 {
-			for _, v := range w.live {
-				if v > t.VolumeCutAt*2 {
-					c.onVolumePassed(t, v, now)
+			for _, f := range w.live {
+				if f.inBytes > t.VolumeCutAt*2 {
+					c.onVolumePassed(t, f.inBytes, now)
 					break
 				}
 			}
