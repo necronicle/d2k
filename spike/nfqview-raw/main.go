@@ -72,8 +72,8 @@ const (
 func align4(n int) int { return (n + 3) &^ 3 }
 
 type flowKey struct {
-	proto            uint8
-	localIP, remote  netip.Addr
+	proto             uint8
+	localIP, remote   netip.Addr
 	localPt, remotePt uint16
 }
 
@@ -620,7 +620,7 @@ func main() {
 	_ = os.WriteFile(*fOut+".summary.json", []byte(summary), 0o644)
 	fmt.Print(summary)
 
-	writeFlows(*fOut+".flows.tsv")
+	writeFlows(*fOut + ".flows.tsv")
 	writeSeq(*fOut + ".seq.tsv")
 	fmt.Fprintf(os.Stderr, "потоки записаны: %s.flows.tsv (%d)\n", *fOut, len(flows))
 }

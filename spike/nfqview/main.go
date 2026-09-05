@@ -330,25 +330,25 @@ loop:
 	defer mu.Unlock()
 
 	summary := map[string]any{
-		"queue":              *fQueue,
-		"copylen":            *fCopyLen,
-		"qlen":               *fQLen,
-		"batch_verdict":      *fBatch,
-		"gso":                *fGSO,
-		"duration_s":         elapsed,
-		"packets":            pkts,
-		"packets_per_s":      float64(pkts) / elapsed,
-		"bytes_copied":       bytesTotal,
-		"flows":              len(flows),
-		"parse_fail":         parseFail,
-		"verdict_fail":       verdictFail,
-		"netlink_errors":     nlErrors,
+		"queue":               *fQueue,
+		"copylen":             *fCopyLen,
+		"qlen":                *fQLen,
+		"batch_verdict":       *fBatch,
+		"gso":                 *fGSO,
+		"duration_s":          elapsed,
+		"packets":             pkts,
+		"packets_per_s":       float64(pkts) / elapsed,
+		"bytes_copied":        bytesTotal,
+		"flows":               len(flows),
+		"parse_fail":          parseFail,
+		"verdict_fail":        verdictFail,
+		"netlink_errors":      nlErrors,
 		"netlink_first_error": firstNLErr,
-		"kernel_queue_start": qs0,
-		"kernel_queue_last":  qsLast,
-		"cpu_seconds":        cpu1 - cpu0,
-		"cpu_percent":        100 * (cpu1 - cpu0) / elapsed,
-		"rss_kib":            readSelfRSS() / 1024,
+		"kernel_queue_start":  qs0,
+		"kernel_queue_last":   qsLast,
+		"cpu_seconds":         cpu1 - cpu0,
+		"cpu_percent":         100 * (cpu1 - cpu0) / elapsed,
+		"rss_kib":             readSelfRSS() / 1024,
 	}
 	js, _ := json.MarshalIndent(summary, "", "  ")
 	_ = os.WriteFile(*fOut+".summary.json", append(js, '\n'), 0o644)
@@ -683,4 +683,3 @@ func readSelfRSS() uint64 {
 	}
 	return mustU(fields[1]) * uint64(os.Getpagesize())
 }
-
