@@ -122,8 +122,16 @@ type Event struct {
 	// вещи, а «ответ пришёл» и «прикладной обмен завершён» тем более.
 	// Различает их тот, кто принимает решение, то есть контроллер.
 	RecordType uint8
-	Bytes      uint32
+	// Какие типы записей ВСТРЕЧАЛИСЬ в начале пакетов с обратной стороны.
+	// Одного RecordType мало: он всегда 22, потому что первым сервер шлёт
+	// ServerHello, а §4.2 прямо говорит, что этого недостаточно.
+	SeenTypes uint8
+	Bytes     uint32
 }
+
+// HasAppData — встречались ли прикладные данные. Это и есть признак, по
+// которому уровень 3 отличается от уровня 2 (§4.2).
+func (e Event) HasAppData() bool { return e.SeenTypes&(1<<(TLSAppData-20)) != 0 }
 
 // Типы записей TLS, встречающиеся в ответе. Не для вывода «работает»: см.
 // комментарий к полю RecordType.
@@ -253,7 +261,12 @@ func (c *Conn) Next() (Event, error) {
 			return ev, errors.New("обмен без типа записи и длины")
 		}
 		ev.RecordType = rest[0]
-		ev.Bytes = binary.BigEndian.Uint32(rest[1:5])
+		if len(rest) >= 6 {
+			ev.SeenTypes = rest[1]
+			ev.Bytes = binary.BigEndian.Uint32(rest[2:6])
+		} else {
+			ev.Bytes = binary.BigEndian.Uint32(rest[1:5])
+		}
 	}
 	return ev, nil
 }

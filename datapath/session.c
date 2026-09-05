@@ -231,12 +231,20 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             size_t rpay_off = ihl + doff;
             if (total > rpay_off) {
                 size_t rpay = total - rpay_off;
+                uint8_t t0 = pkt[rpay_off];
                 if (fl->rev_first_type == 0) {
                     /* Тип первой TLS-записи запоминается как есть. Толковать
                        его здесь нельзя: 0x16 рукопожатие и 0x15 предупреждение
                        — разные вещи, а §4.2 требует, чтобы уровни
                        доказательства различал принимающий решение. */
-                    fl->rev_first_type = pkt[rpay_off];
+                    fl->rev_first_type = t0;
+                }
+                /* Начало пакета — не начало записи, поэтому набор говорит
+                   «такой тип встречался», а не «записей столько-то».
+                   Прикладные данные здесь важнее прочего: по §4.2 одного
+                   ServerHello для подтверждения НЕ хватает. */
+                if (t0 >= 20 && t0 <= 23) {
+                    fl->rev_types |= (uint8_t)(1u << (t0 - 20));
                 }
                 fl->rev_payload_after_hello += (uint32_t)rpay;
             }
@@ -249,12 +257,25 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->saw_synack = 1;
     }
 
-    if (fl->saw_hello && !fl->exchange_told && fl->rev_payload_after_hello > 0) {
+    /* Сообщаем дважды: когда обмен вообще пошёл и когда в нём появились
+       ПРИКЛАДНЫЕ данные. Это разные уровни доказательства (§4.2), и второй
+       наступает позже первого — сообщить только о первом значит навсегда
+       оставить контроллер на уровне 2. */
+    const uint8_t appdata_bit = (uint8_t)(1u << (23 - 20));
+    if (fl->saw_hello && fl->rev_payload_after_hello > 0 &&
+        (!fl->exchange_told ||
+         (!fl->appdata_told && (fl->rev_types & appdata_bit)))) {
+        if (fl->rev_types & appdata_bit) {
+            fl->appdata_told = 1;
+        }
         fl->exchange_told = 1;
         s->exchanges++;
+        d2k_jrn_detail det;
+        memset(&det, 0, sizeof det);
+        det.tos = fl->rev_types;   /* набор увиденных типов записей */
         d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
                         fl->rev_first_type, fl->rev_payload_after_hello,
-                        NULL, NULL, 0, NULL);
+                        &det, NULL, 0, NULL);
     }
 
     /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.

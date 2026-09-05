@@ -359,3 +359,38 @@ func TestОтпечатокСбросаДоезжает(t *testing.T) {
 	}
 	t.Fatal("подозрение с отпечатком не доехало")
 }
+
+func TestПрикладныеДанныеОтличаютсяОтРукопожатия(t *testing.T) {
+	// §4.2: «проверка только первых байтов ServerHello недостаточна». Первый
+	// тип записи всегда 22, поэтому уровень доказательства по нему не
+	// поднять. Набор встреченных типов — то, чем уровень 3 отличается от 2.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	p.say(t, "hello levels.example")
+	p.say(t, "reply 22") // ServerHello
+	p.say(t, "reply 23") // прикладные данные
+
+	sawHandshakeOnly, sawAppData := false, false
+	for i := 0; i < 8; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие %d: %v", i, err)
+		}
+		if ev.Type != control.EvExchange {
+			continue
+		}
+		if !ev.HasAppData() {
+			sawHandshakeOnly = true
+			continue
+		}
+		sawAppData = true
+		break
+	}
+	if !sawHandshakeOnly {
+		t.Fatal("сообщение об обмене на уровне рукопожатия не пришло")
+	}
+	if !sawAppData {
+		t.Fatal("появление прикладных данных не сообщено: уровень навсегда остался бы вторым")
+	}
+}
