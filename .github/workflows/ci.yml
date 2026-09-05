@@ -1,0 +1,109 @@
+name: CI
+
+# Только автоматика d2k. Ничего из релизной машинерии z2k сюда не переносится
+# намеренно: по §7.1 документа продукт независим, и публикация в чужой
+# репозиторий не должна быть возможна даже по ошибке.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Версия закреплена: иначе вердикт CI начинает зависеть от даты прогона.
+  GO_VERSION: "1.25.12"
+
+jobs:
+  go:
+    name: Go — формат, vet, тесты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Формат
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "не отформатировано:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Тесты с детектором гонок
+        # -race обязателен: локальный CI z2k однажды его не гонял, и релиз
+        # сгорел на гонке, которую тесты без него не видели.
+        run: go test -race -count=1 ./...
+
+  build:
+    name: Сборка под все арки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Собрать девять арок
+        run: sh scripts/build.sh
+      - name: Проверить, что бинарники той арки, за какую себя выдают
+        run: |
+          set -eu
+          fail=0
+          for f in builds/d2k-linux-*; do
+            arch=${f##*-}
+            out=$(file -b "$f")
+            echo "$arch: $out"
+            case "$arch:$out" in
+              arm64:*aarch64*|arm:*ARM,*|amd64:*x86-64*|386:*Intel\ 80386*) ;;
+              mips:*MIPS*|mipsle:*MIPS*|mips64le:*MIPS*) ;;
+              ppc64:*PowerPC*|riscv64:*RISC-V*) ;;
+              *) echo "  НЕ СООТВЕТСТВУЕТ"; fail=1 ;;
+            esac
+          done
+          [ "$fail" -eq 0 ]
+
+  shell:
+    name: Скрипты
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          find scripts spike -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh
+
+  datapath:
+    name: Датапат на C — сборка под целевые арки
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Инструменты
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu gcc-mipsel-linux-gnu
+      - name: Собрать измеритель этапа 0 под три арки
+        # Пока это инструмент замера, а не продуктовый датапат. Собирается
+        # здесь ради одного: поймать непереносимость кода (порядок байт,
+        # выравнивание, ширина типов) в тот же день, когда её внесли.
+        run: |
+          set -eu
+          cd spike/nfqview-c
+          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc; do
+            echo "== $cc =="
+            "$cc" -O2 -Wall -Wextra -Werror -c -o /tmp/nfqview-$cc.o nfqview.c
+          done
