@@ -12,10 +12,10 @@ LDFLAGS ?=
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = plan_parse.c plan_apply.c tls.c
-HDR     = include/d2k_plan.h include/d2k_tls.h plan_internal.h
+SRC     = plan_parse.c plan_apply.c tls.c wire.c
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h plan_internal.h
 
-.PHONY: all check test-parse test-apply test-tls cross clean
+.PHONY: all check test-parse test-apply test-tls test-wire cross clean
 
 all: planlab
 
@@ -34,6 +34,12 @@ tls.o: tls.c $(HDR)
 test_tls: test_tls.c tls.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tls.c tls.o $(LDFLAGS)
 
+wire.o: wire.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_wire: test_wire.c wire.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_wire.c wire.o $(LDFLAGS)
+
 test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o $(LDFLAGS)
 
@@ -49,6 +55,9 @@ test-apply: test_plan_apply
 test-tls: test_tls
 	./test_tls
 
+test-wire: test_wire
+	./test_wire
+
 # Переносимость проверяется компиляцией под целевые арки. Запускать там нечего
 # и не нужно: ловим порядок байт, выравнивание и ширину типов.
 cross:
@@ -59,7 +68,7 @@ cross:
 	done
 	@echo "переносимость: aarch64 и mipsel собираются"
 
-check: test-parse test-apply test-tls
+check: test-parse test-apply test-tls test-wire
 
 clean:
-	rm -f *.o test_plan_parse test_plan_apply test_tls planlab
+	rm -f *.o test_plan_parse test_plan_apply test_tls test_wire planlab
