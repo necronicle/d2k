@@ -12,10 +12,10 @@ LDFLAGS ?=
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h plan_internal.h
+SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h plan_internal.h
 
-.PHONY: all check test-parse test-apply test-tls test-wire test-track cross clean
+.PHONY: all check test-parse test-apply test-tls test-wire test-track test-session cross clean
 
 all: planlab
 
@@ -33,6 +33,12 @@ tls.o: tls.c $(HDR)
 
 test_tls: test_tls.c tls.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tls.c tls.o $(LDFLAGS)
+
+session.o: session.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_session: test_session.c session.o track.o tls.o wire.o plan_parse.o plan_apply.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o plan_parse.o plan_apply.o $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -67,6 +73,9 @@ test-wire: test_wire
 test-track: test_track
 	./test_track
 
+test-session: test_session
+	./test_session
+
 # Переносимость проверяется компиляцией под целевые арки. Запускать там нечего
 # и не нужно: ловим порядок байт, выравнивание и ширину типов.
 cross:
@@ -77,7 +86,7 @@ cross:
 	done
 	@echo "переносимость: aarch64 и mipsel собираются"
 
-check: test-parse test-apply test-tls test-wire test-track
+check: test-parse test-apply test-tls test-wire test-track test-session
 
 clean:
-	rm -f *.o test_plan_parse test_plan_apply test_tls test_wire test_track planlab
+	rm -f *.o test_plan_parse test_plan_apply test_tls test_wire test_track test_session planlab
