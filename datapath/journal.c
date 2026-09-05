@@ -50,6 +50,7 @@ const char *d2k_suspect_text(uint8_t code) {
 
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                      uint8_t kind, uint8_t code, uint32_t num,
+                     const d2k_jrn_detail *det,
                      const uint8_t *name, size_t name_len, const char *note) {
     if (!j) {
         return;
@@ -71,6 +72,12 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
     e->kind = kind;
     e->code = code;
     e->num = num;
+    if (det) {
+        e->d_ttl = det->ttl;
+        e->d_ref_ttl = det->ref_ttl;
+        e->d_tos = det->tos;
+        e->d_ipid = det->ipid;
+    }
     e->note = note ? note : (kind == D2K_JRN_SUSPECT ? d2k_suspect_text(code) : NULL);
 
     if (name && name_len) {

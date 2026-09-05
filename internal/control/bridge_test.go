@@ -326,3 +326,36 @@ func TestПредупреждениеTLSНеПутаетсяСРукопожат
 	}
 	t.Fatal("свидетельство обмена не доехало")
 }
+
+func TestОтпечатокСбросаДоезжает(t *testing.T) {
+	// Отпечаток коробки складывается из того, ЧЕМ подделка отличалась от
+	// ответов сервера в том же потоке. Без этих полей в каталоге лежал бы
+	// факт «был сброс», по которому одну коробку от другой не отличить.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	p.say(t, "hello fingerprint.example")
+	p.say(t, "rst")
+
+	for i := 0; i < 6; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие %d: %v", i, err)
+		}
+		if ev.Type != control.EvSuspect {
+			continue
+		}
+		if ev.Code != control.SuspectRST {
+			t.Fatalf("код %d, а ждали сброс в ответ на приветствие", ev.Code)
+		}
+		// Стенд шлёт сброс с TTL 127, а SYN-ACK был с TTL 124.
+		if ev.TTL != 127 {
+			t.Fatalf("TTL подозрительного пакета %d, а ждали 127", ev.TTL)
+		}
+		if ev.RefTTL != 124 {
+			t.Fatalf("ориентир TTL %d, а ждали 124", ev.RefTTL)
+		}
+		return
+	}
+	t.Fatal("подозрение с отпечатком не доехало")
+}

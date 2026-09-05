@@ -120,6 +120,15 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         case D2K_JRN_SUSPECT:
             type = D2K_EV_SUSPECT;
             body[n++] = e->code;
+            /* Подробности — то, ЧЕМ подозрительный пакет отличался от
+               остальных в этом же потоке. Из них складывается отпечаток
+               коробки; без них в каталоге лежал бы факт «был сброс», по
+               которому одну коробку от другой не отличить. */
+            body[n++] = e->d_ttl;
+            body[n++] = e->d_ref_ttl;
+            body[n++] = e->d_tos;
+            body[n++] = (uint8_t)(e->d_ipid >> 8);
+            body[n++] = (uint8_t)e->d_ipid;
             break;
         case D2K_JRN_PLAN_APPLIED:
             type = D2K_EV_APPLIED;

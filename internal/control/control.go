@@ -103,6 +103,14 @@ type Event struct {
 	Name string
 	// Код причины для EvSuspect.
 	Code uint8
+	// Чем подозрительный пакет отличался от остальных в том же потоке.
+	// Ориентир RefTTL взят ИЗ ЭТОГО ЖЕ потока, поэтому разность осмысленна и
+	// на чужой линии, где абсолютные значения другие. Из этого складывается
+	// отпечаток поведения коробки (§3.3).
+	TTL    uint8
+	RefTTL uint8
+	ToS    uint8
+	IPID   uint16
 	// Текст причины для EvRefused — свободный, только для показа.
 	Note string
 
@@ -232,6 +240,12 @@ func (c *Conn) Next() (Event, error) {
 			return ev, errors.New("подозрение без кода")
 		}
 		ev.Code = rest[0]
+		if len(rest) >= 6 {
+			ev.TTL = rest[1]
+			ev.RefTTL = rest[2]
+			ev.ToS = rest[3]
+			ev.IPID = binary.BigEndian.Uint16(rest[4:6])
+		}
 	case EvRefused:
 		ev.Note = string(rest)
 	case EvExchange:

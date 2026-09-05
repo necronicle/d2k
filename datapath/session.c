@@ -84,7 +84,7 @@ static uint16_t rd16(const uint8_t *p) {
    отсутствующего — он выглядит полным. */
 static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                    const char *why) {
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, 0, why);
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, NULL, 0, why);
 }
 
 /* Подозрение. Отмечается ОДИН раз на поток: три улики об одном соединении
@@ -93,13 +93,13 @@ static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
    превращать наблюдение в диагноз, а §2.3 — сохранять отрицательный результат
    вообще. Отсюда ничего не пишется на диск. */
 static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
-                    d2k_flow *fl, uint8_t code) {
+                    d2k_flow *fl, uint8_t code, const d2k_jrn_detail *det) {
     if (fl->suspected) {
         return;
     }
     fl->suspected = 1;
     s->suspects++;
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, det, NULL, 0, NULL);
 }
 
 /* Зовётся при забвении потока по молчанию. Приветствие ушло, ответа с той
@@ -110,7 +110,7 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
         return;
     }
     s->suspects++;
-    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, NULL, NULL, 0, NULL);
 }
 
 static uint32_t rd32(const uint8_t *p) {
@@ -254,7 +254,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         s->exchanges++;
         d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
                         fl->rev_first_type, fl->rev_payload_after_hello,
-                        NULL, 0, NULL);
+                        NULL, NULL, 0, NULL);
     }
 
     /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.
@@ -271,7 +271,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->rst_dropped++;
         s->rst_dropped++;
         if (fl->saw_hello && rev_before == 0) {
-            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_CUT);
+            d2k_jrn_detail det;
+            det.ttl = pkt[8];
+            det.ref_ttl = fl->rev_ttl;
+            det.tos = pkt[1];
+            det.ipid = rd16(pkt + 4);
+            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST_CUT, &det);
         }
         out->verdict = D2K_VERDICT_DROP;
         out->skipped = "чужой сброс снят защитой";
@@ -285,7 +290,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                §2.4 запрещает выводить из него устройство механизма. Сервер
                мог и правда закрыть соединение. */
             fl->saw_rev_rst = 1;
-            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST);
+            d2k_jrn_detail det;
+            det.ttl = pkt[8];
+            det.ref_ttl = fl->rev_profiled ? fl->rev_ttl : 0;
+            det.tos = pkt[1];
+            det.ipid = rd16(pkt + 4);
+            suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
         }
         d2k_track_remove(s->flows, &key);
         out->skipped = rst ? "соединение сброшено" : "соединение закрывается";
@@ -321,7 +331,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     if (fwd && fl->saw_hello && in_seq == fl->hello_seq) {
         fl->hello_repeats++;
         if (fl->hello_repeats >= 2) {
-            suspect(s, now_ns, &key, fl, D2K_SUSPECT_REPEAT);
+            suspect(s, now_ns, &key, fl, D2K_SUSPECT_REPEAT, NULL);
         }
     }
 
@@ -335,13 +345,13 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             if (tls.have_sni) {
                 s->with_sni++;
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0,
-                                pkt + payload_off + tls.sni_off, tls.sni_len,
-                                NULL);
+                                NULL, pkt + payload_off + tls.sni_off,
+                                tls.sni_len, NULL);
             } else {
                 /* Имени нет — и это нормальное состояние модели (§5.3), а не
                    ошибка разбора. */
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME, 0, 0,
-                                NULL, 0, NULL);
+                                NULL, NULL, 0, NULL);
             }
         }
     }
@@ -466,7 +476,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
-    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, NULL, 0, NULL);
 
     d2k_actions_free(&acts);
     return 0;
