@@ -47,6 +47,7 @@ const (
 	// шумом, а не измерением.
 	MinDetectKB = 12
 
+	// Восемь секунд — из пробы донора z2k-detect/internal/tcp16, замер на этой линии.
 	connectTimeout   = 8 * time.Second
 	handshakeTimeout = 8 * time.Second
 

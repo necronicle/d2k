@@ -17,12 +17,30 @@ type tally struct {
 	err  error
 }
 
+// connectTimeout — потолок ожидания TCP-соединения.
+//
+// Унаследовано, а не измерено здесь: то же число уже стоит в
+// internal/volume/probe.go как connectTimeout и handshakeTimeout, а туда
+// пришло из пробы донора z2k-detect/internal/tcp16, где задано замером на
+// этой линии.
+const connectTimeout = 8 * time.Second
+
+// transportCeiling — сколько сверх wait можно занимать транспорту (сама
+// запись всех кусков плюс паузы между ними), прежде чем дедлайн соединения
+// сработает принудительно.
+//
+// Это потолок ожидания ТРАНСПОРТА, а не ответа: ответ ждёт сам wait, и его
+// значение задаёт вызывающий. Число то же, что у connectTimeout, и того же
+// происхождения: internal/volume/probe.go, а туда — из пробы донора
+// z2k-detect/internal/tcp16.
+const transportCeiling = 8 * time.Second
+
 // once шлёт триггер один раз, разрезав его в заданных местах.
 //
 // Своё соединение и свои байты: библиотека TLS шлёт приветствие одним куском и
 // не даёт разрезать его там, где надо, — а вопрос как раз про место разреза.
 func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait time.Duration) (bool, error) {
-	d := net.Dialer{Timeout: 8 * time.Second}
+	d := net.Dialer{Timeout: connectTimeout}
 	c, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return false, err
@@ -33,7 +51,7 @@ func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait ti
 		// перестанет быть опытом про место разреза.
 		_ = tc.SetNoDelay(true)
 	}
-	_ = c.SetDeadline(time.Now().Add(wait + 8*time.Second))
+	_ = c.SetDeadline(time.Now().Add(wait + transportCeiling))
 
 	for _, part := range spans(tr.Payload, cuts) {
 		if _, err := c.Write(part); err != nil {
