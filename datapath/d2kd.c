@@ -140,7 +140,6 @@ static void count_reason(const char *r) {
 static struct {
     uint64_t seen, bytes;
     uint64_t accepted, dropped;
-    uint64_t applied;          /* план применён (или применился бы в observe) */
     uint64_t emitted;          /* собственных пакетов выпущено */
     uint64_t deferred;         /* отложено до срока */
     uint64_t truncated;        /* ядро отдало кусок пакета */
@@ -200,8 +199,13 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
+    /* Счёт применений берётся у сессии, а не свой. Своя переменная считала
+       применения по числу выпущенных пакетов, и план из одной защиты — без
+       единой посылки — показывался как «применён 0», хотя журнал той же
+       минутой писал «план применён». Один факт не может иметь двух счётчиков. */
     printf("план применён %" PRIu64 ", выпущено %" PRIu64
-           ", отложено %" PRIu64 "\n", st.applied, st.emitted, st.deferred);
+           ", отложено %" PRIu64 "\n",
+           d2k_session_applied(s), st.emitted, st.deferred);
     /* Второе число — предел таблицы, а не что попало. В первом полевом
        прогоне здесь стояла длина очереди отправки, и строка читалась как
        «23 потока из 0». */
@@ -562,9 +566,6 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    if (res.n_out > 0) {
-                        st.applied++;
-                    }
 
                     /* ПОРЯДОК ЗДЕСЬ — ЧАСТЬ ПЛАНА, А НЕ ДЕТАЛЬ.
                      *
