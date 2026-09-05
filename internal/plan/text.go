@@ -96,6 +96,11 @@ func (p Plan) Text() string {
 		ord = "reverse"
 	}
 	fmt.Fprintf(&b, "order %s\n", ord)
+	// Порядок строк здесь обязан совпадать с порядком записей в TLV: круг
+	// «текст → TLV → текст» сверяется побайтово.
+	if p.Guards&GuardRSTAlien != 0 {
+		b.WriteString("guard rst_alien\n")
+	}
 	return b.String()
 }
 
@@ -308,6 +313,17 @@ func ParseText(s string) (Plan, error) {
 				p.Order = OrderReverse
 			default:
 				return p, fmt.Errorf("строка %d: неизвестный порядок %q", line, f[1])
+			}
+
+		case "guard":
+			if len(f) != 2 {
+				return p, fmt.Errorf("строка %d: guard rst_alien", line)
+			}
+			switch f[1] {
+			case "rst_alien":
+				p.Guards |= GuardRSTAlien
+			default:
+				return p, fmt.Errorf("строка %d: неизвестная защита %q", line, f[1])
 			}
 
 		default:

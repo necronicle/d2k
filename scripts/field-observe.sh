@@ -136,6 +136,13 @@ fi
 NARROW=""
 [ -n "$SRC" ] && NARROW="$NARROW -s $SRC"
 [ -n "$DST" ] && NARROW="$NARROW -d $DST"
+# Обратное направление сужается теми же концами, но наоборот. Без этого в
+# очередь пошёл бы весь входящий 443-й порт роутера — а сужать опыт требует
+# §2.6, и не ради вежливости: снятие сброса по чужому соединению было бы уже
+# не экспериментом.
+RNARROW=""
+[ -n "$DST" ] && RNARROW="$RNARROW -s $DST"
+[ -n "$SRC" ] && RNARROW="$RNARROW -d $SRC"
 NOTSELF=""
 [ "$MARK" != 0 ] && NOTSELF="-m mark ! --mark $MARK"
 
@@ -149,7 +156,7 @@ if [ $PPE = 1 ]; then
 fi
 iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 if [ $REV = 1 ]; then
-    iptables -t mangle -I FORWARD -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 echo \"POSTROUTING=\$(iptables -t mangle -S POSTROUTING | grep -c -- '--comment $TOKEN') FORWARD=\$(iptables -t mangle -S FORWARD | grep -c -- '--comment $TOKEN')\"
 " | sed 's/^/  правил: /' >&2

@@ -27,6 +27,7 @@ struct d2k_session {
     uint64_t     hellos;
     uint64_t     with_sni;
     uint64_t     suspects;
+    uint64_t     rst_dropped;
 };
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
@@ -172,10 +173,27 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
 
-    /* Направление: совпадает ли сторона этого пакета с той, что открыла
-       поток. «Прямое» — та же сторона, «обратное» — противоположная. */
-    if (fl->fwd_pkts == 0 && fl->rev_pkts == 0) {
-        fl->init_low = src_is_low;
+    /* Направление. Сперва по флагам, и только потом по порядку прибытия.
+       SYN без ACK шлёт тот, кто открывает соединение; SYN с ACK — тот, кто
+       отвечает. Это свойство протокола, а не наблюдения, и потому надёжнее:
+       два направления приходят из ДВУХ правил firewall, и порядок между ними
+       не гарантирован ничем. Ранняя редакция определяла сторону по первому
+       увиденному пакету, и поток, у которого SYN-ACK обогнал SYN, получал
+       направления наоборот — приветствие клиента считалось ответом сервера и
+       не разбиралось вовсе. */
+    if (!fl->dir_known) {
+        if (syn && !ack) {
+            fl->init_low = src_is_low;
+            fl->dir_known = 1;
+        } else if (syn && ack) {
+            fl->init_low = !src_is_low;
+            fl->dir_known = 1;
+        } else if (fl->fwd_pkts == 0 && fl->rev_pkts == 0) {
+            /* Поток подхвачен посреди обмена: рукопожатия мы не видели.
+               Берём порядок прибытия и НЕ считаем это знанием — придёт SYN,
+               поправимся. */
+            fl->init_low = src_is_low;
+        }
     }
     const int fwd = (src_is_low == fl->init_low);
 
@@ -188,6 +206,14 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->fwd_pkts++;
         fl->fwd_bytes += total;
     } else {
+        if (!fl->rev_profiled) {
+            /* Первый пакет с той стороны задаёт ориентир. Обычно это SYN-ACK,
+               то есть заведомо настоящий сервер: подделка приходит позже, в
+               ответ на приветствие. */
+            fl->rev_profiled = 1;
+            fl->rev_ttl = pkt[8];
+            fl->rev_tos = pkt[1];
+        }
         fl->rev_pkts++;
         fl->rev_bytes += total;
         if (fl->saw_hello) {
@@ -203,6 +229,25 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
     /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.
        Но сперва посмотреть, не улика ли это. */
+    if (rst && !fwd && (fl->guards & D2K_GUARD_RST_ALIEN) && fl->rev_profiled &&
+        pkt[8] != fl->rev_ttl) {
+        /* Сброс пришёл с другим TTL, чем всё, что до сих пор отвечало по этому
+           соединению, — значит послан не оттуда. Снимаем.
+
+           Поток НЕ удаляется: настоящий сервер про это соединение ничего не
+           знает и продолжит отвечать, а нам ещё смотреть, чем кончится.
+           Подозрение при этом отмечается: то, что мы сняли подделку, не
+           означает, что её не было. §2.3 — на диск отсюда не идёт ничего. */
+        fl->rst_dropped++;
+        s->rst_dropped++;
+        if (fl->saw_hello && rev_before == 0) {
+            suspect(s, now_ns, &key, fl, "снят чужой сброс в ответ на приветствие");
+        }
+        out->verdict = D2K_VERDICT_DROP;
+        out->skipped = "чужой сброс снят защитой";
+        return 0;
+    }
+
     if (rst || fin) {
         if (rst && !fwd && fl->saw_hello && rev_before == 0) {
             /* Сброс пришёл с той стороны, куда ушло приветствие, и никаких
@@ -374,6 +419,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     out->verdict = (acts.fate == D2K_ORIG_DROP) ? D2K_VERDICT_DROP
                                                 : D2K_VERDICT_ACCEPT;
     fl->plan_done = 1;
+    fl->guards = d2k_plan_guards(s->plan);
     s->applied++;
     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, NULL, 0, NULL);
 
@@ -412,6 +458,10 @@ uint64_t d2k_session_with_sni(const d2k_session *s) {
 
 uint64_t d2k_session_suspects(const d2k_session *s) {
     return s ? s->suspects : 0;
+}
+
+uint64_t d2k_session_rst_dropped(const d2k_session *s) {
+    return s ? s->rst_dropped : 0;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

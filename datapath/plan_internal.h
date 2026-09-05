@@ -22,7 +22,8 @@ enum {
     REC_SPLIT   = 0x0100,
     REC_FAKE    = 0x0101,
     REC_SEQOVL  = 0x0102,
-    REC_ORDER   = 0x0103
+    REC_ORDER   = 0x0103,
+    REC_GUARD   = 0x0104
 };
 
 /* Якоря семантических позиций. */
@@ -75,6 +76,7 @@ struct d2k_plan {
     uint8_t  transport;
     uint8_t  proto;
     uint8_t  order;
+    uint8_t  guards;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

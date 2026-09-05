@@ -91,6 +91,16 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
         case REC_ORDER:
             if (ln != 1) { fail(err, errlen, "порядок не 1 байт"); return -1; }
             break;
+        case REC_GUARD:
+            if (ln != 1) { fail(err, errlen, "защита не 1 байт"); return -1; }
+            if (b[off] == 0 || (b[off] & ~(unsigned)D2K_GUARD_RST_ALIEN) != 0) {
+                /* Пустая или незнакомая защита — отказ, а не «ничего не
+                   делаем»: план, часть которого исполнитель не понял, не
+                   должен исполняться вовсе (§2.5). */
+                fail(err, errlen, "неизвестные биты защиты");
+                return -1;
+            }
+            break;
         default:
             /* Незнакомое не пропускается: см. заголовок файла. */
             fail(err, errlen, "неизвестный тип записи");
@@ -306,6 +316,9 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         case REC_ORDER:
             p->order = v[0];
             break;
+        case REC_GUARD:
+            p->guards = v[0];
+            break;
         default:
             /* Недостижимо: scan уже отверг бы такой план. Ветка оставлена,
                чтобы добавление кода записи без обновления scan не проходило
@@ -349,4 +362,8 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
         used |= p->poisons[i].flags;
     }
     return used;
+}
+
+uint8_t d2k_plan_guards(const d2k_plan *p) {
+    return p ? p->guards : 0;
 }

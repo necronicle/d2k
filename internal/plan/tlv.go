@@ -18,6 +18,7 @@ const (
 	recFake    uint16 = 0x0101
 	recSeqovl  uint16 = 0x0102
 	recOrder   uint16 = 0x0103
+	recGuard   uint16 = 0x0104
 )
 
 var magic = [4]byte{'D', '2', 'K', 'P'}
@@ -84,6 +85,14 @@ func (p Plan) MarshalTLV() ([]byte, error) {
 	if err := p.checkRefs(); err != nil {
 		return nil, err
 	}
+	// План, объявивший требование ниже настоящего, доехал бы до старого
+	// исполнителя, был бы принят и исполнен НЕ ЦЕЛИКОМ — ровно то, что §2.5
+	// запрещает. Поле minexec существует ради этой проверки, и делать её надо
+	// здесь, до записи, а не надеяться на внимательность писавшего текст.
+	if need := p.NeedExec(); p.MinExec < need {
+		return nil, fmt.Errorf(
+			"план требует исполнителя версии %d, а объявляет %d", need, p.MinExec)
+	}
 
 	var recs []byte
 	n := 0
@@ -144,6 +153,14 @@ func (p Plan) MarshalTLV() ([]byte, error) {
 
 	recs = putRec(recs, recOrder, []byte{uint8(p.Order)})
 	n++
+
+	// Записывается только когда есть что записывать: план без защиты обязан
+	// давать те же байты, что и до появления этой операции, иначе все
+	// эталонные файлы разошлись бы разом.
+	if p.Guards != 0 {
+		recs = putRec(recs, recGuard, []byte{p.Guards})
+		n++
+	}
 
 	if n > 0xffff {
 		return nil, errors.New("слишком много записей")
@@ -246,6 +263,14 @@ func UnmarshalTLV(b []byte) (Plan, error) {
 				PayloadID: binary.BigEndian.Uint16(v[0:2]),
 				PoisonID:  binary.BigEndian.Uint16(v[2:4]),
 			})
+		case recGuard:
+			if ln != 1 {
+				return p, errors.New("защита не 1 байт")
+			}
+			if v[0] & ^GuardRSTAlien != 0 {
+				return p, fmt.Errorf("неизвестные биты защиты %#02x", v[0])
+			}
+			p.Guards = v[0]
 		case recOrder:
 			if ln != 1 {
 				return p, errors.New("порядок не 1 байт")

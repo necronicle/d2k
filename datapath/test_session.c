@@ -18,6 +18,18 @@ static int fails;
         }                                                  \
     } while (0)
 
+/* Тот же план плюс защита от чужого сброса. minexec=2: защита появилась во
+   второй версии исполнителя, и план обязан это объявлять. */
+static const uint8_t plan_guard[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 2, 0, 0, 0, 5,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x01, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00,
+    0x01, 0x04, 0x00, 0x01, 0x01
+};
+
 /* План: одна фальшивка перед куском, две копии с паузой 78 мс. */
 static const uint8_t plan_bytes[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 4,
@@ -91,14 +103,22 @@ static size_t build_hello(uint8_t *out) {
 }
 
 /* Тот же поток, но со стороны сервера: концы поменяны местами. */
+static size_t build_rev_pkt_ttl(uint8_t *o, uint16_t client_port, uint8_t flags,
+                                const uint8_t *pay, size_t paylen, uint8_t ttl);
+
 static size_t build_rev_pkt(uint8_t *o, uint16_t client_port, uint8_t flags,
                             const uint8_t *pay, size_t paylen) {
+    return build_rev_pkt_ttl(o, client_port, flags, pay, paylen, 64);
+}
+
+static size_t build_rev_pkt_ttl(uint8_t *o, uint16_t client_port, uint8_t flags,
+                                const uint8_t *pay, size_t paylen, uint8_t ttl) {
     size_t total = 20 + 20 + paylen;
     memset(o, 0, 40);
     o[0] = 0x45;
     wr16(o + 2, (uint16_t)total);
     wr16(o + 4, 0x2000);
-    o[8] = 64;
+    o[8] = ttl;
     o[9] = 6;
     uint8_t s[4] = {1, 2, 3, 4}, d[4] = {192, 168, 1, 67};
     memcpy(o + 12, s, 4);
@@ -262,6 +282,85 @@ int main(void) {
               "поток с ответом на приветствие сочтён подозрительным");
         d2k_session_free(w);
         d2k_session_free(z);
+    }
+
+    /* --- защита от чужого сброса ------------------------------------------
+     * Ориентир берётся из САМОГО потока: TTL первого пакета, пришедшего с той
+     * стороны. Сброс с другим TTL послан не тем, кто до этого отвечал.       */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_guard, sizeof plan_guard, &gp, err, sizeof err) == 0,
+              "план с защитой не загрузился");
+        d2k_session_set_plan(g, gp);
+
+        /* Рукопожатие: SYN клиента, затем SYN-ACK сервера с TTL 124 —
+           он и задаёт ориентир для защиты. */
+        n = build_pkt(pkt, 42000, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 900, buf, sizeof buf, &r);
+        n = build_rev_pkt_ttl(pkt, 42000, 0x12, NULL, 0, 124);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+
+        /* Приветствие: план применяется, защита назначается потоку. */
+        n = build_pkt(pkt, 42000, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        CHECK(d2k_session_applied(g) == 1, "план с защитой не применился");
+
+        /* Сброс с ЧУЖИМ TTL — снимается. */
+        n = build_rev_pkt_ttl(pkt, 42000, 0x14, NULL, 0, 127);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.verdict == D2K_VERDICT_DROP, "чужой сброс не снят");
+        CHECK(d2k_session_rst_dropped(g) == 1, "снятый сброс не посчитан");
+        CHECK(d2k_session_flows(g) > 0,
+              "поток удалён вместе со снятым сбросом: сервер ещё отвечает");
+
+        /* Сброс с ТЕМ ЖЕ TTL — настоящий, проходит и закрывает поток.
+           Это и есть цена ошибки в обратную сторону, и она обязана быть
+           маленькой: настоящий сброс мы не трогаем. */
+        size_t before_flows = d2k_session_flows(g);
+        n = build_rev_pkt_ttl(pkt, 42000, 0x14, NULL, 0, 124);
+        d2k_session_packet(g, pkt, n, 1300, buf, sizeof buf, &r);
+        CHECK(r.verdict == D2K_VERDICT_ACCEPT, "настоящий сброс снят защитой");
+        CHECK(d2k_session_rst_dropped(g) == 1, "настоящий сброс посчитан снятым");
+        CHECK(d2k_session_flows(g) < before_flows, "настоящий сброс не закрыл поток");
+
+        d2k_session_free(g);
+    }
+
+    /* --- SYN-ACK обогнал SYN: направление всё равно верное -----------------
+     * Два направления приходят из ДВУХ правил firewall, и порядок между ними
+     * не гарантирован. Раньше такой поток получал направления наоборот, и
+     * приветствие клиента не разбиралось вовсе.                             */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        n = build_rev_pkt_ttl(pkt, 42002, 0x12, NULL, 0, 124);   /* SYN-ACK первым */
+        d2k_session_packet(g, pkt, n, 900, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 42002, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_hellos(g) == 1,
+              "приветствие потеряно, когда SYN-ACK пришёл раньше SYN");
+        d2k_session_free(g);
+    }
+
+    /* --- без защиты чужой сброс проходит ------------------------------------
+     * Проверка, что защита не включается сама собой: план без guard обязан
+     * оставлять поведение прежним.                                          */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err);
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 42001, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 900, buf, sizeof buf, &r);
+        n = build_rev_pkt_ttl(pkt, 42001, 0x12, NULL, 0, 124);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 42001, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_rev_pkt_ttl(pkt, 42001, 0x14, NULL, 0, 127);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.verdict == D2K_VERDICT_ACCEPT, "защита сработала без плана с защитой");
+        CHECK(d2k_session_rst_dropped(g) == 0, "снятие посчитано там, где защиты нет");
+        d2k_session_free(g);
     }
 
     d2k_session_free(s);
