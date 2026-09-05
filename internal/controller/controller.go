@@ -702,6 +702,20 @@ func answerUnknown(tr Traits, q Question) Traits {
 func addSignal(fp catalog.Fingerprint, s catalog.Signal) catalog.Fingerprint {
 	for i := range fp.Signals {
 		x := &fp.Signals[i]
+		if x.Kind == "volume" && s.Kind == "volume" {
+			// У обрыва по объёму нет ни TTL, ни идентификатора: сравнивать
+			// нечего, кроме самого объёма, и допуск тот же, что в каталоге —
+			// иначе задача накопит приметы, которые каталог сочтёт одной.
+			d := x.Volume - s.Volume
+			if d < 0 {
+				d = -d
+			}
+			if d <= catalog.VolumeSlack {
+				x.Seen += s.Seen
+				return fp
+			}
+			continue
+		}
 		// Допуск по TTL тот же, что в каталоге: иначе задача накопит приметы,
 		// которые каталог потом сочтёт одной.
 		d := int(x.TTL) - int(s.TTL)

@@ -13,6 +13,7 @@
 
 #include "d2k_plans.h"
 #include "d2k_session.h"
+#include "d2k_time.h"
 #include "d2k_tls.h"
 
 /* Сколько первых пакетов потока имеет смысл разбирать в поисках приветствия.
@@ -291,10 +292,22 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
         }
     }
+    /* Признак «время не записано» — отдельный флаг, а не нулевое время. Ноль
+       это законная отметка часов, и опираться на неё значит терять первый же
+       поток, начавшийся в начале отсчёта. */
     if (syn && !ack) {
+        if (!fl->saw_syn) {
+            fl->syn_ns = now_ns;
+        }
         fl->saw_syn = 1;
     }
     if (syn && ack) {
+        /* RTT берём с самого потока: от SYN до SYN-ACK. Ориентир из измерения,
+           а не из константы — на медленной линии константа объявила бы
+           молчанием обычную задержку. */
+        if (fl->saw_syn && !fl->saw_synack && now_ns >= fl->syn_ns) {
+            fl->rtt_ns = now_ns - fl->syn_ns;
+        }
         fl->saw_synack = 1;
     }
 
@@ -447,6 +460,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                                 (uint32_t)payload_len, NULL, NULL, 0, NULL);
             }
+            fl->hello_ns = now_ns;
             fl->saw_hello = 1;
             fl->had_sni = tls.have_sni ? 1 : 0;
             if (!tls.have_sni && !tls.have_record_end) {
@@ -645,6 +659,77 @@ size_t d2k_session_plan_count(const d2k_session *s) {
 
 size_t d2k_session_plan_capacity(const d2k_session *s) {
     return s ? d2k_plantab_capacity(s->plans) : 0;
+}
+
+/* Срок, после которого молчание перестаёт быть задержкой.
+ *
+ * Здоровый ответ на приветствие приходит за один RTT. Первая повторная посылка
+ * TCP уходит примерно через секунду; значит к исходу секунды не пришло ни
+ * ответа, ни толку от повтора. Отсюда пол в одну секунду — он про терпение
+ * человека перед пустой страницей, а не про сеть.
+ *
+ * Множитель на измеренный RTT нужен линиям, где секунда — это меньше двух
+ * оборотов: там пол сработал бы на здоровом соединении. Потолок в пять секунд
+ * — снова про человека: дольше он уже не ждёт, и поиск, начатый позже, ему
+ * не нужен.
+ *
+ * RTT не измерен (поток подхватили посреди обмена) — берём две секунды: одна
+ * на здоровый ответ, одна на неизвестность. */
+static uint64_t silence_deadline(const d2k_flow *f) {
+    const uint64_t floor_ns = NS_PER_S;
+    const uint64_t ceil_ns  = 5 * NS_PER_S;
+    if (!f->rtt_ns) {
+        return 2 * NS_PER_S;
+    }
+    uint64_t d = f->rtt_ns * 8;
+    if (d < floor_ns) { d = floor_ns; }
+    if (d > ceil_ns)  { d = ceil_ns; }
+    return d;
+}
+
+struct sweep_ctx {
+    d2k_session *s;
+    uint64_t     now_ns;
+    size_t       told;
+};
+
+/* Молчание — это ОТСУТСТВИЕ нагрузки в ответ, а не отсутствие пакетов.
+ * Сервер, подтвердивший приветствие пустым ACK и замолчавший, и есть картина
+ * блокировки: TCP жив, ответа нет. */
+static void sweep_one(void *ctx, d2k_flow *f) {
+    struct sweep_ctx *c = ctx;
+    if (!f->saw_hello || f->silence_told || f->suspected) {
+        return;
+    }
+    if (f->rev_payload_after_hello > 0 || f->saw_rev_rst) {
+        return;
+    }
+    /* Обратная сторона должна быть ВИДНА. Правило на обратное направление
+       ставится не всегда, и без него в очередь не приходит ни один пакет
+       сервера: каждый поток выглядел бы молчащим. Это была бы подмена «не
+       смотрели» на «нет ответа» — ровно то, что §2.4 запрещает. Признаком
+       видимости служит любой пакет оттуда, обычно SYN-ACK. */
+    if (f->rev_pkts == 0) {
+        return;
+    }
+    if (c->now_ns < f->hello_ns) {
+        return;
+    }
+    if (c->now_ns - f->hello_ns < silence_deadline(f)) {
+        return;
+    }
+    f->silence_told = 1;
+    c->told++;
+    suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_SILENT, NULL);
+}
+
+size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
+    if (!s) {
+        return 0;
+    }
+    struct sweep_ctx c = { s, now_ns, 0 };
+    d2k_track_walk(s->flows, sweep_one, &c);
+    return c.told;
 }
 
 size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {

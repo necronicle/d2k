@@ -35,12 +35,7 @@
 #include "d2k_raw.h"
 #include "d2k_sched.h"
 #include "d2k_session.h"
-
-/* Константы времени с явной шириной. Смешивать uint64_t с суффиксом ULL
-   нельзя: на aarch64 это разные типы, и printf расходится с аргументом. */
-#define NS_PER_S  UINT64_C(1000000000)
-#define NS_PER_MS UINT64_C(1000000)
-#define NS_PER_US UINT64_C(1000)
+#include "d2k_time.h"
 
 #define RECV_BUF   65536
 #define OUT_BUF    32768
@@ -698,6 +693,10 @@ int main(int argc, char **argv) {
         }
 
         if (t >= next_expire) {
+            /* Сперва заметить молчание, потом забывать. Обратный порядок
+               означал бы, что о молчании узнаём только при забвении потока —
+               через две минуты, когда человек уже ушёл со страницы. */
+            d2k_session_sweep(sess, t);
             d2k_session_expire(sess, t, idle_ns);
             next_expire = t + NS_PER_S;
         }

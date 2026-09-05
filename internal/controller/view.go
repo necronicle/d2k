@@ -115,9 +115,7 @@ func humanSignal(s catalog.Signal) string {
 	case "silent":
 		return "на приветствие не отвечают вовсе"
 	case "volume":
-		// Объём лежит в поле идентификатора: см. volumeSignal. Это измерение
-		// пробы, а не наблюдение за чужим потоком.
-		return fmt.Sprintf("поток рвётся, набрав около %d КБ", s.IPID)
+		return fmt.Sprintf("поток рвётся, набрав около %d КБ", s.Volume)
 	default:
 		return s.Kind
 	}

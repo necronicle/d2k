@@ -77,6 +77,7 @@ func readFile(path string) (*Catalog, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+	c.migrate()
 	return &c, nil
 }
 

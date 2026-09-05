@@ -399,6 +399,88 @@ int main(void) {
         d2k_session_free(g);
     }
 
+    /* --- молчание замечается по измеренному RTT, а не через две минуты ---
+     *
+     * Полевой прогон 06.09.2026: цель молчала в ответ на приветствие, и поиск
+     * не начинался вовсе — подозрение рождалось только при забвении потока, а
+     * это 120 секунд. Человек перед пустой страницей столько не ждёт. */
+    {
+        d2k_session *q = d2k_session_new(16, 32);
+        CHECK(q != NULL, "сессия для молчания не создалась");
+        const uint64_t ms = 1000000ull;
+        uint8_t qp[1024], qb[4096];
+        d2k_result qr;
+
+        /* SYN и SYN-ACK с интервалом 20 мс — вот и измеренный RTT. */
+        size_t qn = build_pkt(qp, 41000, 0x02, NULL, 0);
+        d2k_session_packet(q, qp, qn, 0, qb, sizeof qb, &qr);
+        qn = build_rev_pkt(qp, 41000, 0x12, NULL, 0);
+        d2k_session_packet(q, qp, qn, 20 * ms, qb, sizeof qb, &qr);
+
+        uint8_t qh[512];
+        size_t qhl = build_hello(qh);
+        qn = build_pkt(qp, 41000, 0x18, qh, qhl);
+        d2k_session_packet(q, qp, qn, 30 * ms, qb, sizeof qb, &qr);
+        CHECK(d2k_session_suspects(q) == 0, "подозрение сразу после приветствия");
+
+        CHECK(d2k_session_sweep(q, 530 * ms) == 0,
+              "полсекунды молчания объявлены блокировкой");
+        CHECK(d2k_session_sweep(q, 1530 * ms) == 1,
+              "молчание не замечено на второй секунде");
+        CHECK(d2k_session_suspects(q) == 1, "подозрение о молчании не отмечено");
+        CHECK(d2k_session_sweep(q, 9000 * ms) == 0, "подозрение продублировано");
+        d2k_session_free(q);
+    }
+
+    /* --- без видимости обратной стороны молчания не бывает ---------------
+     *
+     * Правило на обратное направление ставится не всегда. Без него сервер
+     * невидим, и каждый поток выглядел бы молчащим: это подмена «не смотрели»
+     * на «нет ответа». */
+    {
+        d2k_session *q = d2k_session_new(16, 32);
+        const uint64_t ms = 1000000ull;
+        uint8_t qp[1024], qb[4096];
+        d2k_result qr;
+
+        /* Только исходящее: SYN и приветствие. Ответов не видим вовсе. */
+        size_t qn = build_pkt(qp, 43000, 0x02, NULL, 0);
+        d2k_session_packet(q, qp, qn, 0, qb, sizeof qb, &qr);
+        uint8_t qh[512];
+        size_t qhl = build_hello(qh);
+        qn = build_pkt(qp, 43000, 0x18, qh, qhl);
+        d2k_session_packet(q, qp, qn, 30 * ms, qb, sizeof qb, &qr);
+
+        CHECK(d2k_session_sweep(q, 9000 * ms) == 0,
+              "невидимая обратная сторона объявлена молчащей");
+        d2k_session_free(q);
+    }
+
+    /* --- ответивший сервер не молчит, сколько ни выжидай ----------------- */
+    {
+        d2k_session *q = d2k_session_new(16, 32);
+        const uint64_t ms = 1000000ull;
+        uint8_t qp[1024], qb[4096];
+        d2k_result qr;
+
+        size_t qn = build_pkt(qp, 42000, 0x02, NULL, 0);
+        d2k_session_packet(q, qp, qn, 0, qb, sizeof qb, &qr);
+        qn = build_rev_pkt(qp, 42000, 0x12, NULL, 0);
+        d2k_session_packet(q, qp, qn, 20 * ms, qb, sizeof qb, &qr);
+
+        uint8_t qh[512];
+        size_t qhl = build_hello(qh);
+        qn = build_pkt(qp, 42000, 0x18, qh, qhl);
+        d2k_session_packet(q, qp, qn, 30 * ms, qb, sizeof qb, &qr);
+
+        uint8_t sh[8] = { 0x16, 0x03, 0x03, 0x00, 0x03, 0x02, 0x00, 0x00 };
+        qn = build_rev_pkt(qp, 42000, 0x18, sh, sizeof sh);
+        d2k_session_packet(q, qp, qn, 50 * ms, qb, sizeof qb, &qr);
+
+        CHECK(d2k_session_sweep(q, 9000 * ms) == 0, "ответивший сервер объявлен молчащим");
+        d2k_session_free(q);
+    }
+
     d2k_session_free(s);
 
     if (fails) {
@@ -408,3 +490,4 @@ int main(void) {
     printf("сессия: все проверки прошли\n");
     return 0;
 }
+

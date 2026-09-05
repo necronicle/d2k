@@ -201,6 +201,17 @@ void d2k_track_remove(d2k_table *t, const d2k_key *k) {
     }
 }
 
+void d2k_track_walk(d2k_table *t, void (*fn)(void *ctx, d2k_flow *f), void *ctx) {
+    if (!t || !fn) {
+        return;
+    }
+    for (size_t s = 0; s < t->cap; s++) {
+        if (t->state[s] == SLOT_USED) {
+            fn(ctx, &t->slots[s]);
+        }
+    }
+}
+
 size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns,
                         void (*on_expire)(void *ctx, const d2k_flow *f),
                         void *ctx) {

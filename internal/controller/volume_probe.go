@@ -331,9 +331,6 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 func (c *Controller) volumeSignal(t *Task, atKB int) catalog.Fingerprint {
 	c.sayf("  примета: обрыв по объёму около %d КиБ", atKB)
 	return addSignal(t.Fingerprint, catalog.Signal{
-		Kind: "volume", Seen: 1,
-		// Объём кладём в поле идентификатора: он и есть примета этой коробки
-		// на этом направлении, и по нему две коробки различаются.
-		IPID: uint16(atKB),
+		Kind: "volume", Seen: 1, Volume: atKB,
 	})
 }

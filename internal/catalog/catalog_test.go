@@ -501,3 +501,49 @@ func TestУзнаваниеСмотритВсеПриметыОдногоВид�
 		t.Fatalf("кандидатов %d: узнавание не досмотрело список примет", len(got))
 	}
 }
+
+func TestОбрывыБлизкогоОбъёмаЭтоОднаКоробка(t *testing.T) {
+	// Проба качает лестницей по 4000 байт и меньше ступени различить не может.
+	// На роутере 06.09.2026 из-за точного сравнения объёма нашлись ПЯТЬ
+	// «коробок по объёму» с пересекающимися целями — одна и та же коробка,
+	// разнесённая погрешностью прибора.
+	fp := func(kb int) catalog.Fingerprint {
+		return catalog.Fingerprint{
+			Method:  catalog.FingerprintMethod,
+			Signals: []catalog.Signal{{Kind: "volume", Volume: kb, Seen: 1}},
+		}
+	}
+	if !fp(19).Compatible(fp(23)) {
+		t.Fatal("19 и 23 КБ объявлены разными коробками, а различить их прибор не может")
+	}
+	if fp(19).Compatible(fp(200)) {
+		t.Fatal("19 и 200 КБ слиты в одну коробку — это разное поведение")
+	}
+	if fp(19).Match(fp(200)) != 0 {
+		t.Fatal("совпадением сочтено одно лишь совпадение вида приметы")
+	}
+}
+
+func TestСтарыйОбъёмИзПоляИдентификатораПереносится(t *testing.T) {
+	// Записи прежней раскладки оплачены настоящими измерениями и не
+	// выбрасываются (§3.4): объём переезжает в своё поле, где сравнивается с
+	// допуском прибора.
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	old := `{"schema":1,"boxes":[{"id":"box-old","created":"2026-09-05T00:00:00Z",` +
+		`"updated":"2026-09-05T00:00:00Z","fingerprint":{"method":2,` +
+		`"signals":[{"kind":"volume","ipid":16,"seen":2}]},"plans":[],"bindings":[]}]}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := catalog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := st.Catalog().Boxes[0].Fingerprint.Signals[0]
+	if sig.Volume != 16 {
+		t.Fatalf("объём %d, а в прежней раскладке было 16", sig.Volume)
+	}
+	if sig.IPID != 0 {
+		t.Errorf("объём остался и в чужом поле: %d", sig.IPID)
+	}
+}

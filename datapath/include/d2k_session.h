@@ -84,6 +84,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
  * часто убирать — это дело того, кто владеет циклом. */
 size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns);
 
+/* Заметить молчание, не дожидаясь забвения потока.
+   Зовётся по часам. Отмечает подозрение по потокам, где приветствие ушло, а
+   ответа с нагрузкой нет дольше срока, выведенного из ИЗМЕРЕННОГО RTT самого
+   потока. Возвращает, сколько подозрений отмечено. */
+size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns);
+
 size_t   d2k_session_flows(const d2k_session *s);
 size_t   d2k_session_capacity(const d2k_session *s);
 uint64_t d2k_session_applied(const d2k_session *s);
