@@ -1,0 +1,95 @@
+/* journal.c — кольцо наблюдений. Ни одного выделения памяти после создания. */
+#include <stdlib.h>
+#include <string.h>
+
+#include "d2k_journal.h"
+
+struct d2k_journal {
+    d2k_jrn_entry *v;
+    size_t         cap;
+    size_t         n;      /* сколько занято, пока кольцо не заполнилось */
+    size_t         head;   /* куда писать следующую */
+    uint64_t       dropped;
+};
+
+d2k_journal *d2k_journal_new(size_t cap) {
+    d2k_journal *j = calloc(1, sizeof *j);
+    if (!j) {
+        return NULL;
+    }
+    if (cap == 0) {
+        return j;           /* журнал, который ничего не хранит */
+    }
+    j->v = calloc(cap, sizeof *j->v);
+    if (!j->v) {
+        free(j);
+        return NULL;
+    }
+    j->cap = cap;
+    return j;
+}
+
+void d2k_journal_free(d2k_journal *j) {
+    if (!j) {
+        return;
+    }
+    free(j->v);
+    free(j);
+}
+
+void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                     uint8_t kind, const uint8_t *name, size_t name_len,
+                     const char *note) {
+    if (!j || j->cap == 0) {
+        return;
+    }
+    if (j->n == j->cap) {
+        j->dropped++;
+    }
+
+    d2k_jrn_entry *e = &j->v[j->head];
+    memset(e, 0, sizeof *e);
+    e->at_ns = at_ns;
+    if (key) {
+        e->key = *key;
+    }
+    e->kind = kind;
+    e->note = note;
+
+    if (name && name_len) {
+        size_t take = name_len > D2K_JRN_NAME_MAX ? D2K_JRN_NAME_MAX : name_len;
+        /* Имя приходит из сети. В журнал оно попадает как есть, но байты, на
+           которых печать сломалась бы, заменяются точкой: журнал печатается в
+           терминал и в панель, и управляющие символы оттуда не должны
+           доезжать. Экранирование для HTML — дело панели, а не датапата. */
+        for (size_t i = 0; i < take; i++) {
+            uint8_t c = name[i];
+            e->name[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        e->name[take] = '\0';
+        e->name_len = (uint8_t)take;
+    }
+
+    j->head = (j->head + 1) % j->cap;
+    if (j->n < j->cap) {
+        j->n++;
+    }
+}
+
+size_t d2k_journal_count(const d2k_journal *j) {
+    return j ? j->n : 0;
+}
+
+const d2k_jrn_entry *d2k_journal_at(const d2k_journal *j, size_t i) {
+    if (!j || i >= j->n) {
+        return NULL;
+    }
+    /* От старой к новой. Пока кольцо не заполнилось, старая лежит в нуле;
+       после — сразу за головой. */
+    size_t start = (j->n == j->cap) ? j->head : 0;
+    return &j->v[(start + i) % j->cap];
+}
+
+uint64_t d2k_journal_dropped(const d2k_journal *j) {
+    return j ? j->dropped : 0;
+}
