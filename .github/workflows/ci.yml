@@ -42,10 +42,19 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Собрать лабораторию датапата
+        # Тесты моста гоняют planlab — тот же исполнитель, что пойдёт в прод.
+        # Без него они пропустились бы, а пропущенный тест выглядит как
+        # пройденный.
+        run: make -C datapath planlab
+
       - name: Тесты с детектором гонок
         # -race обязателен: локальный CI z2k однажды его не гонял, и релиз
         # сгорел на гонке, которую тесты без него не видели.
-        run: go test -race -count=1 ./...
+        #
+        # D2K_REQUIRE_LAB превращает пропуск тестов моста в провал: молчаливый
+        # пропуск здесь означал бы, что связка Go и C не проверяется вовсе.
+        run: D2K_REQUIRE_LAB=1 go test -race -count=1 ./...
 
   build:
     name: Сборка под все арки
@@ -96,10 +105,26 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc gcc-aarch64-linux-gnu gcc-mipsel-linux-gnu
-      - name: Собрать измеритель этапа 0 под три арки
-        # Пока это инструмент замера, а не продуктовый датапат. Собирается
-        # здесь ради одного: поймать непереносимость кода (порядок байт,
-        # выравнивание, ширина типов) в тот же день, когда её внесли.
+      - name: Тесты исполнителя планов
+        run: make -C datapath check
+
+      - name: Исполнитель планов под целевые арки
+        # Непереносимость обязана ловиться в тот день, когда её внесли, а не на
+        # роутере. Запускать там нечего: ловим порядок байт, выравнивание и
+        # ширину типов.
+        run: |
+          set -eu
+          for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc; do
+            echo "== $cc =="
+            for f in datapath/plan_parse.c datapath/plan_apply.c datapath/planlab.c; do
+              "$cc" -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Idatapath \
+                    -c -o /tmp/$(basename $f .c)-$cc.o "$f"
+            done
+          done
+
+      - name: Измеритель этапа 0 под три арки
+        # Инструмент замера, а не продуктовый датапат. Собирается здесь ради
+        # того же: поймать непереносимость в день внесения.
         run: |
           set -eu
           cd spike/nfqview-c
