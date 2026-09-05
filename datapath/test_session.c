@@ -91,7 +91,7 @@ static size_t build_hello(uint8_t *out) {
 }
 
 int main(void) {
-    d2k_session *s = d2k_session_new(64);
+    d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
     if (!s) {
         return 1;

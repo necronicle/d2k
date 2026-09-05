@@ -14,19 +14,30 @@
 #include "d2k_session.h"
 #include "d2k_tls.h"
 
+/* Сколько первых пакетов потока имеет смысл разбирать в поисках приветствия.
+ * ClientHello приходит первым или почти первым; после этого разбор — чистая
+ * трата на каждом пакете загрузки. */
+#define D2K_HELLO_WINDOW 8
+
 struct d2k_session {
-    d2k_table *flows;
-    d2k_plan  *plan;
-    uint64_t   applied;
+    d2k_table   *flows;
+    d2k_plan    *plan;
+    d2k_journal *jrn;
+    uint64_t     applied;
+    uint64_t     hellos;
+    uint64_t     with_sni;
 };
 
-d2k_session *d2k_session_new(size_t capacity) {
+d2k_session *d2k_session_new(size_t capacity, size_t journal) {
     d2k_session *s = calloc(1, sizeof *s);
     if (!s) {
         return NULL;
     }
     s->flows = d2k_track_new(capacity);
-    if (!s->flows) {
+    s->jrn = d2k_journal_new(journal);
+    if (!s->flows || (journal > 0 && !s->jrn)) {
+        d2k_journal_free(s->jrn);
+        d2k_track_free(s->flows);
         free(s);
         return NULL;
     }
@@ -37,6 +48,7 @@ void d2k_session_free(d2k_session *s) {
     if (!s) {
         return;
     }
+    d2k_journal_free(s->jrn);
     d2k_track_free(s->flows);
     d2k_plan_free(s->plan);
     free(s);
@@ -52,6 +64,14 @@ void d2k_session_set_plan(d2k_session *s, d2k_plan *p) {
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
+}
+
+/* Отказ по плану в журнал. Отдельной функцией, чтобы каждая точка отказа
+   писала одинаково: журнал, в котором половина отказов не отмечена, хуже
+   отсутствующего — он выглядит полным. */
+static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                   const char *why) {
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, NULL, 0, why);
 }
 
 static uint32_t rd32(const uint8_t *p) {
@@ -144,8 +164,56 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
 
+    size_t payload_off = ihl + doff;
+    size_t payload_len = total - payload_off;
+    if (payload_len == 0) {
+        out->skipped = "нет полезной нагрузки";
+        return 0;
+    }
+
+    /* --- узнавание протокола -------------------------------------------
+     * Стоит ДО всего, что связано с планом, и это не перестановка ради
+     * красоты. Наблюдение обязано работать в режиме, где плана нет вовсе:
+     * этап C документа — «видны реальные транзитные соединения», а не
+     * «видны, если есть чем воздействовать». В первой версии проверка
+     * «плана нет» стояла раньше разбора, и первый же полевой прогон дал
+     * 145 пакетов с единственной причиной «плана нет» — о протоколе не
+     * узналось ничего.
+     *
+     * Разбор ограничен началом соединения: дальше он всё равно ничего не
+     * найдёт, а платить за него на каждом пакете загрузки незачем. Предел
+     * здесь свой, а не унаследованный от правила firewall: датапат не
+     * вправе считать, что снаружи стоит connbytes. */
+    d2k_tls_info tls;
+    memset(&tls, 0, sizeof tls);
+    if (!fl->saw_hello && fl->out_pkts <= D2K_HELLO_WINDOW) {
+        d2k_tls_parse(pkt + payload_off, payload_len, &tls);
+        if (tls.is_client_hello) {
+            fl->saw_hello = 1;
+            fl->had_sni = tls.have_sni ? 1 : 0;
+            s->hellos++;
+            if (tls.have_sni) {
+                s->with_sni++;
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI,
+                                pkt + payload_off + tls.sni_off, tls.sni_len,
+                                NULL);
+            } else {
+                /* Имени нет — и это нормальное состояние модели (§5.3), а не
+                   ошибка разбора. */
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME,
+                                NULL, 0, NULL);
+            }
+        }
+    }
+
     if (!s->plan) {
         out->skipped = "плана нет";
+        return 0;
+    }
+    if (!tls.is_client_hello) {
+        /* Не приветствие — не наш случай. План первой версии описывает именно
+           начало TLS-соединения. */
+        out->skipped = "не ClientHello";
         return 0;
     }
     if (fl->plan_done) {
@@ -157,23 +225,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
     if (fl->damaged) {
         out->skipped = "поток испорчен предыдущей отменой";
-        return 0;
-    }
-
-    size_t payload_off = ihl + doff;
-    size_t payload_len = total - payload_off;
-    if (payload_len == 0) {
-        out->skipped = "нет полезной нагрузки";
-        return 0;
-    }
-
-    /* --- протокол ------------------------------------------------------- */
-    d2k_tls_info tls;
-    d2k_tls_parse(pkt + payload_off, payload_len, &tls);
-    if (!tls.is_client_hello) {
-        /* Не приветствие — не наш случай. План первой версии описывает именно
-           начало TLS-соединения. */
-        out->skipped = "не ClientHello";
+        refuse(s, now_ns, &key, out->skipped);
         return 0;
     }
 
@@ -192,6 +244,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         /* Неприменим — пропускаем как есть. Отказ исполнителя это результат, а
            не сбой: якорь может быть невычислим для конкретного пакета. */
         out->skipped = "план неприменим к этому пакету";
+        refuse(s, now_ns, &key, out->skipped);
         d2k_actions_free(&acts);
         return 0;
     }
@@ -228,6 +281,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 fl->damaged = 1;
             }
             out->skipped = "буфер отправки кончился";
+            refuse(s, now_ns, &key, out->skipped);
             d2k_actions_free(&acts);
             return 0;
         }
@@ -236,14 +290,32 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->out[i].len = made;
         used += made;
     }
+    if (acts.fate == D2K_ORIG_HOLD) {
+        /* Удержание оригинала датапат не умеет: пакет в очереди нельзя держать
+           без вердикта, а выпустить его позже самим — отдельная работа с
+           отдельной проверкой. Исполнитель такой судьбы сейчас не порождает,
+           и проверка стоит здесь именно поэтому: если он начнёт, отказ
+           случится сразу, а не превратится тихо в «пропустить». §2.5. */
+        out->n_out = 0;
+        out->verdict = D2K_VERDICT_ACCEPT;
+        out->skipped = "удержание оригинала не поддержано";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return 0;
+    }
     out->n_out = n;
     out->verdict = (acts.fate == D2K_ORIG_DROP) ? D2K_VERDICT_DROP
                                                 : D2K_VERDICT_ACCEPT;
     fl->plan_done = 1;
     s->applied++;
+    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, NULL, 0, NULL);
 
     d2k_actions_free(&acts);
     return 0;
+}
+
+size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
+    return s ? d2k_track_expire(s->flows, now_ns, idle_ns) : 0;
 }
 
 size_t d2k_session_flows(const d2k_session *s) {
@@ -256,4 +328,20 @@ uint64_t d2k_session_applied(const d2k_session *s) {
 
 uint64_t d2k_session_refusals(const d2k_session *s) {
     return s ? d2k_track_refusals(s->flows) : 0;
+}
+
+size_t d2k_session_capacity(const d2k_session *s) {
+    return s ? d2k_track_capacity(s->flows) : 0;
+}
+
+uint64_t d2k_session_hellos(const d2k_session *s) {
+    return s ? s->hellos : 0;
+}
+
+uint64_t d2k_session_with_sni(const d2k_session *s) {
+    return s ? s->with_sni : 0;
+}
+
+const d2k_journal *d2k_session_journal(const d2k_session *s) {
+    return s ? s->jrn : NULL;
 }

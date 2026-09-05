@@ -339,3 +339,14 @@ void d2k_plan_free(d2k_plan *p) {
     free(p->seqovls);
     free(p);
 }
+
+uint8_t d2k_plan_poison_used(const d2k_plan *p) {
+    if (!p) {
+        return 0;
+    }
+    uint8_t used = 0;
+    for (size_t i = 0; i < p->n_poisons; i++) {
+        used |= p->poisons[i].flags;
+    }
+    return used;
+}

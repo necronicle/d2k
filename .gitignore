@@ -15,3 +15,5 @@ datapath/test_plan_*
 datapath/planlab
 datapath/test_nl
 datapath/test_sched
+datapath/test_journal
+datapath/d2kd

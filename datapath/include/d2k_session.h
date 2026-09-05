@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "d2k_journal.h"
 #include "d2k_plan.h"
 #include "d2k_track.h"
 #include "d2k_wire.h"
@@ -50,8 +51,9 @@ typedef struct {
 
 typedef struct d2k_session d2k_session;
 
-/* capacity — предел числа отслеживаемых потоков. */
-d2k_session *d2k_session_new(size_t capacity);
+/* capacity — предел числа отслеживаемых потоков,
+ * journal — глубина диагностического журнала в записях (0 — без журнала). */
+d2k_session *d2k_session_new(size_t capacity, size_t journal);
 void         d2k_session_free(d2k_session *s);
 
 /* Ставит план, который применяется к новым соединениям. Прежний план остаётся
@@ -66,8 +68,21 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out);
 
+/* Освобождает потоки, молчавшие дольше idle_ns. Возвращает сколько освободил.
+ * Зовётся вызывающим, а не сама: датапат не заводит таймеров и не решает, как
+ * часто убирать — это дело того, кто владеет циклом. */
+size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns);
+
 size_t   d2k_session_flows(const d2k_session *s);
+size_t   d2k_session_capacity(const d2k_session *s);
 uint64_t d2k_session_applied(const d2k_session *s);
 uint64_t d2k_session_refusals(const d2k_session *s);
+
+/* Узнано протоколом. Считается независимо от того, есть ли план: наблюдение
+ * не должно зависеть от наличия воздействия. */
+uint64_t d2k_session_hellos(const d2k_session *s);
+uint64_t d2k_session_with_sni(const d2k_session *s);
+
+const d2k_journal *d2k_session_journal(const d2k_session *s);
 
 #endif /* D2K_SESSION_H */

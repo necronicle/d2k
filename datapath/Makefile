@@ -12,14 +12,21 @@ LDFLAGS ?=
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h plan_internal.h
+# Переносимый датапат: собирается и проверяется на любой машине.
+SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c journal.c
+# Системный слой: только Linux. На маке не собирается намеренно — подделывать
+# сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
+# cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
+# доказывает больше, чем компиляция объектников.
+LINUXSRC = nfq.c raw.c
+DAEMON   = d2kd.c
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h plan_internal.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched test_journal
 
-.PHONY: all check san test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched cross clean
+.PHONY: all check san d2kd-aarch64 test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal cross clean
 
 all: planlab
 
@@ -41,8 +48,14 @@ test_tls: test_tls.c tls.o $(HDR)
 session.o: session.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_session: test_session.c session.o track.o tls.o wire.o plan_parse.o plan_apply.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o plan_parse.o plan_apply.o $(LDFLAGS)
+journal.o: journal.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_journal: test_journal.c journal.o track.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_journal.c journal.o track.o $(LDFLAGS)
+
+test_session: test_session.c session.o track.o tls.o wire.o journal.o plan_parse.o plan_apply.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o journal.o plan_parse.o plan_apply.o $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -98,6 +111,9 @@ test-nl: test_nl
 test-sched: test_sched
 	./test_sched
 
+test-journal: test_journal
+	./test_journal
+
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
@@ -120,12 +136,25 @@ cross:
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-a64.o $$f || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-mipsel.o $$f || exit 1; \
 	done
-	@echo "переносимость: aarch64 и mipsel собираются"
+	@echo "== d2kd целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2kd-a64 \
+		$(DAEMON) $(LINUXSRC) $(SRC) || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) || exit 1
+	@echo "переносимость: aarch64 и mipsel собираются, служба линкуется"
+
+# Служба для целевого устройства. Статическая musl: на роутере нет ни нужной
+# libc, ни желания зависеть от той, что там есть.
+BUILDDIR ?= ../builds
+d2kd-aarch64:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
+		-o $(BUILDDIR)/d2kd-aarch64 $(DAEMON) $(LINUXSRC) $(SRC)
+	@ls -l $(BUILDDIR)/d2kd-aarch64
 
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched
+check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal
 
 clean:
 	rm -f *.o $(TESTS) planlab
