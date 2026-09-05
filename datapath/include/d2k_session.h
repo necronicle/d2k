@@ -120,6 +120,10 @@ typedef struct {
     /* Первый байт последней неузнанной нагрузки: 0x16 — рукопожатие TLS и
      * разбор споткнулся внутри, 0x47 — обычный HTTP, прочее — не TLS. */
     uint8_t  last_first_byte;
+    /* Приветствие узнано, но имя уехало в следующий сегмент. Цена того, что
+     * мы читаем первый сегмент вместо пересборки. Измеряется, а не
+     * принимается на веру. */
+    uint64_t sni_next_seg;
 } d2k_payload_stats;
 
 void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);

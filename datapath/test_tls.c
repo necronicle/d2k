@@ -120,6 +120,45 @@ static void check_real_hello(void) {
           "конец записи настоящего приветствия неверен");
 }
 
+
+/* Приветствие с набивкой: так выглядит браузерное, где расширение padding
+   доводит запись до полутора килобайт и больше. */
+static size_t build_hello_padded(uint8_t *out, const char *sni, size_t pad) {
+    uint8_t body[4096];
+    size_t b = 0;
+    body[b++] = 0x03; body[b++] = 0x03;
+    for (int i = 0; i < 32; i++) { body[b++] = (uint8_t)i; }
+    body[b++] = 0;
+    body[b++] = 0x00; body[b++] = 0x02; body[b++] = 0x13; body[b++] = 0x01;
+    body[b++] = 0x01; body[b++] = 0x00;
+
+    uint8_t ext[4096];
+    size_t e = 0;
+    size_t nl = strlen(sni);
+    /* server_name первым: у браузера оно тоже в начале блока расширений. */
+    ext[e++] = 0x00; ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(5 + nl);
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(3 + nl);
+    ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)nl;
+    memcpy(ext + e, sni, nl); e += nl;
+    /* padding (21) в конце — то, что и раздувает браузерное приветствие. */
+    ext[e++] = 0x00; ext[e++] = 0x15;
+    ext[e++] = (uint8_t)(pad >> 8); ext[e++] = (uint8_t)pad;
+    memset(ext + e, 0, pad); e += pad;
+
+    body[b++] = (uint8_t)(e >> 8); body[b++] = (uint8_t)e;
+    memcpy(body + b, ext, e); b += e;
+
+    size_t o = 0;
+    out[o++] = 0x16; out[o++] = 0x03; out[o++] = 0x01;
+    out[o++] = (uint8_t)((b + 4) >> 8); out[o++] = (uint8_t)(b + 4);
+    out[o++] = 0x01;
+    out[o++] = (uint8_t)(b >> 16); out[o++] = (uint8_t)(b >> 8); out[o++] = (uint8_t)b;
+    memcpy(out + o, body, b); o += b;
+    return o;
+}
+
 int main(void) {
     uint8_t buf[1024];
     d2k_tls_info info;
@@ -194,6 +233,38 @@ int main(void) {
     CHECK(info.have_sni == 0, "имя выдано из записи с враньём в длине");
 
     check_real_hello();
+
+    /* --- приветствие браузера: запись не влезает в один сегмент ------------
+     * Приветствие curl — 322 байта и влезает. Приветствие браузера — 1700 с
+     * лишним из-за GREASE и набивки, на PPPoE не влезает в MSS и приходит
+     * ДВУМЯ сегментами. Разборщик, который требует запись целиком, у браузера
+     * не узнаёт ничего — а браузер это и есть пользователь.
+     *
+     * Имя при этом лежит в первом сегменте: расширения идут после наборов
+     * шифров, а набивка — в конце. Значит узнать цель можно, не собирая
+     * запись целиком, и §5.2 говорит про ОГРАНИЧЕННУЮ пересборку именно
+     * потому, что полная тут не нужна.                                      */
+    {
+        uint8_t big[4096];
+        size_t n = build_hello_padded(big, "instagram.com", 1600);
+        /* Обрезаем как MSS: даём разборщику только первый сегмент. */
+        size_t seg = 1400;
+        CHECK(n > seg, "приветствие в проверке влезло в сегмент — проверять нечего");
+        d2k_tls_info info;
+        d2k_tls_parse(big, seg, &info);
+        CHECK(info.is_tls_record, "обрезанная запись не признана записью TLS");
+        CHECK(info.is_client_hello,
+              "приветствие браузера не узнано: запись не влезла в сегмент");
+        CHECK(info.have_sni, "имя не найдено, хотя лежит в первом сегменте");
+        if (info.have_sni) {
+            CHECK(info.sni_len == 13 &&
+                  memcmp(big + info.sni_off, "instagram.com", 13) == 0,
+                  "имя из обрезанного приветствия прочиталось неверно");
+        }
+        /* А конец записи честно неизвестен: он за пределами сегмента. */
+        CHECK(!info.have_record_end,
+              "конец записи объявлен известным, хотя он за пределами сегмента");
+    }
 
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);

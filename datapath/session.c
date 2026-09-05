@@ -43,6 +43,7 @@ struct d2k_session {
     uint64_t     pay_late;         /* прямая, но за окном поиска */
     uint64_t     pay_not_hello;    /* разобрали и это не приветствие */
     uint8_t      last_nonhello_first;
+    uint64_t     sni_in_next_seg;
 
     /* Форма приветствия. Один буфер на всю сессию, и это объявленный предел:
      * хранить приветствие каждого потока значило бы килобайт на поток.
@@ -448,6 +449,14 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             }
             fl->saw_hello = 1;
             fl->had_sni = tls.have_sni ? 1 : 0;
+            if (!tls.have_sni && !tls.have_record_end) {
+                /* Приветствие узнали, а имени нет, и запись оборвана: имя
+                   уехало во второй сегмент. Это ЦЕНА размена «читаем первый
+                   сегмент вместо пересборки», и её надо измерять, а не
+                   принимать на веру: донор оценил её как приемлемую на своей
+                   линии, но своя линия у каждого. */
+                s->sni_in_next_seg++;
+            }
             fl->hello_seq = in_seq;
             s->hellos++;
             if (tls.have_sni) {
@@ -692,6 +701,7 @@ void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out) {
     out->late = s->pay_late;
     out->not_hello = s->pay_not_hello;
     out->last_first_byte = s->last_nonhello_first;
+    out->sni_next_seg = s->sni_in_next_seg;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {
