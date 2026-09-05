@@ -41,6 +41,7 @@ func usage(w *os.File) {
   control              контроллер: связь датапата и каталога коробок
   volume -target H:P   проба на блокировку по объёму соединения
   cut -target H:P      где резать приветствие, чтобы коробка потеряла имя
+  classify -target H:P  чем именно режут и что из этого следует
   serve [-log FILE]    запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
@@ -81,6 +82,9 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "cut":
 		return cmdCut(args[1:], out, errOut)
+
+	case "classify":
+		return cmdClassify(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(args[1:], out, errOut)

@@ -13,9 +13,18 @@ import (
 //	"prefix" — молчит, если ПЕРВЫЙ сегмент начинается с сигнатуры;
 //	"reasm"  — склеивает всё прочитанное и молчит, если сигнатура нашлась
 //	           где угодно: разрез такую не берёт;
-//	"clear"  — отвечает всегда.
-func stand(t *testing.T, mode string, sig []byte) string {
+//	"clear"  — отвечает всегда;
+//	"delay"  — отвечает всегда, но не раньше чем через delay[0] после
+//	           получения чего угодно; sig не используется. Нужен только для
+//	           замера ТАЙМИНГА (сужение ожидания по RTT между вопросами
+//	           дерева, ревью Task 3, п.5) — содержимое здесь ни при чём,
+//	           второй стенд под это заводить незачем.
+func stand(t *testing.T, mode string, sig []byte, delay ...time.Duration) string {
 	t.Helper()
+	var d time.Duration
+	if len(delay) > 0 {
+		d = delay[0]
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -29,10 +38,17 @@ func stand(t *testing.T, mode string, sig []byte) string {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+				// +3с сверх задержки — тот же запас, что был всегда для
+				// остальных режимов (delay=0 для них, ничего не меняется).
+				_ = c.SetDeadline(time.Now().Add(d + 3*time.Second))
 				buf := make([]byte, 8192)
 				n, err := c.Read(buf)
 				if err != nil {
+					return
+				}
+				if mode == "delay" {
+					time.Sleep(d)
+					_, _ = c.Write([]byte{0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00})
 					return
 				}
 				first := append([]byte(nil), buf[:n]...)
