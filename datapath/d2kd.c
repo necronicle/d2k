@@ -352,8 +352,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--copy-range должен быть от 64 до %d\n", MAX_PKT);
         return 2;
     }
-    if (mode == MODE_APPLY && !plan_path) {
-        fprintf(stderr, "режим apply без --plan ничего не сделал бы\n");
+    if (mode == MODE_APPLY && !plan_path && !ctl_path) {
+        /* Планы приходят либо файлом, либо от контроллера через сокет. Без
+           обоих исполнять нечего, и запускаться в таком виде значит оставить
+           человеку процесс, который выглядит работающим обходом. */
+        fprintf(stderr, "режим apply без --plan и без --control ничего не сделал бы\n");
         return 2;
     }
     if (mode == MODE_APPLY && mark == 0) {

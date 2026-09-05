@@ -56,6 +56,8 @@ DST=${D2K_DST:-}
 # Снимать ли трафик на WAN, чтобы увидеть собственный пакет на проводе.
 DUMP_IF=${D2K_DUMP_IF:-}
 DUMP_N=${D2K_DUMP_N:-40}
+# Поднимать ли контроллер: он учится на подозрениях и строит каталог коробок.
+LEARN=${D2K_LEARN:-0}
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TOKEN="d2k$$"
@@ -121,14 +123,39 @@ say "  доставлено $REMOTE_SIZE байт, размер совпал"
 $SSH "chmod +x /tmp/d2kd.$TOKEN && /tmp/d2kd.$TOKEN --help >/dev/null 2>&1 && echo '  служба запускается'"
 
 if [ "$MODE" = apply ]; then
-    [ -n "$PLAN" ] || { say "режим apply без D2K_PLAN ничего не сделал бы"; exit 2; }
+    # План берётся либо из файла, либо у контроллера. Без обоих исполнять
+    # нечего.
+    if [ -z "$PLAN" ] && [ "$LEARN" != 1 ]; then
+        say "режим apply без D2K_PLAN и без D2K_LEARN ничего не сделал бы"
+        exit 2
+    fi
     [ "$MARK" != 0 ] || { say "режим apply без D2K_MARK запрещён: см. §5.5"; exit 2; }
-    [ -n "$DST" ] || { say "режим apply без D2K_DST запрещён: опыт обязан быть узким (§2.6)"; exit 2; }
-    say "== доставка плана =="
-    $SSH_IN "cat > /tmp/d2kd.$TOKEN.plan" < "$PLAN"
-    PSIZE=$($SSH "wc -c < /tmp/d2kd.$TOKEN.plan" | tr -d ' \r')
-    [ "$PSIZE" = "$(wc -c < "$PLAN" | tr -d ' ')" ] || { say "план доехал испорченным"; exit 1; }
-    say "  план $PSIZE байт"
+    # Сужение обязательно, но годится любое: по клиенту или по цели. §2.6
+    # требует ограничить последствия, а не непременно обе стороны — на
+    # роутере живут чужие устройства, и десинк всего 443-го порта был бы не
+    # экспериментом, а аварией.
+    if [ -z "$SRC" ] && [ -z "$DST" ]; then
+        say "режим apply без D2K_SRC и D2K_DST запрещён: опыт обязан быть узким (§2.6)"
+        exit 2
+    fi
+    if [ -n "$PLAN" ]; then
+        say "== доставка плана =="
+        $SSH_IN "cat > /tmp/d2kd.$TOKEN.plan" < "$PLAN"
+        PSIZE=$($SSH "wc -c < /tmp/d2kd.$TOKEN.plan" | tr -d ' \r')
+        [ "$PSIZE" = "$(wc -c < "$PLAN" | tr -d ' ')" ] || { say "план доехал испорченным"; exit 1; }
+        say "  план $PSIZE байт"
+    fi
+fi
+
+if [ "$LEARN" = 1 ]; then
+    say "== доставка контроллера =="
+    GOOS=linux GOARCH=arm64 "${GO:-go}" build -trimpath -o "$REPO/builds/d2k-linux-arm64" ./cmd/d2k
+    CSIZE=$(wc -c < "$REPO/builds/d2k-linux-arm64" | tr -d ' ')
+    $SSH_IN "cat > /tmp/d2k.$TOKEN" < "$REPO/builds/d2k-linux-arm64"
+    RSIZE=$($SSH "wc -c < /tmp/d2k.$TOKEN" | tr -d ' \r')
+    [ "$CSIZE" = "$RSIZE" ] || { say "контроллер доехал испорченным: $CSIZE против $RSIZE"; exit 1; }
+    $SSH "chmod +x /tmp/d2k.$TOKEN"
+    say "  контроллер $RSIZE байт"
 fi
 
 # Сужение: и источник, и цель. Собственные пакеты исключаются по метке —
@@ -181,10 +208,26 @@ $SSH "
 start-stop-daemon -S -b -m -p /tmp/d2kd.$TOKEN.pid -x /tmp/d2kd.$TOKEN -- \
     --queue $QUEUE --mode $MODE --stats 15 --duration $DUR --mark $MARK \
     ${PLAN:+--plan /tmp/d2kd.$TOKEN.plan} \
+    ${LEARN:+--control /tmp/d2kd.$TOKEN.sock} \
     --log /tmp/d2kd.$TOKEN.out
 sleep 1
 echo \"  pid=\$(cat /tmp/d2kd.$TOKEN.pid 2>/dev/null)\"
 " >&2
+
+if [ "$LEARN" = 1 ]; then
+    say "== запуск контроллера =="
+    # Каталог кладём в /tmp: это опыт, а не эксплуатация, и на флеш роутера
+    # ради него писать нечего.
+    $SSH "
+    D2K_CONFIG=/tmp/d2k.$TOKEN.conf sh -c \"
+        printf 'SCHEMA=1\\nMODE=apply\\nPANEL_LISTEN=\\nSTATE_DIR=/tmp/d2k.$TOKEN.state\\nQUEUE_NUM=$QUEUE\\nCONTROL_SOCKET=/tmp/d2kd.$TOKEN.sock\\n' > /tmp/d2k.$TOKEN.conf
+    \"
+    start-stop-daemon -S -b -m -p /tmp/d2k.$TOKEN.pid -x /bin/sh -- -c \
+        'D2K_CONFIG=/tmp/d2k.$TOKEN.conf /tmp/d2k.$TOKEN control > /tmp/d2k.$TOKEN.out 2>&1'
+    sleep 2
+    echo \"  контроллер: \$(head -3 /tmp/d2k.$TOKEN.out 2>/dev/null | tr '\n' ' ')\"
+    " >&2
+fi
 
 say "== проверка привязки очереди =="
 # Замер, начатый до привязки, измеряет тишину и выглядит убедительно.
@@ -206,13 +249,19 @@ if [ -n "$DUMP_IF" ]; then
     sleep 1
 fi
 
-say "== нагрузка, $DUR с =="
+say "== нагрузка =="
 if [ -n "${D2K_LOAD:-}" ]; then
     sh -c "$D2K_LOAD" >&2 || say "  нагрузка вернула $?"
+    # Нагрузка кончилась — мерить больше нечего. Раньше здесь стояло
+    # ожидание всей длительности прогона: служба досиживала свои сорок пять
+    # секунд впустую, и человек смотрел в замерший шелл минуты ради замера,
+    # который занял доли секунды. Даём ей секунду добрать хвост событий и
+    # снимаем.
+    sleep 2
 else
-    say "  своей нагрузки нет — пользуйтесь интернетом как обычно"
+    say "  своей нагрузки нет — пользуйтесь интернетом как обычно, $DUR с"
+    sleep $((DUR + 3))
 fi
-sleep $((DUR + 3))
 
 if [ -n "$DUMP_IF" ]; then
     $SSH "kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid 2>/dev/null) 2>/dev/null; true"
@@ -220,6 +269,16 @@ if [ -n "$DUMP_IF" ]; then
     $SSH_IN "cat /tmp/d2kd.$TOKEN.pcap 2>/dev/null" > "$REPO/docs/field/raw/observe-$STAMP.pcap" || true
     say "  снимок: docs/field/raw/observe-$STAMP.pcap ($(wc -c < "$REPO/docs/field/raw/observe-$STAMP.pcap" | tr -d ' ') байт)"
     $SSH "rm -f /tmp/d2kd.$TOKEN.pcap /tmp/d2kd.$TOKEN.tcpdump.pid"
+fi
+
+if [ "$LEARN" = 1 ]; then
+    say "== контроллер и каталог =="
+    $SSH "kill \$(cat /tmp/d2k.$TOKEN.pid 2>/dev/null) 2>/dev/null; sleep 1; true"
+    mkdir -p "$REPO/docs/field/raw"
+    $SSH "cat /tmp/d2k.$TOKEN.out 2>/dev/null" > "$REPO/docs/field/raw/control-$STAMP.log" || true
+    $SSH "cat /tmp/d2k.$TOKEN.state/catalog.json 2>/dev/null" > "$REPO/docs/field/raw/catalog-$STAMP.json" || true
+    sed 's/^/  /' "$REPO/docs/field/raw/control-$STAMP.log" >&2 || true
+    $SSH "rm -rf /tmp/d2k.$TOKEN /tmp/d2k.$TOKEN.* " || true
 fi
 
 say "== сбор вывода =="

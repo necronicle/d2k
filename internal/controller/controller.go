@@ -29,6 +29,18 @@ const (
 	maxTasks     = 64  // одновременных поисков
 	maxNames     = 512 // потоков, чьё имя цели мы помним
 	taskLifetime = 10 * time.Minute
+	// Сколько раз кандидат должен доехать до соединения, не дав обмена,
+	// чтобы считаться неподошедшим.
+	//
+	// Одного раза мало: наблюдение «снят чужой сброс» говорит, что защита
+	// сработала, но не говорит, дошло ли дело до обмена, — и по нему
+	// кандидата отбрасывать нельзя. Без этого предела кандидат, который
+	// исправно снимает подделку и не приводит к обмену, залипал бы до
+	// истечения задачи, то есть на десять минут.
+	//
+	// Два, а не три: каждое применение без обмена — это ожидание у человека,
+	// и порог здесь считается в его секундах, а не в наших попытках.
+	maxSilentTries = 2
 )
 
 // Task — один согласованный поиск по одной цели.
@@ -258,13 +270,35 @@ func (c *Controller) expire(now time.Time) {
 	}
 }
 
+// failsCandidate — говорит ли наблюдение о том, что текущий кандидат НЕ
+// помог.
+//
+// «Снят чужой сброс» не говорит: это защита сработала, то есть план делает
+// ровно то, ради чего поставлен. Первый полевой прогон споткнулся именно
+// здесь — контроллер записал «кандидат не помог» в ту же секунду, когда
+// датапат писал «обмен пошёл», и отбросил сработавший план.
+//
+// Успехом это наблюдение тоже не является: подделку сняли, а дошло ли дело до
+// обмена — отдельный вопрос. Правильный ответ — не считать его ни тем, ни
+// другим и ждать либо обмена, либо другого подозрения.
+func failsCandidate(code uint8) bool {
+	switch code {
+	case control.SuspectRSTCut:
+		return false
+	default:
+		return true
+	}
+}
+
 func signalOf(ev control.Event) catalog.Signal {
 	s := catalog.Signal{Seen: 1}
 	switch ev.Code {
-	case control.SuspectRST:
+	case control.SuspectRST, control.SuspectRSTCut:
+		// Один и тот же вид: подделанный сброс. Различие между ними — наша
+		// РЕАКЦИЯ (сняли или пропустили), а отпечаток описывает поведение
+		// КОРОБКИ. Разведи их — и одна коробка попала бы в базу дважды, что
+		// и случилось на первом прогоне с этой проверкой.
 		s.Kind = "rst"
-	case control.SuspectRSTCut:
-		s.Kind = "rst_cut"
 	case control.SuspectRepeat:
 		s.Kind = "repeat"
 	case control.SuspectSilent:
@@ -288,6 +322,12 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 
 	t := c.tasks[target]
 	if t == nil {
+		if ev.Code == control.SuspectRSTCut {
+			// Снятый сброс бывает только там, где план УЖЕ стоит: снимает его
+			// защита из плана. Начинать по нему поиск значит искать решение
+			// для цели, у которой решение уже работает.
+			return nil
+		}
 		if len(c.tasks) >= maxTasks {
 			// Отказ, а не безграничный рост. §5.2.
 			c.dropped++
@@ -304,10 +344,16 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 		}
 		c.tasks[target] = t
 		c.sayf("подозрение по %s (%s): начат поиск", target, control.SuspectText(ev.Code))
-	} else if t.Current != nil && t.AppliedCount > 0 {
+	} else if t.Current != nil && t.AppliedCount >= maxSilentTries {
+		c.sayf("по %s кандидат %s применён %d раз без обмена, беру следующий",
+			target, t.Current.Plan.ID, t.AppliedCount)
+		t.Current = nil
+		t.AppliedCount = 0
+	} else if t.Current != nil && t.AppliedCount > 0 && failsCandidate(ev.Code) {
 		// Кандидат доехал до соединения и не помог. Это НЕ доказательство
 		// свойств коробки (§2.4) и никуда не записывается — просто следующий.
-		c.sayf("по %s кандидат %s не помог, беру следующий", target, t.Current.Plan.ID)
+		c.sayf("по %s кандидат %s не помог (%s), беру следующий",
+			target, t.Current.Plan.ID, control.SuspectText(ev.Code))
 		t.Current = nil
 		t.AppliedCount = 0
 	} else if t.Current != nil {
@@ -432,25 +478,34 @@ func (c *Controller) buildQueue(t *Task) ([]Candidate, error) {
 }
 
 func (c *Controller) onExchange(ev control.Event, now time.Time) error {
-	_, target := c.target(ev.Key)
+	kind, target := c.target(ev.Key)
 	t := c.tasks[target]
 	if t == nil || t.Current == nil || t.AppliedCount == 0 {
-		// Обмен по цели, за которой мы не следим, либо до применения
-		// кандидата. Это обычный трафик, и он ничего не подтверждает.
+		// Поиска нет. Но если по этой цели уже есть подтверждённая привязка,
+		// а обмен дошёл до прикладных данных, — уровень доказательства обязан
+		// подняться. Уровень 2 записывается тогда, когда больше ничего не
+		// видно; оставить его навсегда значит хранить заниженное знание.
+		if ev.HasAppData() {
+			c.raiseLevel(kind, target, now)
+		}
+		// В остальном это обычный трафик, и он ничего не подтверждает.
 		return nil
 	}
 
-	// §4.2: уровень 2 нельзя сохранять как уровень 4. Прикладные данные —
-	// то, чем уровень 3 отличается от уровня 2; одного ServerHello мало, и
-	// документ говорит это прямо.
+	// §4.2: уровень 2 нельзя ПОКАЗЫВАТЬ ИЛИ СОХРАНЯТЬ как уровень 4. Здесь он
+	// и сохраняется как 2 — ровно тот, что измерен.
+	//
+	// Не подтверждать вовсе до появления прикладных данных нельзя: без
+	// снятия аппаратной разгрузки обратного направления их почти не видно, а
+	// снятие стоит 66 % ядра (замер этапа 0, решение 0003). Первый полевой
+	// прогон на этом и встал: обмен шёл, а записать было нечего.
+	//
+	// Уровень поднимется сам, когда прикладные данные всё-таки попадут в
+	// окно: датапат сообщает об их появлении отдельно, а Confirm повышает
+	// уровень привязки и не понижает.
 	level := catalog.LevelProtocol
 	if ev.HasAppData() {
 		level = catalog.LevelHandshake
-	}
-	if level < catalog.LevelHandshake {
-		// Сервер начал отвечать, но обмена данными мы ещё не видели.
-		// Не подтверждаем и не отменяем: ждём.
-		return nil
 	}
 
 	box, created, err := c.store.Catalog().Confirm(
@@ -476,6 +531,28 @@ func (c *Controller) onExchange(ev control.Event, now time.Time) error {
 		c.sayf("каталог не записался: %v", err)
 	}
 	return nil
+}
+
+// raiseLevel поднимает уровень доказательства подтверждённой привязки, когда
+// в обмене появились прикладные данные. Понизить уровень отсюда нельзя: он
+// отражает лучшее, что было измерено.
+func (c *Controller) raiseLevel(kind, target string, now time.Time) {
+	cat := c.store.Catalog()
+	for i := range cat.Boxes {
+		bd := cat.Boxes[i].BindingFor(kind, target)
+		if bd == nil || !bd.Enabled || bd.Level >= catalog.LevelHandshake {
+			continue
+		}
+		bd.Level = catalog.LevelHandshake
+		bd.Confirmed = now
+		c.store.Touch()
+		c.sayf("по %s уровень доказательства поднят до %d: пошли прикладные данные",
+			target, bd.Level)
+		if _, err := c.store.Flush(now); err != nil {
+			c.sayf("каталог не записался: %v", err)
+		}
+		return
+	}
 }
 
 // Tasks — живое состояние поисков. §8 вид «Сейчас в работе»: это состояние

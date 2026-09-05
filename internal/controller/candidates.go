@@ -99,7 +99,7 @@ func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
 	sawRST, sawQuiet := false, false
 	for _, s := range fp.Signals {
 		switch s.Kind {
-		case "rst", "rst_cut":
+		case "rst":
 			sawRST = true
 		case "silent", "repeat":
 			sawQuiet = true
@@ -122,10 +122,20 @@ func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
 			{fake: true, ttl: 3, repeats: 2, gap: 78000},
 		}
 	case sawRST:
+		// Пара первой, а не «дешёвая» защита.
+		//
+		// Рассуждение «дешевле всего — значит первым» стоило замера: защита
+		// в одиночку снимает подделанный сброс, но сервер всё равно не
+		// отвечает, и мгновенный отказ превращается в ШЕСТИСЕКУНДНОЕ
+		// зависание. Три таких подряд — восемнадцать секунд ожидания у
+		// человека вместо мгновенного отказа, к которому он привык.
+		//
+		// Цена кандидата измеряется не числом выпущенных пакетов, а тем, во
+		// что обходится его неудача. Порядок здесь именно по этой цене.
 		steps = []step{
-			{guard: true},
 			{guard: true, fake: true, ttl: 3, repeats: 2, gap: 78000},
 			{fake: true, ttl: 3, repeats: 2, gap: 78000},
+			{guard: true},
 		}
 	default:
 		// Молчание, повтор или наблюдение, которого мы ещё не различаем.

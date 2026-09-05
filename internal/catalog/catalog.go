@@ -123,7 +123,7 @@ func (f Fingerprint) Match(other Fingerprint) float64 {
 				continue
 			}
 			// Для сброса требуется совпадение улик, а не только вида.
-			if s.Kind == "rst" || s.Kind == "rst_cut" {
+			if s.Kind == "rst" {
 				if t.TTLDelta == s.TTLDelta && t.IPID == s.IPID && t.ToS == s.ToS {
 					hit++
 				}

@@ -304,3 +304,79 @@ func TestОбменБезПоискаНичегоНеПодтверждает(t 
 		t.Fatalf("обычный трафик записал %d коробок", n)
 	}
 }
+
+func TestСнятыйСбросНеСчитаетсяПровалом(t *testing.T) {
+	// «Снят чужой сброс» — это защита СРАБОТАЛА, а не план не помог. Первый
+	// полевой прогон споткнулся ровно здесь: контроллер отбросил кандидата в
+	// ту же секунду, когда датапат писал «обмен пошёл».
+	r := newRig(t)
+
+	r.say("hello linkedin.com")
+	r.say("rst")
+	r.pump(8)
+	tasks := r.ctrl.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("поисков %d", len(tasks))
+	}
+	firstTry := tasks[0].Attempts
+
+	// Кандидат встал; на следующем соединении защита снимает подделку.
+	r.say("hello linkedin.com")
+	r.pump(4)
+	r.say("rst") // защита кандидата снимет его и отметит rst_cut
+	r.pump(6)
+
+	tasks = r.ctrl.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("поиск закрылся раньше времени; журнал:\n%s", r.log)
+	}
+	if tasks[0].Attempts != firstTry {
+		t.Fatalf("сработавшая защита сочтена провалом: попыток было %d, стало %d;\nжурнал:\n%s",
+			firstTry, tasks[0].Attempts, r.log)
+	}
+}
+
+func TestУровеньДваПодтверждаетИПотомРастёт(t *testing.T) {
+	// §4.2 запрещает выдавать уровень 2 за уровень 4, а не запрещает его
+	// записывать. Без снятия разгрузки обратного направления прикладных
+	// данных почти не видно, и требование уровня 3 означало бы, что не
+	// записывается вообще ничего.
+	r := newRig(t)
+
+	r.say("hello linkedin.com")
+	r.say("rst")
+	r.pump(8)
+	r.say("hello linkedin.com")
+	r.pump(4)
+	r.say("reply 22") // только ServerHello
+	r.pump(6)
+
+	cat := r.store.Catalog()
+	_, bind, _ := cat.Lookup("linkedin.com", "")
+	if bind == nil {
+		t.Fatalf("обмен на уровне 2 не подтверждён вовсе; журнал:\n%s", r.log)
+	}
+	if bind.Level != catalog.LevelProtocol {
+		t.Fatalf("уровень записан как %d, а измерен был 2", bind.Level)
+	}
+
+	// Появились прикладные данные — уровень обязан подняться.
+	r.say("hello linkedin.com")
+	r.pump(4)
+	r.say("rst")
+	r.pump(4)
+	r.say("hello linkedin.com")
+	r.pump(4)
+	r.say("reply 22")
+	r.say("reply 23")
+	r.pump(8)
+
+	_, bind, _ = r.store.Catalog().Lookup("linkedin.com", "")
+	if bind == nil || bind.Level < catalog.LevelHandshake {
+		lvl := -1
+		if bind != nil {
+			lvl = bind.Level
+		}
+		t.Fatalf("уровень не поднялся при появлении прикладных данных: %d;\nжурнал:\n%s", lvl, r.log)
+	}
+}

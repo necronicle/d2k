@@ -37,8 +37,11 @@ const (
 	// ModeOff — служба запущена, но в трафик не вмешивается и не наблюдает.
 	ModeOff Mode = "off"
 	// ModeObserve — только наблюдение: очередь читается, вердикт всегда
-	// «пропустить». Это режим этапов A–C; активного обхода в нём нет.
+	// «пропустить». Активного обхода в нём нет.
 	ModeObserve Mode = "observe"
+	// ModeApply — активное исполнение планов. Включается ЯВНО и обратимо
+	// (§7.2): переход в активный режим не должен случаться сам собой.
+	ModeApply Mode = "apply"
 )
 
 // Config — разобранная конфигурация. Поля заполнены всегда: либо из файла,
@@ -55,6 +58,14 @@ type Config struct {
 
 	// QueueNum — номер NFQUEUE для датапата.
 	QueueNum int
+
+	// ControlSocket — где датапат слушает контроллера.
+	ControlSocket string
+
+	// DecoySNI — имя в приманке. Не константа кода: имя, работающее на одной
+	// линии, не обязано работать на другой, и подбирать его — часть поиска.
+	// Умолчание измерено донором (замер 2026-08-29).
+	DecoySNI string
 
 	// Unknown — ключи, которых этот код не знает. Сохраняются, чтобы откат на
 	// предыдущую версию не терял настройки следующей.
@@ -74,7 +85,11 @@ func Default() Config {
 		PanelListen: "127.0.0.1:8090",
 		StateDir:    "/opt/d2k/state",
 		QueueNum:    2000,
-		Unknown:     map[string]string{},
+		// Сокет в /opt/d2k/run, а не в /tmp: /tmp на роутере — tmpfs, и путь
+		// там пережил бы перезагрузку только по случайности.
+		ControlSocket: "/opt/d2k/run/d2kd.sock",
+		DecoySNI:      "disk.rzd.ru",
+		Unknown:       map[string]string{},
 	}
 }
 
@@ -127,10 +142,10 @@ func Load(path string) (Config, error) {
 			c.Schema = n
 		case "MODE":
 			switch Mode(val) {
-			case ModeOff, ModeObserve:
+			case ModeOff, ModeObserve, ModeApply:
 				c.Mode = Mode(val)
 			default:
-				return c, fmt.Errorf("%s:%d: MODE=%q, допустимы off и observe", path, line, val)
+				return c, fmt.Errorf("%s:%d: MODE=%q, допустимы off, observe и apply", path, line, val)
 			}
 		case "PANEL_LISTEN":
 			c.PanelListen = val
@@ -139,6 +154,13 @@ func Load(path string) (Config, error) {
 				return c, fmt.Errorf("%s:%d: STATE_DIR должен быть абсолютным путём, а не %q", path, line, val)
 			}
 			c.StateDir = val
+		case "CONTROL_SOCKET":
+			if val != "" && !filepath.IsAbs(val) {
+				return c, fmt.Errorf("%s:%d: CONTROL_SOCKET должен быть абсолютным путём, а не %q", path, line, val)
+			}
+			c.ControlSocket = val
+		case "DECOY_SNI":
+			c.DecoySNI = val
 		case "QUEUE_NUM":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 0 || n > 65535 {
@@ -180,13 +202,19 @@ func (c Config) Render() string {
 	fmt.Fprintf(&b, "SCHEMA=%d\n\n", c.Schema)
 	b.WriteString("# off — служба запущена, но трафик не трогает и не наблюдает.\n")
 	b.WriteString("# observe — только наблюдение, вердикт всегда «пропустить».\n")
+	b.WriteString("# apply — активное исполнение подобранных планов.\n")
 	fmt.Fprintf(&b, "MODE=%s\n\n", c.Mode)
 	b.WriteString("# Локальная панель. Пустое значение выключает её.\n")
 	fmt.Fprintf(&b, "PANEL_LISTEN=%s\n\n", c.PanelListen)
 	b.WriteString("# Каталог коробок и журнал решений.\n")
 	fmt.Fprintf(&b, "STATE_DIR=%s\n\n", c.StateDir)
 	b.WriteString("# Номер очереди NFQUEUE для датапата.\n")
-	fmt.Fprintf(&b, "QUEUE_NUM=%d\n", c.QueueNum)
+	fmt.Fprintf(&b, "QUEUE_NUM=%d\n\n", c.QueueNum)
+	b.WriteString("# Где датапат слушает контроллера.\n")
+	fmt.Fprintf(&b, "CONTROL_SOCKET=%s\n\n", c.ControlSocket)
+	b.WriteString("# Имя в приманке. Не константа: имя, работающее на одной линии,\n")
+	b.WriteString("# не обязано работать на другой — подбор его часть поиска.\n")
+	fmt.Fprintf(&b, "DECOY_SNI=%s\n", c.DecoySNI)
 	if len(c.Unknown) > 0 {
 		b.WriteString("\n# Ключи, которых эта сборка не знает. Сохранены намеренно:\n")
 		b.WriteString("# откат на предыдущую версию не должен терять настройки следующей.\n")
@@ -195,4 +223,12 @@ func (c Config) Render() string {
 		}
 	}
 	return b.String()
+}
+
+// CatalogPath — где лежит каталог коробок.
+func (c Config) CatalogPath() string {
+	if c.StateDir == "" {
+		return ""
+	}
+	return filepath.Join(c.StateDir, "catalog.json")
 }

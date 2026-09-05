@@ -35,6 +35,7 @@ func usage(w *os.File) {
   config [-write]      показать конфигурацию; -write создать файл с умолчаниями
   status               что программа делает прямо сейчас
   plan <подкоманда>    перевод плана между текстовой и канонической формой
+  control              контроллер: связь датапата и каталога коробок
   serve                запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
@@ -66,6 +67,9 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "plan":
 		return cmdPlan(args[1:], out, errOut)
+
+	case "control":
+		return cmdControl(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(out, errOut)
