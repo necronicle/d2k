@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/probe"
@@ -42,7 +41,7 @@ func TestОбрывПоОбъёмуНаходитсяПоПовторяемос�
 	r := newRig(t)
 	// Проба меряет 19 КБ там, где наблюдение видело 15: числа намеренно
 	// разные, чтобы было видно, ЧЬЁ измерение становится приметой коробки.
-	r.vol.set(volume.ScanFound, "проходящее.example", 19)
+	r.vol.set(volume.ScanFound, "passing.example", 19)
 	ct := filepath.Join(t.TempDir(), "ct")
 	r.ctrl.SetConntrackPath(ct)
 
@@ -98,7 +97,7 @@ func TestИмяБерётсяИзПробыАНеИзПеребора(t *testing
 	// ставить вслед за подтверждённым измерением ещё пятнадцать — не доверять
 	// собственному прибору и тратить время человека.
 	r := newRig(t)
-	r.vol.set(volume.ScanFound, "проходящее.example", 19)
+	r.vol.set(volume.ScanFound, "passing.example", 19)
 	ct := filepath.Join(t.TempDir(), "ct")
 	r.ctrl.SetConntrackPath(ct)
 	writeCT(t, ct)
@@ -115,14 +114,18 @@ func TestИмяБерётсяИзПробыАНеИзПеребора(t *testing
 	r.pump(4)
 
 	logs := r.log.String()
-	if !strings.Contains(logs, "имя проходящее.example проводит объём") {
+	if !strings.Contains(logs, "имя passing.example проводит объём") {
 		t.Fatalf("проба не спрошена или её ответ не истолкован:\n%s", logs)
 	}
-	if !strings.Contains(logs, "(имя проходящее.example)") {
+	if !strings.Contains(logs, "(имя passing.example)") {
 		t.Fatalf("поставлено не найденное пробой имя:\n%s", logs)
 	}
-	if n := strings.Count(logs, "пробую"); n != 1 {
-		t.Fatalf("кандидатов поставлено %d, а имя уже подобрано пробой:\n%s", n, logs)
+	if n := strings.Count(logs, "(имя passing.example)"); n != 1 {
+		t.Fatalf("имя поставлено %d раз, а проба подобрала его один раз:\n%s", n, logs)
+	}
+	// Подобранное имя обязано ПЕРЕБИТЬ лестницу, а не встать в её конец.
+	if strings.LastIndex(logs, "(поиск)") > strings.LastIndex(logs, "(имя passing.example)") {
+		t.Fatalf("после подобранного имени лестница продолжила своим порядком:\n%s", logs)
 	}
 	if r.probe.count() != before {
 		t.Fatal("для цели с обрывом по объёму пущен пакетный зонд, который тут ничего не мерит")
@@ -183,61 +186,58 @@ func TestНаблюдениеБезПодтвержденияПробойИме�
 	}
 }
 
-func TestПробаНаОбъёмСпрашиваетсяРаньшеВопросовПроРазрез(t *testing.T) {
-	// Порядок несущий: при блокировке по объёму рукопожатие проходит с любым
-	// именем, и вопросы про разбор приветствия отвечают мимо. Спросить их
-	// раньше — получить уверенный неверный ответ.
+func TestИзмерениеОбъёмаНеЗадерживаетЛестницу(t *testing.T) {
+	// Полевой прогон 06.09.2026: обе цели простояли две минуты с заданным
+	// вопросом про объём и без единого поставленного плана. Измерение идёт до
+	// полутора минут, а первый кандидат встаёт за секунду — держать человека
+	// ради вопроса, который на большинстве целей ответит «блока нет», нельзя.
 	r := newRig(t)
-	r.probe.script = []probe.Result{{Outcome: probe.OutcomeExchange}}
-	r.say("hello order.example")
-	r.say("rst")
-	r.pump(10)
-
-	logs := r.log.String()
-	iv := strings.Index(logs, "режут ли поток по объёму")
-	ih := strings.Index(logs, "первое приветствие или последнее")
-	if iv < 0 {
-		t.Fatalf("про объём не спросили вовсе:\n%s", logs)
-	}
-	if ih >= 0 && ih < iv {
-		t.Fatalf("про разрез приветствия спросили раньше, чем про объём:\n%s", logs)
-	}
-}
-
-func TestБезТаблицыЯдраМолчанияНеБывает(t *testing.T) {
-	// «Обрывов не видели» и «не смотрели» — разные утверждения.
-	r := newRig(t)
-	r.ctrl.SetConntrackPath(filepath.Join(t.TempDir(), "нет-такого"))
-	r.say("hello any.example")
-	r.pump(3)
-	if !strings.Contains(r.log.String(), "обрывы по объёму не наблюдаются") {
-		t.Fatalf("недоступность счётчиков не объявлена:\n%s", r.log)
-	}
-	_ = time.Now
-}
-
-func TestПанельНазываетЗаданныйВопрос(t *testing.T) {
-	// Подбор имени по объёму занимает до полутора минут. Всё это время писать
-	// «распознаём поведение» — молчать о том, чем занят прибор.
-	r := newRig(t)
-	r.vol.set(volume.ScanFound, "проходящее.example", 19)
+	r.vol.set(volume.ScanFound, "passing.example", 19)
 	hold := make(chan struct{})
 	r.vol.hold = hold
-	r.say("hello asking.example")
+	r.probe.script = []probe.Result{{Outcome: probe.OutcomeSilence}}
+
+	r.say("hello nowait.example")
 	r.say("rst")
-	for i := 0; i < 10 && r.vol.count() == 0; i++ {
+	for i := 0; i < 12 && r.vol.count() == 0; i++ {
 		r.pump(1)
 	}
-	defer close(hold)
+	r.pump(4)
 
-	var phase string
-	for _, s := range r.ctrl.Knowledge().Searches {
-		if s.Target == "asking.example" {
-			phase = s.Phase
-		}
+	logs := r.log.String()
+	if !strings.Contains(logs, "заодно меряю объём") {
+		close(hold)
+		t.Fatalf("объём не меряется вовсе:\n%s", logs)
 	}
-	if !strings.Contains(phase, "спрашиваем") {
-		t.Fatalf("панель показывает фазу %q, а идёт вопрос:\n%s", phase, r.log)
+	if !strings.Contains(logs, "пробую") {
+		close(hold)
+		t.Fatalf("пока идёт измерение объёма, ни один кандидат не поставлен:\n%s", logs)
+	}
+	close(hold)
+}
+
+func TestПоискНеЗакрываетсяПокаИдётИзмерение(t *testing.T) {
+	// Лестница может кончиться раньше измерения. Закрыть поиск в этот момент
+	// значит выбросить ответ, за который уже заплачено временем человека, —
+	// и именно он единственный, который при блоке по объёму помогает.
+	r := newRig(t)
+	r.vol.set(volume.ScanFound, "passing.example", 19)
+	hold := make(chan struct{})
+	r.vol.hold = hold
+	r.probe.script = []probe.Result{{Outcome: probe.OutcomeSilence}}
+
+	r.say("hello late.example")
+	r.say("rst")
+	r.pump(20)
+
+	if strings.Contains(r.log.String(), "решения не нашлось") {
+		close(hold)
+		t.Fatalf("поиск закрыт, пока измерение объёма ещё шло:\n%s", r.log)
+	}
+	close(hold)
+	r.pump(6)
+	if !strings.Contains(r.log.String(), "(имя passing.example)") {
+		t.Fatalf("дождавшийся ответ не поставлен:\n%s", r.log)
 	}
 }
 

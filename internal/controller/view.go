@@ -43,6 +43,12 @@ func (c *Controller) Knowledge() status.Knowledge {
 		if t.Asking.Name != "" {
 			v.Phase = "спрашиваем: " + t.Asking.Name
 		}
+		if t.Scanning() {
+			// Измерение объёма идёт параллельно лестнице и занимает до
+			// полутора минут. Молчать о нём — оставить человека гадать,
+			// почему поиск «стоит», когда он не стоит.
+			v.Phase += ", попутно спрашиваем: " + questionVolume
+		}
 		if t.Current != nil {
 			v.Candidate = t.Current.Plan.ID
 			v.Source = t.Current.Source

@@ -156,27 +156,35 @@ func (c *Controller) onVolumeVerify(d volumeVerifyDone) error {
 	return nil
 }
 
-// askVolume запускает подбор. Он долгий, поэтому уходит в сторону, а ответ
-// возвращается тем же путём, что и ответ обычного зонда.
-func (c *Controller) askVolume(t *Task) error {
+// askVolume запускает измерение объёма и НЕ ЖДЁТ его.
+//
+// Ожидание здесь стоило полевого прогона: обе цели простояли две минуты с
+// заданным вопросом и без единого поставленного плана. Измерение идёт до
+// полутора минут, а первый кандидат встаёт за секунду — держать человека всё
+// это время ради вопроса, который на большинстве целей ответит «блока нет»,
+// нельзя.
+//
+// Поэтому лестница кандидатов идёт своим ходом, а ответ про объём, когда
+// придёт, ПЕРЕБИВАЕТ её: подстановка имени — единственное, что при этом блоке
+// вообще действует, и ждать своей очереди ей незачем.
+func (c *Controller) askVolume(t *Task) {
 	if t.ServerIP == "" || c.volProber == nil || t.scanning {
-		// Спросить нечем. «Не спрашивали» — не «нет» (§2.4): ставим отказ от
-		// вопроса и идём дальше.
+		// Спросить нечем. «Не спрашивали» — не «нет» (§2.4).
 		t.Traits.VolumeAsked = true
-		return c.step(t)
+		return
 	}
 	if t.Probes >= maxProbesPerTask {
 		c.sayf("по %s бюджет зондов исчерпан (%d) — про объём не спрашиваю", t.Target, t.Probes)
 		t.Traits.VolumeAsked = true
-		return c.step(t)
+		return
 	}
 
 	t.scanning = true
+	t.Traits.VolumeAsked = true
 	t.Probes++
 	c.probesUsed++
-	t.Asking = Question{Name: questionVolume, Why: "если режут по объёму, дело в имени, а не в разрезе"}
-	c.sayf("по %s спрашиваю: %s (%s), накачка исходящим объёмом",
-		t.Target, t.Asking.Name, t.Asking.Why)
+	c.sayf("по %s заодно меряю объём (%s), не останавливая поиск",
+		t.Target, "если режут по объёму, дело в имени, а не в разрезе")
 
 	target := t.Target
 	tgt := volume.Target{IP: t.ServerIP, Port: t.ServerPort, Plain: t.ServerPort == 80}
@@ -191,7 +199,6 @@ func (c *Controller) askVolume(t *Task) error {
 		})
 		c.volResults <- volumeScanDone{target: target, res: res}
 	}()
-	return nil
 }
 
 // seedNameHits согревает порядок кандидатов из каталога.
@@ -227,6 +234,10 @@ func (c *Controller) seedNameHits() {
 // volumeNames — порядок проверки имён: сперва те, что уже открывали дорогу на
 // этой линии. Замена таблице «сеть → имя»: она стареет, а порядок сам
 // подстраивается под то, что здесь работает.
+// Scanning — идёт ли измерение объёма. Наружу ради панели: оно идёт рядом с
+// лестницей, а не вместо неё, и человеку это надо видеть.
+func (t *Task) Scanning() bool { return t.scanning }
+
 // VolumeNames — порядок проверки имён. Наружу ради проверок: согрет ли он
 // прошлым знанием, видно только отсюда.
 func (c *Controller) VolumeNames() []string { return c.volumeNames() }
@@ -263,13 +274,17 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 		return nil
 	}
 	t.scanning = false
-	t.Asking = Question{}
-	t.Traits.VolumeAsked = true
 	r := d.res
 
 	switch r.Verdict {
 	case volume.ScanNoBlock:
 		c.sayf("по %s ответ: объём проходит и без имени — блока по объёму здесь нет", t.Target)
+		if t.Current == nil && t.Asking.Name == "" {
+			// Лестница успела кончиться, пока мы мерили. Теперь ответ есть, и
+			// закрывать поиск можно честно.
+			return c.step(t)
+		}
+		return nil
 
 	case volume.ScanFound:
 		t.Traits.VolumeCut = true
@@ -282,6 +297,11 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 		if len(r.Killed) > 0 {
 			c.sayf("по %s имена, убившие рукопожатие, отброшены: %v", t.Target, r.Killed)
 		}
+		// Перебиваем лестницу: при этом блоке ничто, кроме имени, не поможет,
+		// а очередь была построена без знания о нём.
+		t.Current = nil
+		t.Queue = nil
+		return c.advance(t)
 
 	case volume.ScanExhausted:
 		t.Traits.VolumeCut = true
@@ -289,11 +309,18 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 		c.sayf("по %s ответ: поток рвётся на %d КБ, но ни одно из %d имён его не провело",
 			t.Target, r.CutAtKB, r.Tried)
 		t.Fingerprint = c.volumeSignal(t, r.CutAtKB)
+		if t.Current == nil && t.Asking.Name == "" {
+			return c.step(t)
+		}
+		return nil
 
 	default:
 		c.sayf("по %s про объём ответа нет: %s (%s)", t.Target, r.Verdict, r.Baseline.Err)
+		if t.Current == nil && t.Asking.Name == "" {
+			return c.step(t)
+		}
 	}
-	return c.step(t)
+	return nil
 }
 
 // volumeSignal заводит примету коробки по измеренному обрыву.

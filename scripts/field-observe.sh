@@ -190,8 +190,14 @@ if [ $LEARN = 1 ]; then
     # видят. Исходящее локальное — OUTPUT, входящее локальное — INPUT.
     # Без этих двух правил план к зонду не применился бы, и зонд мерил бы
     # линию без обхода, считая, что мерит с обходом.
-    iptables -t mangle -I OUTPUT -p tcp --dport $PORTS $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
-    iptables -t mangle -I INPUT -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    #
+    # Сужение здесь ОБЯЗАТЕЛЬНО, и его отсутствие стоило прогона: 06.09.2026
+    # опыт по linkedin собрал подозрения по facebook, потому что эти два
+    # правила забирали ВЕСЬ 443-й порт самого роутера — а на нём живут и
+    # вебпанель, и прокси, и обновления. §2.6 требует узкого опыта не ради
+    # вежливости: применение плана к чужому соединению это уже не эксперимент.
+    iptables -t mangle -I OUTPUT -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I INPUT -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 for ch in POSTROUTING FORWARD OUTPUT INPUT; do
     n=\$(iptables -t mangle -S \$ch 2>/dev/null | grep -c -- '--comment $TOKEN')
