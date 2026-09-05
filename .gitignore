@@ -14,3 +14,4 @@ datapath/*.o
 datapath/test_plan_*
 datapath/planlab
 datapath/test_nl
+datapath/test_sched

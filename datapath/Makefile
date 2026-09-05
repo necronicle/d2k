@@ -12,14 +12,14 @@ LDFLAGS ?=
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h plan_internal.h
+SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h plan_internal.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched
 
-.PHONY: all check san test-parse test-apply test-tls test-wire test-track test-session test-nl cross clean
+.PHONY: all check san test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched cross clean
 
 all: planlab
 
@@ -59,6 +59,12 @@ nl.o: nl.c $(HDR)
 test_nl: test_nl.c nl.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_nl.c nl.o $(LDFLAGS)
 
+sched.o: sched.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_sched: test_sched.c sched.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_sched.c sched.o $(LDFLAGS)
+
 test_wire: test_wire.c wire.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_wire.c wire.o $(LDFLAGS)
 
@@ -89,6 +95,9 @@ test-session: test_session
 test-nl: test_nl
 	./test_nl
 
+test-sched: test_sched
+	./test_sched
+
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
@@ -116,7 +125,7 @@ cross:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-track test-session test-nl
+check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched
 
 clean:
 	rm -f *.o $(TESTS) planlab
