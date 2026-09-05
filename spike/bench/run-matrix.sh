@@ -20,7 +20,10 @@ LOADSZ=${LOADSZ:-50000000}
 URL=${URL:-https://speed.cloudflare.com/__down?bytes=}
 RESULTS=${RESULTS:-./results}
 
-rsh() { sshpass -p "$RPASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$RPORT" root@"$ROUTER" "$@"; }
+# -n обязателен: список конфигураций читается циклом из stdin, а ssh без -n
+# вычитывает stdin себе. Матрица от этого отрабатывала ровно одну строку и
+# молча заканчивалась — выглядело как «всё прогнали».
+rsh() { sshpass -p "$RPASS" ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$RPORT" root@"$ROUTER" "$@"; }
 
 mkdir -p "$RESULTS"
 
