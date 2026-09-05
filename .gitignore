@@ -3,3 +3,5 @@ spike/nfqview/nfqview-linux-*
 *.summary.json
 *.ct-*.txt
 docs/field/raw/
+spike/nfqview-c/nfqview-c-linux-*
+spike/bench/results/

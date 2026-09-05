@@ -29,17 +29,39 @@ WAN=${WAN:-ppp0}
 OUT=${OUT:-/tmp/nfqview}
 ARGS=${ARGS:-}
 BIN=${BIN:-/tmp/nfqview}
+# Отметка «прогон закончился сам» ОБЯЗАНА быть своя на каждый запуск. С общим
+# именем сторож от прошлого прогона просыпается посреди текущего, видит, что
+# отметку уже стёрли, и снимает ЧУЖИЕ правила: очередь замолкает на середине
+# замера, а числа выглядят как «железо всё забрало». Поймано 05-09.
+DONE=/tmp/d2k-measure.done.$$
 DEOFF=${DEOFF:-}
 # out — только клиент→сервер (так делает z2k), both — ещё и ответное
 # направление. Замер 05-09: правило по --dports снимает офлоад ТОЛЬКО с той
 # стороны, которую матчит. Ответные пакеты остаются в железе, и именно поэтому
 # входящее видно на 0,08 %.
 DEOFF_DIR=${DEOFF_DIR:-out}
+# Протоколы, с которых снимаем офлоад. QUIC живёт на udp/443 и прячется тем же
+# механизмом, что и TCP, поэтому меряется тем же рычагом.
+DEOFF_PROTO=${DEOFF_PROTO:-tcp}
+# Разбаловка по нескольким очередям: "200:201". Ядро раскладывает потоки по
+# очередям хешем, и на каждую нужен свой процесс — это и есть проверка того,
+# упирается ли датапат в одно ядро.
+QBAL=${QBAL:-}
 
 # BusyBox iptables на этой прошивке может не знать -w. Проверяем, а не
 # предполагаем: молчаливый отказ здесь стоил бы правил, поставленных наполовину.
 IPT="iptables -w"
 $IPT -L INPUT -n >/dev/null 2>&1 || IPT="iptables"
+
+if [ -n "$QBAL" ]; then
+    QSEL="--queue-balance $QBAL"
+    QFIRST=${QBAL%:*}
+    QLAST=${QBAL#*:}
+else
+    QSEL="--queue-num $Q"
+    QFIRST=$Q
+    QLAST=$Q
+fi
 
 if [ -n "$SCOPE" ]; then
     SPEC1="-s $SCOPE"
@@ -56,8 +78,8 @@ fi
 # и правило не встало бы.
 # shellcheck disable=SC2086
 add_rules() {
-    $IPT -I FORWARD 1 $SPEC1 -j NFQUEUE --queue-num "$Q" --queue-bypass || return 1
-    $IPT -I FORWARD 2 $SPEC2 -j NFQUEUE --queue-num "$Q" --queue-bypass || return 1
+    $IPT -I FORWARD 1 $SPEC1 -j NFQUEUE $QSEL --queue-bypass || return 1
+    $IPT -I FORWARD 2 $SPEC2 -j NFQUEUE $QSEL --queue-bypass || return 1
     return 0
 }
 
@@ -68,12 +90,12 @@ add_rules() {
 del_rules() {
     i=0
     while [ $i -lt 8 ]; do
-        $IPT -D FORWARD $SPEC1 -j NFQUEUE --queue-num "$Q" --queue-bypass 2>/dev/null || break
+        $IPT -D FORWARD $SPEC1 -j NFQUEUE $QSEL --queue-bypass 2>/dev/null || break
         i=$((i + 1))
     done
     i=0
     while [ $i -lt 8 ]; do
-        $IPT -D FORWARD $SPEC2 -j NFQUEUE --queue-num "$Q" --queue-bypass 2>/dev/null || break
+        $IPT -D FORWARD $SPEC2 -j NFQUEUE $QSEL --queue-bypass 2>/dev/null || break
         i=$((i + 1))
     done
 }
@@ -86,6 +108,14 @@ deoff_add() {
         -m connskip --connskip "$DEOFF" -j PPE || return 1
     $IPT -t mangle -I FORWARD 1 -s "$SCOPE" -p tcp -m multiport --dports 80,443 \
         -m connskip --connskip "$DEOFF" -j PPE || return 1
+    if [ "$DEOFF_PROTO" = udp ] || [ "$DEOFF_PROTO" = both ]; then
+        $IPT -t mangle -I PREROUTING 1 -s "$SCOPE" -p udp -m multiport --dports 443 \
+            -m connskip --connskip "$DEOFF" -j PPE || return 1
+        $IPT -t mangle -I FORWARD 1 -s "$SCOPE" -p udp -m multiport --dports 443 \
+            -m connskip --connskip "$DEOFF" -j PPE || return 1
+        $IPT -t mangle -I FORWARD 1 -d "$SCOPE" -p udp -m multiport --sports 443 \
+            -m connskip --connskip "$DEOFF" -j PPE || return 1
+    fi
     [ "$DEOFF_DIR" = both ] || return 0
     # В mangle PREROUTING обратный NAT ещё не отработал, и адрес клиента там не
     # виден — поэтому ответное направление цепляем в FORWARD, где он уже свой.
@@ -115,6 +145,15 @@ deoff_del() {
             -m connskip --connskip "$DEOFF" -j PPE 2>/dev/null || break
         i=$((i + 1))
     done
+    for spec in "-t mangle -D PREROUTING -s $SCOPE -p udp -m multiport --dports 443" \
+                "-t mangle -D FORWARD -s $SCOPE -p udp -m multiport --dports 443" \
+                "-t mangle -D FORWARD -d $SCOPE -p udp -m multiport --sports 443"; do
+        i=0
+        while [ $i -lt 4 ]; do
+            $IPT $spec -m connskip --connskip "$DEOFF" -j PPE 2>/dev/null || break
+            i=$((i + 1))
+        done
+    done
 }
 
 ct_snapshot() {
@@ -125,7 +164,7 @@ ct_snapshot() {
     fi
 }
 
-trap 'deoff_del; del_rules; exit 130' INT TERM
+trap 'touch "$DONE"; deoff_del; del_rules; exit 130' INT TERM
 
 echo "== снимок firewall до =="
 $IPT -S FORWARD | head -6
@@ -154,23 +193,37 @@ case "$DUR" in
 esac
 DEADLINE=${DEADLINE:-$(( DSEC + 120 ))}
 # shellcheck disable=SC2086
-( trap "" HUP; sleep "$DEADLINE"; [ -f /tmp/d2k-measure.done ] || {
+( trap "" HUP; sleep "$DEADLINE"; [ -f "$DONE" ] || {
       i=0; while [ $i -lt 8 ]; do
-          $IPT -D FORWARD $SPEC1 -j NFQUEUE --queue-num "$Q" --queue-bypass 2>/dev/null || break; i=$((i+1)); done
+          $IPT -D FORWARD $SPEC1 -j NFQUEUE $QSEL --queue-bypass 2>/dev/null || break; i=$((i+1)); done
       i=0; while [ $i -lt 8 ]; do
-          $IPT -D FORWARD $SPEC2 -j NFQUEUE --queue-num "$Q" --queue-bypass 2>/dev/null || break; i=$((i+1)); done
-  } ) </dev/null >/dev/null 2>&1 &
+          $IPT -D FORWARD $SPEC2 -j NFQUEUE $QSEL --queue-bypass 2>/dev/null || break; i=$((i+1)); done
+  }; rm -f "$DONE" ) </dev/null >/dev/null 2>&1 &
 
-rm -f /tmp/d2k-measure.done
+rm -f "$DONE"
 ct_snapshot > "$OUT.ct-before.txt"
 
 echo "== замер $DUR =="
-# shellcheck disable=SC2086
-"$BIN" -q "$Q" -dur "$DUR" -out "$OUT" $ARGS
-rc=$?
+# Один процесс на очередь: ядро раскладывает потоки хешем, и без второго
+# процесса вторая очередь просто копила бы пакеты до таймаута.
+rc=0
+if [ "$QFIRST" = "$QLAST" ]; then
+    # shellcheck disable=SC2086
+    "$BIN" -q "$QFIRST" -dur "$DUR" -out "$OUT" $ARGS
+    rc=$?
+else
+    qn=$QFIRST
+    while [ "$qn" -le "$QLAST" ]; do
+        # shellcheck disable=SC2086
+        "$BIN" -q "$qn" -dur "$DUR" -out "$OUT-q$qn" $ARGS > "$OUT-q$qn.log" 2>&1 &
+        qn=$((qn + 1))
+    done
+    wait
+    tail -n 3 "$OUT"-q*.log 2>/dev/null
+fi
 
 ct_snapshot > "$OUT.ct-after.txt"
-touch /tmp/d2k-measure.done
+touch "$DONE"
 deoff_del
 del_rules
 
