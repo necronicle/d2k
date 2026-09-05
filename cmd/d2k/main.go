@@ -34,6 +34,7 @@ func usage(w *os.File) {
   version              что за сборка запущена
   config [-write]      показать конфигурацию; -write создать файл с умолчаниями
   status               что программа делает прямо сейчас
+  plan <подкоманда>    перевод плана между текстовой и канонической формой
   serve                запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
@@ -62,6 +63,9 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "status":
 		return cmdStatus(out, errOut)
+
+	case "plan":
+		return cmdPlan(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(out, errOut)

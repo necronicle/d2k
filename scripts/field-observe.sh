@@ -44,6 +44,18 @@ PPE=${D2K_PPE:-1}
 # В PREROUTING обратный NAT ещё не отработал и адрес клиента там не виден,
 # поэтому FORWARD.
 REV=${D2K_REV:-0}
+# План в канонической форме (локальный путь). Собирается `d2k plan compile`.
+PLAN=${D2K_PLAN:-}
+# Метка на собственных пакетах. В режиме apply обязательна: без неё
+# собственные пакеты нечем исключить из своей же очереди (§5.5).
+MARK=${D2K_MARK:-0}
+# Сужение опыта. §2.6 требует ограничивать последствия: на роутере живут
+# чужие устройства, и десинк всего 443-го порта — не эксперимент, а авария.
+SRC=${D2K_SRC:-}
+DST=${D2K_DST:-}
+# Снимать ли трафик на WAN, чтобы увидеть собственный пакет на проводе.
+DUMP_IF=${D2K_DUMP_IF:-}
+DUMP_N=${D2K_DUMP_N:-40}
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TOKEN="d2k$$"
@@ -108,6 +120,25 @@ REMOTE_SIZE=$($SSH "wc -c < /tmp/d2kd.$TOKEN" | tr -d ' \r')
 say "  доставлено $REMOTE_SIZE байт, размер совпал"
 $SSH "chmod +x /tmp/d2kd.$TOKEN && /tmp/d2kd.$TOKEN --help >/dev/null 2>&1 && echo '  служба запускается'"
 
+if [ "$MODE" = apply ]; then
+    [ -n "$PLAN" ] || { say "режим apply без D2K_PLAN ничего не сделал бы"; exit 2; }
+    [ "$MARK" != 0 ] || { say "режим apply без D2K_MARK запрещён: см. §5.5"; exit 2; }
+    [ -n "$DST" ] || { say "режим apply без D2K_DST запрещён: опыт обязан быть узким (§2.6)"; exit 2; }
+    say "== доставка плана =="
+    $SSH_IN "cat > /tmp/d2kd.$TOKEN.plan" < "$PLAN"
+    PSIZE=$($SSH "wc -c < /tmp/d2kd.$TOKEN.plan" | tr -d ' \r')
+    [ "$PSIZE" = "$(wc -c < "$PLAN" | tr -d ' ')" ] || { say "план доехал испорченным"; exit 1; }
+    say "  план $PSIZE байт"
+fi
+
+# Сужение: и источник, и цель. Собственные пакеты исключаются по метке —
+# иначе они вернутся в свою же очередь и система будет учиться на своём эхе.
+NARROW=""
+[ -n "$SRC" ] && NARROW="$NARROW -s $SRC"
+[ -n "$DST" ] && NARROW="$NARROW -d $DST"
+NOTSELF=""
+[ "$MARK" != 0 ] && NOTSELF="-m mark ! --mark $MARK"
+
 say "== правила, жетон $TOKEN =="
 # Порядок: сперва снять офлоад, потом отдать в очередь. Правило PPE матчит
 # ОДНО направление — то, что в нём написано; обратное остаётся в железе.
@@ -116,7 +147,7 @@ set -e
 if [ $PPE = 1 ]; then
     iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
 fi
-iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 if [ $REV = 1 ]; then
     iptables -t mangle -I FORWARD -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
@@ -141,7 +172,8 @@ say "== запуск службы =="
 # nohup на BusyBox нет; start-stop-daemon есть и умеет отвязывать процесс.
 $SSH "
 start-stop-daemon -S -b -m -p /tmp/d2kd.$TOKEN.pid -x /tmp/d2kd.$TOKEN -- \
-    --queue $QUEUE --mode $MODE --stats 15 --duration $DUR \
+    --queue $QUEUE --mode $MODE --stats 15 --duration $DUR --mark $MARK \
+    ${PLAN:+--plan /tmp/d2kd.$TOKEN.plan} \
     --log /tmp/d2kd.$TOKEN.out
 sleep 1
 echo \"  pid=\$(cat /tmp/d2kd.$TOKEN.pid 2>/dev/null)\"
@@ -157,6 +189,16 @@ if [ -z "$BOUND" ] || [ "$BOUND" = "0" ]; then
 fi
 say "  очередь $QUEUE привязана к процессу $BOUND"
 
+if [ -n "$DUMP_IF" ]; then
+    say "== снимок трафика на $DUMP_IF =="
+    # -c ограничивает число пакетов: tcpdump без предела на роутере живёт
+    # вечно и пишет, пока не кончится место.
+    $SSH "start-stop-daemon -S -b -m -p /tmp/d2kd.$TOKEN.tcpdump.pid \
+        -x /opt/bin/tcpdump -- -i $DUMP_IF -n -c $DUMP_N -w /tmp/d2kd.$TOKEN.pcap \
+        ${DST:+host $DST and }tcp port $PORTS 2>/dev/null || echo '  tcpdump не запустился'"
+    sleep 1
+fi
+
 say "== нагрузка, $DUR с =="
 if [ -n "${D2K_LOAD:-}" ]; then
     sh -c "$D2K_LOAD" >&2 || say "  нагрузка вернула $?"
@@ -165,11 +207,19 @@ else
 fi
 sleep $((DUR + 3))
 
+if [ -n "$DUMP_IF" ]; then
+    $SSH "kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid 2>/dev/null) 2>/dev/null; true"
+    mkdir -p "$REPO/docs/field/raw"
+    $SSH_IN "cat /tmp/d2kd.$TOKEN.pcap 2>/dev/null" > "$REPO/docs/field/raw/observe-$STAMP.pcap" || true
+    say "  снимок: docs/field/raw/observe-$STAMP.pcap ($(wc -c < "$REPO/docs/field/raw/observe-$STAMP.pcap" | tr -d ' ') байт)"
+    $SSH "rm -f /tmp/d2kd.$TOKEN.pcap /tmp/d2kd.$TOKEN.tcpdump.pid"
+fi
+
 say "== сбор вывода =="
 mkdir -p "$(dirname "$LOCAL_LOG")"
 $SSH "cat /tmp/d2kd.$TOKEN.out 2>/dev/null" > "$LOCAL_LOG" || true
 teardown
-$SSH "rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid /tmp/d2kd.$TOKEN.out; ls /tmp/d2kd.* 2>/dev/null || echo '  на роутере чисто'" >&2
+$SSH "rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid /tmp/d2kd.$TOKEN.out /tmp/d2kd.$TOKEN.plan; ls /tmp/d2kd.* 2>/dev/null || echo '  на роутере чисто'" >&2
 trap - EXIT
 # shellcheck disable=SC2086  # MUX — набор ключей, разворачивается намеренно
 ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true

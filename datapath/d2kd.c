@@ -562,28 +562,26 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    /* Вердикт первым делом: пока он не послан, пакет стоит в
-                       очереди ядра и держит место. */
-                    if (d2k_nfq_verdict(q, np.id, verdict, err, sizeof err) != 0) {
-                        st.verdict_fail++;
-                    }
-                    if (verdict == D2K_NF_DROP) {
-                        st.dropped++;
-                    } else {
-                        st.accepted++;
+                    if (res.n_out > 0) {
+                        st.applied++;
                     }
 
-                    if (res.n_out == 0) {
-                        continue;
-                    }
-                    st.applied++;
-                    if (mode != MODE_APPLY) {
-                        continue;       /* наблюдение: посчитали и всё */
-                    }
-
-                    /* Задержки в плане отсчитываются от предыдущей посылки. */
+                    /* ПОРЯДОК ЗДЕСЬ — ЧАСТЬ ПЛАНА, А НЕ ДЕТАЛЬ.
+                     *
+                     * Посылки без задержки уходят ДО вердикта. Плечо
+                     * place=before означает «фальшивка перед нагрузкой»; если
+                     * сперва отпустить оригинал, фальшивка придёт коробке
+                     * после него, и плечо превратится в другое. Первая
+                     * редакция службы посылала вердикт первым делом, ради
+                     * освобождения ячейки очереди, — и молча ломала бы
+                     * каждое плечо с place=before.
+                     *
+                     * Ячейка при этом держится дольше ровно на одну
+                     * sendto — десятки микросекунд.
+                     *
+                     * Задержки отсчитываются от предыдущей посылки. */
                     uint64_t at = t;
-                    for (size_t k = 0; k < res.n_out; k++) {
+                    for (size_t k = 0; k < res.n_out && mode == MODE_APPLY; k++) {
                         at += (uint64_t)res.out[k].delay_us * NS_PER_US;
                         const uint8_t *p = obuf + res.out[k].off;
                         size_t plen = res.out[k].len;
@@ -600,6 +598,15 @@ int main(int argc, char **argv) {
                         } else {
                             st.deferred++;
                         }
+                    }
+
+                    if (d2k_nfq_verdict(q, np.id, verdict, err, sizeof err) != 0) {
+                        st.verdict_fail++;
+                    }
+                    if (verdict == D2K_NF_DROP) {
+                        st.dropped++;
+                    } else {
+                        st.accepted++;
                     }
                 }
             }
