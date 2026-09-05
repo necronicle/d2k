@@ -37,6 +37,13 @@ struct d2k_session {
     uint64_t     rst_dropped;
     uint64_t     exchanges;
 
+    /* Разбор нагрузки: почему приветствие не узналось. */
+    uint64_t     pay_reverse;      /* нагрузка с обратной стороны */
+    uint64_t     pay_after_hello;  /* поток уже показал приветствие */
+    uint64_t     pay_late;         /* прямая, но за окном поиска */
+    uint64_t     pay_not_hello;    /* разобрали и это не приветствие */
+    uint8_t      last_nonhello_first;
+
     /* Форма приветствия. Один буфер на всю сессию, и это объявленный предел:
      * хранить приветствие каждого потока значило бы килобайт на поток.
      *
@@ -389,8 +396,30 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         }
     }
 
+    /* Почему разбор не состоялся — считается ОТДЕЛЬНО по каждой причине.
+     *
+     * Раньше все эти случаи сваливались в «плана для этой цели нет», и по
+     * сводке нельзя было отличить ответный пакет от прямого, не оказавшегося
+     * приветствием. Ровно на этом застряла диагностика 2026-09-05: ноль
+     * узнанных приветствий при 59 пакетах с нагрузкой, и ни одной подсказки,
+     * куда смотреть. Прибор, который не различает причины, не прибор. */
+    if (!fwd) {
+        s->pay_reverse++;
+    } else if (fl->saw_hello) {
+        s->pay_after_hello++;
+    } else if (fl->fwd_pkts > D2K_HELLO_WINDOW) {
+        s->pay_late++;
+    }
+
     if (!fl->saw_hello && fwd && fl->fwd_pkts <= D2K_HELLO_WINDOW) {
         d2k_tls_parse(pkt + payload_off, payload_len, &tls);
+        if (!tls.is_client_hello) {
+            s->pay_not_hello++;
+            /* Первый байт нагрузки — самая дешёвая улика о том, ЧТО это
+               было: 0x16 значит рукопожатие и разбор споткнулся внутри,
+               0x47 — обычный HTTP, прочее — не TLS вовсе. */
+            s->last_nonhello_first = pkt[payload_off];
+        }
         if (tls.is_client_hello) {
             /* Последнее приветствие копится всегда: подозрение возникнет на
                этом же соединении, и просить форму будет уже поздно. Один
@@ -648,6 +677,21 @@ uint64_t d2k_session_rst_dropped(const d2k_session *s) {
 
 uint64_t d2k_session_exchanges(const d2k_session *s) {
     return s ? s->exchanges : 0;
+}
+
+void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof *out);
+    if (!s) {
+        return;
+    }
+    out->reverse = s->pay_reverse;
+    out->after_hello = s->pay_after_hello;
+    out->late = s->pay_late;
+    out->not_hello = s->pay_not_hello;
+    out->last_first_byte = s->last_nonhello_first;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

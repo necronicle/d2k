@@ -1,0 +1,219 @@
+#!/bin/sh
+# d2k — служба обхода DPI для Keenetic.
+#
+# BusyBox ash. Никаких башизмов: на роутере другого шелла нет.
+#
+# Два процесса, и это намеренно (§7.1 документа): падение планировщика не
+# должно ронять разбор пакетов. d2kd видит пакеты, d2k подбирает и показывает.
+#
+# Правила firewall живут в СВОИХ цепочках. Не в общих с комментарием: уборка
+# по комментарию однажды промахнулась мимо правила, поставленного чуть иначе,
+# и оно осталось висеть. Своя цепочка снимается целиком и без разбора.
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+NAME=d2k
+DIR=/opt/d2k
+BIN=/opt/sbin/d2k
+DPBIN=/opt/sbin/d2kd
+CONF=$DIR/config
+RUN=$DIR/run
+LOG=$DIR/log
+
+DP_PID=$RUN/d2kd.pid
+CT_PID=$RUN/d2k.pid
+SOCK=$RUN/d2kd.sock
+
+# Собственные цепочки, по одной на направление. Не одна на оба: правило,
+# лежащее в цепочке, вызываемой из двух мест, оценивается ДВАЖДЫ для одного
+# пакета, и датапат видит его дважды. Здесь каждое направление ловится ровно
+# в одном месте, и двойная выдача становится невозможной по построению.
+#
+# Где именно ловить — измерено на этапе 0, а не выбрано:
+#   исходящее  POSTROUTING — видит и транзит, и собственные зонды роутера;
+#   ответное   FORWARD     — в PREROUTING обратный NAT ещё не отработал и
+#                            адрес клиента там не виден;
+#              INPUT       — ответы собственным зондам: они идут не транзитом.
+CHAIN_OUT=D2K_OUT
+CHAIN_IN=D2K_IN
+
+# Значения по умолчанию; конфигурация их перекрывает.
+QUEUE_NUM=2000
+MARK=0x2d
+PORTS=443
+CONNBYTES=0:8
+MODE=observe
+FLOWS=2048
+# Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
+# видит ли служба трафик вообще.
+STATS_SEC=60
+
+# shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
+[ -r "$CONF" ] && . "$CONF"
+
+say() { echo "$NAME: $*"; }
+die() { echo "$NAME: $*" >&2; exit 1; }
+
+running() {
+    # Жив ли процесс, чей pid записан. Не «есть файл», а именно жив: файл
+    # переживает SIGKILL, процесс — нет.
+    [ -f "$1" ] || return 1
+    pid=$(cat "$1" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    return 0
+}
+
+# --- firewall ------------------------------------------------------------
+#
+# Своя цепочка в mangle, и переходы в неё из четырёх мест. Транзитный трафик
+# идёт через POSTROUTING и FORWARD, собственные зонды — через OUTPUT и INPUT:
+# зонд идёт С САМОГО роутера, и транзитные цепочки его не видят.
+
+fw_up() {
+    fw_down   # идемпотентность: повторный запуск не должен плодить правила
+
+    iptables -t mangle -N "$CHAIN_OUT" 2>/dev/null || return 1
+    iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
+
+    # Собственные пакеты исключаются по метке. §5.5: без этого система учится
+    # на своём же эхе.
+    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN
+
+    # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
+    # останавливать его (§10).
+    iptables -t mangle -A "$CHAIN_OUT" -p tcp -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+    iptables -t mangle -A "$CHAIN_IN" -p tcp -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+
+    iptables -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
+    iptables -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
+    iptables -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
+    return 0
+}
+
+fw_down() {
+    for hook in POSTROUTING FORWARD OUTPUT INPUT; do
+        for ch in "$CHAIN_OUT" "$CHAIN_IN"; do
+            while iptables -t mangle -D "$hook" -j "$ch" 2>/dev/null; do :; done
+        done
+    done
+    for ch in "$CHAIN_OUT" "$CHAIN_IN"; do
+        if iptables -t mangle -n -L "$ch" >/dev/null 2>&1; then
+            iptables -t mangle -F "$ch" 2>/dev/null
+            iptables -t mangle -X "$ch" 2>/dev/null
+        fi
+    done
+}
+
+fw_installed() {
+    iptables -t mangle -S POSTROUTING 2>/dev/null | grep -q -- "-j $CHAIN_OUT"
+}
+
+# --- запуск --------------------------------------------------------------
+
+start() {
+    [ "$MODE" = "off" ] && { say "MODE=off — не запускаюсь"; return 0; }
+    [ -x "$DPBIN" ] || die "нет $DPBIN"
+    [ -x "$BIN" ] || die "нет $BIN"
+
+    mkdir -p "$RUN" "$LOG" "$DIR/state" || die "не создать $RUN"
+
+    if running "$DP_PID"; then
+        say "уже запущен"
+        return 0
+    fi
+
+    # Файл сокета переживает SIGKILL и мешает следующему запуску.
+    rm -f "$SOCK"
+
+    dpmode=observe
+    [ "$MODE" = "apply" ] && dpmode=apply
+
+    start-stop-daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
+        --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
+        --flows "$FLOWS" --control "$SOCK" --stats "${STATS_SEC:-60}" \
+        --log "$LOG/d2kd.log" || die "датапат не запустился"
+
+    # Ждём привязки очереди, а не спим наугад: правила, поставленные до
+    # привязки, отправляют пакеты в никуда.
+    i=0
+    while [ $i -lt 50 ]; do
+        bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
+            /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
+        [ -n "$bound" ] && [ "$bound" != "0" ] && break
+        i=$((i + 1))
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    if [ -z "$bound" ] || [ "$bound" = "0" ]; then
+        stop
+        die "очередь $QUEUE_NUM не привязалась — правила не ставлю"
+    fi
+
+    fw_up || { stop; die "не поставить правила"; }
+
+    # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
+    # потоки потомка не перенаправляет, и вывод уходил бы в никуда.
+    start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- serve \
+        -log "$LOG/d2k.log" || say "контроллер не запустился — датапат наблюдает без подбора"
+
+    say "запущен: очередь $QUEUE_NUM, режим $MODE"
+}
+
+stop() {
+    fw_down
+    for p in "$CT_PID" "$DP_PID"; do
+        if running "$p"; then
+            start-stop-daemon -K -q -p "$p" 2>/dev/null
+            i=0
+            while running "$p" && [ $i -lt 30 ]; do
+                i=$((i + 1))
+                sleep 0.1 2>/dev/null || sleep 1
+            done
+            running "$p" && start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
+        fi
+        rm -f "$p"
+    done
+    rm -f "$SOCK"
+    say "остановлен"
+}
+
+status() {
+    echo "$NAME"
+    running "$DP_PID" && echo "  датапат: работает (pid $(cat $DP_PID))" \
+                      || echo "  датапат: не работает"
+    running "$CT_PID" && echo "  контроллер: работает (pid $(cat $CT_PID))" \
+                      || echo "  контроллер: не работает"
+    fw_installed && echo "  правила: стоят" || echo "  правила: НЕ стоят"
+    bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
+        /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
+    if [ -n "$bound" ] && [ "$bound" != "0" ]; then
+        echo "  очередь $QUEUE_NUM: привязана к $bound"
+    else
+        echo "  очередь $QUEUE_NUM: НЕ привязана"
+    fi
+    [ -x "$BIN" ] && "$BIN" version 2>/dev/null | sed 's/^/  /'
+}
+
+# NDM периодически сносит чужие правила. Своего сторожа у d2k пока нет, и
+# делать вид, что есть, нельзя: команда reapply возвращает правила вручную.
+reapply() {
+    running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
+    fw_up || die "не поставить правила"
+    say "правила поставлены заново"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  status ;;
+    reapply) reapply ;;
+    *) echo "использование: $0 {start|stop|restart|status|reapply}" >&2; exit 2 ;;
+esac

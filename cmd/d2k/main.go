@@ -39,7 +39,7 @@ func usage(w *os.File) {
   status               что программа делает прямо сейчас
   plan <подкоманда>    перевод плана между текстовой и канонической формой
   control              контроллер: связь датапата и каталога коробок
-  serve                запустить службу и локальную панель
+  serve [-log FILE]    запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
 `, buildinfo.Short(), config.DefaultPath())
@@ -75,7 +75,7 @@ func run(args []string, out, errOut *os.File) int {
 		return cmdControl(args[1:], out, errOut)
 
 	case "serve":
-		return cmdServe(out, errOut)
+		return cmdServe(args[1:], out, errOut)
 
 	case "help", "-h", "--help":
 		usage(out)
@@ -176,7 +176,27 @@ func cmdStatus(out, errOut *os.File) int {
 	return 0
 }
 
-func cmdServe(out, errOut *os.File) int {
+func cmdServe(args []string, out, errOut *os.File) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	logPath := fs.String("log", "", "писать вывод сюда вместо stdout")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *logPath != "" {
+		// Служба уходит в фон через start-stop-daemon, который потоки
+		// потомка не перенаправляет. Раз файл нужен нам, открываем его сами
+		// — до первой печати, иначе стартовые строки уйдут в никуда, и
+		// диагностировать станет нечем. Ровно это и случилось на первой
+		// установке.
+		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(errOut, "не открыть журнал %s: %v\n", *logPath, err)
+			return 1
+		}
+		out, errOut = f, f
+	}
+
 	c, ok := loadConfig(errOut)
 	if !ok {
 		return 1

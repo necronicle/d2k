@@ -193,9 +193,13 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     uint64_t cpu_ms = 0, rss_kb = 0;
     self_cost(&cpu_ms, &rss_kb);
     uint64_t secs = run_ns / NS_PER_S;
-    printf("--- d2kd, %" PRIu64 " с; процессор %" PRIu64 " мс (%" PRIu64
+    /* Номер процесса в каждой сводке. Журнал дописывается через перезапуски,
+       и «последний блок» без подписи принадлежит неизвестно кому: однажды я
+       приписал показания одного экземпляра другому и сутки искал дефект,
+       которого в той настройке не было. */
+    printf("--- d2kd[%ld], %" PRIu64 " с; процессор %" PRIu64 " мс (%" PRIu64
            ",%" PRIu64 " %%), RSS %" PRIu64 " КиБ ---\n",
-           secs, cpu_ms,
+           (long)getpid(), secs, cpu_ms,
            secs ? cpu_ms / (secs * 10) : 0,
            secs ? (cpu_ms * 10 / secs) % 100 : 0,
            rss_kb);
@@ -226,6 +230,15 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     printf("обрезано %" PRIu64 ", без нагрузки %" PRIu64
            ", без заголовка %" PRIu64 "\n",
            st.truncated, st.no_payload, st.no_hdr);
+    {
+        d2k_payload_stats ps;
+        d2k_session_payload_stats(s, &ps);
+        printf("нагрузка мимо приветствия: обратная %" PRIu64
+               ", после приветствия %" PRIu64 ", за окном %" PRIu64
+               ", не приветствие %" PRIu64 " (первый байт %#02x)\n",
+               ps.reverse, ps.after_hello, ps.late, ps.not_hello,
+               ps.last_first_byte);
+    }
     printf("потеряно ядром %" PRIu64 ", ошибок вердикта %" PRIu64
            ", ошибок отправки %" PRIu64 ", ошибок чтения %" PRIu64 "\n",
            d2k_nfq_lost(q), st.verdict_fail, st.send_fail, st.recv_err);
@@ -477,6 +490,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    printf("=== d2kd[%ld] запущен ===\n", (long)getpid());
     printf("d2kd: очередь %u, режим %s, метка %u, потоков до %u, "
            "fail-open %s%s\n",
            queue, MODE_NAMES[mode], mark, flows, fail_open ? "да" : "НЕТ",
@@ -695,7 +709,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("\n=== итог ===\n");
+    printf("\n=== итог d2kd[%ld] ===\n", (long)getpid());
     print_stats(sess, sched, q, raw, now_ns() - start);
     print_journal(sess, start);
 
