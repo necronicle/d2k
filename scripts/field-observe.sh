@@ -87,7 +87,7 @@ teardown() {
     # Обе цепочки: правило обратного направления живёт в FORWARD, и уборка,
     # смотрящая только в POSTROUTING, оставила бы его висеть.
     $SSH "
-        for ch in POSTROUTING FORWARD; do
+        for ch in POSTROUTING FORWARD OUTPUT INPUT; do
             iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
             sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
         done
@@ -185,6 +185,14 @@ iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF -m conn
 if [ $REV = 1 ]; then
     iptables -t mangle -I FORWARD -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
+if [ $LEARN = 1 ]; then
+    # Зонд идёт С САМОГО РОУТЕРА, а не через него: транзитные цепочки его не
+    # видят. Исходящее локальное — OUTPUT, входящее локальное — INPUT.
+    # Без этих двух правил план к зонду не применился бы, и зонд мерил бы
+    # линию без обхода, считая, что мерит с обходом.
+    iptables -t mangle -I OUTPUT -p tcp --dport $PORTS $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I INPUT -p tcp --sport $PORTS -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+fi
 echo \"POSTROUTING=\$(iptables -t mangle -S POSTROUTING | grep -c -- '--comment $TOKEN') FORWARD=\$(iptables -t mangle -S FORWARD | grep -c -- '--comment $TOKEN')\"
 " | sed 's/^/  правил: /' >&2
 
@@ -192,7 +200,7 @@ echo \"POSTROUTING=\$(iptables -t mangle -S POSTROUTING | grep -c -- '--comment 
 # правила и только по своему жетону.
 $SSH "
 ( sleep $((DUR + 60))
-  for ch in POSTROUTING FORWARD; do
+  for ch in POSTROUTING FORWARD OUTPUT INPUT; do
     iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
     sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
   done
