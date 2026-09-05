@@ -418,9 +418,13 @@ func signalOf(ev control.Event) catalog.Signal {
 	default:
 		s.Kind = fmt.Sprintf("код-%d", ev.Code)
 	}
-	if s.Kind == "rst" || s.Kind == "rst_cut" {
-		// Разность, а не абсолютный TTL: ориентир взят из того же потока,
-		// поэтому разность переносима, а абсолютное значение нет.
+	if s.Kind == "rst" {
+		// TTL самой подделки — примета коробки: она стоит на фиксированном
+		// расстоянии от нас. Разность с TTL сервера сохраняется как
+		// наблюдение, но приметой не является: серверы стоят на разном
+		// расстоянии, и на четырёх целях одной линии разности были 3, 38, 40
+		// и 74 при одном и том же TTL подделки 127.
+		s.TTL = ev.TTL
 		s.TTLDelta = int(ev.TTL) - int(ev.RefTTL)
 		s.ToS = ev.ToS
 		s.IPID = ev.IPID
@@ -509,7 +513,7 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 func addSignal(fp catalog.Fingerprint, s catalog.Signal) catalog.Fingerprint {
 	for i := range fp.Signals {
 		x := &fp.Signals[i]
-		if x.Kind == s.Kind && x.TTLDelta == s.TTLDelta && x.IPID == s.IPID && x.ToS == s.ToS {
+		if x.Kind == s.Kind && x.TTL == s.TTL && x.IPID == s.IPID && x.ToS == s.ToS {
 			x.Seen += s.Seen
 			return fp
 		}

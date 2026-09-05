@@ -19,11 +19,13 @@ fake payload=1 poison=1 repeats=2 gap_us=78000 place=before
 order forward
 `
 
-func fp(delta int, ipid uint16, tos uint8) catalog.Fingerprint {
+// fp — отпечаток с одной приметой сброса. Первый аргумент — TTL самой
+// подделки: именно он примета коробки, а не разность с TTL сервера.
+func fp(ttl uint8, ipid uint16, tos uint8) catalog.Fingerprint {
 	return catalog.Fingerprint{
 		Method: catalog.FingerprintMethod,
 		Signals: []catalog.Signal{
-			{Kind: "rst", TTLDelta: delta, IPID: ipid, ToS: tos, Seen: 1},
+			{Kind: "rst", TTL: ttl, IPID: ipid, ToS: tos, Seen: 1},
 		},
 	}
 }
@@ -51,7 +53,7 @@ func TestБезПодтверждённогоОбменаНеЗаписывае�
 	// §2.3 — главное правило продукта. Уровень 1 (транспорт установился) не
 	// является подтверждением обмена.
 	c := catalog.New()
-	_, _, err := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "linkedin.com", catalog.LevelTransport, time.Now())
 	if err == nil {
 		t.Fatal("привязка записалась по одному установленному транспорту")
@@ -64,7 +66,7 @@ func TestБезПодтверждённогоОбменаНеЗаписывае�
 func TestПодтверждениеСоздаётКоробкуПланИПривязку(t *testing.T) {
 	c := catalog.New()
 	now := time.Now()
-	if _, _, err := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	if _, _, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "linkedin.com", catalog.LevelHandshake, now); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +95,7 @@ func TestПовторноеПодтверждениеНеПлодитДубли�
 	c := catalog.New()
 	now := time.Now()
 	for i := 0; i < 3; i++ {
-		if _, _, err := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+		if _, _, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 			"name", "linkedin.com", catalog.LevelHandshake, now); err != nil {
 			t.Fatal(err)
 		}
@@ -119,9 +121,9 @@ func TestНоваяЦельПривязываетсяКТойЖеКоробке(
 	// модели.
 	c := catalog.New()
 	now := time.Now()
-	_, _, _ = c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "linkedin.com", catalog.LevelHandshake, now)
-	_, _, _ = c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "instagram.com", catalog.LevelHandshake, now)
 
 	if len(c.Boxes) != 1 {
@@ -140,9 +142,9 @@ func TestИмяИщетсяРаньшеАдреса(t *testing.T) {
 	// нельзя.
 	c := catalog.New()
 	now := time.Now()
-	byName, _, _ := c.Confirm(fp(3, 54321, 0x88), armPlan("pn"),
+	byName, _, _ := c.Confirm(fp(127, 54321, 0x88), armPlan("pn"),
 		"name", "discord.com", catalog.LevelHandshake, now)
-	byAddr, _, _ := c.Confirm(fp(9, 111, 0x10), armPlan("pa"),
+	byAddr, _, _ := c.Confirm(fp(64, 111, 0x10), armPlan("pa"),
 		"addr", "162.159.135.232", catalog.LevelHandshake, now)
 	if byName == nil || byAddr == nil {
 		t.Fatal("подтверждение не создало коробок")
@@ -166,9 +168,9 @@ func TestОтключениеПланаИПривязкиНезависимы(t 
 	// §5.6 требует именно независимого отключения.
 	c := catalog.New()
 	now := time.Now()
-	_, _, _ = c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, now)
-	_, _, _ = c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "b.example", catalog.LevelHandshake, now)
 
 	c.Boxes[0].BindingFor("name", "a.example").Enabled = false
@@ -190,12 +192,12 @@ func TestСовпадениеОтпечаткаТолькоПорядокПро�
 	// подтверждённую привязку. Candidates даёт ПОРЯДОК, а не решение.
 	c := catalog.New()
 	now := time.Now()
-	first, _, _ := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	first, _, _ := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, now)
-	_, _, _ = c.Confirm(fp(20, 7, 0x00), armPlan("p2"),
+	_, _, _ = c.Confirm(fp(200, 7, 0x00), armPlan("p2"),
 		"name", "b.example", catalog.LevelHandshake, now)
 
-	got := c.Candidates(fp(3, 54321, 0x88))
+	got := c.Candidates(fp(127, 54321, 0x88))
 	if len(got) == 0 || got[0].ID != first.ID {
 		t.Fatalf("похожая коробка не первая: %v", got)
 	}
@@ -216,7 +218,7 @@ func TestУКоробкиНетТаблицыОтказов(t *testing.T) {
 	path := filepath.Join(dir, "catalog.json")
 	s, _ := catalog.Open(path)
 	s.MinInterval = 0
-	_, _, _ = s.Catalog().Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = s.Catalog().Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, time.Now())
 	s.Touch()
 	if _, err := s.FlushNow(time.Now()); err != nil {
@@ -236,7 +238,7 @@ func TestУКоробкиНетТаблицыОтказов(t *testing.T) {
 func TestПроверкаЛовитБитыеЗаписи(t *testing.T) {
 	c := catalog.New()
 	now := time.Now()
-	_, _, _ = c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	_, _, _ = c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, now)
 
 	// Привязка в никуда.
@@ -261,12 +263,12 @@ func TestКоробкуОпределяетИзмерениеАНеВызыва�
 	now := time.Now()
 
 	// Одно и то же поведение на двух целях — ОДНА коробка.
-	b1, created1, err := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	b1, created1, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "linkedin.com", catalog.LevelHandshake, now)
 	if err != nil || !created1 {
 		t.Fatalf("первая коробка не заведена: %v", err)
 	}
-	b2, created2, err := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	b2, created2, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "instagram.com", catalog.LevelHandshake, now)
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +281,7 @@ func TestКоробкуОпределяетИзмерениеАНеВызыва�
 	}
 
 	// Другое поведение — другая коробка, даже на той же линии.
-	b3, created3, err := c.Confirm(fp(20, 7, 0x00), armPlan("p2"),
+	b3, created3, err := c.Confirm(fp(200, 7, 0x00), armPlan("p2"),
 		"name", "other.example", catalog.LevelHandshake, now)
 	if err != nil || !created3 {
 		t.Fatalf("другое поведение не завело коробку: %v", err)
@@ -295,12 +297,12 @@ func TestКоробкуОпределяетИзмерениеАНеВызыва�
 func TestПротиворечиеРазводитКоробки(t *testing.T) {
 	// Отсутствие сигнала — не противоречие: за одну встречу видно не всё.
 	// А сброс с другим TTL и другим идентификатором — уже другое поведение.
-	rst := fp(3, 54321, 0x88)
-	other := fp(9, 111, 0x10)
+	rst := fp(127, 54321, 0x88)
+	other := fp(64, 111, 0x10)
 	quiet := catalog.Fingerprint{
 		Method: catalog.FingerprintMethod,
 		Signals: []catalog.Signal{
-			{Kind: "rst", TTLDelta: 3, IPID: 54321, ToS: 0x88, Seen: 1},
+			{Kind: "rst", TTL: 127, IPID: 54321, ToS: 0x88, Seen: 1},
 			{Kind: "silent", Seen: 1},
 		},
 	}
@@ -341,14 +343,14 @@ func TestИмяКоробкиНеМеняетсяПриУточненииОтп�
 	// менялось бы вместе с ним и ломало все ссылки.
 	c := catalog.New()
 	now := time.Now()
-	b1, _, _ := c.Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	b1, _, _ := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, now)
 	id := b1.ID
 
 	richer := catalog.Fingerprint{
 		Method: catalog.FingerprintMethod,
 		Signals: []catalog.Signal{
-			{Kind: "rst", TTLDelta: 3, IPID: 54321, ToS: 0x88, Seen: 1},
+			{Kind: "rst", TTL: 127, IPID: 54321, ToS: 0x88, Seen: 1},
 			{Kind: "repeat", Seen: 1},
 		},
 	}
@@ -365,5 +367,52 @@ func TestИмяКоробкиНеМеняетсяПриУточненииОтп�
 	}
 	if len(b2.Fingerprint.Signals) != 2 {
 		t.Fatal("отпечаток не уточнился")
+	}
+}
+
+func TestРазноеРасстояниеДоСервераНеПлодитКоробки(t *testing.T) {
+	// Полевой замер 2026-09-05: пять целей на одной линии дали пять «разных»
+	// коробок. Все четыре сброса имели ToS 0x88 и идентификатор IP 54321,
+	// различались только разности TTL — потому что серверы стоят на разном
+	// расстоянии, а коробка на одном и том же.
+	//
+	// Приметой коробки должен быть TTL самой подделки. Здесь это и
+	// закреплено: четыре цели, четыре разных сервера, одна коробка.
+	c := catalog.New()
+	now := time.Now()
+
+	targets := []string{"linkedin.com", "instagram.com", "www.torproject.org", "facebook.com"}
+	var ids []string
+	for _, tgt := range targets {
+		// TTL подделки один и тот же, потому что коробка одна.
+		box, _, err := c.Confirm(fp(127, 54321, 0x88), armPlan("p1"),
+			"name", tgt, catalog.LevelProtocol, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, box.ID)
+	}
+	for i, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("цель %s попала в другую коробку: %s против %s",
+				targets[i], id, ids[0])
+		}
+	}
+	if len(c.Boxes) != 1 {
+		t.Fatalf("коробок %d, а цензор один", len(c.Boxes))
+	}
+	if len(c.Boxes[0].Bindings) != 4 {
+		t.Fatalf("привязок %d, а целей четыре", len(c.Boxes[0].Bindings))
+	}
+
+	// А другой TTL подделки — уже другая коробка: это другое расстояние, то
+	// есть другое место в сети.
+	other, created, err := c.Confirm(fp(64, 54321, 0x88), armPlan("p2"),
+		"name", "elsewhere.example", catalog.LevelProtocol, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || other.ID == ids[0] {
+		t.Fatal("подделка с другого расстояния слилась с прежней коробкой")
 	}
 }

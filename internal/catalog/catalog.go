@@ -31,7 +31,15 @@ const SchemaVersion = 1
 // записи кандидатами на перепроверку (§3.4), а не мусором: выбрасывать
 // подтверждённое из-за смены алгоритма значит терять работу, которая была
 // оплачена настоящими измерениями.
-const FingerprintMethod = 1
+//
+// Версия 2: приметой коробки стал АБСОЛЮТНЫЙ TTL подделанного пакета вместо
+// его разности с TTL сервера. Замер 2026-09-05 показал, почему: пять целей
+// на одной линии дали пять «разных» коробок с одинаковыми ToS 0x88 и
+// идентификатором IP 54321 — различались только разности, потому что серверы
+// стоят на разном расстоянии, а коробка на одном и том же. Обратный счёт дал
+// TTL 127 у всех четырёх. Разность отвечает на вопрос «подделка ли это», а не
+// «чья она».
+const FingerprintMethod = 2
 
 // Уровни доказательства успеха по §4.2. Уровень 2 нельзя показывать или
 // сохранять как уровень 4, поэтому он записывается числом, а не словом
@@ -46,10 +54,18 @@ const (
 
 // Signal — одно наблюдавшееся отличие в поведении линии.
 //
-// Для сброса ключевое поле — TTLDelta, а не TTL: ориентир взят из того же
-// потока, поэтому разность переносима, а абсолютное значение нет.
+// Для сброса примета коробки — TTL самого подделанного пакета, а не его
+// разность с TTL сервера. Коробка стоит на фиксированном расстоянии от нас,
+// серверы — на разном; разность поэтому гуляет от цели к цели, а абсолютное
+// значение держится. Замер 2026-09-05: четыре цели, разности 3, 38, 40 и 74,
+// TTL подделки у всех 127.
+//
+// TTLDelta сохраняется как наблюдение — он отвечает на вопрос «подделка ли
+// это», — но в сравнении отпечатков не участвует: он про пару «коробка и
+// сервер», а не про коробку.
 type Signal struct {
 	Kind     string `json:"kind"`
+	TTL      uint8  `json:"ttl,omitempty"`
 	TTLDelta int    `json:"ttl_delta,omitempty"`
 	ToS      uint8  `json:"tos,omitempty"`
 	IPID     uint16 `json:"ipid,omitempty"`
@@ -72,8 +88,10 @@ func (f Fingerprint) find(kind string) (Signal, bool) {
 	return Signal{}, false
 }
 
+// sameEvidence — одна ли это примета. Разность TTL сюда НЕ входит: она про
+// пару «коробка и сервер», а не про коробку, и на разных целях разная.
 func sameEvidence(a, b Signal) bool {
-	return a.TTLDelta == b.TTLDelta && a.IPID == b.IPID && a.ToS == b.ToS
+	return a.TTL == b.TTL && a.IPID == b.IPID && a.ToS == b.ToS
 }
 
 // Compatible — можно ли считать, что два отпечатка сняты с одного поведения.
@@ -374,7 +392,7 @@ func (c *Catalog) Recognise(fp Fingerprint) (box *Box, unambiguous bool) {
 func boxID(fp Fingerprint, now time.Time) string {
 	sig := make([]string, 0, len(fp.Signals))
 	for _, s := range fp.Signals {
-		sig = append(sig, fmt.Sprintf("%s/%d/%d/%d", s.Kind, s.TTLDelta, s.IPID, s.ToS))
+		sig = append(sig, fmt.Sprintf("%s/%d/%d/%d", s.Kind, s.TTL, s.IPID, s.ToS))
 	}
 	sort.Strings(sig)
 	h := sha256.Sum256([]byte(fmt.Sprintf("%d|%s", fp.Method, strings.Join(sig, ";"))))
@@ -471,8 +489,7 @@ func mergeFingerprint(a, b Fingerprint) Fingerprint {
 		found := false
 		for i := range out.Signals {
 			t := &out.Signals[i]
-			if t.Kind == s.Kind && t.TTLDelta == s.TTLDelta &&
-				t.IPID == s.IPID && t.ToS == s.ToS {
+			if t.Kind == s.Kind && sameEvidence(*t, s) {
 				t.Seen += s.Seen
 				found = true
 				break

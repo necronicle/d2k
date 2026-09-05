@@ -16,7 +16,7 @@ func filled(t *testing.T, path string) *catalog.Store {
 		t.Fatal(err)
 	}
 	s.MinInterval = 0
-	if _, _, err := s.Catalog().Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	if _, _, err := s.Catalog().Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestЗаписьАтомарнаИХранитПрежнюю(t *testing.T) 
 	s := filled(t, path)
 
 	// Вторая запись обязана оставить прежнюю версию рядом.
-	if _, _, err := s.Catalog().Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	if _, _, err := s.Catalog().Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "b.example", catalog.LevelHandshake, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestБитыйКаталогОткатываетсяНаПрежний(t *t
 	dir := t.TempDir()
 	path := filepath.Join(dir, "catalog.json")
 	s := filled(t, path)
-	if _, _, err := s.Catalog().Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	if _, _, err := s.Catalog().Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "b.example", catalog.LevelHandshake, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestЧастотаЗаписиОграничена(t *testing.T) {
 	s.MinInterval = time.Hour
 	now := time.Now()
 
-	if _, _, err := s.Catalog().Confirm(fp(3, 54321, 0x88), armPlan("p1"),
+	if _, _, err := s.Catalog().Confirm(fp(127, 54321, 0x88), armPlan("p1"),
 		"name", "a.example", catalog.LevelHandshake, now); err != nil {
 		t.Fatal(err)
 	}
