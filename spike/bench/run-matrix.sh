@@ -18,6 +18,11 @@ DEOFF=${DEOFF:-1000000}
 LOADS=${LOADS:-3}
 LOADSZ=${LOADSZ:-50000000}
 URL=${URL:-https://speed.cloudflare.com/__down?bytes=}
+# Полный адрес нагрузки, если источник не принимает размер параметром.
+# Понадобился, когда Cloudflare начал отдавать 403 после долгой серии
+# прогонов: два скачивания из трёх возвращали по четыре байта, и конфигурация
+# получала нагрузку втрое меньше соседней. Такие числа несравнимы.
+FIXEDURL=${FIXEDURL:-}
 RESULTS=${RESULTS:-./results}
 
 # -n обязателен: список конфигураций читается циклом из stdin, а ssh без -n
@@ -81,7 +86,14 @@ printf '%s\n' "$CONFIGS" | while IFS='|' read -r name bin args dir; do
     speeds=""
     i=0
     while [ "$i" -lt "$LOADS" ]; do
-        s=$(curl -4 -s -o /dev/null -w '%{speed_download}' "${URL}${LOADSZ}" 2>/dev/null || echo 0)
+        if [ -n "$FIXEDURL" ]; then
+            r=$(curl -4 -s -o /dev/null -w '%{speed_download} %{http_code} %{size_download}' "$FIXEDURL" 2>/dev/null || echo "0 000 0")
+        else
+            r=$(curl -4 -s -o /dev/null -w '%{speed_download} %{http_code} %{size_download}' "${URL}${LOADSZ}" 2>/dev/null || echo "0 000 0")
+        fi
+        code=$(echo "$r" | cut -d" " -f2)
+        [ "$code" = 200 ] || echo "  ВНИМАНИЕ: загрузка вернула код $code — конфигурация недогружена"
+        s=$(echo "$r" | cut -d" " -f1)
         speeds="$speeds $s"
         i=$((i + 1))
     done

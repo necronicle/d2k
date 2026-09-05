@@ -47,9 +47,13 @@ const (
 	nfqaCfgFFailOpen = 1 << 0
 	nfqaCfgFGSO      = 1 << 2
 
+	// Значения из enum nfqnl_attr_type ядра. VERDICT_HDR = 2, а НЕ 1:
+	// единицу занимает PACKET_HDR. С единицей ядро не находит заголовок
+	// вердикта среди разобранных атрибутов и отвечает EINVAL, а sendto при
+	// этом возвращает успех — пакеты молча копятся в очереди.
 	nfqaPacketHdr  = 1
+	nfqaVerdictHdr = 2
 	nfqaPayload    = 10
-	nfqaVerdictHdr = 1
 
 	nfAccept = 1
 
@@ -111,6 +115,8 @@ var (
 	stParse  uint64
 	stVerdct uint64
 	stRecv   uint64
+	errShown int
+	dumpLeft = 2
 )
 
 func nowSec() float64 {
@@ -209,6 +215,10 @@ func sendVerdict(id uint32, batch bool) error {
 	binary.BigEndian.PutUint32(vhdr[4:], id)
 	l := msgInit(vbuf, typ, syscall.NLM_F_REQUEST, uint16(*fQueue))
 	l = putAttr(vbuf, l, nfqaVerdictHdr, vhdr)
+	if dumpLeft > 0 {
+		dumpLeft--
+		fmt.Fprintf(os.Stderr, "[вердикт] %d байт: % x\n", l, vbuf[:l])
+	}
 	return send(vbuf, l)
 }
 
@@ -483,6 +493,16 @@ func main() {
 				mtype := binary.LittleEndian.Uint16(buf[pos+4:])
 				if mlen < nlmsgHdrLen || mlen > left {
 					break
+				}
+				// Ядро отвечает NLMSG_ERROR на кривой запрос. Без этой ветки
+				// ошибка вердикта выглядит как «отправлено успешно»: sendto
+				// возвращает nil, а пакеты копятся в очереди.
+				if mtype == syscall.NLMSG_ERROR && errShown < 3 {
+					code := int32(binary.LittleEndian.Uint32(buf[pos+nlmsgHdrLen:]))
+					badType := binary.LittleEndian.Uint16(buf[pos+nlmsgHdrLen+4+4:])
+					fmt.Fprintf(os.Stderr, "[ядро] ошибка %d (%s) на сообщение type=0x%04x\n",
+						code, syscall.Errno(-code), badType)
+					errShown++
 				}
 				if mtype&0xff == nfqnlMsgPacket && mtype != syscall.NLMSG_ERROR && mtype != syscall.NLMSG_DONE {
 					var id uint32
