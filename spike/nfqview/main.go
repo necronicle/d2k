@@ -106,6 +106,7 @@ var (
 	fLAN     = flag.String("lan", "192.168.1.0/24", "локальная подсеть: по ней определяется направление")
 	fOut     = flag.String("out", "/tmp/nfqview", "префикс файлов результата")
 	fBatch   = flag.Bool("batch", false, "групповой вердикт вместо попакетного")
+	fGSO     = flag.Bool("gso", false, "просить ядро не резать объединённые сегменты")
 )
 
 func main() {
@@ -141,7 +142,12 @@ func main() {
 		// Замер идёт на живом домашнем роутере, и цена ошибки инструмента не
 		// должна ложиться на пользователя. Сколько прошло мимо — видно по
 		// счётчикам ядра, так что честность числа это не портит.
+		// GSO: без этого флага ядро разрезает объединённый сегмент перед
+		// очередью, и за каждый кусок платится отдельный round-trip.
 		Flags: nfqueue.NfQaCfgFlagFailOpen,
+	}
+	if *fGSO {
+		cfg.Flags |= nfqueue.NfQaCfgFlagGSO
 	}
 
 	nf, err := nfqueue.Open(&cfg)
@@ -328,6 +334,7 @@ loop:
 		"copylen":            *fCopyLen,
 		"qlen":               *fQLen,
 		"batch_verdict":      *fBatch,
+		"gso":                *fGSO,
 		"duration_s":         elapsed,
 		"packets":            pkts,
 		"packets_per_s":      float64(pkts) / elapsed,

@@ -54,6 +54,7 @@ static int opt_dur = 60;
 static int opt_tick = 10;
 static int opt_batch = 0;
 static int dbg_left = 0;
+static int opt_gso = 0;
 static const char *opt_out = "/tmp/nfqview";
 static uint32_t lan_addr = 0, lan_mask = 0;
 
@@ -181,7 +182,12 @@ static int queue_config(void) {
     uint32_t maxlen = htonl((uint32_t)opt_qlen);
     // FAIL_OPEN по тем же соображениям, что и в Go-версии: переполнение должно
     // пропускать пакет, а не ронять его. Замер идёт на живом роутере.
-    uint32_t flags = htonl(NFQA_CFG_F_FAIL_OPEN), mask = htonl(NFQA_CFG_F_FAIL_OPEN);
+    // GSO: без этого флага ядро разрезает объединённый сегмент перед очередью,
+    // и за каждый кусок платится отдельный round-trip. С флагом приходит целый
+    // super-packet. Для чтения это безопасно; для будущего исполнителя правок
+    // — нет, но здесь мы только считаем.
+    uint32_t fl = NFQA_CFG_F_FAIL_OPEN | (opt_gso ? NFQA_CFG_F_GSO : 0);
+    uint32_t flags = htonl(fl), mask = htonl(NFQA_CFG_F_FAIL_OPEN | NFQA_CFG_F_GSO);
     nlh = msg_init(buf, NFQ_SUBSYS | NFQNL_MSG_CONFIG, NLM_F_REQUEST | NLM_F_ACK, opt_queue);
     put_attr(nlh, NFQA_CFG_PARAMS, &params, sizeof(params));
     put_attr(nlh, NFQA_CFG_QUEUE_MAXLEN, &maxlen, sizeof(maxlen));
@@ -384,13 +390,13 @@ static void write_outputs(double elapsed, double cpu, struct qstat q0, struct qs
     if (fh) {
         fprintf(fh,
                 "{\n  \"impl\": \"c\",\n  \"queue\": %d,\n  \"copylen\": %d,\n  \"qlen\": %d,\n"
-                "  \"batch_verdict\": %s,\n  \"duration_s\": %.3f,\n  \"packets\": %llu,\n"
+                "  \"gso\": %s,\n  \"batch_verdict\": %s,\n  \"duration_s\": %.3f,\n  \"packets\": %llu,\n"
                 "  \"packets_per_s\": %.1f,\n  \"bytes_copied\": %llu,\n  \"flows\": %llu,\n"
                 "  \"parse_fail\": %llu,\n  \"verdict_fail\": %llu,\n  \"recv_errors\": %llu,\n"
                 "  \"cpu_seconds\": %.2f,\n  \"cpu_percent\": %.2f,\n  \"rss_kib\": %llu,\n"
                 "  \"kernel_queue_start\": {\"queue_depth_now\": %llu, \"copy_mode\": %llu, \"copy_range\": %llu, \"queue_dropped\": %llu, \"user_dropped\": %llu, \"id_sequence\": %llu},\n"
                 "  \"kernel_queue_last\": {\"queue_depth_now\": %llu, \"copy_mode\": %llu, \"copy_range\": %llu, \"queue_dropped\": %llu, \"user_dropped\": %llu, \"id_sequence\": %llu}\n}\n",
-                opt_queue, opt_copylen, opt_qlen, opt_batch ? "true" : "false", elapsed,
+                opt_queue, opt_copylen, opt_qlen, opt_gso ? "true" : "false", opt_batch ? "true" : "false", elapsed,
                 (unsigned long long)stat_pkts, stat_pkts / (elapsed > 0 ? elapsed : 1),
                 (unsigned long long)stat_bytes, (unsigned long long)n_flows,
                 (unsigned long long)stat_parse_fail, (unsigned long long)stat_verdict_fail,
@@ -469,7 +475,8 @@ static void usage(void) {
             "  -lan CIDR   локальная подсеть (192.168.1.0/24)\n"
             "  -out PFX    префикс файлов результата (/tmp/nfqview)\n"
             "  -batch      групповой вердикт\n"
-            "  -debug N    разобрать первые N сообщений вслух\n");
+            "  -debug N    разобрать первые N сообщений вслух\n"
+            "  -gso        просить ядро не резать объединённые сегменты\n");
 }
 
 static int parse_lan(const char *cidr) {
@@ -498,6 +505,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-out") && i + 1 < argc) opt_out = argv[++i];
         else if (!strcmp(argv[i], "-batch")) opt_batch = 1;
         else if (!strcmp(argv[i], "-debug") && i + 1 < argc) dbg_left = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-gso")) opt_gso = 1;
         else { usage(); return 2; }
     }
     if (parse_lan(lan) < 0) { fprintf(stderr, "плохая подсеть -lan\n"); return 2; }
@@ -537,8 +545,11 @@ int main(int argc, char **argv) {
         if (t - t0 >= opt_dur) break;
 
         // Таймаут нужен, чтобы тик отчёта и выход по времени случались даже в
-        // полной тишине на линии.
-        struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+        // полной тишине на линии. 20 мс, а не 200: в групповом режиме именно
+        // этот таймаут добивает недобранный остаток пакетов, и при 200 мс хвост
+        // каждой пачки застревал на пятую долю секунды. Замер c-batch из-за
+        // этого выглядел вдвое хуже попакетного — цена была моей, не механизма.
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 20000};
         setsockopt(nl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         ssize_t n = recv(nl_fd, buf, RECV_BUF, 0);
