@@ -40,6 +40,7 @@ func usage(w *os.File) {
   plan <подкоманда>    перевод плана между текстовой и канонической формой
   control              контроллер: связь датапата и каталога коробок
   volume -target H:P   проба на блокировку по объёму соединения
+  cut -target H:P      где резать приветствие, чтобы коробка потеряла имя
   serve [-log FILE]    запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
@@ -77,6 +78,9 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "volume":
 		return cmdVolume(args[1:], out, errOut)
+
+	case "cut":
+		return cmdCut(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(args[1:], out, errOut)

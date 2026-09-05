@@ -48,6 +48,24 @@ static const uint8_t plan_between_no_split[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
+/* Перекрытие: приставка в два байта, разрезов нет. Ответ на коробку, которая
+   ПЕРЕСОБИРАЕТ поток — разрез её не берёт, а склейку отравить можно. */
+static const uint8_t plan_seqovl[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 3,
+    0x00, 0x10, 0x00, 0x04, 0x00, 0x01, 0xAA, 0xBB,
+    0x01, 0x02, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+/* Перекрытие вместе с разрезом по началу имени. */
+static const uint8_t plan_seqovl_split[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 4,
+    0x00, 0x10, 0x00, 0x04, 0x00, 0x01, 0xAA, 0xBB,
+    0x01, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x02, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
 static uint8_t hello[64];
 
 static void init_pkt(d2k_pkt *in, int have_sni) {
@@ -199,6 +217,58 @@ int main(void) {
         d2k_actions_free(&a);
         d2k_plan_free(p);
         p = NULL;
+    }
+
+    /* --- перекрытие без разреза ----------------------------------------- */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_seqovl, sizeof plan_seqovl, &p, err, sizeof err) == 0,
+              "план с перекрытием не загрузился");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            init_pkt(&in, 1);
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "перекрытие не применилось");
+            CHECK(a.n == 1, "перекрытие без разреза даёт один кусок");
+            if (a.n == 1) {
+                CHECK(a.v[0].pre_len == 2, "приставка не поставлена");
+                CHECK(a.v[0].pre != NULL && a.v[0].pre[0] == 0xAA && a.v[0].pre[1] == 0xBB,
+                      "приставка не та");
+                /* Номер сдвинут НАЗАД на длину приставки: сервер выбросит её
+                   как уже полученное, коробка — положит в поток. */
+                CHECK(a.v[0].seq == in.seq - 2, "номер не сдвинут назад на длину приставки");
+                CHECK(a.v[0].len == in.payload_len, "нагрузка урезана");
+                CHECK(a.fate == D2K_ORIG_DROP, "оригинал обязан быть подавлен: мы шлём его сами");
+            }
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- перекрытие вместе с разрезом ------------------------------------ */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_seqovl_split, sizeof plan_seqovl_split, &p, err, sizeof err) == 0,
+              "план с перекрытием и разрезом не загрузился");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            init_pkt(&in, 1);
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "не применилось");
+            CHECK(a.n == 2, "разрез даёт два куска");
+            if (a.n == 2) {
+                CHECK(a.v[0].pre_len == 2, "приставка только у первого куска");
+                CHECK(a.v[0].seq == in.seq - 2, "первый кусок не сдвинут назад");
+                CHECK(a.v[0].len == in.sni_off, "первый кусок не до имени");
+                CHECK(a.v[1].pre_len == 0, "приставка попала и во второй кусок");
+                CHECK(a.v[1].seq == in.seq + (uint32_t)in.sni_off,
+                      "второй кусок с неверным номером");
+            }
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
     }
 
     if (fails) {

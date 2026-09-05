@@ -166,9 +166,22 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     }
 
     if (owns_payload) {
-        /* Куски нагрузки. Перекрытие первой версии не реализовано в этой
-           задаче — оно приходит следующей, и до тех пор план с ним
-           отвергается при загрузке. */
+        /* ПЕРЕКРЫТИЕ. Первый кусок выходит с номером на длину приставки
+           МЕНЬШЕ, чем начало нагрузки, и несёт эту приставку впереди.
+           Сервер выбросит её как уже полученное и склеит нагрузку верно;
+           коробка, складывающая поток по порядку прихода, положит приставку
+           в поток и разберёт не то, что разберёт сервер.
+           Это ответ на коробку, которая ПЕРЕСОБИРАЕТ: разрез её не берёт,
+           потому что она склеивает куски, а вот отравить склейку можно. */
+        const struct d2k_payload *ovl = NULL;
+        const struct d2k_poison  *ovl_po = NULL;
+        if (p->n_seqovls > 0) {
+            ovl = d2k_find_payload(p, p->seqovls[0].payload_id);
+            if (p->seqovls[0].poison_id) {
+                ovl_po = d2k_find_poison(p, p->seqovls[0].poison_id);
+            }
+        }
+
         size_t start = 0;
         for (size_t i = 0; i <= n_pts; i++) {
             size_t end = (i < n_pts) ? pts[i] : in->payload_len;
@@ -179,6 +192,16 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             e->seq = in->seq + (uint32_t)start;
             e->bytes = in->payload + start;
             e->len = end - start;
+            if (i == 0 && ovl && ovl->len > 0) {
+                e->pre = ovl->bytes;
+                e->pre_len = ovl->len;
+                e->seq = in->seq - (uint32_t)ovl->len;
+                if (ovl_po) {
+                    e->ttl = ovl_po->ttl;
+                    e->poison = ovl_po->flags;
+                    e->seq_shift = ovl_po->seq_shift;
+                }
+            }
             start = end;
 
             /* Фальшивка между кусками — после каждого, кроме последнего. */

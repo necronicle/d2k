@@ -185,6 +185,31 @@ int main(void) {
     e.seq = 1000; e.bytes = body; e.len = sizeof body;
     CHECK(d2k_wire_build(&c, &e, pkt, 10) == 0, "сборка в маленький буфер должна отказать");
 
+    /* --- приставка перекрытия едет впереди нагрузки и входит в сумму ----- */
+    {
+        d2k_emit e;
+        memset(&e, 0, sizeof e);
+        const uint8_t pre[] = {0xAA, 0xBB};
+        const uint8_t pay[] = {0x16, 0x03, 0x01, 0x00};
+        e.kind = D2K_EMIT_PAYLOAD;
+        e.seq = 998;
+        e.pre = pre;
+        e.pre_len = sizeof pre;
+        e.bytes = pay;
+        e.len = sizeof pay;
+
+        uint8_t out[128];
+        size_t n = d2k_wire_build(&c, &e, out, sizeof out);
+        CHECK(n == 20 + 20 + sizeof pre + sizeof pay,
+              "длина пакета не учла приставку");
+        if (n) {
+            CHECK(out[40] == 0xAA && out[41] == 0xBB, "приставка не впереди");
+            CHECK(out[42] == 0x16 && out[45] == 0x00, "нагрузка съехала");
+            CHECK(d2k_wire_tcp_checksum_ok(out, n),
+                  "сумма не сошлась: приставка не попала в подсчёт");
+        }
+    }
+
     check_golden();
 
     if (fails) {
