@@ -97,6 +97,106 @@
 
   </div>
 
+  {{/* Узнанное. Каталог написан чернилами и остаётся; идущий поиск —
+       карандашом, и если он кончится ничем, от него не останется следа
+       (§2.3). Это единственное различение между двумя разделами. */}}
+  <section class="learned">
+    <h2>Сейчас в работе</h2>
+    {{if not .K.Linked}}
+    <p class="quiet">
+      Контроллер не подключён к датапату: {{.K.LinkNote}}. Панель показывает
+      прошлое знание, но не происходящее.
+    </p>
+    {{else if .K.Searches}}
+    <ul class="hunt">
+      {{range .K.Searches}}
+      <li>
+        <span class="target">{{.Target}}</span>
+        <span class="phase">{{.Phase}}</span>
+        <span class="counts">
+          <span><b>попыток</b> {{.Attempts}}</span>
+          <span><b>зондов</b> {{.Probes}}</span>
+          {{if .Candidate}}<span><b>кандидат</b> {{.Candidate}}</span>{{end}}
+        </span>
+      </li>
+      {{end}}
+    </ul>
+    <p class="quiet">
+      Поиск не записывается. Если он кончится ничем, от него не останется
+      следа — ни в каталоге, ни здесь.
+    </p>
+    {{else}}
+    <p class="quiet">
+      Ничего не ищется. Это обычное состояние: поиск начинается, только когда
+      соединение вызвало подозрение.
+    </p>
+    {{end}}
+  </section>
+
+  <section class="learned">
+    <h2>Изученные коробки</h2>
+    {{if .K.Boxes}}
+    <div class="boxes">
+      {{range .K.Boxes}}
+      <article class="box">
+        <header>
+          <h3>{{.ID}}</h3>
+          <span class="when">узнана {{.Created.Format "02.01 15:04"}}</span>
+        </header>
+
+        {{/* Карточка обозначает МОДЕЛЬ ПОВЕДЕНИЯ. Ни производителя, ни
+             адреса, ни экземпляра оборудования здесь нет: одно и то же
+             поведение может принадлежать нескольким устройствам (§3, §8). */}}
+        <h4>Чем себя выдаёт</h4>
+        <dl class="print">
+          {{range .Signals}}
+          <dt>{{.Kind}}</dt>
+          <dd>{{.Human}} <span class="seen">— наблюдалось {{.Seen}}</span></dd>
+          {{end}}
+        </dl>
+
+        <h4>Цели</h4>
+        <ul class="targets">
+          {{range .Bindings}}
+          <li>
+            <span class="name{{if not .Enabled}} off{{end}}">{{.Target}}</span>
+            {{/* Линейка: залито столько, сколько ИЗМЕРЕНО. Пустые клетки —
+                 уровни, до которых не дошли, а не украшение. §4.2 запрещает
+                 показывать уровень 2 как уровень 4. */}}
+            {{$lvl := .Level}}
+            <span class="rule5" role="img"
+                  aria-label="доказательство: {{.Level}} из 5, {{.LevelName}}">
+              {{/* Уровень запоминается ДО вложенного range: внутри него $
+                   указывает на корень данных, а не на привязку, и линейка
+                   молча рисовалась бы пустой. */}}
+              {{range $i := iter 5}}<i class="{{if lt $i $lvl}}on{{end}}"></i>{{end}}
+            </span>
+            <span class="level">{{.LevelName}}</span>
+            <span class="hits">подтверждений {{.Successes}}</span>
+          </li>
+          {{end}}
+        </ul>
+
+        {{range .Plans}}
+        <div class="plan">
+          <p{{if not .Enabled}} class="off"{{end}}>{{.Human}}</p>
+          <details>
+            <summary>техническое представление плана {{.ID}}</summary>
+            <pre>{{.Text}}</pre>
+          </details>
+        </div>
+        {{end}}
+      </article>
+      {{end}}
+    </div>
+    {{else}}
+    <p class="quiet">
+      Пока ничего не изучено. Это не сбой: база начинается пустой, и запись
+      появляется только вместе с подтверждённым решением.
+    </p>
+    {{end}}
+  </section>
+
   <p class="warn">
     Панель только читает. Изменяющих запросов у неё нет, поэтому нет и
     аутентификации — первый такой запрос добавлять без неё нельзя.

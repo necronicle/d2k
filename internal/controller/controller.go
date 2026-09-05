@@ -135,6 +135,10 @@ type Controller struct {
 	dropped  int
 	Applied  int // сколько раз кандидат доехал до соединения
 	Confirms int
+
+	// probesUsed — всего зондов за сеанс. §10 требует считать стоимость
+	// зондов на новую цель.
+	probesUsed int
 }
 
 // New создаёт контроллер.
@@ -791,6 +795,7 @@ func (c *Controller) startProbe(t *Task, now time.Time) {
 
 	t.probing = true
 	t.Probes++
+	c.probesUsed++
 	target, ip, port := t.Target, t.ServerIP, t.ServerPort
 	c.sayf("по %s стучусь сам: %s -> %s:%d", target, how, ip, port)
 	go func() {

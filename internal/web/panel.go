@@ -29,11 +29,25 @@ var assets embed.FS
 //go:embed templates/panel.html
 var tmplFS embed.FS
 
+// KnowledgeSource — откуда панель берёт узнанное.
+//
+// Интерфейс, а не ссылка на контроллер: панель не должна знать ни устройства
+// каталога, ни того, чем «проверяем готовое» отличается от «ищем новое». И
+// без контроллера она обязана работать — просто честно говорить, что
+// происходящего не видит.
+type KnowledgeSource interface {
+	Knowledge() status.Knowledge
+}
+
 // Panel отдаёт снимок состояния человеку и машине.
 type Panel struct {
 	cfg     config.Config
 	started time.Time
 	tmpl    *template.Template
+	know    KnowledgeSource
+	// linkNote — почему узнанного нет, если источника не дали. Отсутствие
+	// объяснения читается как поломка, а это не поломка.
+	linkNote string
 }
 
 // New готовит панель. Шаблон разбирается один раз на старте: ошибка разметки
@@ -41,11 +55,38 @@ type Panel struct {
 func New(cfg config.Config, started time.Time) (*Panel, error) {
 	t, err := template.New("panel.html").Funcs(template.FuncMap{
 		"uptime": humanUptime,
+		// iter даёт шаблону счётный ряд для линейки доказательства. В Go
+		// шаблонах нет цикла по числу, а рисовать пять клеток руками значит
+		// однажды нарисовать четыре.
+		"iter": func(n int) []int {
+			out := make([]int, n)
+			for i := range out {
+				out[i] = i
+			}
+			return out
+		},
 	}).ParseFS(tmplFS, "templates/panel.html")
 	if err != nil {
 		return nil, fmt.Errorf("разметка панели: %w", err)
 	}
-	return &Panel{cfg: cfg, started: started, tmpl: t}, nil
+	return &Panel{
+		cfg: cfg, started: started, tmpl: t,
+		linkNote: "служба запущена без контроллера",
+	}, nil
+}
+
+// SetKnowledge подключает источник узнанного. Без него панель показывает
+// сборку и настройки, но не коробки и не поиски.
+func (p *Panel) SetKnowledge(k KnowledgeSource) { p.know = k }
+
+// SetLinkNote объясняет, почему узнанного нет.
+func (p *Panel) SetLinkNote(s string) { p.linkNote = s }
+
+func (p *Panel) knowledge() status.Knowledge {
+	if p.know == nil {
+		return status.Knowledge{Linked: false, LinkNote: p.linkNote}
+	}
+	return p.know.Knowledge()
 }
 
 // Handler — маршруты панели.
@@ -95,10 +136,11 @@ func (p *Panel) page(w http.ResponseWriter, r *http.Request) {
 
 	data := struct {
 		S       status.Snapshot
+		K       status.Knowledge
 		Built   int
 		Total   int
 		Working bool
-	}{S: s, Built: built, Total: total, Working: s.Working()}
+	}{S: s, K: p.knowledge(), Built: built, Total: total, Working: s.Working()}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := p.tmpl.Execute(w, data); err != nil {
@@ -111,7 +153,10 @@ func (p *Panel) apiStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(p.snapshot())
+	_ = enc.Encode(struct {
+		status.Snapshot
+		Knowledge status.Knowledge `json:"knowledge"`
+	}{Snapshot: p.snapshot(), Knowledge: p.knowledge()})
 }
 
 // Serve поднимает панель и блокируется до отмены контекста.

@@ -330,3 +330,269 @@ body {
         gap: calc(var(--step) * 1);
     }
 }
+
+/* ======================================================================
+   Узнанное: коробки и поиски.
+   
+   Продолжение того же листа, а не новый раздел с другими правилами.
+   Одно новое различение, и оно из §2.3: подтверждённое написано ЧЕРНИЛАМИ и
+   остаётся, идущий поиск — КАРАНДАШОМ и стирается без следа, если кончится
+   ничем. Отсюда пунктир и приглушённый цвет у поисков и сплошная рамка у
+   коробок; ничего больше между ними не различается.
+   ====================================================================== */
+
+:root {
+    /* Карандаш: то, чего может не стать. Между чернилами и сеткой. */
+    --pencil: #7d8b99;
+}
+
+.learned {
+    margin-top: calc(var(--step) * 8);
+}
+
+.learned > h2 {
+    margin: 0 0 calc(var(--step) * 3);
+    font-size: 0.95rem;
+    font-weight: 650;
+    padding-bottom: calc(var(--step) * 2);
+    border-bottom: var(--rule);
+}
+
+/* --- идущие поиски: карандаш ------------------------------------------- */
+
+.hunt {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: calc(var(--step) * 2);
+}
+
+.hunt > li {
+    /* Пунктир, а не рамка: этой записи может не стать. */
+    border: 1px dashed var(--pencil);
+    background: transparent;
+    padding: calc(var(--step) * 3);
+    color: var(--pencil);
+}
+
+.hunt .target {
+    display: block;
+    font-family: var(--mono);
+    font-size: 0.9rem;
+    color: var(--ink);
+}
+
+.hunt .phase {
+    display: block;
+    margin-top: calc(var(--step));
+    color: var(--ink-soft);
+}
+
+.hunt .counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 calc(var(--step) * 4);
+    margin-top: calc(var(--step) * 2);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.hunt .counts b {
+    font-weight: 500;
+    color: var(--ink-faint);
+}
+
+.quiet {
+    margin: 0;
+    color: var(--ink-soft);
+    max-width: 56ch;
+}
+
+/* --- коробка: чернила --------------------------------------------------- */
+
+.boxes {
+    display: grid;
+    gap: calc(var(--step) * 4);
+}
+
+.box {
+    border: var(--rule);
+    background: var(--paper);
+    padding: calc(var(--step) * 4);
+}
+
+.box > header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: calc(var(--step) * 2);
+    padding-bottom: calc(var(--step) * 2);
+    border-bottom: var(--rule);
+}
+
+.box > header h3 {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 0.95rem;
+    font-weight: 600;
+}
+
+.box > header .when {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.box h4 {
+    margin: calc(var(--step) * 4) 0 calc(var(--step) * 2);
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink-soft);
+}
+
+/* Отпечаток — столбец измерений, как на бирке образца: значение
+   выровнено, подпись обычным шрифтом. Моноширинный только у чисел: он
+   здесь работает выключкой, а не украшением. */
+.print {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: calc(var(--step)) calc(var(--step) * 4);
+    align-items: baseline;
+}
+
+.print dt {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--measure);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.print dd {
+    margin: 0;
+    color: var(--ink-soft);
+}
+
+.print dd .seen {
+    color: var(--ink-faint);
+}
+
+/* --- цели и линейка доказательства -------------------------------------- */
+
+.targets {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: calc(var(--step) * 2);
+}
+
+.targets > li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: calc(var(--step)) calc(var(--step) * 3);
+}
+
+.targets .name {
+    font-family: var(--mono);
+    font-size: 0.88rem;
+    min-width: 16ch;
+}
+
+.targets .off {
+    color: var(--ink-faint);
+    text-decoration: line-through;
+}
+
+/* Линейка доказательства: пять клеток, залито столько, сколько ИЗМЕРЕНО.
+   Та же грамматика, что у цепочки звеньев: залито — есть, пусто — дырка,
+   сквозь неё видна миллиметровка. Смысл — не дать прочитать «сервер
+   ответил» как «прикладной обмен прошёл» (§4.2). */
+.rule5 {
+    display: inline-flex;
+    gap: 2px;
+    vertical-align: baseline;
+}
+
+.rule5 i {
+    width: calc(var(--step) * 2);
+    height: calc(var(--step) * 3);
+    border: 1px solid var(--grid-strong);
+    background: var(--hole);
+}
+
+.rule5 i.on {
+    background: var(--measure);
+    border-color: var(--measure);
+}
+
+.targets .level {
+    color: var(--ink-soft);
+    font-size: 0.9rem;
+}
+
+.targets .hits {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+}
+
+/* --- план --------------------------------------------------------------- */
+
+.plan {
+    border-top: var(--rule);
+    padding-top: calc(var(--step) * 3);
+    margin-top: calc(var(--step) * 4);
+}
+
+.plan p {
+    margin: 0;
+    max-width: 62ch;
+}
+
+.plan .off {
+    color: var(--ink-faint);
+}
+
+.plan details {
+    margin-top: calc(var(--step) * 2);
+}
+
+.plan summary {
+    cursor: pointer;
+    color: var(--measure);
+    font-size: 0.85rem;
+}
+
+.plan summary:focus-visible {
+    outline: 2px solid var(--measure);
+    outline-offset: 2px;
+}
+
+.plan pre {
+    margin: calc(var(--step) * 2) 0 0;
+    padding: calc(var(--step) * 3);
+    background: var(--hole);
+    border: var(--rule);
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.5;
+}
+
+@media (max-width: 40rem) {
+    .print {
+        grid-template-columns: 1fr;
+        gap: 0 0;
+    }
+    .print dd {
+        margin-bottom: calc(var(--step) * 2);
+    }
+}

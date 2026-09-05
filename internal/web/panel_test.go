@@ -120,3 +120,123 @@ func TestРаспознаваниеПетли(t *testing.T) {
 		}
 	}
 }
+
+// fakeKnowledge — узнанное для проверки разметки. Настоящий контроллер сюда
+// не тащим: панель обязана работать от данных, а не от связки.
+type fakeKnowledge struct{ k status.Knowledge }
+
+func (f fakeKnowledge) Knowledge() status.Knowledge { return f.k }
+
+func renderWith(t *testing.T, k status.Knowledge) string {
+	t.Helper()
+	p, err := New(config.Default(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetKnowledge(fakeKnowledge{k})
+	rec := httptest.NewRecorder()
+	p.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != 200 {
+		t.Fatalf("код %d", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+func TestУровеньДваНеЧитаетсяКакГотово(t *testing.T) {
+	// §4.2: уровень 2 нельзя показывать как уровень 4. Линейка залита ровно
+	// на измеренное, а слова названы так, чтобы «сервер ответил» нельзя было
+	// принять за «обмен прошёл».
+	body := renderWith(t, status.Knowledge{
+		Linked: true,
+		Boxes: []status.BoxView{{
+			ID:      "box-test",
+			Signals: []status.SignalView{{Kind: "rst", Human: "сброс не от сервера", Seen: 3}},
+			Bindings: []status.BindingView{
+				{Target: "a.example", Level: 2, LevelName: status.LevelName(2), Successes: 1, Enabled: true},
+				{Target: "b.example", Level: 3, LevelName: status.LevelName(3), Successes: 4, Enabled: true},
+			},
+		}},
+	})
+
+	if !strings.Contains(body, status.LevelName(2)) {
+		t.Fatal("уровень не назван словами")
+	}
+	// Ни один уровень не называется словом, которое можно прочитать как
+	// «всё в порядке»: измеряется не исправность, а глубина доказательства.
+	for n := 1; n <= 5; n++ {
+		if strings.Contains(status.LevelName(n), "работает") {
+			t.Fatalf("уровень %d назван словом «работает» — оно ничего не измеряет", n)
+		}
+	}
+	// Линейка залита ровно на измеренное: две клетки за уровень 2 и три за
+	// уровень 3.
+	if n := strings.Count(body, `class="on"`); n != 5 {
+		t.Fatalf("залитых клеток %d, а ждали 2+3=5", n)
+	}
+	if !strings.Contains(body, "доказательство: 2 из 5") {
+		t.Fatal("для незрячего уровень не назван")
+	}
+}
+
+func TestКарточкаКоробкиНеВыдумываетУстройство(t *testing.T) {
+	// §8 запрещает показывать недоказанные производителя, физический адрес
+	// или экземпляр оборудования. Карточка обозначает МОДЕЛЬ ПОВЕДЕНИЯ.
+	body := renderWith(t, status.Knowledge{
+		Linked: true,
+		Boxes: []status.BoxView{{
+			ID:      "box-test",
+			Signals: []status.SignalView{{Kind: "rst", Human: "сброс не от сервера: TTL 126", Seen: 4}},
+		}},
+	})
+	for _, forbidden := range []string{"производитель", "модель оборудования", "устройство "} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Fatalf("карточка утверждает про железо: %q", forbidden)
+		}
+	}
+	if !strings.Contains(body, "TTL 126") {
+		t.Fatal("измеренная примета не показана")
+	}
+}
+
+func TestПустаяБазаНеВыглядитПоломкой(t *testing.T) {
+	body := renderWith(t, status.Knowledge{Linked: true})
+	if !strings.Contains(body, "Это не сбой") {
+		t.Fatal("пустая база не объяснена — читается как поломка")
+	}
+	if !strings.Contains(body, "Ничего не ищется") {
+		t.Fatal("отсутствие поисков не объяснено")
+	}
+}
+
+func TestБезКонтроллераПанельНеВыдаётПрошлоеЗаНастоящее(t *testing.T) {
+	p, err := New(config.Default(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	p.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "не подключён к датапату") {
+		t.Fatal("панель молчит о том, что происходящего не видит")
+	}
+}
+
+func TestИдущийПоискПоказанКакЖивоеСостояние(t *testing.T) {
+	// §2.3 и §8: закрытый неудачей поиск исчезает бесследно, и панель обязана
+	// сказать об этом, а не делать вид, что ведёт историю.
+	body := renderWith(t, status.Knowledge{
+		Linked: true,
+		Searches: []status.SearchView{{
+			Target: "linkedin.com", Phase: "проверяем готовый план коробки box-4c",
+			Attempts: 2, Probes: 2, Candidate: "plan-b0",
+		}},
+	})
+	if !strings.Contains(body, "linkedin.com") || !strings.Contains(body, "готовый план коробки") {
+		t.Fatal("идущий поиск не показан")
+	}
+	// Проверяем по фразе, а не по куску строки: перенос в шаблоне не должен
+	// ломать вердикт проверки.
+	if !strings.Contains(body, "Поиск не записывается") {
+		t.Fatal("панель не говорит, что неудачный поиск не записывается")
+	}
+}

@@ -17,7 +17,10 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/buildinfo"
+	"github.com/necronicle/d2k/internal/catalog"
 	"github.com/necronicle/d2k/internal/config"
+	"github.com/necronicle/d2k/internal/control"
+	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/status"
 	"github.com/necronicle/d2k/internal/web"
 )
@@ -178,11 +181,11 @@ func cmdServe(out, errOut *os.File) int {
 	if !ok {
 		return 1
 	}
-	if c.PanelListen == "" {
-		// Без панели служба не делает НИЧЕГО наблюдаемого: датапата ещё нет.
-		// Запускать её в таком виде — значит оставить человеку работающий
-		// процесс, который выглядит как работающий обход.
-		fmt.Fprintf(errOut, "PANEL_LISTEN пуст, а датапата ещё нет — запускать нечего.\n")
+	if c.PanelListen == "" && c.ControlSocket == "" {
+		// Без панели и без датапата служба не делает ничего наблюдаемого.
+		// Запускать её в таком виде — значит оставить человеку процесс,
+		// который выглядит работающим обходом.
+		fmt.Fprintf(errOut, "PANEL_LISTEN и CONTROL_SOCKET пусты — запускать нечего.\n")
 		return 3
 	}
 
@@ -193,12 +196,60 @@ func cmdServe(out, errOut *os.File) int {
 		return 1
 	}
 
+	// Каталог и контроллер. Панель работает и без них — просто честно
+	// говорит, что происходящего не видит: показывать прошлое знание за
+	// настоящее нельзя.
+	var stopCtl func()
+	if store, err := catalog.Open(c.CatalogPath()); err != nil && store == nil {
+		panel.SetLinkNote(fmt.Sprintf("каталог %s не читается: %v", c.CatalogPath(), err))
+	} else {
+		if err != nil {
+			// Откат на предыдущую версию каталога. Работать можно, но знать
+			// об этом обязательно.
+			fmt.Fprintf(errOut, "внимание: %v\n", err)
+		}
+		conn, derr := control.Dial(c.ControlSocket)
+		if derr != nil {
+			panel.SetLinkNote(fmt.Sprintf("датапат на %s не отвечает", c.ControlSocket))
+		} else {
+			ctrl := controller.New(conn, store, out)
+			ctrl.SetDecoy(c.DecoySNI)
+			if err := ctrl.Sync(); err != nil {
+				fmt.Fprintf(errOut, "не поставить планы подтверждённых привязок: %v\n", err)
+			}
+			panel.SetKnowledge(ctrl)
+			go func() {
+				if err := ctrl.Run(); err != nil {
+					fmt.Fprintf(errOut, "контроллер остановлен: %v\n", err)
+				}
+			}()
+			stopCtl = func() {
+				_ = conn.Close()
+				// §5.5: у остановки должен быть описанный путь, и
+				// «накопленное потерялось» им не является.
+				if wrote, err := store.FlushNow(time.Now()); err != nil {
+					fmt.Fprintf(errOut, "каталог не записан при остановке: %v\n", err)
+				} else if wrote {
+					fmt.Fprintf(out, "каталог записан при остановке.\n")
+				}
+			}
+		}
+	}
+	if stopCtl != nil {
+		defer stopCtl()
+	}
+
 	fmt.Fprintf(out, "%s\n", buildinfo.Short())
 	fmt.Fprintf(out, "панель: http://%s/\n", c.PanelListen)
 	// Говорим это при каждом запуске, а не только в панели: человек, поднявший
 	// службу из консоли, должен узнать правду до того, как решит, что обход
 	// заработал.
-	fmt.Fprintf(out, "датапат не написан: трафик не наблюдается, обход не применяется.\n")
+	if stopCtl == nil {
+		// Говорим это при каждом запуске, а не только в панели: человек,
+		// поднявший службу из консоли, должен узнать правду до того, как
+		// решит, что обход заработал.
+		fmt.Fprintf(out, "контроллер не подключён к датапату — обход не подбирается.\n")
+	}
 	if !web.LoopbackOnly(c.PanelListen) {
 		fmt.Fprintf(errOut, "внимание: панель слушает не на петле (%s) и доступна из сети. Аутентификации у неё нет.\n", c.PanelListen)
 	}
