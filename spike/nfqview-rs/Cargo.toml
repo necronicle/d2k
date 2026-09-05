@@ -1,0 +1,16 @@
+[package]
+name = "nfqview-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Только объявления системных вызовов. Рантайма не добавляет — это нужно,
+# чтобы сравнение с C оставалось сравнением языков, а не обвязок.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

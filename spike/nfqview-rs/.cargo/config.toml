@@ -1,0 +1,6 @@
+# Линкуем через zig: он несёт musl и заголовки Linux для aarch64.
+# link-self-contained=no обязателен: иначе rustc подкладывает СВОЙ crt1.o
+# поверх zig-овского и линковщик падает на дубликате символа _start.
+[target.aarch64-unknown-linux-musl]
+linker = "/Library/Zapret2/d2k/spike/nfqview-rs/zig-aarch64-linker.sh"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=no"]

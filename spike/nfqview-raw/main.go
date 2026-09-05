@@ -116,7 +116,7 @@ var (
 	stVerdct uint64
 	stRecv   uint64
 	errShown int
-	dumpLeft = 2
+	dumpLeft = 0
 )
 
 func nowSec() float64 {
@@ -454,7 +454,11 @@ func main() {
 
 	// Таймаут на чтение нужен, чтобы тик отчёта и выход по времени случались
 	// и в полной тишине на линии.
-	tv := syscall.Timeval{Sec: 0, Usec: 200000}
+	// 20 мс, а не 200: в групповом режиме этим таймаутом добирается остаток
+	// пачки, и при 200 мс хвост каждой группы застревал на пятую долю секунды.
+	// Из-за этого go-raw-batch показывал 6,4 МБ/с при самом низком CPU — цена
+	// была моя, не механизма.
+	tv := syscall.Timeval{Sec: 0, Usec: 20000}
 	_ = syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
 
 	buf := make([]byte, recvBuf)
