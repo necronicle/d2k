@@ -476,6 +476,12 @@ func (c *Controller) onSuspect(ev control.Event, now time.Time) error {
 		}
 		c.tasks[target] = t
 		c.sayf("подозрение по %s (%s): начат поиск", target, control.SuspectText(ev.Code))
+		if sig.TTL != 0 || sig.IPID != 0 {
+			// Примета печатается целиком: без неё «узнавание не сработало»
+			// приходится угадывать по последствиям.
+			c.sayf("  примета: %s ttl=%d (сервер %d) tos=%#02x ipid=%d",
+				sig.Kind, sig.TTL, ev.RefTTL, sig.ToS, sig.IPID)
+		}
 		// Просим форму приветствия: зонд обязан повторять то, что шлёт
 		// клиент, а не своё. Если не успеет прийти — соберём похожее сами и
 		// скажем об этом.

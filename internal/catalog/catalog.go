@@ -430,14 +430,28 @@ func (c *Catalog) Confirm(fp Fingerprint, p Plan,
 	b, _ := c.Recognise(fp)
 	created := false
 	if b == nil {
-		c.Boxes = append(c.Boxes, Box{
-			ID:          boxID(fp, now),
-			Created:     now,
-			Fingerprint: fp,
-		})
-		b = &c.Boxes[len(c.Boxes)-1]
-		created = true
-	} else {
+		// Имя выводится из отпечатка, значит два одинаковых отпечатка дадут
+		// одно имя. Если узнавание почему-то не сработало, а имя уже занято —
+		// это ТА ЖЕ коробка, и заводить вторую с тем же именем нельзя:
+		// каталог с двумя одноимёнными записями не проходит проверку и не
+		// записывается вовсе, то есть теряется всё подтверждённое за сеанс.
+		//
+		// Проверка стоит здесь, а не только в Validate, потому что Validate
+		// ловит уже случившееся, а тут ещё можно поступить правильно.
+		id := boxID(fp, now)
+		if ex := c.BoxByID(id); ex != nil {
+			b = ex
+		} else {
+			c.Boxes = append(c.Boxes, Box{
+				ID:          id,
+				Created:     now,
+				Fingerprint: fp,
+			})
+			b = &c.Boxes[len(c.Boxes)-1]
+			created = true
+		}
+	}
+	if !created {
 		// Уточняем отпечаток: новые сигналы добавляются, счётчик виденного
 		// растёт. Старые не выбрасываются — они были измерены.
 		b.Fingerprint = mergeFingerprint(b.Fingerprint, fp)

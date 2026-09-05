@@ -416,3 +416,30 @@ func TestРазноеРасстояниеДоСервераНеПлодитКо�
 		t.Fatal("подделка с другого расстояния слилась с прежней коробкой")
 	}
 }
+
+func TestДваОдинаковыхОтпечаткаНеДаютДвеОдноимённыхКоробки(t *testing.T) {
+	// Имя выводится из отпечатка, значит одинаковые отпечатки дадут одно имя.
+	// Каталог с двумя одноимёнными записями не проходит проверку и НЕ
+	// ЗАПИСЫВАЕТСЯ ВОВСЕ — теряется всё подтверждённое за сеанс. Ровно это и
+	// случилось на полевом прогоне 2026-09-05.
+	c := catalog.New()
+	now := time.Now()
+	f := fp(127, 54321, 0x88)
+
+	for i, tgt := range []string{"a.example", "b.example", "c.example"} {
+		if _, _, err := c.Confirm(f, armPlan("p1"), "name", tgt,
+			catalog.LevelProtocol, now); err != nil {
+			t.Fatalf("цель %d: %v", i, err)
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("каталог не проходит проверку: %v", err)
+	}
+	if len(c.Boxes) != 1 {
+		ids := make([]string, len(c.Boxes))
+		for i, b := range c.Boxes {
+			ids[i] = b.ID
+		}
+		t.Fatalf("коробок %d с именами %v, а отпечаток один", len(c.Boxes), ids)
+	}
+}
