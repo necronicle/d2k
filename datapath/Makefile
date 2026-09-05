@@ -12,10 +12,14 @@ LDFLAGS ?=
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h plan_internal.h
+SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h plan_internal.h
 
-.PHONY: all check test-parse test-apply test-tls test-wire test-track test-session cross clean
+# Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
+# разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl
+
+.PHONY: all check san test-parse test-apply test-tls test-wire test-track test-session test-nl cross clean
 
 all: planlab
 
@@ -49,6 +53,12 @@ test_track: test_track.c track.o $(HDR)
 wire.o: wire.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+nl.o: nl.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_nl: test_nl.c nl.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_nl.c nl.o $(LDFLAGS)
+
 test_wire: test_wire.c wire.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_wire.c wire.o $(LDFLAGS)
 
@@ -76,6 +86,23 @@ test-track: test_track
 test-session: test_session
 	./test_session
 
+test-nl: test_nl
+	./test_nl
+
+# Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
+# утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
+# потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
+SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+           -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude
+san:
+	@set -e; for t in $(TESTS); do \
+		echo "== $$t =="; \
+		$(CC) $(SANFLAGS) -o /tmp/d2k-san-$$t $$t.c \
+			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') ; \
+		/tmp/d2k-san-$$t; \
+	done
+	@echo "санитайзеры: все проверки прошли"
+
 # Переносимость проверяется компиляцией под целевые арки. Запускать там нечего
 # и не нужно: ловим порядок байт, выравнивание и ширину типов.
 cross:
@@ -89,7 +116,7 @@ cross:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-track test-session
+check: all test-parse test-apply test-tls test-wire test-track test-session test-nl
 
 clean:
-	rm -f *.o test_plan_parse test_plan_apply test_tls test_wire test_track test_session planlab
+	rm -f *.o $(TESTS) planlab

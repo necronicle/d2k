@@ -26,6 +26,9 @@ make -C datapath clean
 make -C datapath check
 make -C datapath planlab
 
+echo "== датапат: санитайзеры =="
+make -C datapath san
+
 echo "== датапат: переносимость =="
 make -C datapath cross
 

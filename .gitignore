@@ -13,3 +13,4 @@ docs/superpowers/
 datapath/*.o
 datapath/test_plan_*
 datapath/planlab
+datapath/test_nl
