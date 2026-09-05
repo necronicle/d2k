@@ -270,3 +270,59 @@ func TestВторойКонтроллерОтвергается(t *testing.T) {
 		t.Fatalf("второй контроллер не отвергнут: прочитано %d, ошибка %v", n, err)
 	}
 }
+
+func TestСвидетельствоОбменаДоезжает(t *testing.T) {
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	p.say(t, "hello example.net")
+	p.say(t, "reply 22") // 22 — рукопожатие TLS
+
+	var ex *control.Event
+	for i := 0; i < 6; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие %d: %v", i, err)
+		}
+		if ev.Type == control.EvExchange {
+			ex = &ev
+			break
+		}
+	}
+	if ex == nil {
+		t.Fatal("свидетельство обмена не доехало")
+	}
+	if ex.RecordType != control.TLSHandshake {
+		t.Fatalf("тип записи %d, а ждали рукопожатие (%d)",
+			ex.RecordType, control.TLSHandshake)
+	}
+	if ex.Bytes == 0 {
+		t.Fatal("байты обмена нулевые")
+	}
+}
+
+func TestПредупреждениеTLSНеПутаетсяСРукопожатием(t *testing.T) {
+	// §4.2: уровень 2 не выдавать за уровень 4. Датапат сообщает ТИП записи,
+	// а не вывод «работает»; вывод делает контроллер. Проверка на то, что тип
+	// доезжает неискажённым.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	p.say(t, "hello alert.example")
+	p.say(t, "reply 21") // 21 — предупреждение TLS
+
+	for i := 0; i < 6; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие %d: %v", i, err)
+		}
+		if ev.Type == control.EvExchange {
+			if ev.RecordType != control.TLSAlert {
+				t.Fatalf("тип записи %d, а ждали предупреждение (%d)",
+					ev.RecordType, control.TLSAlert)
+			}
+			return
+		}
+	}
+	t.Fatal("свидетельство обмена не доехало")
+}

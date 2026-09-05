@@ -127,6 +127,14 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         case D2K_JRN_PLAN_REFUSED:
             type = D2K_EV_REFUSED;
             break;
+        case D2K_JRN_EXCHANGE:
+            type = D2K_EV_EXCHANGE;
+            body[n++] = e->code;            /* тип первой TLS-записи */
+            body[n++] = (uint8_t)(e->num >> 24);
+            body[n++] = (uint8_t)(e->num >> 16);
+            body[n++] = (uint8_t)(e->num >> 8);
+            body[n++] = (uint8_t)e->num;
+            break;
         default:
             continue;
         }

@@ -103,6 +103,10 @@ uint64_t d2k_session_suspects(const d2k_session *s);
  * счётчика их не различить. */
 uint64_t d2k_session_rst_dropped(const d2k_session *s);
 
+/* Сколько потоков дали обмен: с обратной стороны пришла нагрузка после
+ * приветствия. Это НАБЛЮДЕНИЕ уровня 2 по §4.2, а не «работает». */
+uint64_t d2k_session_exchanges(const d2k_session *s);
+
 const d2k_journal *d2k_session_journal(const d2k_session *s);
 
 #endif /* D2K_SESSION_H */

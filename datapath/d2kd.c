@@ -216,9 +216,11 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            d2k_session_flows(s), d2k_session_capacity(s),
            d2k_session_refusals(s));
     printf("узнано приветствий %" PRIu64 ", из них с именем %" PRIu64
-           ", подозрений %" PRIu64 ", снято чужих сбросов %" PRIu64 "\n",
+           ", обменов %" PRIu64 ", подозрений %" PRIu64
+           ", снято чужих сбросов %" PRIu64 "\n",
            d2k_session_hellos(s), d2k_session_with_sni(s),
-           d2k_session_suspects(s), d2k_session_rst_dropped(s));
+           d2k_session_exchanges(s), d2k_session_suspects(s),
+           d2k_session_rst_dropped(s));
     printf("в очереди отправки %zu, отказов расписания %" PRIu64 "\n",
            d2k_sched_count(sched), d2k_sched_refusals(sched));
     printf("обрезано %" PRIu64 ", без нагрузки %" PRIu64
@@ -254,6 +256,7 @@ static const char *jrn_kind(uint8_t k) {
     case D2K_JRN_PLAN_APPLIED:  return "план применён";
     case D2K_JRN_PLAN_REFUSED:  return "план не применён";
     case D2K_JRN_SUSPECT:       return "подозрение:";
+    case D2K_JRN_EXCHANGE:      return "обмен пошёл";
     default:                    return "?";
     }
 }

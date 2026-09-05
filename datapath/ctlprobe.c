@@ -13,6 +13,7 @@
  * Команды со stdin, по строке:
  *   hello <имя>   пропустить через сессию приветствие с этим именем
  *   rst           сброс с чужим TTL по последнему потоку
+ *   reply <тип>   ответ сервера с нагрузкой (тип TLS-записи, напр. 22)
  *   plans         напечатать, сколько планов в таблице
  *   quit
  */
@@ -163,6 +164,16 @@ int main(int argc, char **argv) {
                 d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
                 printf("hello %s: посылок %zu, пропуск %s\n", line + 6, r.n_out,
                        r.skipped ? r.skipped : "нет");
+            } else if (strncmp(line, "reply ", 6) == 0) {
+                uint8_t rec[64];
+                memset(rec, 0, sizeof rec);
+                rec[0] = (uint8_t)atoi(line + 6);
+                rec[1] = 0x03; rec[2] = 0x03;
+                rec[3] = 0x00; rec[4] = 0x28;
+                size_t sz = build_pkt(pkt, 1, port, 0x18, 124, rec, sizeof rec);
+                d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
+                printf("reply: обменов %llu\n",
+                       (unsigned long long)d2k_session_exchanges(sess));
             } else if (strcmp(line, "rst") == 0) {
                 size_t sz = build_pkt(pkt, 1, port, 0x14, 127, NULL, 0);
                 d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);

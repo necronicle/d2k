@@ -35,6 +35,7 @@ struct d2k_session {
     uint64_t     with_sni;
     uint64_t     suspects;
     uint64_t     rst_dropped;
+    uint64_t     exchanges;
 };
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
@@ -83,7 +84,7 @@ static uint16_t rd16(const uint8_t *p) {
    отсутствующего — он выглядит полным. */
 static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                    const char *why) {
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, NULL, 0, why);
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, 0, why);
 }
 
 /* Подозрение. Отмечается ОДИН раз на поток: три улики об одном соединении
@@ -98,7 +99,7 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     }
     fl->suspected = 1;
     s->suspects++;
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, NULL, 0, NULL);
 }
 
 /* Зовётся при забвении потока по молчанию. Приветствие ушло, ответа с той
@@ -109,8 +110,7 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
         return;
     }
     s->suspects++;
-    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT,
-                    D2K_SUSPECT_SILENT, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, NULL, 0, NULL);
 }
 
 static uint32_t rd32(const uint8_t *p) {
@@ -228,6 +228,18 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         fl->rev_bytes += total;
         if (fl->saw_hello) {
             fl->rev_after_hello++;
+            size_t rpay_off = ihl + doff;
+            if (total > rpay_off) {
+                size_t rpay = total - rpay_off;
+                if (fl->rev_first_type == 0) {
+                    /* Тип первой TLS-записи запоминается как есть. Толковать
+                       его здесь нельзя: 0x16 рукопожатие и 0x15 предупреждение
+                       — разные вещи, а §4.2 требует, чтобы уровни
+                       доказательства различал принимающий решение. */
+                    fl->rev_first_type = pkt[rpay_off];
+                }
+                fl->rev_payload_after_hello += (uint32_t)rpay;
+            }
         }
     }
     if (syn && !ack) {
@@ -235,6 +247,14 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
     if (syn && ack) {
         fl->saw_synack = 1;
+    }
+
+    if (fl->saw_hello && !fl->exchange_told && fl->rev_payload_after_hello > 0) {
+        fl->exchange_told = 1;
+        s->exchanges++;
+        d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
+                        fl->rev_first_type, fl->rev_payload_after_hello,
+                        NULL, 0, NULL);
     }
 
     /* Закрытие — повод отпустить ячейку сразу, не дожидаясь молчания.
@@ -314,13 +334,13 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             s->hellos++;
             if (tls.have_sni) {
                 s->with_sni++;
-                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0,
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0,
                                 pkt + payload_off + tls.sni_off, tls.sni_len,
                                 NULL);
             } else {
                 /* Имени нет — и это нормальное состояние модели (§5.3), а не
                    ошибка разбора. */
-                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME, 0,
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME, 0, 0,
                                 NULL, 0, NULL);
             }
         }
@@ -446,7 +466,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
-    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, NULL, 0, NULL);
+    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, 0, NULL);
 
     d2k_actions_free(&acts);
     return 0;
@@ -499,6 +519,10 @@ uint64_t d2k_session_suspects(const d2k_session *s) {
 
 uint64_t d2k_session_rst_dropped(const d2k_session *s) {
     return s ? s->rst_dropped : 0;
+}
+
+uint64_t d2k_session_exchanges(const d2k_session *s) {
+    return s ? s->exchanges : 0;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

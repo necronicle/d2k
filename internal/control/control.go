@@ -105,7 +105,26 @@ type Event struct {
 	Code uint8
 	// Текст причины для EvRefused — свободный, только для показа.
 	Note string
+
+	// Для EvExchange: тип первой TLS-записи с обратной стороны и сколько
+	// байт нагрузки пришло после приветствия.
+	//
+	// Это НАБЛЮДЕНИЕ, а не «работает». §4.2 требует различать уровни
+	// доказательства: 0x16 (рукопожатие) и 0x15 (предупреждение) — разные
+	// вещи, а «ответ пришёл» и «прикладной обмен завершён» тем более.
+	// Различает их тот, кто принимает решение, то есть контроллер.
+	RecordType uint8
+	Bytes      uint32
 }
+
+// Типы записей TLS, встречающиеся в ответе. Не для вывода «работает»: см.
+// комментарий к полю RecordType.
+const (
+	TLSChangeCipherSpec uint8 = 20
+	TLSAlert            uint8 = 21
+	TLSHandshake        uint8 = 22
+	TLSAppData          uint8 = 23
+)
 
 // Conn — подключение к датапату.
 type Conn struct {
@@ -215,6 +234,12 @@ func (c *Conn) Next() (Event, error) {
 		ev.Code = rest[0]
 	case EvRefused:
 		ev.Note = string(rest)
+	case EvExchange:
+		if len(rest) < 5 {
+			return ev, errors.New("обмен без типа записи и длины")
+		}
+		ev.RecordType = rest[0]
+		ev.Bytes = binary.BigEndian.Uint32(rest[1:5])
 	}
 	return ev, nil
 }
