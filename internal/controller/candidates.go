@@ -1,16 +1,51 @@
 package controller
 
 import (
+	"bufio"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/necronicle/d2k/internal/catalog"
 	"github.com/necronicle/d2k/internal/plan"
 )
 
+//go:embed lists/decoy_names.txt
+var decoyList string
+
+// decoyNames — имена, которыми задаётся вопрос «какое проходит на этой линии».
+//
+// Не база заблокированных доменов, которую §2.2 запрещает, а алфавит
+// инструмента. Порядок сохранён от источника: перестановка под собственный
+// замер была бы подгонкой под одну линию.
+func decoyNames() []string {
+	var out []string
+	sc := bufio.NewScanner(strings.NewReader(decoyList))
+	for sc.Scan() {
+		s := strings.TrimSpace(sc.Text())
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// maxDecoyTries — сколько имён перебираем за один поиск.
+//
+// Список источника длинный, а каждая попытка — это соединение человека.
+// Замер донора показал, что рабочие имена стоят в начале (5-е, 12-е, 57-е),
+// поэтому глубокий перебор окупается плохо. Число выбрано так, чтобы покрыть
+// начало списка и не превратить поиск в час ожидания.
+const maxDecoyTries = 16
+
 // Candidate — план, который предстоит проверить на фактической цели.
 type Candidate struct {
+	// Decoy — какое имя подставлено в приманку. Пустое — приманки нет либо
+	// имя не является осью этого кандидата.
+	Decoy string
 	// Откуда взялся: имя коробки либо «поиск». Нужно счётчику §10 «доля
 	// встреч с известными моделями, завершённых без нового поиска».
 	Source string
@@ -96,13 +131,15 @@ func wrap(p plan.Plan, proto string) (catalog.Plan, error) {
 // Ни один отказ отсюда не попадает на диск (§2.3): лестница строится заново
 // при каждом поиске.
 func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
-	sawRST, sawQuiet := false, false
+	sawRST, sawQuiet, sawVolume := false, false, false
 	for _, s := range fp.Signals {
 		switch s.Kind {
 		case "rst":
 			sawRST = true
 		case "silent", "repeat":
 			sawQuiet = true
+		case "volume":
+			sawVolume = true
 		}
 	}
 
@@ -145,6 +182,25 @@ func generate(fp catalog.Fingerprint, decoy string) ([]Candidate, error) {
 			{fake: true, ttl: 6, repeats: 2, gap: 78000},
 			{fake: true, ttl: 3, repeats: 4, gap: 0},
 		}
+	}
+
+	// Обрыв по объёму — отдельная ось, и она про ИМЯ, а не про разрез.
+	// Замер донора: результат одинаков и с одним видом разреза, и с другим;
+	// несущая часть — имя в приманке. Значит и перебирать надо имена.
+	if sawVolume {
+		names := decoyNames()
+		if len(names) > maxDecoyTries {
+			names = names[:maxDecoyTries]
+		}
+		out := make([]Candidate, 0, len(names))
+		for _, nm := range names {
+			p, err := fakePlan(nm, 3, 2, 78000, sawRST)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Candidate{Source: "имя " + nm, Plan: p, Decoy: nm})
+		}
+		return out, nil
 	}
 
 	out := make([]Candidate, 0, len(steps))

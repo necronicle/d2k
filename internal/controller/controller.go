@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/catalog"
+	"github.com/necronicle/d2k/internal/conntrack"
 	"github.com/necronicle/d2k/internal/control"
 	"github.com/necronicle/d2k/internal/plan"
 	"github.com/necronicle/d2k/internal/probe"
@@ -107,6 +108,9 @@ type Task struct {
 	awaiting bool
 	// Сколько раз зондировали. §10 требует считать стоимость зондов на цель.
 	Probes int
+	// Объём, на котором потоки к этой цели кончаются раз за разом. Ноль —
+	// не наблюдали.
+	VolumeCutAt int64
 }
 
 // Prober — то, чем контроллер стучится в цель. Интерфейс, а не структура,
@@ -133,6 +137,11 @@ type Controller struct {
 	// в каком получил, поэтому очередь ожидающих — обычная FIFO.
 	pendingAcks []string
 	results     chan probeDone
+
+	// Наблюдение за объёмом: обрыв, который не виден в окне первых пакетов.
+	volume   map[string]*volumeWatch
+	ctPath   string
+	ctWarned bool
 
 	// Цели, по которым поиск недавно закончился ничем. Только в памяти и
 	// только на короткий срок: §2.3 запрещает персистить отказ, но десять
@@ -167,8 +176,14 @@ func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 		names:    map[control.Key]string{},
 		results:  make(chan probeDone, 32),
 		cooldown: map[string]time.Time{},
+		volume:   map[string]*volumeWatch{},
+		ctPath:   conntrack.DefaultPath,
 	}
 }
+
+// SetConntrackPath подменяет источник счётчиков ядра. Для проверок: они не
+// должны зависеть от того, что творится в таблице этой машины.
+func (c *Controller) SetConntrackPath(p string) { c.ctPath = p }
 
 // SetProber подменяет способ стучаться в цель. Нужен проверкам: они не должны
 // ходить в сеть.
@@ -282,6 +297,12 @@ func (c *Controller) Run() error {
 		}
 	}()
 
+	// Счётчики ядра опрашиваются по часам, а не по событиям: обрыв по объёму
+	// случается ПОСЛЕ того, как окно наблюдения датапата давно закрылось, и
+	// никакого события про него не придёт.
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+
 	for {
 		select {
 		case ev := <-events:
@@ -292,6 +313,8 @@ func (c *Controller) Run() error {
 			if err := c.onProbe(r); err != nil {
 				return err
 			}
+		case <-tick.C:
+			c.pollVolume(c.now())
 		case err := <-fail:
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -304,6 +327,7 @@ func (c *Controller) Run() error {
 // Pump разбирает готовые результаты зондов, не блокируя. Для проверок,
 // которые зовут Handle напрямую.
 func (c *Controller) Pump() error {
+	c.pollVolume(c.now())
 	for {
 		select {
 		case r := <-c.results:
@@ -324,6 +348,13 @@ func (c *Controller) Handle(ev control.Event) error {
 	switch ev.Type {
 	case control.EvHello:
 		c.remember(ev.Key, ev.Name)
+		if ev.Name != "" {
+			// Под наблюдение по объёму ставим сразу: обрыв случится позже,
+			// когда окно датапата уже закроется, и начинать смотреть в тот
+			// момент будет поздно.
+			ip, _ := serverOf(ev.Key)
+			c.watchVolume(ev.Name, ip)
+		}
 
 	case control.EvAck:
 		return c.onAck(ev, now)
@@ -662,7 +693,11 @@ func (c *Controller) advance(t *Task) error {
 		c.pendingAcks = append(c.pendingAcks, t.Target)
 		t.Current = &cand
 		t.AppliedCount = 0
-		t.awaiting = c.prober != nil && t.ServerIP != ""
+		// Для обрыва по объёму зонд не годится: чтобы перевалить за порог,
+		// нужен полный сеанс TLS и прикладной запрос, а §2.6 запрещает
+		// подмешивать такое. Проверяем тем же прибором, которым обнаружили —
+		// счётчиками ядра на трафике самого человека, как и делает донор.
+		t.awaiting = c.prober != nil && t.ServerIP != "" && t.VolumeCutAt == 0
 		t.Attempts++
 		c.sayf("по %s пробую %s (%s), попытка %d",
 			t.Target, cand.Plan.ID, cand.Source, t.Attempts)
@@ -834,6 +869,13 @@ func (c *Controller) onAck(ev control.Event, now time.Time) error {
 		c.sayf("по %s датапат отверг %s, беру следующий", target, t.Current.Plan.ID)
 		t.Current = nil
 		return c.advance(t)
+	}
+	if t.VolumeCutAt > 0 {
+		// Цель с обрывом по объёму проверяется счётчиком ядра, а не зондом:
+		// зонд не доберётся до порога, потому что для этого нужен полный сеанс
+		// и прикладной запрос. Пустить его сюда — потратить время и ничего не
+		// измерить.
+		return nil
 	}
 	c.startProbe(t, now)
 	return nil
