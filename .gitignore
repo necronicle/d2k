@@ -7,3 +7,6 @@ spike/nfqview-c/nfqview-c-linux-*
 spike/bench/results/
 spike/nfqview-raw/nfqview-raw-linux-*
 builds/
+
+# Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
+docs/superpowers/
