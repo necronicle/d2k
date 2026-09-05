@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/probe"
 	"github.com/necronicle/d2k/internal/volume"
 )
@@ -127,12 +128,17 @@ func TestИмяБерётсяИзПробыАНеИзПеребора(t *testing
 		t.Fatal("для цели с обрывом по объёму пущен пакетный зонд, который тут ничего не мерит")
 	}
 
-	// Поток перевалил за обрыв вдвое — вот это доказательство.
-	writeCT(t, ct, ctLine(probeServerIP, 60000, 163654))
+	// Проверка идёт сама и немедленно: ждать, пока человек прокачает через
+	// цель двадцать килобайт, — это те самые «повторы вместо времени».
 	r.pump(3)
-
-	if !strings.Contains(r.log.String(), "обрыв по объёму снят") {
-		t.Fatalf("превышение объёма не засчитано:\n%s", r.log)
+	if r.vol.probeCount() == 0 {
+		t.Fatalf("поставленный план никто не проверил:\n%s", r.log)
+	}
+	if r.vol.probeSNI != "volume.example" {
+		t.Fatalf("проверка пошла с именем %q, а датапат ищет план по имени цели", r.vol.probeSNI)
+	}
+	if !strings.Contains(r.log.String(), "провёл 39 КБ там, где рвалось на 19 КБ") {
+		t.Fatalf("прохождение объёма не засчитано:\n%s", r.log)
 	}
 	_, bind, _ := r.store.Catalog().Lookup("volume.example", "")
 	if bind == nil {
@@ -208,4 +214,99 @@ func TestБезТаблицыЯдраМолчанияНеБывает(t *testing
 		t.Fatalf("недоступность счётчиков не объявлена:\n%s", r.log)
 	}
 	_ = time.Now
+}
+
+func TestПанельНазываетЗаданныйВопрос(t *testing.T) {
+	// Подбор имени по объёму занимает до полутора минут. Всё это время писать
+	// «распознаём поведение» — молчать о том, чем занят прибор.
+	r := newRig(t)
+	r.vol.set(volume.ScanFound, "проходящее.example", 19)
+	hold := make(chan struct{})
+	r.vol.hold = hold
+	r.say("hello asking.example")
+	r.say("rst")
+	for i := 0; i < 10 && r.vol.count() == 0; i++ {
+		r.pump(1)
+	}
+	defer close(hold)
+
+	var phase string
+	for _, s := range r.ctrl.Knowledge().Searches {
+		if s.Target == "asking.example" {
+			phase = s.Phase
+		}
+	}
+	if !strings.Contains(phase, "спрашиваем") {
+		t.Fatalf("панель показывает фазу %q, а идёт вопрос:\n%s", phase, r.log)
+	}
+}
+
+func TestПорядокИмёнСогреваетсяИзКаталога(t *testing.T) {
+	// После перезагрузки роутера подбор не должен начинать с нуля: имя,
+	// однажды открывшее дорогу, записано внутри сработавшего плана, и порядок
+	// кандидатов обязан это учитывать.
+	r := newRig(t)
+	// Имя латиницей намеренно: согревание достаёт его из приманки внутри
+	// плана, а разбор приветствия читает только печатный ASCII — как и все
+	// настоящие имена узлов.
+	r.vol.set(volume.ScanFound, "passing.example", 19)
+	ct := filepath.Join(t.TempDir(), "ct")
+	r.ctrl.SetConntrackPath(ct)
+	writeCT(t, ct)
+	r.say("hello first.example")
+	r.pump(3)
+	for i, n := range []int64{15994, 16000, 15900} {
+		writeCT(t, ct, ctLine(probeServerIP, 50000+i, n))
+		r.pump(2)
+		writeCT(t, ct)
+		r.pump(2)
+	}
+	r.pump(4)
+	writeCT(t, ct, ctLine(probeServerIP, 60000, 163654))
+	r.pump(3)
+	if _, bind, _ := r.store.Catalog().Lookup("first.example", ""); bind == nil {
+		t.Fatalf("решение не записано, согревать нечем:\n%s", r.log)
+	}
+
+	// Новый контроллер на том же каталоге — как после перезагрузки.
+	fresh := controller.New(r.conn, r.store, r.log)
+	if got := fresh.VolumeNames(); len(got) == 0 || got[0] != "passing.example" {
+		head := got
+		if len(head) > 3 {
+			head = head[:3]
+		}
+		t.Fatalf("порядок кандидатов начинается с %v, а сработавшее имя известно", head)
+	}
+}
+
+func TestНеПрошедшийПланУступаетМестоСледующему(t *testing.T) {
+	// Цель бывает закрыта сразу двумя способами: объём режется, и вдобавок имя
+	// в настоящем приветствии не пропускают. Остановиться на подстановке имени
+	// значило бы бросить такую цель на полпути.
+	r := newRig(t)
+	r.vol.set(volume.ScanFound, "passing.example", 19)
+	r.vol.verifyVerdict = volume.VerdictCut
+	ct := filepath.Join(t.TempDir(), "ct")
+	r.ctrl.SetConntrackPath(ct)
+	writeCT(t, ct)
+	r.say("hello both.example")
+	r.pump(3)
+	for i, n := range []int64{15994, 16000, 15900} {
+		writeCT(t, ct, ctLine(probeServerIP, 50000+i, n))
+		r.pump(2)
+		writeCT(t, ct)
+		r.pump(2)
+	}
+	r.pump(12)
+
+	logs := r.log.String()
+	if !strings.Contains(logs, "объём не провёл") {
+		t.Fatalf("неудача проверки не записана:\n%s", logs)
+	}
+	if n := strings.Count(logs, "пробую"); n < 2 {
+		t.Fatalf("поставлен %d кандидат: после неудачи имени поиск не продолжен:\n%s", n, logs)
+	}
+	if !strings.Contains(logs, "(поиск)") {
+		t.Fatalf("после оси имени не пробовалась ось разреза:\n%s", logs)
+	}
 }

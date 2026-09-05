@@ -56,16 +56,46 @@ type fakeVolume struct {
 	tried   int
 	calls   int
 	names   []string
+	// hold — задержать ответ. Подбор в жизни идёт до полутора минут, и
+	// проверить, что видно человеку ВО ВРЕМЯ него, иначе нечем.
+	hold chan struct{}
+
+	// Проверка поставленного плана.
+	probes        int
+	probeSNI      string
+	verifyVerdict volume.Verdict
 }
 
 func (f *fakeVolume) Scan(_ context.Context, t volume.Target, names []string, _ volume.ScanOptions) volume.ScanResult {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	hold := f.hold
 	f.calls++
 	f.names = names
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return volume.ScanResult{
 		Target: t, Verdict: f.verdict, Name: f.name, CutAtKB: f.cutKB, Tried: f.tried,
 	}
+}
+
+// Probe — проверка поставленного плана. Отдельный сценарий: подбор и проверка
+// отвечают на разные вопросы, и путать их в стенде нельзя.
+func (f *fakeVolume) Probe(_ context.Context, t volume.Target, sni string, p volume.Pump) volume.Result {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probes++
+	f.probeSNI = sni
+	return volume.Result{Target: t, SNI: sni, Pump: p, Verdict: f.verifyVerdict, AtKB: 39}
+}
+
+func (f *fakeVolume) probeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.probes
 }
 
 func (f *fakeVolume) count() int {
@@ -236,7 +266,7 @@ func newRig(t *testing.T) *rig {
 		clock: time.Date(2026, 9, 5, 21, 0, 0, 0, time.UTC),
 	}
 	r.probe = &fakeProber{}
-	r.vol = &fakeVolume{verdict: volume.ScanNoBlock}
+	r.vol = &fakeVolume{verdict: volume.ScanNoBlock, verifyVerdict: volume.VerdictPassed}
 	r.ctrl = controller.New(conn, store, log)
 	r.ctrl.SetClock(func() time.Time { return r.clock })
 	r.ctrl.SetProber(r.probe)

@@ -144,6 +144,7 @@ type Controller struct {
 	// Подбор имени по объёму: своя проба, свой канал ответов.
 	volProber  VolumeProber
 	volResults chan volumeScanDone
+	volVerify  chan volumeVerifyDone
 	// nameHits — сколько раз имя уже проводило объём на этой линии. Только в
 	// памяти: это ускоритель порядка перебора, а не знание о цели.
 	nameHits map[string]int
@@ -175,7 +176,7 @@ type Controller struct {
 
 // New создаёт контроллер.
 func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
-	return &Controller{
+	c := &Controller{
 		conn:     conn,
 		store:    store,
 		out:      out,
@@ -191,8 +192,11 @@ func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 
 		volProber:  liveVolumeProber{},
 		volResults: make(chan volumeScanDone, 8),
+		volVerify:  make(chan volumeVerifyDone, 8),
 		nameHits:   map[string]int{},
 	}
+	c.seedNameHits()
+	return c
 }
 
 // SetConntrackPath подменяет источник счётчиков ядра. Для проверок: они не
@@ -331,6 +335,10 @@ func (c *Controller) Run() error {
 			if err := c.onVolumeScan(r); err != nil {
 				return err
 			}
+		case r := <-c.volVerify:
+			if err := c.onVolumeVerify(r); err != nil {
+				return err
+			}
 		case <-tick.C:
 			c.pollVolume(c.now())
 		case err := <-fail:
@@ -354,6 +362,10 @@ func (c *Controller) Pump() error {
 			}
 		case r := <-c.volResults:
 			if err := c.onVolumeScan(r); err != nil {
+				return err
+			}
+		case r := <-c.volVerify:
+			if err := c.onVolumeVerify(r); err != nil {
 				return err
 			}
 		default:
@@ -720,10 +732,9 @@ func (c *Controller) advance(t *Task) error {
 		c.pendingAcks = append(c.pendingAcks, t.Target)
 		t.Current = &cand
 		t.AppliedCount = 0
-		// Для обрыва по объёму зонд не годится: чтобы перевалить за порог,
-		// нужен полный сеанс TLS и прикладной запрос, а §2.6 запрещает
-		// подмешивать такое. Проверяем тем же прибором, которым обнаружили —
-		// счётчиками ядра на трафике самого человека, как и делает донор.
+		// Для обрыва по объёму пакетный зонд не годится: чтобы перевалить за
+		// порог, нужен полный сеанс TLS и прикладной запрос. Такую цель
+		// проверяет накачка объёма — тем же прибором, которым обнаружили.
 		t.awaiting = c.prober != nil && t.ServerIP != "" && t.VolumeCutAt == 0
 		t.Attempts++
 		c.sayf("по %s пробую %s (%s), попытка %d",
@@ -898,10 +909,9 @@ func (c *Controller) onAck(ev control.Event, now time.Time) error {
 		return c.advance(t)
 	}
 	if t.VolumeCutAt > 0 {
-		// Цель с обрывом по объёму проверяется счётчиком ядра, а не зондом:
-		// зонд не доберётся до порога, потому что для этого нужен полный сеанс
-		// и прикладной запрос. Пустить его сюда — потратить время и ничего не
-		// измерить.
+		// Цель с обрывом по объёму проверяется накачкой объёма, а не пакетным
+		// зондом: тот до порога не доберётся, ему для этого нужен полный сеанс.
+		c.verifyVolume(t)
 		return nil
 	}
 	c.startProbe(t, now)

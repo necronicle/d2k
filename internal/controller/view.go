@@ -37,6 +37,12 @@ func (c *Controller) Knowledge() status.Knowledge {
 			Probes:   t.Probes,
 			Phase:    "распознаём поведение",
 		}
+		// Заданный вопрос виден человеку: подбор имени по объёму занимает до
+		// полутора минут, и «распознаём поведение» всё это время не объясняет
+		// ничего.
+		if t.Asking.Name != "" {
+			v.Phase = "спрашиваем: " + t.Asking.Name
+		}
 		if t.Current != nil {
 			v.Candidate = t.Current.Plan.ID
 			v.Source = t.Current.Source
@@ -102,6 +108,10 @@ func humanSignal(s catalog.Signal) string {
 		return "приветствие приходится повторять: ответа нет"
 	case "silent":
 		return "на приветствие не отвечают вовсе"
+	case "volume":
+		// Объём лежит в поле идентификатора: см. volumeSignal. Это измерение
+		// пробы, а не наблюдение за чужим потоком.
+		return fmt.Sprintf("поток рвётся, набрав около %d КБ", s.IPID)
 	default:
 		return s.Kind
 	}

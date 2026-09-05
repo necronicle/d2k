@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/catalog"
+	"github.com/necronicle/d2k/internal/plan"
 
 	"github.com/necronicle/d2k/internal/volume"
 )
@@ -54,6 +55,7 @@ const (
 // ходили в сеть.
 type VolumeProber interface {
 	Scan(ctx context.Context, t volume.Target, names []string, opt volume.ScanOptions) volume.ScanResult
+	Probe(ctx context.Context, t volume.Target, sni string, pump volume.Pump) volume.Result
 }
 
 type liveVolumeProber struct{}
@@ -62,12 +64,96 @@ func (liveVolumeProber) Scan(ctx context.Context, t volume.Target, names []strin
 	return volume.Scan(ctx, t, names, opt)
 }
 
+func (liveVolumeProber) Probe(ctx context.Context, t volume.Target, sni string, pump volume.Pump) volume.Result {
+	return volume.Probe(ctx, t, sni, pump)
+}
+
 // SetVolumeProber подменяет пробу на объём.
 func (c *Controller) SetVolumeProber(p VolumeProber) { c.volProber = p }
 
 type volumeScanDone struct {
 	target string
 	res    volume.ScanResult
+}
+
+type volumeVerifyDone struct {
+	target string
+	res    volume.Result
+}
+
+// verifyVolume проверяет поставленный план тем же прибором, которым нашли
+// обрыв.
+//
+// Раньше здесь стояло ожидание: план ставился, и поиск ждал, пока человек сам
+// прокачает через цель достаточно объёма. Это ровно те «повторы вместо
+// времени», от которых мы уходили: устройство, которое ходит на сервер раз в
+// сутки, не подтвердило бы решение никогда.
+//
+// Зонд идёт с НАСТОЯЩИМ именем цели: датапат ищет план по имени, и только так
+// поставленная приманка вообще вступает в дело. Проверяется, стало быть, не
+// «проходит ли имя», а «работает ли поставленный план» — это разные вопросы, и
+// первый уже отвечен подбором.
+func (c *Controller) verifyVolume(t *Task) {
+	if c.volProber == nil || t.ServerIP == "" || t.scanning {
+		return
+	}
+	t.scanning = true
+	target := t.Target
+	tgt := volume.Target{IP: t.ServerIP, Port: t.ServerPort, Plain: t.ServerPort == 80}
+	c.sayf("по %s проверяю поставленный план объёмом: %s:%d", target, t.ServerIP, t.ServerPort)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c.volVerify <- volumeVerifyDone{target: target, res: c.volProber.Probe(ctx, tgt, target, volume.PumpOut)}
+	}()
+}
+
+// onVolumeVerify — проверка ответила.
+func (c *Controller) onVolumeVerify(d volumeVerifyDone) error {
+	t := c.tasks[d.target]
+	if t == nil {
+		return nil
+	}
+	t.scanning = false
+	if t.Current == nil {
+		return nil
+	}
+
+	if d.res.Verdict != volume.VerdictPassed {
+		c.sayf("по %s план %s объём не провёл: %s", t.Target, t.Current.Plan.ID, d.res.Verdict)
+		t.Current = nil
+		return c.advance(t)
+	}
+
+	// Уровень 4 по §4.2: прикладной обмен в ПРОВЕРЯЕМОМ объёме — известно,
+	// на чём рвалось раньше, и известно, сколько прошло теперь.
+	c.sayf("по %s план %s провёл %d КБ там, где рвалось на %d КБ",
+		t.Target, t.Current.Plan.ID, d.res.AtKB, t.VolumeCutAt/1024)
+	box, created, err := c.store.Catalog().Confirm(
+		t.Fingerprint, t.Current.Plan, t.Kind, t.Target, catalog.LevelApplication, c.now())
+	if err != nil {
+		c.sayf("по %s объём прошёл, но записать нечего: %v", t.Target, err)
+		return nil
+	}
+	c.store.Touch()
+	c.Confirms++
+	what := "коробка " + box.ID
+	if created {
+		what = "заведена коробка " + box.ID
+	}
+	if t.Current.Decoy != "" {
+		c.sayf("по %s подошло имя %s: %s, план %s",
+			t.Target, t.Current.Decoy, what, t.Current.Plan.ID)
+	}
+	delete(c.tasks, t.Target)
+	if w := c.volume[t.Target]; w != nil {
+		w.told = false
+		w.samples = nil
+	}
+	if _, err := c.store.Flush(c.now()); err != nil {
+		c.sayf("каталог не записался: %v", err)
+	}
+	return nil
 }
 
 // askVolume запускает подбор. Он долгий, поэтому уходит в сторону, а ответ
@@ -108,15 +194,63 @@ func (c *Controller) askVolume(t *Task) error {
 	return nil
 }
 
+// seedNameHits согревает порядок кандидатов из каталога.
+//
+// Имена, уже открывавшие дорогу, записаны внутри подтверждённых планов — в
+// приманке. Доставать их оттуда, а не заводить отдельное поле, значит держать
+// один источник правды: план, который сработал, и есть доказательство, что имя
+// работает. Перезагрузка роутера после этого не стоит человеку лишних проб.
+func (c *Controller) seedNameHits() {
+	cat := c.store.Catalog()
+	for i := range cat.Boxes {
+		for _, pl := range cat.Boxes[i].Plans {
+			if pl.Successes == 0 {
+				continue
+			}
+			parsed, err := plan.ParseText(pl.Text)
+			if err != nil {
+				continue
+			}
+			for _, f := range parsed.Fakes {
+				pay := findPayload(parsed, f.PayloadID)
+				if pay == nil {
+					continue
+				}
+				if sni := sniOf(pay.Bytes); sni != "" {
+					c.nameHits[sni] += pl.Successes
+				}
+			}
+		}
+	}
+}
+
 // volumeNames — порядок проверки имён: сперва те, что уже открывали дорогу на
 // этой линии. Замена таблице «сеть → имя»: она стареет, а порядок сам
 // подстраивается под то, что здесь работает.
+// VolumeNames — порядок проверки имён. Наружу ради проверок: согрет ли он
+// прошлым знанием, видно только отсюда.
+func (c *Controller) VolumeNames() []string { return c.volumeNames() }
+
 func (c *Controller) volumeNames() []string {
 	all := decoyNames()
 	if len(c.nameHits) == 0 {
 		return all
 	}
-	out := append([]string(nil), all...)
+	// Сработавшее имя может не значиться в списке кандидатов вовсе: список —
+	// заготовка, а знание приходит из замера. Выбросить такое имя значило бы
+	// забыть единственное, что здесь точно работало.
+	known := make(map[string]bool, len(all))
+	out := make([]string, 0, len(all)+len(c.nameHits))
+	for _, n := range all {
+		known[n] = true
+	}
+	for n := range c.nameHits {
+		if !known[n] {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out) // порядок среди равных не должен зависеть от обхода карты
+	out = append(out, all...)
 	sort.SliceStable(out, func(i, j int) bool { return c.nameHits[out[i]] > c.nameHits[out[j]] })
 	return out
 }
@@ -141,10 +275,10 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 		t.Traits.VolumeCut = true
 		t.Traits.PassingName = r.Name
 		t.VolumeCutAt = int64(r.CutAtKB) * 1024
-		t.Fingerprint = c.volumeSignal(t, r.CutAtKB)
 		c.nameHits[r.Name]++
 		c.sayf("по %s ответ: поток рвётся на %d КБ, имя %s проводит объём (проверено имён %d)",
 			t.Target, r.CutAtKB, r.Name, r.Tried)
+		t.Fingerprint = c.volumeSignal(t, r.CutAtKB)
 		if len(r.Killed) > 0 {
 			c.sayf("по %s имена, убившие рукопожатие, отброшены: %v", t.Target, r.Killed)
 		}
@@ -152,9 +286,9 @@ func (c *Controller) onVolumeScan(d volumeScanDone) error {
 	case volume.ScanExhausted:
 		t.Traits.VolumeCut = true
 		t.VolumeCutAt = int64(r.CutAtKB) * 1024
-		t.Fingerprint = c.volumeSignal(t, r.CutAtKB)
 		c.sayf("по %s ответ: поток рвётся на %d КБ, но ни одно из %d имён его не провело",
 			t.Target, r.CutAtKB, r.Tried)
+		t.Fingerprint = c.volumeSignal(t, r.CutAtKB)
 
 	default:
 		c.sayf("по %s про объём ответа нет: %s (%s)", t.Target, r.Verdict, r.Baseline.Err)
