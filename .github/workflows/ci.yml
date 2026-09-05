@@ -116,7 +116,7 @@ jobs:
           set -eu
           for cc in gcc aarch64-linux-gnu-gcc mipsel-linux-gnu-gcc; do
             echo "== $cc =="
-            for f in datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c datapath/planlab.c; do
+            for f in datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c datapath/track.c datapath/planlab.c; do
               "$cc" -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Idatapath \
                     -c -o /tmp/$(basename $f .c)-$cc.o "$f"
             done
