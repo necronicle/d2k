@@ -18,6 +18,7 @@
 
 #include "d2k_journal.h"
 #include "d2k_plan.h"
+#include "d2k_plans.h"
 #include "d2k_track.h"
 #include "d2k_wire.h"
 
@@ -56,7 +57,11 @@ typedef struct d2k_session d2k_session;
 d2k_session *d2k_session_new(size_t capacity, size_t journal);
 void         d2k_session_free(d2k_session *s);
 
-/* Ставит план, который применяется к новым соединениям. Прежний план остаётся
+/* Таблица планов по целям — то, чем пользуется продукт. Владение остаётся у
+ * сессии; вызывающий ставит и убирает записи через d2k_plantab_*. */
+d2k_plantab *d2k_session_plans(d2k_session *s);
+
+/* Ставит ЗАПАСНОЙ план, применяемый ко всем целям без своего плана. Прежний план остаётся
  * действовать на уже обслуживаемых: §2.5 запрещает менять действия посреди
  * соединения. Владение планом переходит сессии. */
 void d2k_session_set_plan(d2k_session *s, d2k_plan *p);

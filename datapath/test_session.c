@@ -327,6 +327,42 @@ int main(void) {
         d2k_session_free(g);
     }
 
+    /* --- план выбирается по цели, а не один на всех ------------------------
+     * §2.6: план закрепляется за контекстом, на котором подтверждён. Имя
+     * точнее адреса, поэтому ищется первым.                                  */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *by_name = NULL, *by_addr = NULL;
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &by_name, err, sizeof err);
+        d2k_plan_load(plan_guard, sizeof plan_guard, &by_addr, err, sizeof err);
+
+        /* Приветствие в наших пакетах несёт имя hetzner.com, а адрес цели —
+           1.2.3.4. Ставим планы на оба ключа и проверяем, что берётся тот,
+           что по имени. */
+        uint8_t dst[4] = {1, 2, 3, 4};
+        uint32_t dst_be;
+        memcpy(&dst_be, dst, 4);
+        d2k_plantab_set_addr(d2k_session_plans(g), dst_be, by_addr);
+        d2k_plantab_set_name(d2k_session_plans(g),
+                             (const uint8_t *)"hetzner.com", 11, by_name);
+
+        n = build_pkt(pkt, 43000, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2, "план по имени не применился");
+        CHECK(d2k_session_applied(g) == 1, "применение не посчитано");
+
+        /* Цель без своего плана и без запасного — пропуск с объяснением. */
+        d2k_session *w = d2k_session_new(64, 64);
+        n = build_pkt(pkt, 43001, 0x18, hello, hlen);
+        d2k_session_packet(w, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0, "план взялся ниоткуда");
+        CHECK(r.verdict == D2K_VERDICT_ACCEPT, "цель без плана не пропущена");
+        CHECK(d2k_session_hellos(w) == 1,
+              "приветствие не узнано из-за отсутствия плана");
+        d2k_session_free(w);
+        d2k_session_free(g);
+    }
+
     /* --- SYN-ACK обогнал SYN: направление всё равно верное -----------------
      * Два направления приходят из ДВУХ правил firewall, и порядок между ними
      * не гарантирован. Раньше такой поток получал направления наоборот, и

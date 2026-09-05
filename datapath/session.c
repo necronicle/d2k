@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "d2k_plans.h"
 #include "d2k_session.h"
 #include "d2k_tls.h"
 
@@ -21,6 +22,12 @@
 
 struct d2k_session {
     d2k_table   *flows;
+    d2k_plantab *plans;
+    /* Запасной план — на все цели сразу. В продукте его быть не должно: §2.6
+     * закрепляет план за контекстом, на котором он подтверждён, а один план
+     * на весь трафик означает, что ошибка на одной цели переключит все
+     * остальные без проверки. Он существует для опытов, где сужение задано
+     * снаружи правилом firewall на одну пару адресов. */
     d2k_plan    *plan;
     d2k_journal *jrn;
     uint64_t     applied;
@@ -37,7 +44,9 @@ d2k_session *d2k_session_new(size_t capacity, size_t journal) {
     }
     s->flows = d2k_track_new(capacity);
     s->jrn = d2k_journal_new(journal);
-    if (!s->flows || (journal > 0 && !s->jrn)) {
+    s->plans = d2k_plantab_new(256);
+    if (!s->flows || !s->plans || (journal > 0 && !s->jrn)) {
+        d2k_plantab_free(s->plans);
         d2k_journal_free(s->jrn);
         d2k_track_free(s->flows);
         free(s);
@@ -50,6 +59,7 @@ void d2k_session_free(d2k_session *s) {
     if (!s) {
         return;
     }
+    d2k_plantab_free(s->plans);
     d2k_journal_free(s->jrn);
     d2k_track_free(s->flows);
     d2k_plan_free(s->plan);
@@ -316,8 +326,23 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         }
     }
 
-    if (!s->plan) {
-        out->skipped = "плана нет";
+    /* Выбор плана по цели. Имя из приветствия точнее адреса и потому идёт
+       первым; адрес — запасной ключ, за которым у CDN стоят сотни имён. */
+    const d2k_plan *use = NULL;
+    if (tls.is_client_hello) {
+        uint32_t dst_be;
+        memcpy(&dst_be, pkt + 16, 4);
+        use = d2k_plantab_find(s->plans,
+                               tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
+                               tls.have_sni ? tls.sni_len : 0,
+                               dst_be);
+        if (!use) {
+            use = s->plan;
+        }
+    }
+
+    if (!use) {
+        out->skipped = "плана для этой цели нет";
         return 0;
     }
     if (!tls.is_client_hello) {
@@ -350,7 +375,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
     d2k_actions acts;
     memset(&acts, 0, sizeof acts);
-    if (d2k_plan_apply(s->plan, fl, &in, &acts) != 0) {
+    if (d2k_plan_apply(use, fl, &in, &acts) != 0) {
         /* Неприменим — пропускаем как есть. Отказ исполнителя это результат, а
            не сбой: якорь может быть невычислим для конкретного пакета. */
         out->skipped = "план неприменим к этому пакету";
@@ -419,12 +444,16 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     out->verdict = (acts.fate == D2K_ORIG_DROP) ? D2K_VERDICT_DROP
                                                 : D2K_VERDICT_ACCEPT;
     fl->plan_done = 1;
-    fl->guards = d2k_plan_guards(s->plan);
+    fl->guards = d2k_plan_guards(use);
     s->applied++;
     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, NULL, 0, NULL);
 
     d2k_actions_free(&acts);
     return 0;
+}
+
+d2k_plantab *d2k_session_plans(d2k_session *s) {
+    return s ? s->plans : NULL;
 }
 
 size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
