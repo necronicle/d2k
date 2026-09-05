@@ -10,10 +10,10 @@ builds/
 
 # Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
 docs/superpowers/
+# Собранное. Раньше здесь была россыпь частных правил, и test_session,
+# test_tls, test_track, test_wire мимо неё уехали в репозиторий бинарниками.
 datapath/*.o
-datapath/test_plan_*
+datapath/test_*
+!datapath/test_*.c
 datapath/planlab
-datapath/test_nl
-datapath/test_sched
-datapath/test_journal
 datapath/d2kd
