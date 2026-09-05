@@ -7,13 +7,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/necronicle/d2k/internal/buildinfo"
 	"github.com/necronicle/d2k/internal/config"
+	"github.com/necronicle/d2k/internal/status"
+	"github.com/necronicle/d2k/internal/web"
 )
 
 func main() {
@@ -28,7 +34,7 @@ func usage(w *os.File) {
   version              что за сборка запущена
   config [-write]      показать конфигурацию; -write создать файл с умолчаниями
   status               что программа делает прямо сейчас
-  serve                запустить службу
+  serve                запустить службу и локальную панель
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
 `, buildinfo.Short(), config.DefaultPath())
@@ -118,51 +124,45 @@ func cmdStatus(out, errOut *os.File) int {
 	if !ok {
 		return 1
 	}
+	// Тот же снимок, что показывает панель. Два источника разошлись бы, и
+	// человек получил бы два разных ответа на один вопрос.
+	s := status.Collect(c, time.Time{})
 
 	fmt.Fprintf(out, "%s\n\n", buildinfo.Short())
 
-	src := c.Path
-	if !c.Existed {
+	src := s.ConfigPath
+	if !s.ConfigExists {
 		src += " (файла нет, действуют умолчания)"
 	}
 	fmt.Fprintf(out, "конфигурация:  %s\n", src)
-	fmt.Fprintf(out, "режим:         %s\n", c.Mode)
-	fmt.Fprintf(out, "каталог:       %s%s\n", c.StateDir, dirNote(c.StateDir))
-	if c.PanelListen == "" {
+	fmt.Fprintf(out, "режим:         %s\n", s.Mode)
+	fmt.Fprintf(out, "каталог:       %s (%s)\n", s.StateDir, s.StateDirNote)
+	if s.PanelListen == "" {
 		fmt.Fprintf(out, "панель:        выключена\n")
 	} else {
-		fmt.Fprintf(out, "панель:        %s\n", c.PanelListen)
+		fmt.Fprintf(out, "панель:        %s\n", s.PanelListen)
 	}
-	fmt.Fprintf(out, "очередь:       %d\n", c.QueueNum)
+	fmt.Fprintf(out, "очередь:       %d\n", s.QueueNum)
 
-	// Пока датапата нет, писать что-либо про наблюдение трафика нельзя: это
-	// ровно тот случай, когда «неизвестное показывается как исправное».
-	fmt.Fprintf(out, "\nдатапат:       НЕ РЕАЛИЗОВАН (этап A)\n")
-	fmt.Fprintf(out, "наблюдение:    нет — пакеты не читаются\n")
-	fmt.Fprintf(out, "обход:         нет — ни один план не исполняется\n")
-	fmt.Fprintf(out, "каталог коробок: пуст — хранилище ещё не реализовано\n")
+	built, total := s.BuiltCount()
+	fmt.Fprintf(out, "\nобработка (построено %d из %d):\n", built, total)
+	for _, st := range s.Stages {
+		mark := "нет"
+		if st.Built {
+			mark = "есть"
+		}
+		fmt.Fprintf(out, "  %-4s %-20s %s\n", mark, st.Title, st.Detail)
+	}
 
-	if len(c.Unknown) > 0 {
-		fmt.Fprintf(out, "\nнепонятые ключи конфигурации: %v\n", c.UnknownKeys())
+	fmt.Fprintf(out, "\nпоказаний нет:\n")
+	for _, a := range s.Absent {
+		fmt.Fprintf(out, "  %-22s %s\n", a.Title, a.Detail)
+	}
+
+	if len(s.UnknownKeys) > 0 {
+		fmt.Fprintf(out, "\nнепонятые ключи конфигурации: %v\n", s.UnknownKeys)
 	}
 	return 0
-}
-
-func dirNote(p string) string {
-	if p == "" {
-		return " (не задан)"
-	}
-	st, err := os.Stat(p)
-	switch {
-	case os.IsNotExist(err):
-		return " (не создан)"
-	case err != nil:
-		return fmt.Sprintf(" (недоступен: %v)", err)
-	case !st.IsDir():
-		return " (существует, но это не каталог)"
-	default:
-		return ""
-	}
 }
 
 func cmdServe(out, errOut *os.File) int {
@@ -170,12 +170,38 @@ func cmdServe(out, errOut *os.File) int {
 	if !ok {
 		return 1
 	}
-	// Отказ, а не тихий запуск пустой службы: запущенный d2k, который ничего
-	// не делает, выглядит для человека как работающий обход. §2.3 документа
-	// запрещает показывать неизвестное исправным, и это тот же случай.
-	fmt.Fprintf(errOut, "%s\n", buildinfo.Short())
-	fmt.Fprintf(errOut, "serve пока не реализован: датапат отсутствует, режим %q исполнять нечем.\n", c.Mode)
-	fmt.Fprintf(errOut, "Запущенная служба без датапата выглядела бы работающей, поэтому запуск отклонён.\n")
-	_ = out
-	return 3
+	if c.PanelListen == "" {
+		// Без панели служба не делает НИЧЕГО наблюдаемого: датапата ещё нет.
+		// Запускать её в таком виде — значит оставить человеку работающий
+		// процесс, который выглядит как работающий обход.
+		fmt.Fprintf(errOut, "PANEL_LISTEN пуст, а датапата ещё нет — запускать нечего.\n")
+		return 3
+	}
+
+	started := time.Now()
+	panel, err := web.New(c, started)
+	if err != nil {
+		fmt.Fprintf(errOut, "%v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(out, "%s\n", buildinfo.Short())
+	fmt.Fprintf(out, "панель: http://%s/\n", c.PanelListen)
+	// Говорим это при каждом запуске, а не только в панели: человек, поднявший
+	// службу из консоли, должен узнать правду до того, как решит, что обход
+	// заработал.
+	fmt.Fprintf(out, "датапат не написан: трафик не наблюдается, обход не применяется.\n")
+	if !web.LoopbackOnly(c.PanelListen) {
+		fmt.Fprintf(errOut, "внимание: панель слушает не на петле (%s) и доступна из сети. Аутентификации у неё нет.\n", c.PanelListen)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := panel.Serve(ctx, c.PanelListen); err != nil {
+		fmt.Fprintf(errOut, "%v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "остановлено\n")
+	return 0
 }

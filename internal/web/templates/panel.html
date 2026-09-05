@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>d2k — состояние</title>
+<link rel="stylesheet" href="/assets/panel.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="head">
+    <h1>d2k</h1>
+    <dl>
+      <dt>версия</dt><dd>{{.S.Version}}</dd>
+      <dt>коммит</dt><dd>{{if .S.Commit}}{{slice .S.Commit 0 12}}{{else}}неизвестен{{end}}</dd>
+      <dt>собрано</dt><dd>{{if .S.Built}}{{.S.Built}}{{else}}неизвестно{{end}}</dd>
+      {{if .S.Dirty}}<dd class="dirty">сборка с незакоммиченными правками</dd>{{end}}
+    </dl>
+  </header>
+
+  {{/* Первое, что читает человек, — ответ на единственный вопрос, ради
+       которого он сюда пришёл. Не число, не индикатор: фраза. */}}
+  <section class="verdict">
+    {{if .Working}}
+    <p>d2k наблюдает трафик.</p>
+    {{else}}
+    <p>d2k не смотрит на трафик и ничего не обходит.</p>
+    <p class="why">
+      Датапат ещё не написан: очередь ядра не открывается, пакеты не читаются,
+      ни один план не исполняется. Режим <code>{{.S.Mode}}</code> в конфигурации
+      задан, но исполнять его нечем.
+    </p>
+    {{end}}
+  </section>
+
+  {{/* Цепочка обработки. Залитые чернилами звенья существуют, пустые клетки —
+       дырки в приборе: сквозь них видна та же миллиметровка, что и под
+       страницей. Ни зелёного, ни красного: ничего не сломано. */}}
+  <ul class="chain">
+    {{range $i, $st := .S.Stages}}
+    <li class="stage {{if $st.Built}}built{{else}}unbuilt{{end}}" style="--i: {{$i}}">
+      <h3>{{$st.Title}}</h3>
+      <span class="mark">{{if $st.Built}}есть{{else}}не написано{{end}}</span>
+      <p>{{$st.Detail}}</p>
+    </li>
+    {{end}}
+  </ul>
+  <p class="chain-note">построено {{.Built}} из {{.Total}} звеньев обработки</p>
+
+  <div class="bands">
+
+    <section class="band">
+      <h2>Что настроено</h2>
+      <dl class="facts">
+        <dt>режим</dt>
+        <dd>{{.S.Mode}}</dd>
+
+        <dt>конфигурация</dt>
+        <dd>{{.S.ConfigPath}}{{if not .S.ConfigExists}}<br><span class="note">файла нет, действуют умолчания</span>{{end}}</dd>
+
+        <dt>каталог состояния</dt>
+        <dd>{{.S.StateDir}}<br><span class="note">{{.S.StateDirNote}}</span></dd>
+
+        <dt>очередь</dt>
+        <dd>{{.S.QueueNum}}</dd>
+
+        <dt>панель</dt>
+        <dd>{{.S.PanelListen}}</dd>
+
+        {{if .S.UptimeSeconds}}
+        <dt>служба работает</dt>
+        <dd>{{uptime .S.UptimeSeconds}}</dd>
+        {{end}}
+      </dl>
+
+      {{if .S.UnknownKeys}}
+      <p class="warn">
+        В конфигурации есть ключи, которых эта сборка не знает:
+        {{range $i, $k := .S.UnknownKeys}}{{if $i}}, {{end}}<code>{{$k}}</code>{{end}}.
+        Они сохранены — откат на предыдущую версию не должен терять настройки следующей.
+      </p>
+      {{end}}
+    </section>
+
+    <section class="band">
+      <h2>Чего панель не показывает и почему</h2>
+      {{/* Обычная панель показала бы здесь нули и зелёные точки. Ноль и
+           «мы не измеряем» — разные утверждения, и подменять второе первым
+           запрещено (§2.3 документа). */}}
+      <ul class="absent">
+        {{range .S.Absent}}
+        <li><b>{{.Title}}</b><span>{{.Detail}}</span></li>
+        {{end}}
+      </ul>
+    </section>
+
+  </div>
+
+  <p class="warn">
+    Панель только читает. Изменяющих запросов у неё нет, поэтому нет и
+    аутентификации — первый такой запрос добавлять без неё нельзя.
+  </p>
+
+  <footer class="foot">
+    <span>снимок {{.S.Taken.Format "15:04:05"}}</span>
+    <span>данные: <a href="/api/status">/api/status</a></span>
+  </footer>
+
+</div>
+</body>
+</html>
