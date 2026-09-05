@@ -212,13 +212,20 @@ if [ "$QFIRST" = "$QLAST" ]; then
     "$BIN" -q "$QFIRST" -dur "$DUR" -out "$OUT" $ARGS
     rc=$?
 else
+    # Ждём ИМЕННО процессы замера. Голый wait ждёт и сторожа со своим долгим
+    # sleep, из-за чего прогон на две очереди занимал не длительность замера,
+    # а длительность сторожа.
+    pids=""
     qn=$QFIRST
     while [ "$qn" -le "$QLAST" ]; do
         # shellcheck disable=SC2086
         "$BIN" -q "$qn" -dur "$DUR" -out "$OUT-q$qn" $ARGS > "$OUT-q$qn.log" 2>&1 &
+        pids="$pids $!"
         qn=$((qn + 1))
     done
-    wait
+    for pid in $pids; do
+        wait "$pid" || rc=$?
+    done
     tail -n 3 "$OUT"-q*.log 2>/dev/null
 fi
 
