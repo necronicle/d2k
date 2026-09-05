@@ -1,3 +1,5 @@
 spike/nfqview/nfqview-linux-*
 *.tsv
 *.summary.json
+*.ct-*.txt
+docs/field/raw/

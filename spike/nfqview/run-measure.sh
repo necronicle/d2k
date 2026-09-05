@@ -30,6 +30,11 @@ OUT=${OUT:-/tmp/nfqview}
 ARGS=${ARGS:-}
 BIN=${BIN:-/tmp/nfqview}
 DEOFF=${DEOFF:-}
+# out — только клиент→сервер (так делает z2k), both — ещё и ответное
+# направление. Замер 05-09: правило по --dports снимает офлоад ТОЛЬКО с той
+# стороны, которую матчит. Ответные пакеты остаются в железе, и именно поэтому
+# входящее видно на 0,08 %.
+DEOFF_DIR=${DEOFF_DIR:-out}
 
 # BusyBox iptables на этой прошивке может не знать -w. Проверяем, а не
 # предполагаем: молчаливый отказ здесь стоил бы правил, поставленных наполовину.
@@ -81,6 +86,11 @@ deoff_add() {
         -m connskip --connskip "$DEOFF" -j PPE || return 1
     $IPT -t mangle -I FORWARD 1 -s "$SCOPE" -p tcp -m multiport --dports 80,443 \
         -m connskip --connskip "$DEOFF" -j PPE || return 1
+    [ "$DEOFF_DIR" = both ] || return 0
+    # В mangle PREROUTING обратный NAT ещё не отработал, и адрес клиента там не
+    # виден — поэтому ответное направление цепляем в FORWARD, где он уже свой.
+    $IPT -t mangle -I FORWARD 1 -d "$SCOPE" -p tcp -m multiport --sports 80,443 \
+        -m connskip --connskip "$DEOFF" -j PPE || return 1
     return 0
 }
 
@@ -96,6 +106,12 @@ deoff_del() {
     i=0
     while [ $i -lt 4 ]; do
         $IPT -t mangle -D FORWARD -s "$SCOPE" -p tcp -m multiport --dports 80,443 \
+            -m connskip --connskip "$DEOFF" -j PPE 2>/dev/null || break
+        i=$((i + 1))
+    done
+    i=0
+    while [ $i -lt 4 ]; do
+        $IPT -t mangle -D FORWARD -d "$SCOPE" -p tcp -m multiport --sports 80,443 \
             -m connskip --connskip "$DEOFF" -j PPE 2>/dev/null || break
         i=$((i + 1))
     done
