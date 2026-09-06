@@ -141,6 +141,13 @@ test-ctl: test_ctl
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
+#
+# planlab добавлен отдельным шагом, а не в TESTS: он не самопроверяющийся
+# бинарник (нет CHECK/fails), а инструмент со своим argv. Но именно planlab —
+# доказательство того, что план делает НА ПРОВОДЕ (см. шапку planlab.c), и
+# самый рискованный класс UB (сравнение указателей из разных выделений) этот
+# набор санитайзеров и так ловит плохо — тем более нельзя оставлять сам
+# инструмент несобранным с той же строгостью, что и остальной датапат.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude
 san:
@@ -150,6 +157,9 @@ san:
 			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') ; \
 		/tmp/d2k-san-$$t; \
 	done
+	@echo "== planlab =="
+	@$(CC) $(SANFLAGS) -o /tmp/d2k-san-planlab planlab.c plan_parse.c plan_apply.c
+	@/tmp/d2k-san-planlab testdata/fake_before.tlv testdata/one_hello.txt >/dev/null
 	@echo "санитайзеры: все проверки прошли"
 
 # Тот же набор ЧУЖИМ компилятором. Не роскошь: локально всё собирает clang, а
@@ -168,7 +178,10 @@ gcc-warn:
 	@echo "чужой компилятор: предупреждений нет"
 
 # Переносимость проверяется компиляцией под целевые арки. Запускать там нечего
-# и не нужно: ловим порядок байт, выравнивание и ширину типов.
+# и не нужно: ловим порядок байт, выравнивание и ширину типов. planlab слинкован
+# целиком по той же причине, что и d2kd целиком чуть ниже: компиляция
+# по-файлово в цикле выше не гарантирует, что именно ЭТА комбинация объектов
+# слинкуется под обеими целевыми libc.
 cross:
 	@for f in $(SRC); do \
 		echo "== $$f =="; \
@@ -179,6 +192,10 @@ cross:
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2kd-a64 \
 		$(DAEMON) $(LINUXSRC) $(SRC) || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) || exit 1
+	@echo "== planlab целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/planlab-a64 \
+		planlab.c plan_parse.c plan_apply.c || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/planlab-mipsel planlab.c plan_parse.c plan_apply.c || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, служба линкуется"
 
 # Служба для целевого устройства. Статическая musl: на роутере нет ни нужной
