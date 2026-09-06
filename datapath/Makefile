@@ -84,8 +84,18 @@ plans.o: plans.c $(HDR)
 ctl.o: ctl.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_ctl: test_ctl.c ctl.o journal.o track.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o journal.o track.o $(LDFLAGS)
+# ctlsrv.o и вся цепочка session.o добавлены задачей про вытеснение таблицы
+# планов: test_ctl проверял только framing сокета (d2k_ctl.c), а разбор
+# команд SET_NAME/SET_ADDR (d2k_ctlsrv_command, ctlsrv.c) не проверялся
+# настоящим кадром вовсе — отказ «нет места» от отказа «план негоден»
+# различимы на уровне ЭТОГО разбора, и подделывать его нельзя (см. шапку
+# файла). Тот же список объектников, что у test_session/ctlprobe.
+test_ctl: test_ctl.c ctl.o ctlsrv.o session.o journal.o track.o tls.o wire.o \
+          wire_udp.o plans.o plan_parse.o plan_apply.o core_quic.o \
+          core_crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o journal.o \
+	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
+	    core_quic.o core_crypto.o $(LDFLAGS)
 
 test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_plans.c plans.o plan_parse.o plan_apply.o $(LDFLAGS)

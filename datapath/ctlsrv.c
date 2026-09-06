@@ -41,15 +41,24 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t limits, char *why, size_t cap) {
 }
 
 /* Подтверждает команду. Зовётся ровно один раз на команду — иначе
-   контроллер, ждущий подтверждения, дождался бы чужого. */
-static void ack(d2k_ctlsrv *cx, uint16_t type, int ok) {
+   контроллер, ждущий подтверждения, дождался бы чужого.
+ *
+ * reason значим только при ok == 0 (см. D2K_ACK_* в d2k_ctl.h) — успех
+ * всегда несёт D2K_ACK_OK, чтобы контроллеру не приходилось смотреть на
+ * причину, когда смотреть не на что. Раньше здесь был только признак
+ * успеха: контроллер получал одну и ту же «нулевую единицу отказа» что на
+ * негодный план, что на переполненную таблицу планов, и не мог отличить
+ * своего негодного кандидата от чужой нехватки места (см. большой
+ * комментарий у D2K_EV_ACK, d2k_ctl.h). */
+static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     /* Место под ключ потока есть у всех событий одинаково: подтверждение не
        про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
-    uint8_t body[D2K_KEY_WIRE_LEN + 3];
+    uint8_t body[D2K_KEY_WIRE_LEN + 4];
     memset(body, 0, sizeof body);
     body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)type;
     body[D2K_KEY_WIRE_LEN + 2] = ok ? 1 : 0;
+    body[D2K_KEY_WIRE_LEN + 3] = ok ? D2K_ACK_OK : reason;
     if (ok) {
         cx->ok_cmds++;
     } else {
@@ -70,36 +79,49 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     case D2K_CMD_SET_ADDR: {
         size_t hdr = (type == D2K_CMD_SET_NAME) ? (len ? 1u + b[0] : 1u) : 4u;
         if (len < hdr) {
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         d2k_plan *p = NULL;
         if (d2k_plan_load(b + hdr, len - hdr, &p, why, sizeof why) != 0) {
             fprintf(stderr, "d2kd: план от контроллера не принят: %s\n", why);
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_PLAN);
             return;
         }
         if (!d2k_plan_fits(p, cx->send_limits, why, sizeof why)) {
             fprintf(stderr, "d2kd: план от контроллера не активирован: %s\n", why);
             d2k_plan_free(p);
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_PLAN);
             return;
         }
         int rc;
         if (type == D2K_CMD_SET_NAME) {
-            rc = d2k_plantab_set_name(tab, b + 1, b[0], p);
+            rc = d2k_plantab_set_name(tab, b + 1, b[0], cx->now_ns, p);
         } else {
             uint32_t addr;
             memcpy(&addr, b, 4);
-            rc = d2k_plantab_set_addr(tab, addr, p);
+            rc = d2k_plantab_set_addr(tab, addr, cx->now_ns, p);
         }
-        /* Владение планом перешло таблице в любом случае, включая отказ. */
-        ack(cx, type, rc == 0);
+        /* Владение планом перешло таблице в любом случае, включая отказ.
+           rc различает ДВЕ разные по вине причины: -1 — таблице планов
+           нечего вытеснить (не вина плана, см. d2k_plans.h; с вытеснением
+           по давности недостижимо для таблицы ненулевой ёмкости, но
+           различение оставлено на случай нарушения этого инварианта), -2 —
+           аргументы самой команды негодны (например, пустое имя). Обе
+           причины не «план негоден», и путать их с D2K_ACK_BAD_PLAN нельзя:
+           контроллер решает по этому коду, жечь ли кандидата. */
+        uint8_t reason = D2K_ACK_OK;
+        if (rc == -1) {
+            reason = D2K_ACK_NO_ROOM;
+        } else if (rc != 0) {
+            reason = D2K_ACK_BAD_ARGS;
+        }
+        ack(cx, type, rc == 0, reason);
         return;
     }
     case D2K_CMD_ARM_SHAPE:
         if (len < 1 || len < 1u + b[0]) {
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         if (d2k_session_want_shape(cx->sess, b + 1, b[0])) {
@@ -116,31 +138,31 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
                 }
             }
         }
-        ack(cx, type, 1);
+        ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_NAME:
         if (len < 1 || len < 1u + b[0]) {
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         d2k_plantab_del_name(tab, b + 1, b[0]);
-        ack(cx, type, 1);
+        ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_ADDR: {
         if (len < 4) {
-            ack(cx, type, 0);
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         uint32_t addr;
         memcpy(&addr, b, 4);
         d2k_plantab_del_addr(tab, addr);
-        ack(cx, type, 1);
+        ack(cx, type, 1, D2K_ACK_OK);
         return;
     }
     default:
         /* Незнакомая команда — не повод рвать соединение, но и не повод
            делать вид, что она исполнена. Отвечаем отказом и продолжаем. */
-        ack(cx, type, 0);
+        ack(cx, type, 0, D2K_ACK_BAD_ARGS);
         return;
     }
 }

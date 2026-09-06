@@ -281,6 +281,11 @@ int main(int argc, char **argv) {
             d2k_ctl_accept(ctl);
         }
         if (ip != (nfds_t)-1 && (p[ip].revents & (POLLIN | POLLHUP))) {
+            /* Тот же счётчик, что метит симулированные пакеты ниже: единые
+               монотонные часы для вытеснения в таблице планов (d2k_plans.h)
+               и для остального стенда, а не два независимых источника
+               времени в одном процессе. */
+            cx.now_ns = now++;
             d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);
         }
         d2k_ctl_flush(ctl);

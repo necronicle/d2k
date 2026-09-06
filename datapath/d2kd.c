@@ -538,6 +538,10 @@ int main(int argc, char **argv) {
 
     while (!stop_flag) {
         uint64_t t = now_ns();
+        /* Часы для вытеснения в таблице планов (d2k_plantab_set_name/set_addr,
+           см. d2k_plans.h) — точность в сотни миллисекунд достаточна: там
+           считают минуты простоя записи, а не наносекунды. */
+        cx.now_ns = t;
         if (duration_s && t - start >= (uint64_t)duration_s * NS_PER_S) {
             break;
         }

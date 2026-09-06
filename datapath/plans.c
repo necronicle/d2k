@@ -11,6 +11,11 @@ typedef struct {
     uint8_t  name_len;
     uint8_t  name[D2K_TARGET_NAME_MAX];
     uint32_t addr_be;
+    /* Давность последнего обращения — единственное, что нужно вытеснению по
+       LRU. Не индекс и не список: список давности стоил бы указателей на
+       каждую запись ради таблицы, которую и так обходят целиком раз на
+       установку плана (см. d2k_plans.h). */
+    uint64_t last_used_ns;
     d2k_plan *plan;
 } entry;
 
@@ -94,15 +99,64 @@ static entry *take_free(d2k_plantab *t) {
     return NULL;
 }
 
+/* Кандидат на вытеснение — запись с самой старой отметкой обращения.
+   Линейный перебор: см. обоснование размера таблицы и частоты вызова в
+   d2k_plans.h. Строгое "меньше", а не "меньше или равно" — при равных
+   отметках (например, таблицу только что залили одной пачкой команд с одним
+   и тем же now_ns) побеждает запись с МЕНЬШИМ индексом, а take_free выше
+   раздаёт свободные слоты по возрастанию индекса — то есть при равенстве
+   давности вытесняется та, что вставлена раньше. Разумный запасной порядок,
+   а не порча инварианта. */
+static entry *oldest(d2k_plantab *t) {
+    entry *victim = NULL;
+    for (size_t i = 0; i < t->cap; i++) {
+        if (t->v[i].kind == KEY_FREE) {
+            continue;
+        }
+        if (!victim || t->v[i].last_used_ns < victim->last_used_ns) {
+            victim = &t->v[i];
+        }
+    }
+    return victim;
+}
+
+/* Свободная запись для новой цели — своя, если она есть, иначе вытесненная.
+   Отказа здесь больше нет: см. большой комментарий у d2k_plans.h про то,
+   почему любой объявленный предел когда-нибудь заполнится и почему навсегда
+   отказывать новой цели неверно. */
+static entry *take_free_or_evict(d2k_plantab *t) {
+    entry *e = take_free(t);
+    if (e) {
+        return e;
+    }
+    e = oldest(t);
+    if (!e) {
+        /* cap == 0: d2k_plantab_new такую таблицу не создаёт (возвращает
+           NULL), так что живой t сюда с cap == 0 попасть не должен. Проверка
+           не бумажный тигр — это единственная страховка от разыменования
+           NULL ниже, если инвариант всё-таки нарушен. */
+        return NULL;
+    }
+    /* Полный memset, а не только освобождение плана: вызывающий (set_name/
+       set_addr) безусловно зовёт d2k_plan_free(e->plan) ЕЩЁ РАЗ на только что
+       возвращённой записи — тем же путём, что и при замене плана уже
+       существующей цели. Если не занулить e->plan здесь, тот вызов освободит
+       уже освобождённый указатель. */
+    d2k_plan_free(e->plan);
+    memset(e, 0, sizeof *e);
+    t->used--;
+    return e;
+}
+
 int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
-                         d2k_plan *p) {
+                         uint64_t now_ns, d2k_plan *p) {
     if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX) {
         d2k_plan_free(p);
         return -2;
     }
     entry *e = find_name(t, name, len);
     if (!e) {
-        e = take_free(t);
+        e = take_free_or_evict(t);
         if (!e) {
             d2k_plan_free(p);
             return -1;
@@ -112,6 +166,7 @@ int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
         e->name_len = (uint8_t)len;
         memcpy(e->name, name, len);
     }
+    e->last_used_ns = now_ns;
     /* Прежний план освобождается здесь, а не у вызывающего: иначе замена
        плана цели молча текла бы. */
     d2k_plan_free(e->plan);
@@ -119,14 +174,15 @@ int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
     return 0;
 }
 
-int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, d2k_plan *p) {
+int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
+                         d2k_plan *p) {
     if (!t) {
         d2k_plan_free(p);
         return -2;
     }
     entry *e = find_addr(t, addr_be);
     if (!e) {
-        e = take_free(t);
+        e = take_free_or_evict(t);
         if (!e) {
             d2k_plan_free(p);
             return -1;
@@ -135,6 +191,7 @@ int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, d2k_plan *p) {
         e->kind = KEY_ADDR;
         e->addr_be = addr_be;
     }
+    e->last_used_ns = now_ns;
     d2k_plan_free(e->plan);
     e->plan = p;
     return 0;
@@ -161,22 +218,28 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
     return t ? drop(t, find_addr(t, addr_be)) : 0;
 }
 
-const d2k_plan *d2k_plantab_find(const d2k_plantab *t, const uint8_t *name,
-                                 size_t len, uint32_t addr_be) {
+const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
+                                 size_t len, uint32_t addr_be, uint64_t now_ns) {
     if (!t) {
         return NULL;
     }
-    d2k_plantab *m = (d2k_plantab *)t;
     if (name && len) {
-        entry *e = find_name(m, name, len);
+        entry *e = find_name(t, name, len);
         if (e) {
+            /* Обращение продлевает жизнь записи — см. d2k_plans.h про то,
+               почему рабочая цель не должна вытесняться наравне с забытой. */
+            e->last_used_ns = now_ns;
             return e->plan;
         }
     }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
-    entry *e = find_addr(m, addr_be);
-    return e ? e->plan : NULL;
+    entry *e = find_addr(t, addr_be);
+    if (e) {
+        e->last_used_ns = now_ns;
+        return e->plan;
+    }
+    return NULL;
 }
 
 size_t d2k_plantab_count(const d2k_plantab *t) {

@@ -356,9 +356,9 @@ int main(void) {
         uint8_t dst[4] = {1, 2, 3, 4};
         uint32_t dst_be;
         memcpy(&dst_be, dst, 4);
-        d2k_plantab_set_addr(d2k_session_plans(g), dst_be, by_addr);
+        d2k_plantab_set_addr(d2k_session_plans(g), dst_be, 1, by_addr);
         d2k_plantab_set_name(d2k_session_plans(g),
-                             (const uint8_t *)"hetzner.com", 11, by_name);
+                             (const uint8_t *)"hetzner.com", 11, 1, by_name);
 
         n = build_pkt(pkt, 43000, 0x18, hello, hlen);
         d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);

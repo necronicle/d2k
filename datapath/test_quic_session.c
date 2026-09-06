@@ -303,7 +303,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
               "план не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;
@@ -469,7 +469,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
               "план не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;
@@ -514,7 +514,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
               "план не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;
@@ -542,7 +542,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_split, sizeof plan_split, &p, err, sizeof err) == 0,
               "план с разрезом не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;
@@ -570,7 +570,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_badsum, sizeof plan_badsum, &p, err, sizeof err) == 0,
               "план с BADSUM не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;
@@ -609,7 +609,7 @@ int main(void) {
         char err[160];
         CHECK(d2k_plan_load(plan_too_many_repeats, sizeof plan_too_many_repeats, &p, err, sizeof err) == 0,
               "план с repeats=20 не загрузился");
-        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, p);
+        d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
         d2k_result r;

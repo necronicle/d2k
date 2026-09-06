@@ -628,6 +628,9 @@ func TestКомандаПодтверждается(t *testing.T) {
 		if !ev.AckOK {
 			t.Fatal("годная команда отвергнута")
 		}
+		if ev.AckReason != control.AckOK {
+			t.Fatalf("у успеха причина отказа %d, а не control.AckOK", ev.AckReason)
+		}
 		return
 	}
 	t.Fatal("подтверждение не пришло")
@@ -660,6 +663,13 @@ func TestНегоднаяКомандаПодтверждаетсяОтказо�
 		}
 		if ev.AckOK {
 			t.Fatal("неисполнимый план подтверждён как принятый")
+		}
+		// Причина обязана быть «план негоден», а не «нет места» — до
+		// разделения причин (см. onAck, internal/controller/controller.go)
+		// контроллер не мог отличить одно от другого и жёг кандидата даже
+		// тогда, когда виновата была нехватка места, а не сам план.
+		if ev.AckReason != control.AckBadPlan {
+			t.Fatalf("причина отказа неисполнимого плана %d, а не control.AckBadPlan", ev.AckReason)
 		}
 		return
 	}

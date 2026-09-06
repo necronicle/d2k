@@ -944,3 +944,104 @@ func TestQUICПрименениеНеПортитСчётчикTCPКандида
 			tasks)
 	}
 }
+
+// TestНехваткаМестаНеЖжётКандидата — задача про вытеснение в таблице планов
+// (datapath/plans.c): переполненная таблица раньше отвечала на SET_NAME/
+// SET_ADDR отказом без причины, и onAck читал ЛЮБОЙ отказ как «наш кандидат
+// плохой» — цель сжигала все кандидаты подряд, хотя не подошёл не кандидат,
+// а таблице датапата не хватило места. Замер на живом роутере (2026-09-06):
+// вместимость 256 литералом, каталог 276 записей, «планов по целям 256 из
+// 256» и КАЖДАЯ следующая цель — отказ навсегда.
+//
+// Датапат вытесняет самую давно не использованную запись вместо отказа (см.
+// d2k_plantab_set_name/set_addr, datapath/plans.c) — с этим исправлением
+// настоящий ctlprobe в этом стенде ответом «нет места» ответить больше не
+// может: свободное место находится вытеснением всегда, когда ёмкость таблицы
+// планов хотя бы 1 (а она выводится из --flows и не бывает меньше). Именно
+// поэтому ack на push кандидата ниже подменяется синтетическим: воспроизвести
+// «нет места» настоящим стендом означало бы отменить только что сделанное
+// исправление. Подмена — ОДНО событие ack, не весь стенд: задача, кандидат и
+// очередь — настоящие, из настоящего поиска через настоящий ctlprobe; только
+// ЭТОТ КОНКРЕТНЫЙ ответ на КОНКРЕТНУЮ команду синтезирован, чтобы проверить
+// ветку кода, которая обязана существовать (сегодня — как страховка, а не
+// как боевой путь) независимо от того, насколько редко она сработает по
+// факту (см. большой комментарий у D2K_ACK_NO_ROOM, datapath/include/d2k_ctl.h).
+func TestНехваткаМестаНеЖжётКандидата(t *testing.T) {
+	r := newRig(t)
+	const target = "noroom.example"
+
+	r.say("hello " + target)
+	r.say("rst")
+
+	// Дожидаемся ack на ПЕРВЫЙ push кандидата (SET_NAME) и НЕ отдаём его
+	// настоящему Handle — перехватываем по типу (AckOf == CmdSetName), а не
+	// ловим момент гонкой: настоящий стенд теперь отвечает на этот push
+	// только ok=1 (вытеснение делает «нет места» недостижимым, задача про
+	// вытеснение), так что ловить окно «ack ещё не пришёл» бессмысленно и
+	// хрупко — оно ничем не отличается от «ack уже пришёл». Все ОСТАЛЬНЫЕ
+	// события (hello, форма, подтверждение WantShape, зонды по объёму и
+	// классификации) идут через настоящий Handle/Pump, чтобы поиск дошёл до
+	// push сам, без подделки стенда целиком — подменяется только ЭТО ОДНО
+	// событие.
+	var sawRealAck bool
+	for i := 0; i < 100 && !sawRealAck; i++ {
+		if err := r.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		ev, err := r.conn.Next()
+		if err == nil {
+			if ev.Type == control.EvAck && ev.AckOf == control.CmdSetName {
+				sawRealAck = true
+			} else if err := r.ctrl.Handle(ev); err != nil {
+				t.Fatalf("контроллер не переварил событие: %v", err)
+			}
+		}
+		if err := r.ctrl.Pump(); err != nil {
+			t.Fatalf("контроллер не переварил зонд: %v", err)
+		}
+	}
+	if !sawRealAck {
+		t.Fatalf("ack на push кандидата не пришёл; журнал:\n%s", r.log)
+	}
+	var task *controller.Task
+	for _, tk := range r.ctrl.Tasks() {
+		if tk.Target == target {
+			task = tk
+		}
+	}
+	if task == nil || task.Current == nil {
+		t.Fatalf("после push кандидата нет задачи с текущим кандидатом; журнал:\n%s", r.log)
+	}
+	candidateID := task.Current.Plan.ID
+
+	if err := r.ctrl.Handle(control.Event{
+		Type: control.EvAck, AckOf: control.CmdSetName,
+		AckOK: false, AckReason: control.AckNoRoom,
+	}); err != nil {
+		t.Fatalf("контроллер не переварил ack «нет места»: %v", err)
+	}
+
+	var after *controller.Task
+	for _, tk := range r.ctrl.Tasks() {
+		if tk.Target == target {
+			after = tk
+		}
+	}
+	if after == nil {
+		t.Fatalf("задача %s пропала после отказа «нет места»; журнал:\n%s", target, r.log)
+	}
+	if after.Current == nil {
+		t.Fatalf("кандидат сожжён при отказе «нет места»; журнал:\n%s", r.log)
+	}
+	if after.Current.Plan.ID != candidateID {
+		t.Fatalf("кандидат заменён при отказе «нет места»: был %s, стал %s; журнал:\n%s",
+			candidateID, after.Current.Plan.ID, r.log)
+	}
+	if strings.Contains(r.log.String(), "беру следующий") {
+		t.Fatalf("отказ «нет места» отмечен как «беру следующего» — кандидат считается негодным:\n%s",
+			r.log)
+	}
+	if !strings.Contains(r.log.String(), "не хватило места") {
+		t.Fatalf("отказ «нет места» не отмечен как нехватка места:\n%s", r.log)
+	}
+}

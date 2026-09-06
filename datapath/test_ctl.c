@@ -18,6 +18,7 @@
 #include <sys/un.h>
 
 #include "d2k_ctl.h"
+#include "d2k_ctlsrv.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -68,6 +69,38 @@ static void frame(uint8_t *o, uint16_t type, const uint8_t *body, size_t len) {
     if (len) {
         memcpy(o + 6, body, len);
     }
+}
+
+/* Читает один кадр D2K_EV_ACK целиком и разбирает тело: тип подтверждаемой
+ * команды, признак успеха, код причины (см. d2k_ctl.h). Кадр ACK — фиксированной
+ * длины (ключ нулевой, но место под него есть у всех событий одинаково), так
+ * что read() одним вызовом на весь кадр — не подгонка под этот тест, а свойство
+ * формата. Возвращает 1, если прочитан целый и это действительно ACK. */
+static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
+    uint8_t buf[6 + D2K_KEY_WIRE_LEN + 2 + 1 + 1];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n != (ssize_t)sizeof buf) {
+        return 0;
+    }
+    uint16_t type = (uint16_t)((buf[4] << 8) | buf[5]);
+    if (type != D2K_EV_ACK) {
+        return 0;
+    }
+    const uint8_t *body = buf + 6;
+    *cmd = (uint16_t)((body[D2K_KEY_WIRE_LEN] << 8) | body[D2K_KEY_WIRE_LEN + 1]);
+    *ok = body[D2K_KEY_WIRE_LEN + 2];
+    *reason = body[D2K_KEY_WIRE_LEN + 3];
+    return 1;
+}
+
+/* Тело команды SET_NAME: [длина имени u8][имя][план TLV]. */
+static size_t set_name_body(uint8_t *body, const char *name,
+                            const uint8_t *plan, size_t planlen) {
+    size_t nl = strlen(name);
+    body[0] = (uint8_t)nl;
+    memcpy(body + 1, name, nl);
+    memcpy(body + 1 + nl, plan, planlen);
+    return 1 + nl + planlen;
 }
 
 int main(void) {
@@ -202,6 +235,164 @@ int main(void) {
         CHECK(strcmp(d2k_suspect_text(D2K_SUSPECT_RST),
                      "сброс в ответ на приветствие") == 0, "текст причины RST не тот");
         CHECK(d2k_suspect_text(200) != NULL, "неизвестный код без текста");
+    }
+
+    /* --- SET_NAME/SET_ADDR настоящим разбором (d2k_ctlsrv_command) ------------
+     *
+     * До сих пор этот файл проверял только framing сокета (d2k_ctl.c) —
+     * подделанным обратным вызовом on_cmd. Отказ «нет места» отличим от
+     * отказа «план негоден» именно в РАЗБОРЕ команды (ctlsrv.c), и его
+     * нельзя проверить подделкой: настоящая сессия, настоящая таблица
+     * планов, настоящий ack.
+     *
+     * Вместимость таблицы планов — d2k_session_new(2, 0) — выводится из
+     * вместимости таблицы потоков (2), а не из литерала: тот же вывод,
+     * что делает session.c из --flows. Маленькая специально: переполнение
+     * достижимо третьей же командой. */
+    {
+        d2k_session *sess = d2k_session_new(2, 0);
+        CHECK(sess != NULL, "сессия для разбора команд не создалась");
+
+        d2k_ctlsrv cx;
+        memset(&cx, 0, sizeof cx);
+        cx.sess = sess;
+        cx.ctl = c;
+        /* 0 — только наблюдение, d2k_plan_fits тогда пропускает любой план
+           (см. её комментарий): у этого блока задача — различить причины
+           ОТКАЗА разбора команды, а не причины непригодности плана коробке,
+           это отдельно проверено в internal/control/bridge_test.go. */
+        cx.send_limits = 0;
+
+        static const uint8_t tiny[] = {
+            'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 1,
+            0x01, 0x03, 0x00, 0x01, 0x00
+        };
+
+        /* Предыдущий блок закрыл своего cli, но ни разу не поллил c после
+           этого — сервер узнаёт об уходе собеседника только через
+           d2k_ctl_poll/d2k_ctl_flush (см. drop_peer в ctl.c), а не сам
+           по себе. Без этого d2k_ctl_peer_fd(c) всё ещё показывает СТАРЫЙ
+           fd занятым, и accept() ниже отверг бы наше новое подключение как
+           «второго контроллера» (см. блок «второй контроллер отвергается»
+           выше) — молча, а запись в уже закрытый cli падала бы SIGPIPE. */
+        d2k_ctl_poll(c, on_cmd, NULL);
+        CHECK(d2k_ctl_peer_fd(c) == -1, "старый собеседник не отвалился перед новым подключением");
+
+        cli = dial();
+        CHECK(cli >= 0, "клиент для разбора команд не подключился");
+        d2k_ctl_accept(c);
+        CHECK(d2k_ctl_peer_fd(c) >= 0, "подключение для разбора команд не принято");
+
+        /* Годная команда: ack ok=1, причина D2K_ACK_OK. */
+        {
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, "ok.example", tiny, sizeof tiny);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "годная команда не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "годная команда не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на годную команду не пришёл");
+            CHECK(cmd == D2K_CMD_SET_NAME, "ack не на ту команду");
+            CHECK(ok == 1, "годная команда отвергнута");
+            CHECK(reason == D2K_ACK_OK, "у успеха причина не D2K_ACK_OK");
+        }
+
+        /* Байты плана не разбираются: ack ok=0, причина D2K_ACK_BAD_PLAN —
+           «план негоден», а не «нет места». Раньше (ack(cx, type, rc == 0))
+           это было той же самой единицей отказа, что и переполнение таблицы:
+           контроллер не мог их различить (см. d2k_ctl.h). */
+        {
+            static const uint8_t garbage[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, "bad.example", garbage, sizeof garbage);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "негодный план не отправился");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "негодный план не разобрался");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на негодный план не пришёл");
+            CHECK(ok == 0, "негодный план подтверждён как принятый");
+            CHECK(reason == D2K_ACK_BAD_PLAN, "негодный план не помечен D2K_ACK_BAD_PLAN");
+        }
+
+        /* Имя пустое: ack ok=0, причина D2K_ACK_BAD_ARGS. План тут годный —
+           отказала САМА КОМАНДА, а не план; смешивать с BAD_PLAN нельзя. */
+        {
+            uint8_t body[32], f[48];
+            body[0] = 0;
+            memcpy(body + 1, tiny, sizeof tiny);
+            size_t blen = 1 + sizeof tiny;
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "команда с пустым именем не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "команда с пустым именем не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на пустое имя не пришёл");
+            CHECK(ok == 0, "пустое имя принято как цель");
+            CHECK(reason == D2K_ACK_BAD_ARGS, "пустое имя не помечено D2K_ACK_BAD_ARGS");
+        }
+
+        /* Главное: таблица полна — новая цель встаёт ВЫТЕСНЕНИЕМ, а не
+           отказом. До вытеснения именно так на живом роутере отказывала
+           КАЖДАЯ следующая цель после заполнения (см. d2k_plans.h).
+         *
+         * Вместимость таблицы планов выводится из d2k_track_capacity(flows)
+         * (session.c), а не из d2k_session_new(2, ...) буквально: track.c
+         * округляет capacity вверх до степени двойки С ПОЛОМ 16 (round_pow2
+         * начинает с p=16 и удваивает, пока не догонит n) — при capacity=2
+         * настоящая вместимость таблицы потоков и, значит, таблицы планов —
+         * 16, а не 2. Число 16 здесь — не своя константа теста, а измеренное
+         * значение этого пола; захардкодить «2» вместо него значило бы
+         * повторить ту же ошибку, которую чинит эта задача, уже в тесте. */
+        {
+            CHECK(d2k_session_plan_count(sess) == 1,
+                  "перед заполнением в таблице не одна принятая запись");
+            size_t cap = d2k_session_plan_capacity(sess);
+            CHECK(cap == 16,
+                  "вместимость таблицы планов не выведена из числа потоков (16 с полом round_pow2)");
+
+            /* Долить до вместимости: «ok.example» уже стоит, insert ok.example
+               был первым и потому старше всех — он и обязан вытесниться. */
+            for (size_t i = 1; i < cap; i++) {
+                /* 64, не 32: gcc считает ширину %zu хуже некуда (до 20 цифр
+                   на 64-битном size_t) и иначе ловит -Wformat-truncation,
+                   даже зная, что здесь i < cap <= 16 и реально нужно байт
+                   пять. См. задачу «зелёный на маке, красный на Linux». */
+                char nm[64];
+                snprintf(nm, sizeof nm, "filler%zu.example", i);
+                uint8_t body[64], f[80];
+                size_t blen = set_name_body(body, nm, tiny, sizeof tiny);
+                frame(f, D2K_CMD_SET_NAME, body, blen);
+                CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель-наполнитель не отправилась");
+                CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель-наполнитель не разобралась");
+                d2k_ctl_flush(c);
+                uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на наполнитель не пришёл");
+                CHECK(ok == 1, "наполнитель отвергнут при заполнении ровно до вместимости");
+            }
+            CHECK(d2k_session_plan_count(sess) == cap, "таблица не заполнилась ровно до вместимости");
+
+            /* Таблица теперь полна. Следующая цель обязана встать
+               вытеснением самой давно не использованной («ok.example» —
+               она вставлена первой из всех и её ни разу не трогали
+               повторно), а не получить отказ «мест нет». */
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, "overflow.example", tiny, sizeof tiny);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель после заполнения не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель после заполнения не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на цель после заполнения не пришёл");
+            CHECK(ok == 1, "заполненная таблица отказала вместо вытеснения");
+            CHECK(reason == D2K_ACK_OK, "у вытеснения причина не D2K_ACK_OK");
+            CHECK(d2k_session_plan_count(sess) == cap,
+                  "вытеснение изменило число записей в таблице");
+        }
+
+        close(cli);
+        d2k_session_free(sess);
     }
 
     d2k_ctl_close(c);

@@ -100,7 +100,17 @@ d2k_session *d2k_session_new(size_t capacity, size_t journal) {
        придуманной величиной без замера. */
     s->uflows = d2k_track_new(capacity);
     s->jrn = d2k_journal_new(journal);
-    s->plans = d2k_plantab_new(256);
+    /* Вместимость таблицы планов выводится из вместимости таблицы TCP-потоков
+       (--flows), а не подбирается литералом: цели не может понадобиться план,
+       если у неё нет потока, значит верхняя граница числа целей — число
+       отслеживаемых потоков. d2k_track_capacity(s->flows), а не сырой
+       capacity — округление до степени двойки внутри d2k_track_new делает
+       фактическую вместимость таблицы потоков и таблицы планов равными на
+       ту же величину, а не рассинхронизированными на округление. Если
+       s->flows не создался (OOM), d2k_track_capacity(NULL) == 0, и
+       d2k_plantab_new(0) вернёт NULL — это уже разбирает проверка ниже, как
+       и отказ любой другой из таблиц. */
+    s->plans = d2k_plantab_new(d2k_track_capacity(s->flows));
     if (!s->flows || !s->uflows || !s->plans || (journal > 0 && !s->jrn)) {
         d2k_plantab_free(s->plans);
         d2k_journal_free(s->jrn);
@@ -368,7 +378,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     uint32_t dst_be;
     memcpy(&dst_be, pkt + 16, 4);
     const d2k_plan *use = d2k_plantab_find(s->plans, (const uint8_t *)name,
-                                           name_len, dst_be);
+                                           name_len, dst_be, now_ns);
     if (!use) {
         use = s->plan;
     }
@@ -867,7 +877,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         use = d2k_plantab_find(s->plans,
                                tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
                                tls.have_sni ? tls.sni_len : 0,
-                               dst_be);
+                               dst_be, now_ns);
         if (!use) {
             use = s->plan;
         }
