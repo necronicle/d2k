@@ -109,6 +109,37 @@ static void check_generic_vectors(void) {
           "HMAC-SHA256 разошёлся с RFC 4231 Test Case 1");
 }
 
+/* Ревью 2026-09-06: strlen(label) в d2k_hkdf_expand_label копировался в
+ * full_label[] без проверки — ревьюер собрал модуль под санитайзерами
+ * проекта, подал метку в 110 байт и воспроизвёл переполнение стека. Правка
+ * в crypto.c — ранний отказ (-1) при label_len > D2K_HKDF_LABEL_MAX, ДО
+ * первого memcpy. Проверяем и точную репродукцию, и границу вплотную с обеих
+ * сторон: если бы порог проверялся как ">=" вместо ">", пара
+ * over_by_one/at_limit это бы поймала. */
+static void check_hkdf_label_length_guard(void) {
+    uint8_t secret[32];
+    memset(secret, 0, sizeof secret);
+    uint8_t out[16];
+
+    char reviewer_repro[111];
+    memset(reviewer_repro, 'A', 110);
+    reviewer_repro[110] = '\0';
+    CHECK(d2k_hkdf_expand_label(secret, reviewer_repro, out, sizeof out) == -1,
+          "метка в 110 байт (репродукция ревью) не отклонена");
+
+    char over_by_one[D2K_HKDF_LABEL_MAX + 2];
+    memset(over_by_one, 'B', D2K_HKDF_LABEL_MAX + 1);
+    over_by_one[D2K_HKDF_LABEL_MAX + 1] = '\0';
+    CHECK(d2k_hkdf_expand_label(secret, over_by_one, out, sizeof out) == -1,
+          "метка длиной D2K_HKDF_LABEL_MAX+1 не отклонена");
+
+    char at_limit[D2K_HKDF_LABEL_MAX + 1];
+    memset(at_limit, 'C', D2K_HKDF_LABEL_MAX);
+    at_limit[D2K_HKDF_LABEL_MAX] = '\0';
+    CHECK(d2k_hkdf_expand_label(secret, at_limit, out, sizeof out) == 0,
+          "метка длиной ровно D2K_HKDF_LABEL_MAX отклонена, хотя обязана пройти");
+}
+
 /* Настоящий клиентский Initial целиком, RFC 9001 Приложение A.2, DCID тот же
  * (0x8394c8f03e515708), что и выше. 1200 байт — минимальный размер датаграммы
  * QUIC Initial (RFC 9000 §14.1), из них 16 последних байт — тег AEAD. */
@@ -338,6 +369,7 @@ int main(void) {
     CHECK(memcmp(hp, want_hp, sizeof hp) == 0, "hp не сошёлся с вектором");
 
     check_generic_vectors();
+    check_hkdf_label_length_guard();
     check_rfc9001_a2_packet();
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }

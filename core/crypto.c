@@ -338,21 +338,27 @@ void d2k_hkdf_extract(const uint8_t *salt, size_t slen,
     d2k_hmac_sha256(salt, slen, ikm, ilen, out);
 }
 
-void d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
-                            uint8_t *out, size_t out_len) {
+int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
+                           uint8_t *out, size_t out_len) {
     /* HkdfLabel (RFC 8446 §7.1): length(2, big-endian) || len(full_label)(1)
      * || full_label || len(context)(1)=0. Контекст в этом модуле всегда пуст
      * (QUIC Initial его не использует, RFC 9001 §5.1). label — короткий
-     * ASCII-литерал нашего же кода ("client in", "quic key", "quic iv",
-     * "quic hp"), не сетевой вход: 64 байта под "tls13 "+label — запас на
-     * порядок больше самой длинной метки, которая тут вообще бывает. */
+     * ASCII-литерал нашего же кода, но проверка длины — не на честном слове
+     * вызывающего (ревью 2026-09-06: без неё strlen(label) > D2K_HKDF_LABEL_MAX
+     * переполняет full_label ниже; воспроизведено меткой в 110 байт под
+     * санитайзерами). Нарушение контракта — сразу отказ, ДО первого memcpy:
+     * ни один из буферов ниже ещё не тронут. */
     size_t label_len = strlen(label);
-    uint8_t full_label[64];
+    if (label_len > D2K_HKDF_LABEL_MAX) {
+        return -1;
+    }
+
+    uint8_t full_label[6 + D2K_HKDF_LABEL_MAX];
     memcpy(full_label, "tls13 ", 6);
     memcpy(full_label + 6, label, label_len);
     size_t full_len = 6 + label_len;
 
-    uint8_t info[2 + 1 + 64 + 1];
+    uint8_t info[2 + 1 + (6 + D2K_HKDF_LABEL_MAX) + 1];
     info[0] = (uint8_t)(out_len >> 8);
     info[1] = (uint8_t)(out_len);
     info[2] = (uint8_t)full_len;
@@ -368,7 +374,7 @@ void d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
     size_t written = 0;
     uint8_t counter = 1;
     while (written < out_len) {
-        uint8_t buf[32 + (2 + 1 + 64 + 1) + 1];
+        uint8_t buf[32 + (2 + 1 + (6 + D2K_HKDF_LABEL_MAX) + 1) + 1];
         size_t buf_len = 0;
         memcpy(buf, t_prev, t_prev_len);
         buf_len += t_prev_len;
@@ -390,6 +396,7 @@ void d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
         t_prev_len = 32;
         counter = (uint8_t)(counter + 1);
     }
+    return 0;
 }
 
 /* ===================== GF(2^128) / GHASH (NIST SP 800-38D §6.3) ===================== */
