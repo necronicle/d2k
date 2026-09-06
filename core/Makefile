@@ -20,22 +20,23 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
 # QUIC не трогают сеть, вход — байтовые вектора RFC, а не петля-мишень.
-# test_quicprobe заводит СВОЙ стенд (датаграммный, не потоковый — см. его
-# шапку) и в TESTHDR не входит: он не общий ни с кем.
+# test_quicprobe и test_quic_arms заводят СВОЙ стенд каждый (датаграммный, не
+# потоковый — см. их шапки) и в TESTHDR не входят: они не общие ни с кем и
+# друг с другом (задача 6 подменяет ДРУГИЕ крючки, чем задача 5).
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -57,6 +58,13 @@ quic.o: quic.c $(HDR)
 quicprobe.o: quicprobe.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Задача 6: подбор плеча зовёт d2k_quic_build_pool/d2k_quic_verify_response
+# (quicprobe.c, экспортированы задачей 6 — см. их doc-комментарии в
+# d2k_quicprobe.h про то, почему не дублируются) и d2k_mark_hook (d2k_meas.h,
+# как есть — та же метка, что и у остальных отправителей дерева).
+props.o: props.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -71,6 +79,9 @@ test_quic: test_quic.c quic.o crypto.o $(HDR)
 
 test_quicprobe: test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
+
+test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
@@ -87,7 +98,10 @@ test-quic: test_quic
 test-quicprobe: test_quicprobe
 	./test_quicprobe
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe
+test-quic-arms: test_quic_arms
+	./test_quic_arms
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -148,6 +162,11 @@ cross:
 		test_quicprobe.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-mipsel \
 		test_quicprobe.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+	@echo "== test_quic_arms целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
+		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
+		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
