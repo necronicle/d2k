@@ -20,19 +20,19 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c
-HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h
+SRC     = meas.c verdict.c crypto.c quic.c
+HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
-# test_crypto стенда не использует вовсе: криптография не трогает сеть, вход —
-# байтовые вектора RFC, а не петля-мишень.
+# test_crypto и test_quic стенда не используют вовсе: криптография и разбор
+# QUIC не трогают сеть, вход — байтовые вектора RFC, а не петля-мишень.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto
+TESTS   = test_meas test_verdict test_crypto test_quic
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic
 
-all: meas.o verdict.o crypto.o
+all: meas.o verdict.o crypto.o quic.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -41,6 +41,11 @@ verdict.o: verdict.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 crypto.o: crypto.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Разбор QUIC зовёт примитивы crypto.c (HKDF, AES-ECB, AES-GCM) — см. шапку
+# quic.c: снятие защиты заголовка и расшифровка Initial стоят целиком на них.
+quic.o: quic.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
@@ -52,6 +57,9 @@ test_verdict: test_verdict.c meas.o verdict.o $(HDR) $(TESTHDR)
 test_crypto: test_crypto.c crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_crypto.c crypto.o $(TEST_LDFLAGS)
 
+test_quic: test_quic.c quic.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o crypto.o $(TEST_LDFLAGS)
+
 test-meas: test_meas
 	./test_meas
 
@@ -61,7 +69,10 @@ test-verdict: test_verdict
 test-crypto: test_crypto
 	./test_crypto
 
-check: all test-meas test-verdict test-crypto
+test-quic: test_quic
+	./test_quic
+
+check: all test-meas test-verdict test-crypto test-quic
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -112,6 +123,11 @@ cross:
 		test_crypto.c crypto.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_crypto-mipsel \
 		test_crypto.c crypto.c -lpthread || exit 1
+	@echo "== test_quic целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic-a64 \
+		test_quic.c quic.c crypto.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic-mipsel \
+		test_quic.c quic.c crypto.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
