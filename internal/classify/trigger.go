@@ -18,37 +18,111 @@ package classify
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
-
-	"github.com/necronicle/d2k/internal/plan"
+	"fmt"
+	"io"
+	"net"
+	"time"
 )
 
 // Trigger — байты, которыми спрашиваем, и координаты имени внутри них.
 //
-// Координаты нужны поиску границы: резать вслепую по всей длине дороже, чем
-// начать с окрестностей имени, а без координат нельзя и назвать место разреза
-// осмысленно.
+// Координаты нужны разрезам: режут по имени, а не по середине пакета.
 type Trigger struct {
 	Payload []byte
 	SNI     string
 	SNIOff  int
 	SNILen  int
+	// Shape — какого клиента приветствие: «современный» или «старый».
+	// Хранится, чтобы вердикт можно было прочитать вместе с тем, на ком он
+	// снят: приём, найденный на одном приветствии, на другом может не
+	// работать.
+	Shape string
 }
 
-// TLSTrigger — приветствие с заданным именем.
-func TLSTrigger(sni string) (Trigger, error) {
+// captureHello поднимает настоящего клиента crypto/tls над трубой и забирает
+// первую запись, которую тот пишет.
+//
+// ПРИВЕТСТВИЕ НЕ КОНСТРУИРУЕТСЯ РУКАМИ, И ЭТО НЕ ЛЕНЬ. Форма приветствия — это
+// и есть измерительный прибор: коробка принимает решение по ней. Самодельное
+// приветствие с другим набором расширений меряет НЕ ТУ коробку, что видит
+// браузер, и вердикт получается про несуществующий мир.
+//
+// Проверено на этой линии 06.09.2026, дорогой ценой: самодельное приветствие на
+// 93 байта проходило там, где настоящее приветствие curl получало сброс
+// мгновенно. План, подтверждённый самодельным приветствием, лёг в каталог с
+// уровнем 3 и 4796 «успехами» — и не открывал сайт ни разу.
+func captureHello(sni string, maxVersion uint16) ([]byte, error) {
+	client, server := net.Pipe()
+	captured := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _ := io.ReadAtLeast(server, buf, 1)
+		captured <- append([]byte(nil), buf[:n]...)
+		// Рукопожатию не дают завершиться намеренно: нужна первая запись, а не
+		// сессия.
+		_ = server.Close()
+	}()
+
+	cfg := &tls.Config{ServerName: sni, MinVersion: tls.VersionTLS12} //nolint:gosec
+	if maxVersion != 0 {
+		cfg.MaxVersion = maxVersion
+	}
+	c := tls.Client(client, cfg)
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = c.Handshake() // ошибка ожидаема: труба закроется сразу после захвата
+	_ = client.Close()
+
+	select {
+	case b := <-captured:
+		if len(b) < 16 {
+			return nil, fmt.Errorf("приветствие вышло длиной %d байт", len(b))
+		}
+		return b, nil
+	case <-time.After(3 * time.Second):
+		return nil, errors.New("приветствие не собралось")
+	}
+}
+
+// CaptureHello — настоящее приветствие современного клиента для этого имени.
+//
+// Наружу, потому что нужно не только дереву вердиктов: контроллер зондирует
+// цель тем же приветствием, и расхождение между «чем мерим» и «что шлёт
+// браузер» уже стоило проекту каталога с ложными успехами.
+func CaptureHello(sni string) ([]byte, error) {
+	if sni == "" {
+		return nil, errors.New("приветствию нужно имя")
+	}
+	return captureHello(sni, 0)
+}
+
+func trigger(sni string, maxVersion uint16, shape string) (Trigger, error) {
 	if sni == "" {
 		return Trigger{}, errors.New("триггеру нужно имя")
 	}
-	h, err := plan.Hello(sni, 0x30)
+	b, err := captureHello(sni, maxVersion)
 	if err != nil {
 		return Trigger{}, err
 	}
-	off := bytes.Index(h, []byte(sni))
-	if off < 0 {
-		return Trigger{}, errors.New("имя не нашлось в собранном приветствии")
+	t := Trigger{Payload: b, SNI: sni, Shape: shape, SNIOff: -1}
+	if i := bytes.Index(b, []byte(sni)); i >= 0 {
+		t.SNIOff, t.SNILen = i, len(sni)
 	}
-	return Trigger{Payload: h, SNI: sni, SNIOff: off, SNILen: len(sni)}, nil
+	return t, nil
+}
+
+// TLSTrigger — приветствие СОВРЕМЕННОГО клиента: браузер, телефон.
+func TLSTrigger(sni string) (Trigger, error) { return trigger(sni, 0, "современный") }
+
+// TLS12Trigger — приветствие СТАРОГО клиента: телевизор, приставка.
+//
+// У него другая длина, другой набор расширений и другое место имени внутри.
+// Приём, найденный на современном приветствии, там может не работать — ради
+// этого различия режим и существует.
+func TLS12Trigger(sni string) (Trigger, error) {
+	return trigger(sni, tls.VersionTLS12, "старый")
 }
 
 // Control — приветствие с ДРУГИМ именем на ту же цель.
@@ -56,4 +130,8 @@ func TLSTrigger(sni string) (Trigger, error) {
 // Контроль отвечает на вопрос «а содержимое вообще при чём?»: если и он
 // молчит, наши байты ни при чём. Внешнего сервера здесь нет и быть не может
 // (§3.5) — меняется только имя, адрес тот же.
-func Control(sni string) (Trigger, error) { return TLSTrigger(sni) }
+//
+// Контроль ТЕМ ЖЕ именем, что и триггер, — не контроль вовсе: если имя под
+// блокировкой, молчать будут оба, и «режут адрес» получится из собственной
+// ошибки ввода.
+func Control(sni string) (Trigger, error) { return trigger(sni, 0, "контроль") }

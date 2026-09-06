@@ -24,7 +24,6 @@ import (
 	"github.com/necronicle/d2k/internal/classify"
 	"github.com/necronicle/d2k/internal/conntrack"
 	"github.com/necronicle/d2k/internal/control"
-	"github.com/necronicle/d2k/internal/plan"
 	"github.com/necronicle/d2k/internal/probe"
 )
 
@@ -1109,11 +1108,21 @@ func (c *Controller) onAck(ev control.Event, now time.Time) error {
 // по-разному относиться к приветствию браузера и к нашему (§3.1, §5.5).
 func (c *Controller) clientHello(t *Task) ([]byte, error) {
 	if len(t.Shape) == 0 {
-		return plan.Hello(t.Target, 0x30)
+		// САМОДЕЛЬНОЕ ПРИВЕТСТВИЕ ЗДЕСЬ БЫЛО ГЛАВНОЙ ОШИБКОЙ ПРОЕКТА.
+		//
+		// Форма приветствия — это измерительный прибор: коробка решает по ней.
+		// Самодельные 93 байта из plan.Hello проходили там, где настоящее
+		// приветствие браузера получало сброс мгновенно. План, подтверждённый
+		// таким зондом, ложился в каталог с уровнем 3 — и не открывал сайт ни
+		// разу. Замер 06.09.2026: сохранённый для instagram план дал реальному
+		// curl 000 три раза подряд, имея 4796 записанных «успехов».
+		//
+		// Берём настоящее приветствие у crypto/tls — то же, что берёт донор.
+		return classify.CaptureHello(t.Target)
 	}
 	reshaped, dropped, err := probe.Reshape(t.Shape, 0x55)
 	if err != nil {
-		return plan.Hello(t.Target, 0x30)
+		return classify.CaptureHello(t.Target)
 	}
 	if len(dropped) > 0 {
 		c.sayf("по %s из формы клиента убраны расширения %v: билеты возобновления не копируем",

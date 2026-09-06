@@ -108,8 +108,11 @@ func TestОжиданиеСужаетсяПослеПервогоОтвета(t 
 	tr, _ := TLSTrigger("любое.example")
 	addr := stand(t, "delay", nil, 2*time.Second)
 	// Options{} нарочно НЕ через opts(): там Wait задан явно (700мс) и
-	// автоматический режим по RTT вообще не включится.
-	r := Run(context.Background(), addr, tr, Options{Gap: loopbackGap})
+	// автоматический режим по RTT вообще не включится. Повтор ставим ОДИН
+	// явно: проверяется сужение ожидания между вопросами, а не умолчание в
+	// три повтора — с тремя первый вопрос ответил бы трижды, и различие
+	// между вопросами утонуло бы в подсчёте.
+	r := Run(context.Background(), addr, tr, Options{Gap: loopbackGap, Repeats: 1})
 
 	if len(r.Trace) < 2 {
 		t.Fatalf("трасса короче двух вопросов: %+v", r.Trace)
