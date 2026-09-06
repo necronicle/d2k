@@ -727,11 +727,18 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    шапку файла), потом ждём ответы разом через poll(), пока не истечёт
    wait_ms с момента отправки или не ответят все. Каждый пришедший ответ
    проверяется независимо через verify (см. qp_verify_fn выше), тайм-аут без
-   ответа — тишина (fail, не err); явная ошибка сокета при отправке — err. */
+   ответа — тишина (fail, не err). ДВА РАЗНЫХ "не получилось", неразличимых
+   ранее (правка ревью 2026-09-06, круг 4, находка 5): попытка вовсе НЕ
+   ОТПРАВИЛАСЬ (сбой socket()/connect()/send() в qp_send_one, наша сторона,
+   к сети отношения не имеет) против попытка ОТПРАВИЛАСЬ и получила явный
+   сетевой отказ (POLLERR/ошибка recv() — ICMP «порт недоступен» и подобное).
+   Обе считаются в err (d2k_tally не различает), но refused_out, если не
+   NULL, — только вторые: err ⊇ refused. */
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
-                              int repeats, uint32_t *rtt_ms_out, qp_verify_fn verify) {
+                              int repeats, uint32_t *rtt_ms_out, int *refused_out,
+                              qp_verify_fn verify) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -744,10 +751,13 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
            точек разреза (нарушение контракта отклоняется целиком, а не
            ужимается до похожего): опыт не проводится вовсе, вместо того
            чтобы молча провести МЕНЬШЕ, чем спросили (правка ревью 2026-09-06
-           круг 3, находка E). Сегодня недостижимо — оба вызывающих просят
-           D2K_QUIC_REPEATS=3 или D2K_QUIC_CLEAR_CONFIRM_REPEATS=2, оба
-           меньше D2K_QUIC_MAX_ADDRS=8, — но контракт не должен держаться на
-           том, что сегодняшние вызовы его не нарушают. */
+           круг 3, находка E). НЕ "недостижимо" (прежняя редакция ошибалась,
+           проверив только вызовы ИЗНУТРИ d2k_quic_classify, а не сам хук —
+           d2k_quic_ask_hook extern и часть контракта независимо от
+           вызывающего; ревьюер вызвал его напрямую с repeats=99 и получил
+           err=99, правка ревью 2026-09-06, круг 4, находка 2) — предел
+           D2K_QUIC_MAX_ADDRS назван в doc-комментарии d2k_quic_ask_fn,
+           покрыт тестом (см. test_quicprobe.c). */
         d2k_tally bad;
         memset(&bad, 0, sizeof bad);
         bad.err = repeats;
@@ -755,6 +765,9 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
         bad.marked = (mark == 0);
         if (rtt_ms_out) {
             *rtt_ms_out = 0;
+        }
+        if (refused_out) {
+            *refused_out = 0; /* ни одна попытка не отправлялась — отказывать нечему */
         }
         return bad;
     }
@@ -768,7 +781,12 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     int fds[D2K_QUIC_MAX_ADDRS];
     int marked[D2K_QUIC_MAX_ADDRS];
     int done[D2K_QUIC_MAX_ADDRS];
-    int result[D2K_QUIC_MAX_ADDRS]; /* 1 pass, 0 тишина/не подтверждено, -1 транспорт */
+    /* 1 pass, 0 тишина/не подтверждено, -1 НЕ ОТПРАВИЛОСЬ (наша сторона, сеть
+       не спрошена), -2 ОТПРАВИЛОСЬ и получило явный сетевой отказ (правка
+       ревью 2026-09-06, круг 4, находка 5 — прежде оба случая были одним и
+       тем же -1, и вызывающий не мог отличить "не спросили" от "спросили и
+       отказали"). */
+    int result[D2K_QUIC_MAX_ADDRS];
     struct timespec sent_at[D2K_QUIC_MAX_ADDRS];
     int pending = 0;
 
@@ -778,7 +796,7 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             t.marked = 0;
         }
         if (fds[i] < 0) {
-            result[i] = -1;
+            result[i] = -1; /* не отправилось: socket()/connect()/send() в qp_send_one */
             done[i] = 1;
         } else {
             result[i] = 0;
@@ -848,23 +866,36 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             } else if (n == 0) {
                 result[i] = 0;
             } else {
-                result[i] = -1; /* POLLERR/явная ошибка сокета — транспорт */
+                /* POLLERR/явная ошибка recv() ПОСЛЕ успешной отправки — это
+                   сетевой отказ (ICMP «порт недоступен» и подобное), не
+                   "опыт не состоялся": датаграмма ушла, ответ (в широком
+                   смысле — включая отказ) пришёл. Отдельный код -2, не -1,
+                   ровно для этого различия (находка 5 выше). */
+                result[i] = -2;
             }
         }
     }
 
+    int refused = 0;
     for (int i = 0; i < repeats; i++) {
         if (fds[i] >= 0) {
             close(fds[i]);
         }
         if (result[i] == 1) {
             t.pass++;
-        } else if (result[i] < 0) {
+        } else if (result[i] == -2) {
+            t.err++;
+            t.fail++;
+            refused++;
+        } else if (result[i] == -1) {
             t.err++;
             t.fail++;
         } else {
             t.fail++;
         }
+    }
+    if (refused_out) {
+        *refused_out = refused;
     }
     return t;
 }
@@ -872,28 +903,33 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
-                           int repeats, uint32_t *rtt_ms_out) {
+                           int repeats, uint32_t *rtt_ms_out, int *refused_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, msg, wait_ms, mark, repeats, rtt_ms_out,
-                        qp_verify_aead);
+                        refused_out, qp_verify_aead);
 }
 
-/* Живость через согласование версии — та же дисциплина повторов, метки и
+/* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
    параллельной отправки, что и у обычных вопросов (см. большой комментарий
    у qp_build_vn_trigger выше, находка C ревью), только проверщик другой
-   (структурный, не AEAD) и RTT не нужен (rtt_ms_out=NULL). Не через
-   d2k_quic_ask_hook: разветвлять ПОДМЕНЯЕМЫЙ в тестах оракул на два
-   независимых протокола ответа ради одного вызывающего было бы
-   преждевременным обобщением шва, который и так существует только из-за
-   ограничения тестовой платформы (см. d2k_quicprobe.h у d2k_quic_ask_hook);
-   тестируется отдельно, настоящими сокетами на 127.0.0.1 — адресная ротация
-   этому зонду не нужна, он до неё не доходит. */
+   (структурный, не AEAD), RTT не нужен (rtt_ms_out=NULL), и ПОРОГ ПРИЁМА
+   ДРУГОЙ: вызывающий (d2k_quic_classify) принимает ЛЮБОЙ vn.pass > 0 как
+   доказательство "путь жив" — не единогласие 3/3 (правка ревью 2026-09-06,
+   круг 4, находка 1). Это решение вызывающего, не этой функции: quic_ask_ex
+   лишь считает "сколько из скольких", порог — на стороне того, кто читает
+   d2k_tally. Не через d2k_quic_ask_hook: разветвлять ПОДМЕНЯЕМЫЙ в тестах
+   оракул на два независимых протокола ответа ради одного вызывающего было
+   бы преждевременным обобщением шва, который и так существует только
+   из-за ограничения тестовой платформы (см. d2k_quicprobe.h у
+   d2k_quic_ask_hook); тестируется отдельно, настоящими сокетами на
+   127.0.0.1 — адресная ротация этому зонду не нужна, он до неё не доходит. */
 static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, uint32_t mark) {
     uint8_t trig_buf[1200];
     size_t tlen = qp_build_vn_trigger(trig_buf, sizeof trig_buf);
     d2k_hello msg;
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
-    return quic_ask_ex(addr, port, NULL, 0, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, qp_verify_vn);
+    return quic_ask_ex(addr, port, NULL, 0, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
+                        qp_verify_vn);
 }
 
 /* Реальный оракул — умолчание d2k_quic_ask_hook (см. d2k_quicprobe.h про то,
@@ -1000,9 +1036,9 @@ static void qp_arm_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN], size_
         return;
     }
     static const uint8_t garbage16[16]; /* ровно 16 нулей — тот же мусор, что и у донора (questions.go:97) */
-    d2k_tally armed =
-        d2k_quic_ask_hook(fresh, port, garbage16, sizeof garbage16, trigger, wait_ms, mark, D2K_QUIC_REPEATS, NULL);
-    r->probes += D2K_QUIC_REPEATS;
+    d2k_tally armed = d2k_quic_ask_hook(fresh, port, garbage16, sizeof garbage16, trigger, wait_ms,
+                                         mark, D2K_QUIC_REPEATS, NULL, NULL);
+    r->probes += armed.pass + armed.fail; /* измеренное число, не литерал (находка 2 ревью, круг 4) */
     if (!armed.marked) {
         *all_marked = 0;
     }
@@ -1092,22 +1128,45 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
         reason_set(&r, "бюджет исчерпан до базовой проверки живости — вопрос НЕ ЗАДАН");
     } else {
         uint32_t rtt_ms = 0;
-        d2k_tally base_ctl =
-            d2k_quic_ask_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms, mark, D2K_QUIC_REPEATS, &rtt_ms);
-        r.probes += D2K_QUIC_REPEATS;
+        int refused = 0;
+        d2k_tally base_ctl = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
+                                                mark, D2K_QUIC_REPEATS, &rtt_ms, &refused);
+        r.probes += base_ctl.pass + base_ctl.fail; /* измеренное, не литерал (находка 2 ревью, круг 4) */
         if (!base_ctl.marked) {
             all_marked = 0;
         }
 
-        if (base_ctl.err == D2K_QUIC_REPEATS) {
-            /* "Транспорт" здесь — любой сбой ДО ответа (socket()/inet_pton()/
-               connect()/send() тоже считаются через qp_send_one, не только
-               ICMP): называть это "портом недоступен" значило бы утверждать
-               конкретный сетевой факт, которого err сам по себе не
-               различает — прежняя редакция называла (правка ревью
-               2026-09-06 круг 3, находка E, "верни осторожность"). */
+        if (refused > 0) {
+            /* Донорский порог (probe.go: base.Refused > 0) — ЛЮБОЙ сетевой
+               отказ (ICMP «порт недоступен» и подобное, см. quic_ask_ex)
+               уже доказывает факт: путь отвечает отказом, остальные две
+               попытки ничего к этому не добавляют и отнять доказательство
+               не могут — то же рассуждение "присутствие, не единогласие",
+               что и у зонда согласования версии ниже (находка 1 ревью, круг
+               4), только факт здесь другой (отказ, а не тишина). Порог
+               ставим по ФАКТУ присутствия отказа, не утверждая ПРИЧИНУ,
+               по которой отказ мог прийти не на все три попытки (рейт-лимит
+               ICMP на стороне цели — вещь известная, но не измеренная нами,
+               правка ревью 2026-09-06 круг 4, находка 5). refused ⊆
+               base_ctl.err (см. quic_ask_ex) — отдельный счётчик именно
+               потому, что err ЕЩЁ включает "не отправилось" (наша сторона),
+               а refused — только настоящий сетевой отказ ПОСЛЕ отправки. */
             r.verdict = D2K_V_UNREACHABLE;
-            reason_set(&r, "нет UDP-ответа с %s: %d/%d — транспорт, не решение коробки", pool[0],
+            reason_set(&r, "%s отвечает сетевым отказом (%d/%d, ICMP или подобное) — транспорт, "
+                           "не решение коробки",
+                       pool[0], refused, D2K_QUIC_REPEATS);
+        } else if (base_ctl.err == D2K_QUIC_REPEATS) {
+            /* refused == 0 здесь по построению (иначе сработала бы ветка
+               выше) — значит НИ ОДНА из трёх попыток не была даже
+               отправлена: сбой socket()/connect()/send() в qp_send_one,
+               наша сторона, к сети отношения не имеет. "Транспорт, не
+               решение коробки" здесь была бы ложью — это утверждение о
+               СЕТИ, а сеть не спрошена ни разу (правка ревью 2026-09-06
+               круг 4, находка 5: прежняя редакция называла эту ветку
+               UNREACHABLE, приравнивая "не отправилось" к "спросили и
+               отказали"). */
+            r.verdict = D2K_V_FLAKY;
+            reason_set(&r, "не отправилось ни разу (%d/%d) — наша сторона, опыт не состоялся",
                        base_ctl.err, D2K_QUIC_REPEATS);
         } else if (base_ctl.err > 0) {
             r.verdict = D2K_V_FLAKY;
@@ -1117,15 +1176,16 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
             r.verdict = D2K_V_FLAKY;
             reason_set(&r, "базовая живость не воспроизводится: %d/%d", base_ctl.pass, D2K_QUIC_REPEATS);
         } else if (base_ctl.pass == 0) {
-            /* Тишина без единой ошибки транспорта — путь мог быть и жив, и
-               мёртв; зонд согласования версии решает, не неся содержимого
+            /* Тишина без единой ошибки транспорта и без единого сетевого
+               отказа (обе ветки выше уже исключены) — путь мог быть и жив,
+               и мёртв; зонд согласования версии решает, не неся содержимого
                вовсе (см. большой комментарий у qp_build_vn_trigger). Три
                параллельных попытки, метка, учёт в all_marked — та же
-               дисциплина, что и у любого другого вопроса (правка ревью
-               2026-09-06 круг 3, находки A и C: раньше был один зонд без
-               метки, и его исход не входил в r.marked). */
+               дисциплина ПОВТОРОВ, что и у любого другого вопроса (правка
+               ревью 2026-09-06 круг 3, находки A и C), но ПОРОГ ПРИЁМА —
+               другой, см. ветку vn.pass > 0 ниже. */
             d2k_tally vn = qp_ask_vn(pool[0], port, d2k_quic_wait_ms, mark);
-            r.probes += D2K_QUIC_REPEATS;
+            r.probes += vn.pass + vn.fail; /* измеренное, не литерал (находка 2 ревью, круг 4) */
             if (!vn.marked) {
                 all_marked = 0;
             }
@@ -1133,12 +1193,23 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                 r.verdict = D2K_V_FLAKY;
                 reason_set(&r, "согласование версии: %d/%d не состоялись — транспорт", vn.err,
                            D2K_QUIC_REPEATS);
-            } else if (vn.pass > 0 && vn.pass < D2K_QUIC_REPEATS) {
-                r.verdict = D2K_V_FLAKY;
-                reason_set(&r, "согласование версии не воспроизводится: %d/%d — одна обычная потеря "
-                               "не должна решать между UNREACHABLE и INCONCLUSIVE",
-                           vn.pass, D2K_QUIC_REPEATS);
-            } else if (vn.pass == D2K_QUIC_REPEATS) {
+            } else if (vn.pass > 0) {
+                /* ПОРОГ ПРИСУТСТВИЯ, НЕ ЕДИНОГЛАСИЯ (правка ревью
+                   2026-09-06, круг 4, находка 1 — ошибка формулировки
+                   дispatch круга 3, не моей реализации: единогласие
+                   отвечает на вопрос "одинаково ли коробка решает три раза"
+                   — вопрос про РЕШЕНИЕ. Зонд согласования версии спрашивает
+                   про ФАКТ: жив ли путь. ОДИН пришедший ответ уже доказывает
+                   факт; второй и третий ничего к доказательству не
+                   добавляют и отнять его не могут. RFC 9000 §6.1: "A server
+                   MAY limit the number of packets to which it responds with
+                   a Version Negotiation packet"; §21.5.4 объясняет причину
+                   — VN является вектором усиления, ограничение отклика
+                   штатно, не аномалия сети. Донор (probe.go:308) использует
+                   тот же порог: `if vn.Answered == 0`. Неполный ответ здесь
+                   НЕ обязательно потеря — это может быть штатный лимит
+                   сервера, поэтому текст ниже не утверждает причину
+                   недостающих ответов, только факт присутствия. */
                 r.verdict = D2K_V_INCONCLUSIVE;
                 /* Честно: наше имя (trigger) на этой ветке НЕ СПРАШИВАЛОСЬ ни
                    разу — молчит именно КОНТРОЛЬНОЕ имя, а согласование версии
@@ -1154,9 +1225,21 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                                "версии %d/%d) — наше имя не спрашивалось, мерить нечем",
                            D2K_QUIC_REPEATS, vn.pass, D2K_QUIC_REPEATS);
             } else {
-                r.verdict = D2K_V_UNREACHABLE;
-                reason_set(&r, "молчит всё, включая согласование версии (0/%d) — транспорт, не "
-                               "решение коробки",
+                /* vn.pass == 0 и vn.err == 0: опыты СОСТОЯЛИСЬ (отправлены,
+                   дождались тайм-аута без единой ошибки) и на контроле, и на
+                   согласовании версии — ответа нет ни на один. НАХОДКА 3
+                   РЕВЬЮ (круг 4): это тишина, а не "транспорт не случился",
+                   и полная тишина на UDP/443 одинаково объясняется мёртвым
+                   путём и блокировкой порта/протокола целиком — различить
+                   нельзя (§2.3), значит нельзя утверждать "не решение
+                   коробки": прежняя формулировка знала ровно то, чего знать
+                   нельзя, только с другой стороны, чем запрещает §2.3.
+                   Приведено к тому же честному виду, что и у соседнего
+                   вывода на шаге 3 ("нельзя отличить содержимое от
+                   недоступности сервера"). */
+                r.verdict = D2K_V_INCONCLUSIVE;
+                reason_set(&r, "молчит всё, включая согласование версии (0/%d) — нельзя отличить "
+                               "мёртвый путь от блокировки порта/протокола (§2.3)",
                            D2K_QUIC_REPEATS);
             }
         } else {
@@ -1172,9 +1255,9 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
             }
 
             /* ===== ШАГ 1: прямой зонд (тот же адрес — живость уже подтверждена) ===== */
-            d2k_tally base =
-                d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark, D2K_QUIC_REPEATS, NULL);
-            r.probes += D2K_QUIC_REPEATS;
+            d2k_tally base = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
+                                                D2K_QUIC_REPEATS, NULL, NULL);
+            r.probes += base.pass + base.fail; /* измеренное, не литерал (находка 2 ревью, круг 4) */
             if (!base.marked) {
                 all_marked = 0;
             }
@@ -1185,8 +1268,8 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                            D2K_QUIC_REPEATS);
             } else if (base.pass == D2K_QUIC_REPEATS) {
                 d2k_tally confirm = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
-                                                       D2K_QUIC_CLEAR_CONFIRM_REPEATS, NULL);
-                r.probes += D2K_QUIC_CLEAR_CONFIRM_REPEATS;
+                                                       D2K_QUIC_CLEAR_CONFIRM_REPEATS, NULL, NULL);
+                r.probes += confirm.pass + confirm.fail; /* измеренное (находка 2 ревью, круг 4) */
                 if (!confirm.marked) {
                     all_marked = 0;
                 }
@@ -1225,8 +1308,8 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                 } else {
                     nap_us(D2K_QUIC_GAP_US); /* §7: пауза между вопросами по той же тройке */
                     d2k_tally same = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, dyn_wait, mark,
-                                                        D2K_QUIC_REPEATS, NULL);
-                    r.probes += D2K_QUIC_REPEATS;
+                                                        D2K_QUIC_REPEATS, NULL, NULL);
+                    r.probes += same.pass + same.fail; /* измеренное (находка 2 ревью, круг 4) */
                     if (!same.marked) {
                         all_marked = 0;
                     }
@@ -1276,9 +1359,9 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                                                "ЗАДАН — пул из %zu исчерпан",
                                            D2K_QUIC_REPEATS, n_pool);
                             } else {
-                                d2k_tally clean = d2k_quic_ask_hook(fresh1, port, NULL, 0, control,
-                                                                     dyn_wait, mark, D2K_QUIC_REPEATS, NULL);
-                                r.probes += D2K_QUIC_REPEATS;
+                                d2k_tally clean = d2k_quic_ask_hook(fresh1, port, NULL, 0, control, dyn_wait,
+                                                                     mark, D2K_QUIC_REPEATS, NULL, NULL);
+                                r.probes += clean.pass + clean.fail; /* измеренное (находка 2 ревью, круг 4) */
                                 if (!clean.marked) {
                                     all_marked = 0;
                                 }
