@@ -9,6 +9,23 @@
 
 #include "d2k_ctlsrv.h"
 
+/* Кладёт ключ потока в тело события ПОЛЯМИ, а не наложением структуры на
+ * буфер: memcpy(тело, &ключ, sizeof ключ) отправил бы на провод и три байта
+ * дыры выравнивания (sizeof(d2k_key) == 16, значащих байт — D2K_KEY_WIRE_LEN
+ * == 13), с непредсказуемым содержимым — см. большой комментарий у d2k_key
+ * (d2k_track.h) про то, почему на эту дыру нельзя полагаться нигде, кроме
+ * зануления внутри d2k_key_make. Тот же приём, каким остальной датапат
+ * (wire.c, wire_udp.c) собирает заголовки: поле в поле, явным порядком.
+ * Возвращает D2K_KEY_WIRE_LEN — сколько байт записано. */
+static size_t put_key(uint8_t *out, const d2k_key *k) {
+    memcpy(out + 0, &k->low_ip, 4);
+    memcpy(out + 4, &k->high_ip, 4);
+    memcpy(out + 8, &k->low_port, 2);
+    memcpy(out + 10, &k->high_port, 2);
+    out[12] = k->proto;
+    return D2K_KEY_WIRE_LEN;
+}
+
 int d2k_plan_fits(const d2k_plan *p, uint32_t limits, char *why, size_t cap) {
     if (limits == 0) {
         return 1;   /* наблюдение: на провод ничего не пойдёт */
@@ -28,11 +45,11 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t limits, char *why, size_t cap) {
 static void ack(d2k_ctlsrv *cx, uint16_t type, int ok) {
     /* Место под ключ потока есть у всех событий одинаково: подтверждение не
        про поток, но общая раскладка проще и сборке, и разбору. Ключ нулевой. */
-    uint8_t body[12 + 3];
+    uint8_t body[D2K_KEY_WIRE_LEN + 3];
     memset(body, 0, sizeof body);
-    body[12] = (uint8_t)(type >> 8);
-    body[13] = (uint8_t)type;
-    body[14] = ok ? 1 : 0;
+    body[D2K_KEY_WIRE_LEN] = (uint8_t)(type >> 8);
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)type;
+    body[D2K_KEY_WIRE_LEN + 2] = ok ? 1 : 0;
     if (ok) {
         cx->ok_cmds++;
     } else {
@@ -91,11 +108,11 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             size_t slen = 0;
             const uint8_t *sh = d2k_session_shape(cx->sess, &slen);
             if (sh && slen > 0 && cx->ctl) {
-                uint8_t body[12 + 2048];
-                memset(body, 0, 12);
-                if (slen <= sizeof body - 12) {
-                    memcpy(body + 12, sh, slen);
-                    d2k_ctl_event(cx->ctl, D2K_EV_SHAPE, body, 12 + slen);
+                uint8_t body[D2K_KEY_WIRE_LEN + 2048];
+                memset(body, 0, D2K_KEY_WIRE_LEN);
+                if (slen <= sizeof body - D2K_KEY_WIRE_LEN) {
+                    memcpy(body + D2K_KEY_WIRE_LEN, sh, slen);
+                    d2k_ctl_event(cx->ctl, D2K_EV_SHAPE, body, D2K_KEY_WIRE_LEN + slen);
                 }
             }
         }
@@ -145,9 +162,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             continue;
         }
         /* Хватает и на приветствие целиком: форма приезжает сюда же. */
-        uint8_t body[16 + 2048 + 8];
-        memcpy(body, &e->key, sizeof e->key);
-        size_t n = sizeof e->key;
+        uint8_t body[D2K_KEY_WIRE_LEN + 2048 + 8];
+        size_t n = put_key(body, &e->key);
         uint16_t type = 0;
         switch (e->kind) {
         case D2K_JRN_HELLO_SNI:

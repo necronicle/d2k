@@ -18,12 +18,13 @@ static int fails;
         }                                                  \
     } while (0)
 
+/* Транспорт здесь не предмет проверки — всегда 6 (TCP). */
 static d2k_key mk(uint16_t port) {
     d2k_key k;
     uint8_t s[4] = {192, 168, 1, 67}, d[4] = {1, 2, 3, 4};
     uint8_t sp[2], dp[2] = {0x01, 0xbb};
     memcpy(sp, &port, 2);
-    d2k_key_make(&k, s, d, sp, dp);
+    d2k_key_make(&k, 6, s, d, sp, dp);
     return k;
 }
 

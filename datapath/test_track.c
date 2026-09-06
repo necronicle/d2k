@@ -18,12 +18,14 @@ static int fails;
         }                                                  \
     } while (0)
 
+/* Транспорт здесь не предмет проверки (см. отдельный блок про proto ниже) —
+   всегда 6 (TCP), чтобы не трогать полсотни мест, которые зовут mk(). */
 static d2k_key mk(uint16_t port) {
     d2k_key k;
     uint8_t s[4] = {192, 168, 1, 67}, d[4] = {1, 2, 3, 4};
     uint8_t sp[2], dp[2] = {0x01, 0xbb};
     memcpy(sp, &port, 2);
-    d2k_key_make(&k, s, d, sp, dp);
+    d2k_key_make(&k, 6, s, d, sp, dp);
     return k;
 }
 
@@ -62,8 +64,8 @@ int main(void) {
         uint8_t c1[4] = {192, 168, 1, 67}, c2[4] = {1, 2, 3, 4};
         uint8_t p1[2] = {0xc0, 0x00}, p2[2] = {0x01, 0xbb};
         d2k_key out_key, in_key;
-        int out_low = d2k_key_make(&out_key, c1, c2, p1, p2);
-        int in_low  = d2k_key_make(&in_key,  c2, c1, p2, p1);
+        int out_low = d2k_key_make(&out_key, 6, c1, c2, p1, p2);
+        int in_low  = d2k_key_make(&in_key,  6, c2, c1, p2, p1);
         CHECK(memcmp(&out_key, &in_key, sizeof out_key) == 0,
               "прямое и обратное направления дали разные ключи");
         CHECK(out_low != in_low,
@@ -74,6 +76,34 @@ int main(void) {
         d2k_flow *a2 = d2k_track_get(s, &in_key, 200);
         CHECK(a1 == a2, "стороны одного соединения попали в разные потоки");
         CHECK(d2k_track_count(s) == 1, "одно соединение заняло две ячейки");
+        d2k_track_free(s);
+    }
+
+    /* --- разный транспорт при одинаковой паре адрес+порт даёт РАЗНЫЕ ключи -
+     * По ревью задачи 4 QUIC-вертикали: TCP-поток и QUIC/UDP-поток к одному и
+     * тому же адресу с одинаковым портом — обычное поведение браузера
+     * (гоняет QUIC и TCP наперегонки), а не редкий случай, и без proto в
+     * ключе они canonicalize в один и тот же ключ (см. d2k_key, d2k_track.h).
+     * Проверяется на самом примитиве — ключ и таблица — а не только выше, на
+     * session.c/ctlprobe: если ЭТА проверка когда-нибудь провалится, искать
+     * причину придётся не там. */
+    {
+        uint8_t c1[4] = {192, 168, 1, 67}, c2[4] = {1, 2, 3, 4};
+        uint8_t p1[2] = {0xc0, 0x00}, p2[2] = {0x01, 0xbb};
+        d2k_key tcp_key, udp_key;
+        d2k_key_make(&tcp_key, 6, c1, c2, p1, p2);
+        d2k_key_make(&udp_key, 17, c1, c2, p1, p2);
+        CHECK(memcmp(&tcp_key, &udp_key, sizeof tcp_key) != 0,
+              "TCP- и UDP-ключ с одинаковой парой адрес+порт совпали");
+        CHECK(tcp_key.proto == 6 && udp_key.proto == 17,
+              "поле proto не сохранилось в ключе");
+
+        d2k_table *s = d2k_track_new(16);
+        d2k_flow *a1 = d2k_track_get(s, &tcp_key, 100);
+        d2k_flow *a2 = d2k_track_get(s, &udp_key, 200);
+        CHECK(a1 != a2, "TCP- и UDP-поток попали в один и тот же слот таблицы");
+        CHECK(d2k_track_count(s) == 2,
+              "TCP- и UDP-поток с одинаковым адресом и портом схлопнулись в один");
         d2k_track_free(s);
     }
 

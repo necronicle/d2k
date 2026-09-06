@@ -40,6 +40,20 @@ static const uint8_t plan_bytes[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
+/* План с ОДНОЙ фальшивкой и repeats=20 (ревью задачи 4, круг 2): repeats —
+ * байт TLV без потолка (d2k_plan.h/plan_parse.c), а d2k_result.out[] вмещает
+ * 16 посылок (d2k_session.h) — 20 > 16. Нужен для проверки, что план,
+ * просящий больше посылок, чем помещается в результат, отвергается целиком,
+ * а не тихо обрезается до 16 с видом «применён». Заголовок "D2KP" + schema=1
+ * + minexec=1 + flags=0 + число записей=2: REC_PAYLOAD (id=1, байт 0xAA) и
+ * REC_FAKE (payload_id=1, poison_id=0, repeats=20, placement=PLACE_BEFORE,
+ * gap_us=0). */
+static const uint8_t plan_too_many_repeats[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+    0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0xAA,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static void wr32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
@@ -396,6 +410,27 @@ int main(void) {
         d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
         CHECK(r.verdict == D2K_VERDICT_ACCEPT, "защита сработала без плана с защитой");
         CHECK(d2k_session_rst_dropped(g) == 0, "снятие посчитано там, где защиты нет");
+        d2k_session_free(g);
+    }
+
+    /* --- план с repeats больше вместимости out[] отвергается целиком -------
+       Ревью задачи 4, круг 2: repeats берётся из TLV байтом без потолка (до
+       255), d2k_result.out[] вмещает 16 (d2k_session.h). Раньше n тихо
+       обрезался до 16, на провод уходило меньше посылок, чем описывал план,
+       а plan_done/applied++/PLAN_APPLIED ставились как за полное исполнение.
+       Честный исход — отказ целиком: ни одной посылки, план не применён. */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_too_many_repeats, sizeof plan_too_many_repeats, &gp, err, sizeof err) == 0,
+              "план с repeats=20 не загрузился");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 43100, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0, "план с repeats=20 отправил хоть одну посылку вместо честного отказа");
+        CHECK(r.verdict == D2K_VERDICT_ACCEPT, "ничего не отправив, оригинал обязаны пропустить");
+        CHECK(r.skipped != NULL, "отказ по переполнению out[] не объяснён вызывающему");
+        CHECK(d2k_session_applied(g) == 0, "план с repeats=20 засчитан применённым (обрезанным)");
         d2k_session_free(g);
     }
 

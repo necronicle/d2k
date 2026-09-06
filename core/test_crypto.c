@@ -368,6 +368,194 @@ static void check_rfc9001_a2_packet(void) {
     }
 }
 
+/* ===================================================================
+ * S-box AES стал табличным поиском (ревью 2026-09-06, круг 2 задачи 4
+ * QUIC-вертикали: формула стоила 51 мкс/блок AES, 3,5 мс на один разбор
+ * QUIC Initial на роутере Марка — см. отчёт задачи и большой комментарий
+ * у d2k_aes_sbox_byte в d2k_crypto.h). Таблица не введена по памяти и не
+ * скопирована с непроверенного источника: здесь — НЕЗАВИСИМАЯ реализация
+ * той же формулы FIPS-197 §5.1.1 (обратный элемент GF(2^8) через x^254,
+ * затем аффинное преобразование), не разделяющая ни строчки кода с
+ * production-версией в crypto.c, — и она обязана дать те же 256 значений,
+ * что и d2k_aes_sbox_byte. Ровно это раньше доказывал вывод при разработке
+ * ("сверено на S(0x01)=0x7c и S(0x00)=0x63"); здесь то же доказательство
+ * проверяется на ВСЕХ 256 значениях, а не на двух for-документации ради.
+ * ===================================================================*/
+
+static uint8_t ref_xtime(uint8_t a) {
+    uint8_t hi_mask = (uint8_t)(-(int)(a >> 7));
+    return (uint8_t)((uint8_t)(a << 1) ^ (uint8_t)(hi_mask & 0x1B));
+}
+
+static uint8_t ref_gf_mul(uint8_t a, uint8_t b) {
+    uint8_t p = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t lsb_mask = (uint8_t)(-(int)(b & 1u));
+        p = (uint8_t)(p ^ (uint8_t)(a & lsb_mask));
+        a = ref_xtime(a);
+        b = (uint8_t)(b >> 1);
+    }
+    return p;
+}
+
+static uint8_t ref_sbox_byte(uint8_t x) {
+    uint8_t x2   = ref_gf_mul(x, x);
+    uint8_t x4   = ref_gf_mul(x2, x2);
+    uint8_t x8   = ref_gf_mul(x4, x4);
+    uint8_t x16  = ref_gf_mul(x8, x8);
+    uint8_t x32  = ref_gf_mul(x16, x16);
+    uint8_t x64  = ref_gf_mul(x32, x32);
+    uint8_t x128 = ref_gf_mul(x64, x64);
+    uint8_t inv  = ref_gf_mul(x2, x4);
+    inv = ref_gf_mul(inv, x8);
+    inv = ref_gf_mul(inv, x16);
+    inv = ref_gf_mul(inv, x32);
+    inv = ref_gf_mul(inv, x64);
+    inv = ref_gf_mul(inv, x128);
+
+    uint8_t r1 = (uint8_t)((uint8_t)(inv << 1) | (uint8_t)(inv >> 7));
+    uint8_t r2 = (uint8_t)((uint8_t)(inv << 2) | (uint8_t)(inv >> 6));
+    uint8_t r3 = (uint8_t)((uint8_t)(inv << 3) | (uint8_t)(inv >> 5));
+    uint8_t r4 = (uint8_t)((uint8_t)(inv << 4) | (uint8_t)(inv >> 4));
+    return (uint8_t)(inv ^ r1 ^ r2 ^ r3 ^ r4 ^ 0x63);
+}
+
+static void check_aes_sbox_table(void) {
+    int mismatches = 0;
+    for (int x = 0; x < 256; x++) {
+        uint8_t want = ref_sbox_byte((uint8_t)x);
+        uint8_t got = d2k_aes_sbox_byte((uint8_t)x);
+        if (want != got) {
+            mismatches++;
+        }
+    }
+    CHECK(mismatches == 0, "таблица aes_sbox разошлась с формулой FIPS-197 хотя бы на одном байте");
+    /* Два ориентира из самого FIPS-197 (Приложение B): если ИМЕННО они
+       разойдутся, "разошлась на одном байте" выше не укажет, на каком. */
+    CHECK(d2k_aes_sbox_byte(0x00) == 0x63, "S(0x00) не 0x63");
+    CHECK(d2k_aes_sbox_byte(0x01) == 0x7c, "S(0x01) не 0x7c");
+}
+
+/* ===================================================================
+ * GHASH ускорена той же правкой (круг 2 задачи 4): H на все блоки одного
+ * вызова один и тот же, и предвычисление его 128 сдвигов ОДИН раз вместо
+ * пересчёта на КАЖДЫЙ блок убрало 75% оставшегося (после S-box) времени
+ * разбора QUIC Initial — см. отчёт задачи и большой комментарий в crypto.c.
+ *
+ * GF(2^128) на 2^128 значениях исчерпывающей проверке не поддаётся (в
+ * отличие от 256-значного S-box), поэтому здесь — НЕЗАВИСИМАЯ копия старой,
+ * непеределанной формулы (ref_gf128_mul/ref_ghash, не разделяющая ни строчки
+ * с production-версией в crypto.c) и сверка на нескольких векторах, что
+ * покрывают разные формы входа (пустой AAD/CT, ровно один блок, неполный
+ * последний блок, несколько блоков плюс неполный хвост — та же форма, что у
+ * настоящего 1200-байтного Initial). Это предел того, что вообще можно
+ * доказать без формальной модели, а не «то же самое доказательство, что и у
+ * таблицы» — отчёт задачи прямо называет разницу, а не выдаёт одно за другое.
+ * ===================================================================*/
+
+static uint8_t ref_gf128_mul_step(uint8_t v15_lsb, uint8_t v0) {
+    /* Один шаг редукции v[0] после сдвига — вынесено, чтобы не повторять
+       выражение трижды в ref_gf128_mul. */
+    uint8_t lsb_mask = (uint8_t)(-(int)v15_lsb);
+    return (uint8_t)(v0 ^ (uint8_t)(lsb_mask & 0xe1));
+}
+
+static void ref_gf128_mul(const uint8_t x[16], const uint8_t y[16], uint8_t out[16]) {
+    uint8_t z[16], v[16];
+    memset(z, 0, 16);
+    memcpy(v, y, 16);
+    for (int i = 0; i < 128; i++) {
+        uint8_t bit = (uint8_t)((x[i / 8] >> (7 - (i % 8))) & 1u);
+        uint8_t bit_mask = (uint8_t)(-(int)bit);
+        for (int j = 0; j < 16; j++) {
+            z[j] = (uint8_t)(z[j] ^ (uint8_t)(v[j] & bit_mask));
+        }
+        uint8_t v15_lsb = (uint8_t)(v[15] & 1u);
+        for (int j = 15; j > 0; j--) {
+            v[j] = (uint8_t)((uint8_t)(v[j] >> 1) | (uint8_t)(v[j - 1] << 7));
+        }
+        v[0] = (uint8_t)(v[0] >> 1);
+        v[0] = ref_gf128_mul_step(v15_lsb, v[0]);
+    }
+    memcpy(out, z, 16);
+}
+
+static void ref_ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
+                      const uint8_t *c, size_t c_len, uint8_t out[16]) {
+    uint8_t y[16], block[16], prod[16];
+    memset(y, 0, 16);
+
+    size_t i;
+    for (i = 0; i + 16 <= aad_len; i += 16) {
+        for (int j = 0; j < 16; j++) { y[j] = (uint8_t)(y[j] ^ aad[i + j]); }
+        ref_gf128_mul(y, h, prod);
+        memcpy(y, prod, 16);
+    }
+    if (i < aad_len) {
+        memset(block, 0, 16);
+        memcpy(block, aad + i, aad_len - i);
+        for (int j = 0; j < 16; j++) { y[j] = (uint8_t)(y[j] ^ block[j]); }
+        ref_gf128_mul(y, h, prod);
+        memcpy(y, prod, 16);
+    }
+    for (i = 0; i + 16 <= c_len; i += 16) {
+        for (int j = 0; j < 16; j++) { y[j] = (uint8_t)(y[j] ^ c[i + j]); }
+        ref_gf128_mul(y, h, prod);
+        memcpy(y, prod, 16);
+    }
+    if (i < c_len) {
+        memset(block, 0, 16);
+        memcpy(block, c + i, c_len - i);
+        for (int j = 0; j < 16; j++) { y[j] = (uint8_t)(y[j] ^ block[j]); }
+        ref_gf128_mul(y, h, prod);
+        memcpy(y, prod, 16);
+    }
+
+    uint64_t aad_bits = (uint64_t)aad_len * 8;
+    uint64_t c_bits = (uint64_t)c_len * 8;
+    memset(block, 0, 16);
+    for (int j = 0; j < 8; j++) {
+        block[j] = (uint8_t)(aad_bits >> (8 * (7 - j)));
+        block[8 + j] = (uint8_t)(c_bits >> (8 * (7 - j)));
+    }
+    for (int j = 0; j < 16; j++) { y[j] = (uint8_t)(y[j] ^ block[j]); }
+    ref_gf128_mul(y, h, prod);
+    memcpy(out, prod, 16);
+}
+
+static void check_one_ghash_vector(const char *label, const uint8_t *h,
+                                   const uint8_t *aad, size_t aad_len,
+                                   const uint8_t *c, size_t c_len) {
+    uint8_t want[16], got[16];
+    ref_ghash(h, aad, aad_len, c, c_len, want);
+    d2k_ghash_for_test(h, aad, aad_len, c, c_len, got);
+    char msg[160];
+    snprintf(msg, sizeof msg, "GHASH разошёлся с независимой формулой: %s", label);
+    CHECK(memcmp(want, got, 16) == 0, msg);
+}
+
+static void check_ghash_fast_path(void) {
+    uint8_t h_zero[16]; memset(h_zero, 0, sizeof h_zero);
+    uint8_t h_ff[16]; memset(h_ff, 0xff, sizeof h_ff);
+    uint8_t h_mixed[16];
+    for (size_t i = 0; i < sizeof h_mixed; i++) { h_mixed[i] = (uint8_t)(i * 0x11 + 7); }
+
+    static uint8_t big[1177]; /* тот же размер CT, что у настоящего 1200-байтного Initial */
+    for (size_t i = 0; i < sizeof big; i++) { big[i] = (uint8_t)(i * 3 + 1); }
+
+    /* И AAD, и CT пустые — только блок длин. */
+    check_one_ghash_vector("H=0, AAD и CT пустые", h_zero, NULL, 0, NULL, 0);
+    /* H = все единицы, AAD ровно один блок (16 байт), CT пустой. */
+    check_one_ghash_vector("H=0xFF..FF, AAD ровно 16 байт", h_ff, big, 16, NULL, 0);
+    /* AAD короче блока (неполный последний блок AAD). */
+    check_one_ghash_vector("AAD 5 байт (неполный блок)", h_mixed, big, 5, NULL, 0);
+    /* Форма настоящего QUIC Initial: короткий AAD, длинный CT с хвостом. */
+    check_one_ghash_vector("AAD 23 байта, CT 1177 байт (форма QUIC Initial)",
+                           h_mixed, big, 23, big, sizeof big);
+    /* CT ровно кратен блоку. */
+    check_one_ghash_vector("AAD пуст, CT ровно 64 байта", h_ff, NULL, 0, big, 64);
+}
+
 int main(void) {
     uint8_t initial_secret[32], cis[32];
     d2k_hkdf_extract(initial_salt, sizeof initial_salt, dcid, sizeof dcid, initial_secret);
@@ -401,6 +589,8 @@ int main(void) {
     check_generic_vectors();
     check_hkdf_label_length_guard();
     check_rfc9001_a2_packet();
+    check_aes_sbox_table();
+    check_ghash_fast_path();
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf("криптография: все проверки прошли\n");

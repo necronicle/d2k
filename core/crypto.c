@@ -5,70 +5,70 @@
  * FIPS-197, GCM — NIST SP 800-38D. Проверка — vectors в test_crypto.c, не
  * чтение этого файла глазами.
  *
- * БЕЗ ТАБЛИЦ, ЗАВИСЯЩИХ ОТ СЕКРЕТА (см. d2k_crypto.h). Единственная таблица
- * во всём файле — sha256_k[64], константы раунда SHA-256: индекс там —
- * счётчик раунда 0..63, известный заранее и одинаковый для любого входа, а
- * не байт ключа или текста, поэтому к классу проблемы «кэш утекает секрет
- * через индекс» она отношения не имеет. AES S-box считается формулой (GF(2^8)
- * обращение через возведение в степень), MixColumns и ключевое расписание —
- * той же арифметикой через xtime, GHASH — побитовым сдвигом в GF(2^128):
- * ни одного обращения к памяти, где адрес зависел бы от секретного байта.
+ * ДВЕ ТАБЛИЦЫ, ИНДЕКСИРУЕМЫЕ ДАННЫМИ: sha256_k[64] (константы раунда SHA-256
+ * — индекс там счётчик раунда 0..63, известный заранее и одинаковый для
+ * любого входа, к классу «кэш утекает секрет через индекс» отношения не
+ * имеет) и aes_sbox[256] (индекс — байт состояния AES). Вторая — сознательное
+ * отступление от общего правила «без таблиц, зависящих от секрета»: см.
+ * большой комментарий у d2k_aes_sbox_byte в d2k_crypto.h про измеренную цену
+ * формулы (3,5 мс на разбор одного QUIC Initial) и про то, почему именно
+ * здесь секрета за этим индексом фактически нет. MixColumns и ключевое
+ * расписание — арифметикой через xtime (одна операция, не S-box-подобная
+ * лестница умножений), GHASH — побитовым сдвигом в GF(2^128): в них таблицы
+ * не понадобились и замер после табличного S-box не показал в них заметной
+ * доли (см. отчёт задачи 4).
  */
 #include <string.h>
 
 #include "d2k_crypto.h"
 
-/* ===================== GF(2^8): S-box AES без таблицы ===================== */
+/* ===================== GF(2^8): xtime и S-box AES ===================== */
 
 /* x*2 в GF(2^8) по модулю многочлена AES x^8+x^4+x^3+x+1 (0x11B). Без ветвлений
- * по значению a: перенос гасится маской, а не if'ом. */
+ * по значению a: перенос гасится маской, а не if'ом. Нужна MixColumns и
+ * ключевому расписанию (Rcon) — обе обходятся одним xtime, без S-box-подобной
+ * цены, поэтому таблицы для них не заводились и не понадобились (см. большой
+ * комментарий у d2k_aes_sbox_byte в d2k_crypto.h про то, откуда взялась цена,
+ * которую заводить таблицу стоило). */
 static uint8_t xtime(uint8_t a) {
     uint8_t hi_mask = (uint8_t)(-(int)(a >> 7));
     return (uint8_t)((uint8_t)(a << 1) ^ (uint8_t)(hi_mask & 0x1B));
 }
 
-/* Умножение в GF(2^8), тем же способом, но для произвольного второго
- * операнда: 8 шагов сдвиг-и-условный-XOR по битам b, без таблиц и без
- * ветвления по значению a или b (маски вместо if). Нужно только для
- * S-box (возведение в степень) — MixColumns обходится одним xtime. */
-static uint8_t gf_mul(uint8_t a, uint8_t b) {
-    uint8_t p = 0;
-    for (int i = 0; i < 8; i++) {
-        uint8_t lsb_mask = (uint8_t)(-(int)(b & 1u));
-        p = (uint8_t)(p ^ (uint8_t)(a & lsb_mask));
-        a = xtime(a);
-        b = (uint8_t)(b >> 1);
-    }
-    return p;
-}
+/* Таблица S-box Rijndael, FIPS-197 §5.1.1, ровно 256 значений — байт x
+ * отображается в aes_sbox[x]. НЕ введена по памяти и не скопирована с
+ * непроверенного источника: test_crypto.c независимо пересчитывает эти же
+ * 256 значений формулой (обратный элемент GF(2^8) через x^254, затем
+ * аффинное преобразование) и сверяет побайтно — см. там же. Почему таблица,
+ * а не формула на каждый вызов — большой комментарий у d2k_aes_sbox_byte в
+ * d2k_crypto.h: формула стоила 13 умножений в GF(2^8) на байт, замеренная
+ * цена — 51 мкс/блок AES и 3,5 мс на разбор одного QUIC Initial на роутере
+ * (aarch64), и это неприемлемо для горячего пути. Секрет, который защищала
+ * бы constant-time формула, здесь и так открыт (DCID в заголовке пакета) —
+ * там же подробно почему это делает табличный поиск безопасным именно тут. */
+static const uint8_t aes_sbox[256] = {
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
 
-/* S-box Rijndael без единой таблицы: обратный элемент GF(2^8) через x^254
- * (x^(-1) для x!=0; для x==0 степень тоже даёт 0 — ЭТО И ЕСТЬ соглашение
- * AES "обратный нуля — ноль", отдельной ветки не нужно), затем аффинное
- * преобразование FIPS-197 §5.1.1. 254 = 2+4+...+128, поэтому семь
- * возведений в квадрат и шесть умножений дают x^254; преобразование
- * s = inv ^ rotl(inv,1) ^ rotl(inv,2) ^ rotl(inv,3) ^ rotl(inv,4) ^ 0x63
- * сверено на S(0x01)=0x7c и S(0x00)=0x63 при выводе. */
-static uint8_t sbox_byte(uint8_t x) {
-    uint8_t x2   = gf_mul(x, x);
-    uint8_t x4   = gf_mul(x2, x2);
-    uint8_t x8   = gf_mul(x4, x4);
-    uint8_t x16  = gf_mul(x8, x8);
-    uint8_t x32  = gf_mul(x16, x16);
-    uint8_t x64  = gf_mul(x32, x32);
-    uint8_t x128 = gf_mul(x64, x64);
-    uint8_t inv  = gf_mul(x2, x4);   /* x^6   */
-    inv = gf_mul(inv, x8);           /* x^14  */
-    inv = gf_mul(inv, x16);          /* x^30  */
-    inv = gf_mul(inv, x32);          /* x^62  */
-    inv = gf_mul(inv, x64);          /* x^126 */
-    inv = gf_mul(inv, x128);         /* x^254 */
-
-    uint8_t r1 = (uint8_t)((uint8_t)(inv << 1) | (uint8_t)(inv >> 7));
-    uint8_t r2 = (uint8_t)((uint8_t)(inv << 2) | (uint8_t)(inv >> 6));
-    uint8_t r3 = (uint8_t)((uint8_t)(inv << 3) | (uint8_t)(inv >> 5));
-    uint8_t r4 = (uint8_t)((uint8_t)(inv << 4) | (uint8_t)(inv >> 4));
-    return (uint8_t)(inv ^ r1 ^ r2 ^ r3 ^ r4 ^ 0x63);
+/* Экспортирована ради test_crypto.c (см. d2k_crypto.h) — сама она уже
+ * тривиальна, вся работа сделана таблицей выше. */
+uint8_t d2k_aes_sbox_byte(uint8_t x) {
+    return aes_sbox[x];
 }
 
 /* ===================== AES-128: расписание ключа и прямой шифр ===================== */
@@ -91,10 +91,10 @@ static void aes128_key_expand(const uint8_t key[16], aes128_ks *ks) {
         memcpy(temp, w[i - 1], 4);
         if (i % 4 == 0) {
             uint8_t t0 = temp[0];
-            temp[0] = sbox_byte(temp[1]); /* RotWord, затем SubWord */
-            temp[1] = sbox_byte(temp[2]);
-            temp[2] = sbox_byte(temp[3]);
-            temp[3] = sbox_byte(t0);
+            temp[0] = d2k_aes_sbox_byte(temp[1]); /* RotWord, затем SubWord */
+            temp[1] = d2k_aes_sbox_byte(temp[2]);
+            temp[2] = d2k_aes_sbox_byte(temp[3]);
+            temp[3] = d2k_aes_sbox_byte(t0);
             temp[0] = (uint8_t)(temp[0] ^ rcon);
             rcon = xtime(rcon);
         }
@@ -111,7 +111,7 @@ static void aes128_key_expand(const uint8_t key[16], aes128_ks *ks) {
 
 static void sub_bytes(uint8_t st[16]) {
     for (int i = 0; i < 16; i++) {
-        st[i] = sbox_byte(st[i]);
+        st[i] = d2k_aes_sbox_byte(st[i]);
     }
 }
 
@@ -411,28 +411,47 @@ int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
 
 /* ===================== GF(2^128) / GHASH (NIST SP 800-38D §6.3) ===================== */
 
-/* Умножение в GF(2^128) строго по определению SP 800-38D §6.3: старший бит —
- * первый бит первого байта X, редуцирующий многочлен зашит как константа
- * R = 0xE1 || 0^120. 128 шагов "сдвиг вправо и, если вытолкнутый бит был
- * единицей, XOR с R" — ни одной таблицы, обращения к памяти не зависят от
- * значений X и Y. */
-static void gf128_mul(const uint8_t x[16], const uint8_t y[16], uint8_t out[16]) {
-    uint8_t z[16];
+/* Умножение в GF(2^128), НАЙДЕННОЕ МЕДЛЕННЫМ ЗАМЕРОМ (ревью 2026-09-06, круг
+ * 2 задачи 4): после того как S-box AES стал таблицей, GHASH оказался 75%
+ * оставшегося времени разбора одного QUIC Initial (242,8 из 325,1 мкс на
+ * роутере Марка, aarch64 — см. отчёт задачи). Причина не в самом умножении
+ * (тут нет S-box-подобной лестницы — только сдвиги), а в том, что второй
+ * операнд Y ВСЕГДА один и тот же H на все ~75 блоков одного вызова ghash(), а
+ * прежняя реализация каждый раз заново считала всю 128-шаговую цепочку
+ * сдвигов H с нуля — то есть 75-кратно повторяла одну и ту же работу. Отсюда
+ * gf128_h_table/gf128_mul_fast ниже: та же операция (тот же порядок бит, та
+ * же редукция константой R = 0xE1 || 0^120 из SP 800-38D §6.3), но цепочка
+ * сдвигов H считается один раз на ghash(), а не один раз на блок.
+ *
+ * Старая, непеределанная версия оставлена НЕЗАВИСИМОЙ копией в test_crypto.c
+ * (ref_gf128_mul) — сверка на нескольких векторах доказывает, что ускорение
+ * не разошлось со определением; здесь она не нужна и не зовётся, поэтому не
+ * дублирована — GF(2^128) на 2^128 значениях исчерпывающей проверке не
+ * поддаётся (в отличие от 256-значного S-box), и сверка на нескольких
+ * векторах — предел того, что вообще можно доказать без формальной модели. */
+static void gf128_h_table(const uint8_t h[16], uint8_t table[128][16]) {
     uint8_t v[16];
-    memset(z, 0, 16);
-    memcpy(v, y, 16);
+    memcpy(v, h, 16);
     for (int i = 0; i < 128; i++) {
-        uint8_t bit = (uint8_t)((x[i / 8] >> (7 - (i % 8))) & 1u);
-        uint8_t bit_mask = (uint8_t)(-(int)bit);
-        for (int j = 0; j < 16; j++) {
-            z[j] = (uint8_t)(z[j] ^ (uint8_t)(v[j] & bit_mask));
-        }
+        memcpy(table[i], v, 16);
         uint8_t lsb_mask = (uint8_t)(-(int)(v[15] & 1u));
         for (int j = 15; j > 0; j--) {
             v[j] = (uint8_t)((uint8_t)(v[j] >> 1) | (uint8_t)(v[j - 1] << 7));
         }
         v[0] = (uint8_t)(v[0] >> 1);
         v[0] = (uint8_t)(v[0] ^ (uint8_t)(lsb_mask & 0xe1));
+    }
+}
+
+static void gf128_mul_fast(const uint8_t x[16], const uint8_t table[128][16], uint8_t out[16]) {
+    uint8_t z[16];
+    memset(z, 0, 16);
+    for (int i = 0; i < 128; i++) {
+        uint8_t bit = (uint8_t)((x[i / 8] >> (7 - (i % 8))) & 1u);
+        uint8_t bit_mask = (uint8_t)(-(int)bit);
+        for (int j = 0; j < 16; j++) {
+            z[j] = (uint8_t)(z[j] ^ (uint8_t)(table[i][j] & bit_mask));
+        }
     }
     memcpy(out, z, 16);
 }
@@ -445,14 +464,16 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
     uint8_t y[16];
     uint8_t block[16];
     uint8_t prod[16];
+    uint8_t htab[128][16];
     memset(y, 0, 16);
+    gf128_h_table(h, htab);
 
     size_t i;
     for (i = 0; i + 16 <= aad_len; i += 16) {
         for (int j = 0; j < 16; j++) {
             y[j] = (uint8_t)(y[j] ^ aad[i + j]);
         }
-        gf128_mul(y, h, prod);
+        gf128_mul_fast(y, htab, prod);
         memcpy(y, prod, 16);
     }
     if (i < aad_len) {
@@ -461,7 +482,7 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
         for (int j = 0; j < 16; j++) {
             y[j] = (uint8_t)(y[j] ^ block[j]);
         }
-        gf128_mul(y, h, prod);
+        gf128_mul_fast(y, htab, prod);
         memcpy(y, prod, 16);
     }
 
@@ -469,7 +490,7 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
         for (int j = 0; j < 16; j++) {
             y[j] = (uint8_t)(y[j] ^ c[i + j]);
         }
-        gf128_mul(y, h, prod);
+        gf128_mul_fast(y, htab, prod);
         memcpy(y, prod, 16);
     }
     if (i < c_len) {
@@ -478,7 +499,7 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
         for (int j = 0; j < 16; j++) {
             y[j] = (uint8_t)(y[j] ^ block[j]);
         }
-        gf128_mul(y, h, prod);
+        gf128_mul_fast(y, htab, prod);
         memcpy(y, prod, 16);
     }
 
@@ -492,8 +513,14 @@ static void ghash(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
     for (int j = 0; j < 16; j++) {
         y[j] = (uint8_t)(y[j] ^ block[j]);
     }
-    gf128_mul(y, h, prod);
+    gf128_mul_fast(y, htab, prod);
     memcpy(out, prod, 16);
+}
+
+/* Экспортирована ради test_crypto.c (см. d2k_crypto.h) — сама тривиальна. */
+void d2k_ghash_for_test(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
+                        const uint8_t *c, size_t c_len, uint8_t out[16]) {
+    ghash(h, aad, aad_len, c, c_len, out);
 }
 
 /* ===================== AES-128-GCM (NIST SP 800-38D) ===================== */

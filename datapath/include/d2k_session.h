@@ -90,10 +90,32 @@ size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns);
    потока. Возвращает, сколько подозрений отмечено. */
 size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns);
 
+/* Суммы по ОБЕИМ таблицам (TCP и UDP/QUIC, см. struct d2k_session в
+ * session.c) — грубая оценка суммарной нагрузки, не диагностика. По ревью
+ * задачи 4 (круг 2): для диагностики «какая таблица под давлением» сумма
+ * ОПАСНА — TCP-таблица может быть уже на пределе (--flows считает потоки на
+ * ТРАНСПОРТ, а не на датапат целиком, см. _tcp/_udp ниже), а сумма с пустой
+ * UDP-таблицей покажет благополучный процент заполнения. Сводка d2kd.c
+ * печатает _tcp/_udp раздельно ровно поэтому; эти три функции остаются для
+ * тех редких случаев, где нужен именно общий порядок величины. */
 size_t   d2k_session_flows(const d2k_session *s);
 size_t   d2k_session_capacity(const d2k_session *s);
-uint64_t d2k_session_applied(const d2k_session *s);
 uint64_t d2k_session_refusals(const d2k_session *s);
+
+/* Раздельно по таблицам — то, что обязана показывать диагностика оператору.
+ * --flows задаёт ёмкость КАЖДОЙ из двух таблиц (TCP и UDP) отдельно, а не
+ * общий бюджет датапата: у UDP нет соединения, окно наблюдения — первые
+ * датаграммы потока (D2K_HELLO_WINDOW), и его профиль нагрузки на таблицу
+ * никак не связан с TCP, так что общий бюджет на двоих означал бы, что
+ * всплеск одного протокола отнимает ёмкость у другого без всякой причины. */
+size_t   d2k_session_flows_tcp(const d2k_session *s);
+size_t   d2k_session_flows_udp(const d2k_session *s);
+size_t   d2k_session_capacity_tcp(const d2k_session *s);
+size_t   d2k_session_capacity_udp(const d2k_session *s);
+uint64_t d2k_session_refusals_tcp(const d2k_session *s);
+uint64_t d2k_session_refusals_udp(const d2k_session *s);
+
+uint64_t d2k_session_applied(const d2k_session *s);
 
 /* Узнано протоколом. Считается независимо от того, есть ли план: наблюдение
  * не должно зависеть от наличия воздействия. */

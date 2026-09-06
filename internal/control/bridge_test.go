@@ -135,6 +135,62 @@ func TestСобытиеПриветствияДоезжает(t *testing.T) {
 	if ev.Key.LowPort != 443 {
 		t.Fatalf("порт низкого конца %d, а ждали 443", ev.Key.LowPort)
 	}
+	if ev.Key.Proto != 6 {
+		t.Fatalf("транспорт в ключе %d, а ждали 6 (TCP)", ev.Key.Proto)
+	}
+}
+
+func TestTCPИQUICСОдинаковымАдресомИПортомДаютРазныеКлючи(t *testing.T) {
+	// По ревью задачи 4 QUIC-вертикали: TCP и UDP — независимые пространства
+	// портов, поэтому браузер, гоняющий QUIC и TCP к одному адресу
+	// наперегонки, вполне может свести их к одинаковой паре адрес+порт.
+	// Контроллер держит состояние ПО КЛЮЧУ, и без транспорта в ключе эти два
+	// потока делили бы и перетирали друг другу состояние. Проверяется через
+	// настоящий C-стенд (ctlprobe), а не через представление о нём: команда
+	// "quic" в ctlprobe нарочно переиспользует порт последнего hello, чтобы
+	// получить ИМЕННО такое совпадение.
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	p.say(t, "hello example.com")
+	tcpEv, err := c.Next()
+	if err != nil {
+		t.Fatalf("TCP-событие не прочиталось: %v", err)
+	}
+	if tcpEv.Type != control.EvHello {
+		t.Fatalf("тип TCP-события %#04x, а ждали приветствие", tcpEv.Type)
+	}
+
+	p.say(t, "quic")
+	quicEv, err := c.Next()
+	if err != nil {
+		t.Fatalf("QUIC-событие не прочиталось: %v", err)
+	}
+	if quicEv.Type != control.EvHello {
+		t.Fatalf("тип QUIC-события %#04x, а ждали приветствие", quicEv.Type)
+	}
+
+	// Оба приветствия — от одного и того же имени (ctlprobe шлёт QUIC Initial
+	// с example.com внутри, см. шапку ctlprobe.c) и с одного и того же адреса
+	// и порта — иначе сама проверка ничего не доказывала бы.
+	if tcpEv.Name != "example.com" || quicEv.Name != "example.com" {
+		t.Fatalf("имена разошлись: TCP %q, QUIC %q", tcpEv.Name, quicEv.Name)
+	}
+	if tcpEv.Key.LowIP != quicEv.Key.LowIP || tcpEv.Key.HighIP != quicEv.Key.HighIP ||
+		tcpEv.Key.LowPort != quicEv.Key.LowPort || tcpEv.Key.HighPort != quicEv.Key.HighPort {
+		t.Fatalf("адрес+порт разошлись, проверка не про то: TCP %v, QUIC %v",
+			tcpEv.Key, quicEv.Key)
+	}
+
+	if tcpEv.Key.Proto != 6 {
+		t.Fatalf("транспорт TCP-ключа %d, а ждали 6", tcpEv.Key.Proto)
+	}
+	if quicEv.Key.Proto != 17 {
+		t.Fatalf("транспорт QUIC-ключа %d, а ждали 17", quicEv.Key.Proto)
+	}
+	if tcpEv.Key == quicEv.Key {
+		t.Fatalf("TCP- и QUIC-ключ совпали целиком при одинаковом адресе и порте: %v", tcpEv.Key)
+	}
 }
 
 func TestПодозрениеПриходитКодом(t *testing.T) {
@@ -211,6 +267,54 @@ func TestПланСтавитсяПоИмениИПрименяется(t *testi
 	got = p.say(t, "hello example.org")
 	if !strings.Contains(got, "посылок 0") {
 		t.Fatalf("план применился к чужой цели: %q", got)
+	}
+}
+
+// TestПланПоИмениПрименяетсяИКQUIC — задача 4 научила handle_udp искать план
+// по извлечённому из QUIC Initial имени тем же способом, что и TCP; здесь это
+// проверяется на том же проводе, которым ставит план настоящий контроллер
+// (control.Conn.SetPlanName), а не только изнутри d2k_session_packet
+// (test_quic_session.c). Имя "example.com" не выбор теста — это фиксированное
+// имя ФИКСИРОВАННОГО вектора v1_initial, зашитого в команду "quic" (см.
+// ctlprobe.c и core/test_quic.c), подменить нельзя.
+func TestПланПоИмениПрименяетсяИКQUIC(t *testing.T) {
+	p, sock := start(t)
+	c := dial(t, sock)
+
+	// Без порчи (PoisonID: 0): rzd_arm.plan портит TCP-контрольную сумму
+	// (badsum), а её UDP-сборка исполнять не умеет и честно отказывает
+	// (wire_udp.c) — это отдельное, отдельно проверенное свойство отказа, а
+	// не то, что здесь проверяется. Здесь важно, что САМ поиск плана по имени
+	// у QUIC-потока работает, а для этого годится и порча="ничего".
+	pl := plan.Plan{
+		Schema: plan.SchemaCurrent, MinExec: 1,
+		Transport: 17, Proto: 1,
+		Payloads: []plan.Payload{{ID: 1, Bytes: []byte{0xDE, 0xAD}}},
+		Fakes:    []plan.Fake{{PayloadID: 1, PoisonID: 0, Repeats: 1}},
+	}
+	tlv, err := pl.MarshalTLV()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.SetPlanName("example.com", tlv); err != nil {
+		t.Fatalf("план не отправился: %v", err)
+	}
+	var line string
+	for i := 0; i < 50; i++ {
+		line = p.say(t, "plans")
+		if strings.Contains(line, "planов 1") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(line, "planов 1") {
+		t.Fatalf("план не встал в таблицу: %q", line)
+	}
+
+	got := p.say(t, "quic")
+	if strings.Contains(got, "посылок 0") {
+		t.Fatal("план по имени не применился к QUIC-потоку: " + got)
 	}
 }
 

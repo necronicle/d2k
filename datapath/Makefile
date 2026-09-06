@@ -5,12 +5,28 @@
 # памятью там, где Go не даёт, и единственная защита — жёсткие ключи и тесты.
 
 CC      ?= cc
-CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude
+CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I$(CORE_DIR)/include
 LDFLAGS ?=
 
 # Кросс-компиляторы для проверки переносимости. Пути переопределяются извне.
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
+
+# Разбор QUIC (задача 2 этой же вертикали) живёт в core/ — отдельной единице
+# сборки со своим Makefile. Датапату он нужен на каждом UDP-пакете в горячем
+# пути (session.c), и линкуется ИСХОДНИКАМИ, а не копией: crypto.c/quic.c
+# зависят только от <string.h> и собственных заголовков, CFLAGS ядра побайтно
+# совпадают с датапатовскими (сверено построчно с core/Makefile), а pthread
+# нужен только тестам ядра — этим двум файлам нет.
+#
+# Объектники — под своими именами ЗДЕСЬ, в датапате (core_quic.o,
+# core_crypto.o), а НЕ в ../core/: если бы оба Makefile метили в один и тот же
+# путь, каждый считал бы файл своим, и несовпадение mtime/флагов одного билда
+# портило бы зависимости другого молча.
+CORE_DIR = ../core
+CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/crypto.c
+COREOBJ  = core_quic.o core_crypto.o
+COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_crypto.h
 
 # Переносимый датапат: собирается и проверяется на любой машине.
 SRC     = plan_parse.c plan_apply.c tls.c wire.c wire_udp.c track.c session.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
@@ -20,13 +36,13 @@ SRC     = plan_parse.c plan_apply.c tls.c wire.c wire_udp.c track.c session.c nl
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h
+HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nl test_sched test_journal test_plans test_ctl
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nl test_sched test_journal test_plans test_ctl test_quic_session
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session cross clean
 
 all: planlab ctlprobe
 
@@ -45,6 +61,17 @@ tls.o: tls.c $(HDR)
 test_tls: test_tls.c tls.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tls.c tls.o $(LDFLAGS)
 
+# core/quic.c и core/crypto.c компилируются СЮДА, под именами core_quic.o и
+# core_crypto.o — см. большой комментарий у CORE_DIR выше про то, почему не
+# в ../core/.
+core_quic.o: $(CORE_DIR)/quic.c $(COREHDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+core_crypto.o: $(CORE_DIR)/crypto.c $(COREHDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# session.c — единственный потребитель разбора QUIC в датапате (задача 4),
+# поэтому единственная новая зависимость по ссылке — здесь.
 session.o: session.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -66,8 +93,17 @@ test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(HDR)
 test_journal: test_journal.c journal.o track.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_journal.c journal.o track.o $(LDFLAGS)
 
-test_session: test_session.c session.o track.o tls.o wire.o journal.o plans.o plan_parse.o plan_apply.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o journal.o plans.o plan_parse.o plan_apply.o $(LDFLAGS)
+# wire_udp.o и core_quic.o/core_crypto.o добавлены задачей 4: session.c теперь
+# зовёт d2k_wire_build_udp и разбор QUIC на UDP-ветке пакетного пути, и без
+# них линковка падает неопределёнными ссылками.
+test_session: test_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_crypto.o $(LDFLAGS)
+
+# test_quic_session.c (задача 4) — то же самое дерево модулей, что и
+# test_session, тем же списком объектников: обе проверяют d2k_session_packet
+# целиком, только на разных транспортах.
+test_quic_session: test_quic_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_crypto.o $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -108,8 +144,12 @@ planlab: planlab.c plan_parse.o plan_apply.o $(HDR)
 # Стенд управляющего сокета: тот же разбор команд и та же сессия, что в d2kd,
 # но пакеты собираются на месте. Нужен, чтобы Go-клиент проверялся против
 # настоящего C-сервера, а не против представления о нём.
-ctlprobe: ctlprobe.c $(SRC:.c=.o) $(HDR)
-	$(CC) $(CFLAGS) -o $@ ctlprobe.c $(SRC:.c=.o) $(LDFLAGS)
+#
+# $(COREOBJ) добавлен задачей 4 по той же причине, что и у test_session: SRC
+# содержит session.c, а он теперь зовёт разбор QUIC — без объектников ядра
+# ссылки останутся неопределёнными.
+ctlprobe: ctlprobe.c $(SRC:.c=.o) $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ ctlprobe.c $(SRC:.c=.o) $(COREOBJ) $(LDFLAGS)
 
 test-parse: test_plan_parse
 	./test_plan_parse
@@ -147,6 +187,9 @@ test-plans: test_plans
 test-ctl: test_ctl
 	./test_ctl
 
+test-quic-session: test_quic_session
+	./test_quic_session
+
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а весь датапат состоит из разбора чужих байтов. Отдельная цель,
 # потому что -fsanitize замедляет и не собирается частью кросс-компиляторов.
@@ -158,12 +201,12 @@ test-ctl: test_ctl
 # набор санитайзеров и так ловит плохо — тем более нельзя оставлять сам
 # инструмент несобранным с той же строгостью, что и остальной датапат.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
-           -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude
+           -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude -I$(CORE_DIR)/include
 san:
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-san-$$t $$t.c \
-			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') ; \
+			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') $(CORESRC) ; \
 		/tmp/d2k-san-$$t; \
 	done
 	@echo "== planlab =="
@@ -181,7 +224,7 @@ san:
 # нужен для переносимости. Переопределяется через GCC=.
 GCC ?= mipsel-unknown-linux-gnu-gcc
 gcc-warn:
-	@for f in $(SRC) $(LINUXSRC) $(DAEMON) planlab.c ctlprobe.c $(TESTS:=.c); do \
+	@for f in $(SRC) $(CORESRC) $(LINUXSRC) $(DAEMON) planlab.c ctlprobe.c $(TESTS:=.c); do \
 		$(GCC) $(CFLAGS) -c -o /tmp/d2k-gccwarn.o $$f || exit 1; \
 	done
 	@echo "чужой компилятор: предупреждений нет"
@@ -192,15 +235,15 @@ gcc-warn:
 # по-файлово в цикле выше не гарантирует, что именно ЭТА комбинация объектов
 # слинкуется под обеими целевыми libc.
 cross:
-	@for f in $(SRC); do \
+	@for f in $(SRC) $(CORESRC); do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-a64.o $$f || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-mipsel.o $$f || exit 1; \
 	done
 	@echo "== d2kd целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2kd-a64 \
-		$(DAEMON) $(LINUXSRC) $(SRC) || exit 1
-	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) || exit 1
+		$(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2kd-mipsel $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) || exit 1
 	@echo "== planlab целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/planlab-a64 \
 		planlab.c plan_parse.c plan_apply.c || exit 1
@@ -213,13 +256,13 @@ BUILDDIR ?= ../builds
 d2kd-aarch64:
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kd-aarch64 $(DAEMON) $(LINUXSRC) $(SRC)
+		-o $(BUILDDIR)/d2kd-aarch64 $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC)
 	@ls -l $(BUILDDIR)/d2kd-aarch64
 
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl
+check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session
 
 clean:
 	rm -f *.o $(TESTS) planlab ctlprobe

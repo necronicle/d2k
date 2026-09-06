@@ -69,32 +69,68 @@ func SuspectText(code uint8) string {
 // FrameMax — предел кадра, тот же, что у датапата.
 const FrameMax = 65536
 
-// Key — канонический ключ потока: низкий конец пары, затем высокий.
-// Названия low/high, а не src/dst, потому что у соединения источника нет —
-// он есть у пакета.
+// keyLen — ширина ключа потока НА ПРОВОДЕ, полями: 4 (LowIP) + 4 (HighIP) +
+// 2 (LowPort) + 2 (HighPort) + 1 (Proto) = 13 байт. Обязана совпадать с
+// D2K_KEY_WIRE_LEN (datapath/include/d2k_ctlsrv.h) — несовпадение ловит
+// bridge_test.go, гоняющий настоящий C-стенд против этого кода, а не
+// сравнение исходников на глаз.
+//
+// Это НЕ sizeof структуры Key ни на одной из сторон: на C-стороне
+// sizeof(d2k_key) — 16 из-за выравнивания, а здесь Key — четыре широких поля
+// плюс байт, и Go тем более не обязан класть их в памяти так же, как C. Ключ
+// разбирается и собирается полями, а не наложением структуры на буфер.
+const keyLen = 13
+
+// Key — канонический ключ потока: низкий конец пары, затем высокий, затем
+// транспорт. Названия low/high, а не src/dst, потому что у соединения
+// источника нет — он есть у пакета.
+//
+// Proto (6 TCP, 17 UDP) добавлен по ревью задачи 4 QUIC-вертикали: без него
+// TCP-поток и QUIC-поток к одному и тому же адресу с одинаковым портом (порты
+// TCP и UDP — независимые пространства нумерации, совпадение не запрещено
+// ничем, а браузер именно так и делает — гоняет QUIC и TCP к одному адресу
+// наперегонки и откатывается на TCP, если QUIC не идёт) дали бы ОДИН ключ —
+// а контроллер держит состояние ПО КЛЮЧУ, и общий ключ означал бы, что два
+// потока разных протоколов делят и перетирают друг другу состояние.
 type Key struct {
 	LowIP    [4]byte
 	HighIP   [4]byte
 	LowPort  uint16
 	HighPort uint16
+	Proto    uint8
 }
 
 func (k Key) String() string {
-	return fmt.Sprintf("%d.%d.%d.%d:%d - %d.%d.%d.%d:%d",
+	return fmt.Sprintf("%s %d.%d.%d.%d:%d - %d.%d.%d.%d:%d",
+		protoName(k.Proto),
 		k.LowIP[0], k.LowIP[1], k.LowIP[2], k.LowIP[3], k.LowPort,
 		k.HighIP[0], k.HighIP[1], k.HighIP[2], k.HighIP[3], k.HighPort)
 }
 
+// protoName — для показа. Источник истины — числовой код (тот же принцип,
+// что и у SuspectText: сравнивать поведение по тексту нельзя).
+func protoName(proto uint8) string {
+	switch proto {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	default:
+		return fmt.Sprintf("proto(%d)", proto)
+	}
+}
+
 func parseKey(b []byte) (Key, error) {
 	var k Key
-	if len(b) < 12 {
-		return k, errors.New("ключ потока короче 12 байт")
+	if len(b) < keyLen {
+		return k, fmt.Errorf("ключ потока короче %d байт", keyLen)
 	}
 	copy(k.LowIP[:], b[0:4])
 	copy(k.HighIP[:], b[4:8])
 	// Порты лежат в сетевом порядке — ровно как в заголовке.
 	k.LowPort = binary.BigEndian.Uint16(b[8:10])
 	k.HighPort = binary.BigEndian.Uint16(b[10:12])
+	k.Proto = b[12]
 	return k, nil
 }
 
@@ -269,7 +305,7 @@ func (c *Conn) Next() (Event, error) {
 		return ev, err
 	}
 	ev.Key = key
-	rest := body[12:]
+	rest := body[keyLen:]
 
 	switch ev.Type {
 	case EvHello:

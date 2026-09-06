@@ -9,6 +9,12 @@
 # Правила firewall живут в СВОИХ цепочках. Не в общих с комментарием: уборка
 # по комментарию однажды промахнулась мимо правила, поставленного чуть иначе,
 # и оно осталось висеть. Своя цепочка снимается целиком и без разбора.
+#
+# fw_up/fw_down проверены настоящим iptables (не только shellcheck'ом — тот
+# в scripts/check.sh, а этот файл в его глоб *.sh не попадает: init-скрипты
+# Keenetic называются без расширения): sh scripts/check_firewall.sh гоняет их
+# в Linux-контейнере и сверяет вывод `iptables -S` построчно. Требует Docker,
+# в обычный гейт не включён — запускать вручную при правке этого файла.
 
 PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -78,16 +84,35 @@ fw_up() {
     iptables -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
 
     # Собственные пакеты исключаются по метке. §5.5: без этого система учится
-    # на своём же эхе.
+    # на своём же эхе. Без -p — правило покрывает ЛЮБОЙ транспорт по метке, TCP
+    # и UDP одинаково: зонды QUIC (задача 4) метятся тем же MARK, что и зонды
+    # TCP, и им нужен тот же выход до NFQUEUE, иначе собственные зонды службы
+    # вернутся в её же очередь.
     iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
-    # останавливать его (§10).
+    # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
+    # что и TCP: без --queue-bypass там остановка датапата обрывает весь QUIC
+    # в сети, а не просто перестаёт его обрабатывать.
     iptables -t mangle -A "$CHAIN_OUT" -p tcp -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
     iptables -t mangle -A "$CHAIN_IN" -p tcp -m multiport --sports "$PORTS" \
+        -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+
+    # То же самое для UDP (задача 4: датапат видит QUIC поверх UDP 443).
+    # CONNBYTES с тем же порогом, что у TCP, — не для симметрии ради
+    # симметрии: D2K_HELLO_WINDOW в session.c ограничивает разбор QUIC
+    # ровно тем же числом первых датаграмм потока, так что очередь ничего не
+    # выигрывает, продолжая получать пакеты сверх этого окна.
+    iptables -t mangle -A "$CHAIN_OUT" -p udp -m multiport --dports "$PORTS" \
+        -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+    iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass

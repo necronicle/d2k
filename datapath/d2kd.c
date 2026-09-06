@@ -158,7 +158,8 @@ static void usage(void) {
         "  --plan FILE        план в канонической форме TLV\n"
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
-        "  --flows N          предел числа отслеживаемых потоков (2048)\n"
+        "  --flows N          предел числа потоков — отдельно на TCP и на\n"
+        "                     UDP/QUIC, не общий бюджет датапата (2048)\n"
         "  --queue-len N      глубина очереди ядра в пакетах (1024)\n"
         "  --copy-range N     сколько байт пакета брать у ядра (1600)\n"
         "  --sched-slots N    сколько отложенных пакетов держать (128)\n"
@@ -210,10 +211,20 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            d2k_session_applied(s), st.emitted, st.deferred);
     /* Второе число — предел таблицы, а не что попало. В первом полевом
        прогоне здесь стояла длина очереди отправки, и строка читалась как
-       «23 потока из 0». */
-    printf("потоков %zu из %zu, отказов таблицы %" PRIu64 "\n",
-           d2k_session_flows(s), d2k_session_capacity(s),
-           d2k_session_refusals(s));
+       «23 потока из 0».
+       TCP и UDP — раздельно, а не суммой (ревью задачи 4, круг 2): --flows
+       задаёт ёмкость КАЖДОЙ таблицы отдельно, и сумма топит ситуацию «одна
+       таблица уже у предела, другая пустая» в благополучном на вид числе —
+       например, «1600 из 4096» читается как 39% занятости ровно в момент,
+       когда TCP-таблица (2048 потоков, порог отказа 3/4 — 1536) уже
+       отказывает. По той же причине — отказы каждой таблицы отдельно: сумма
+       не говорит, какая из двух реально отказывала. */
+    printf("потоков TCP %zu из %zu (отказов %" PRIu64 "), "
+           "UDP %zu из %zu (отказов %" PRIu64 ")\n",
+           d2k_session_flows_tcp(s), d2k_session_capacity_tcp(s),
+           d2k_session_refusals_tcp(s),
+           d2k_session_flows_udp(s), d2k_session_capacity_udp(s),
+           d2k_session_refusals_udp(s));
     printf("узнано приветствий %" PRIu64 ", из них с именем %" PRIu64
            ", обменов %" PRIu64 ", подозрений %" PRIu64
            ", снято чужих сбросов %" PRIu64 "\n",
@@ -258,6 +269,17 @@ static unsigned port_of(const void *p) {
     return (unsigned)b[0] << 8 | b[1];
 }
 
+/* Для показа. Источник истины — числовой код в ключе (d2k_key.proto), а не
+   этот текст: сравнивать поведение по строке нельзя (тот же принцип, что и
+   у d2k_suspect_text). */
+static const char *proto_name(uint8_t proto) {
+    switch (proto) {
+    case 6:  return "tcp";
+    case 17: return "udp";
+    default: return "?";
+    }
+}
+
 static const char *jrn_kind(uint8_t k) {
     switch (k) {
     case D2K_JRN_HELLO_SNI:     return "приветствие";
@@ -291,8 +313,9 @@ static void print_journal(const d2k_session *s, uint64_t start) {
            о направлении. */
         const uint8_t *la = (const uint8_t *)&e->key.low_ip;
         const uint8_t *ha = (const uint8_t *)&e->key.high_ip;
-        printf("  %6" PRIu64 " мс  %u.%u.%u.%u:%u - %u.%u.%u.%u:%u  %s%s%s%s\n",
+        printf("  %6" PRIu64 " мс  %s %u.%u.%u.%u:%u - %u.%u.%u.%u:%u  %s%s%s%s\n",
                (e->at_ns - start) / NS_PER_MS,
+               proto_name(e->key.proto),
                la[0], la[1], la[2], la[3], port_of(&e->key.low_port),
                ha[0], ha[1], ha[2], ha[3], port_of(&e->key.high_port),
                jrn_kind(e->kind),

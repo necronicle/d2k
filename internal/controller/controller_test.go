@@ -189,13 +189,27 @@ type fakeProber struct {
 	script []probe.Result
 	calls  int
 	hellos [][]byte
+	// hold — задержать ответ. По образцу fakeVolume.hold/fakeClassify.hold:
+	// без него зонд на подтверждение кандидата (advance -> awaiting) отвечает
+	// в своей горутине настолько быстро, что второй Pump() внутри того же
+	// вызова может утащить и его результат тоже — порядок между «отпустить
+	// один зонд» и «получить именно этот ответ, не следующий» тогда решает
+	// планировщик, а не тест. Нужен там, где важно поймать задачу МЕЖДУ
+	// зондами, а не после того, как вся лестница домоталась до конца.
+	hold chan struct{}
 }
 
 func (f *fakeProber) Do(_ context.Context, _ string, _ int, hello []byte) probe.Result {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	hold := f.hold
 	f.calls++
 	f.hellos = append(f.hellos, append([]byte(nil), hello...))
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if len(f.script) == 0 {
 		return probe.Result{Outcome: probe.OutcomeSilence}
 	}
@@ -734,5 +748,199 @@ func TestВопросПредшествуетКандидатам(t *testing.T) 
 	}
 	if box, _, _ := r.store.Catalog().Lookup("linkedin.com", ""); box == nil {
 		t.Fatalf("после верного ответа решение не найдено:\n%s", logs)
+	}
+}
+
+// readAndHandle читает события с сокета по одному и сразу отдаёт их в
+// Handle — как в бою, где каждое событие обрабатывается по прибытии, — пока
+// не встретит событие типа want (тоже передав его в Handle) или не кончится
+// лимит попыток. Pump() здесь НЕ зовётся ни разу: это то, ради чего функция
+// вообще нужна отдельно от r.pump() — обычный pump() в каждом раунде
+// вычитывает ответы зондов из фонового канала, а этому тесту важно самому
+// решать, когда зонду разрешено ответить (см. rig.probe.hold ниже).
+func readAndHandle(t *testing.T, r *rig, want uint16) control.Event {
+	t.Helper()
+	for i := 0; i < 8; i++ {
+		if err := r.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		ev, err := r.conn.Next()
+		if err != nil {
+			t.Fatalf("событие (ждали тип %d): %v; журнал:\n%s", want, err, r.log)
+		}
+		if err := r.ctrl.Handle(ev); err != nil {
+			t.Fatalf("контроллер не переварил событие типа %d: %v", ev.Type, err)
+		}
+		if ev.Type == want {
+			return ev
+		}
+	}
+	t.Fatalf("тип события %d не пришёл за отведённые попытки; журнал:\n%s", want, r.log)
+	return control.Event{}
+}
+
+func TestQUICПрименениеНеПортитСчётчикTCPКандидата(t *testing.T) {
+	// Находка 6 ревью задачи 4 (круг 2): taskForKey резолвит цель по ИМЕНИ
+	// (c.target читает c.names[ключ], а задачи лежат в c.tasks[имя]), а не по
+	// ключу с транспортом, — так что TCP-поток и QUIC-поток к одному имени
+	// делят один *Task и один AppliedCount. Правило ротации (maxSilentTries,
+	// см. onSuspect) верно только тогда, когда обмен (EvExchange) в принципе
+	// МОГ прийти в ответ на применение, а датапат считает обмен и молчаливый
+	// сброс ТОЛЬКО по TCP-таблице потоков (session.c: handle_udp возвращается
+	// раньше общего хвоста d2k_session_packet, где копятся exchanges и
+	// rst_dropped; d2k_session_sweep обходит только s->flows). Задача 4
+	// научила датапат применять план и к QUIC-потокам, так что EvApplied
+	// реально приходит и с Proto==17 — без разбора протокола в Handle() такое
+	// применение молча накручивало бы AppliedCount TCP-кандидата и могло бы
+	// вызвать ротацию рабочего плана по молчанию потоков, для которых обмен
+	// структурно ненаблюдаем (задачи 5/6 QUIC-вертикали ещё не существуют).
+	r := newRig(t)
+	// hold блокирует ответ зонда, пока тест сам не решит его отпустить: без
+	// этого зонд на подтверждение первого кандидата (запущенный ВНУТРИ
+	// обработки ответа на вопрос «встаёт ли транспорт») мог бы успеть
+	// ответить и уйти в advance() ДО того, как тест успеет прочитать
+	// состояние задачи — гонка двух горутин без точки синхронизации. Здесь
+	// синхронизация — сам канал: он отпускает ровно столько ответов, сколько
+	// тест явно передал ему через `<-`.
+	r.probe.hold = make(chan struct{})
+
+	r.say("hello example.com")
+	readAndHandle(t, r, control.EvHello)
+	r.say("rst")
+	readAndHandle(t, r, control.EvSuspect)
+
+	// Отпускаем ровно ОДИН ответ зонда — на вопрос «встаёт ли транспорт»,
+	// первый и обязательный для любой свежей задачи (nextQuestion). Зонд на
+	// подтверждение кандидата, запущенный дальше внутри advance(), тоже
+	// вызовет Do() и тоже встанет на этот же hold, но получить свой ответ
+	// сможет только вторым `<-hold`, которого этот тест никогда не пошлёт —
+	// он и не должен: до сравнения счётчика дело дойти не обязано.
+	r.probe.hold <- struct{}{}
+
+	var tasks []*controller.Task
+	for i := 0; i < 100; i++ {
+		if err := r.ctrl.Pump(); err != nil {
+			t.Fatalf("Pump: %v", err)
+		}
+		tasks = r.ctrl.Tasks()
+		if len(tasks) == 1 && tasks[0].Current != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(tasks) != 1 || tasks[0].Current == nil {
+		t.Fatalf("ожидал ровно одну задачу с кандидатом после ответа на вопрос; задачи: %+v; журнал:\n%s",
+			tasks, r.log)
+	}
+	if tasks[0].AppliedCount != 0 {
+		t.Fatalf("AppliedCount %d до всякого применения — ожидал 0", tasks[0].AppliedCount)
+	}
+
+	// Кандидат уже отправлен в ctlprobe (advance -> push), но команда идёт по
+	// сокету асинхронно — тот же приём ожидания, что и в
+	// TestПланСтавитсяПоИмениИПрименяется.
+	var line string
+	for i := 0; i < 50; i++ {
+		line = r.say("plans")
+		if strings.Contains(line, "planов 1") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(line, "planов 1") {
+		t.Fatalf("план кандидата не встал в таблицу: %q; журнал:\n%s", line, r.log)
+	}
+	var plansN, okBefore, badN uint64
+	if _, err := fmt.Sscanf(line, "planов %d, команд принято %d, отвергнуто %d",
+		&plansN, &okBefore, &badN); err != nil {
+		t.Fatalf("не разобрать ответ %q: %v", line, err)
+	}
+
+	// Кандидат, который в самом деле выбрал advance() (запасной, everythingPlan
+	// из classify.Compose на пустом векторе свойств), портит TCP-контрольную
+	// сумму (plan.PoisonBadSum) — а её UDP-сборка исполнять не умеет и честно
+	// отказывает (wire_udp.c, см. TestПланПоИмениПрименяетсяИКQUIC в
+	// internal/control/bridge_test.go, где это же проверено отдельно). Для
+	// НАХОДКИ 6 это не имеет значения: она про то, что делает Handle() с
+	// EvApplied, а не про то, какую конкретно порчу выбрал сегодняшний
+	// синтез кандидатов (тот, что умеет и TCP, и UDP, — работа задач 5/6, не
+	// этой). Меняем план цели на порто-нейтральный (без порчи вовсе, чтобы
+	// UDP-сборка ничего не отвергла) — таблица планов ctlprobe одна на имя, и
+	// его прямая перестановка не трогает t.Current/AppliedCount на стороне
+	// Go: Handle() смотрит только на факт события EvApplied и на его Proto,
+	// а не на байты применённого плана.
+	udpOK := plan.Plan{
+		Schema: plan.SchemaCurrent, MinExec: 1,
+		Transport: 17, Proto: 1,
+		Payloads: []plan.Payload{{ID: 1, Bytes: []byte{0xDE, 0xAD}}},
+		Fakes:    []plan.Fake{{PayloadID: 1, PoisonID: 0, Repeats: 1}},
+	}
+	tlv, err := udpOK.MarshalTLV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.conn.SetPlanName("example.com", tlv); err != nil {
+		t.Fatalf("замена плана цели не отправилась: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		line = r.say("plans")
+		var p2, ok2, b2 uint64
+		if _, err := fmt.Sscanf(line, "planов %d, команд принято %d, отвергнуто %d", &p2, &ok2, &b2); err == nil {
+			if ok2 > okBefore {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(line, "planов 1") {
+		t.Fatalf("замена плана цели не встала: %q; журнал:\n%s", line, r.log)
+	}
+
+	// QUIC-поток к ТОЙ ЖЕ цели: "quic" переиспользует порт последнего
+	// hello/rst — тот самый случай гонки TCP/QUIC браузера к одному имени,
+	// см. TestTCPИQUICСОдинаковымАдресомИПортомДаютРазныеКлючи в
+	// internal/control/bridge_test.go. От одной датаграммы приходит два
+	// события: сперва hello (имя узнано по QUIC-ключу — без него
+	// c.names[quic-ключ] не был бы известен, и taskForKey не нашёл бы
+	// задачу), затем applied (план сработал) — handle_udp делает и то, и
+	// другое в одном вызове, и журналирует их в этом порядке.
+	r.say("quic")
+	quicHello := readAndHandle(t, r, control.EvHello)
+	if quicHello.Key.Proto != 17 {
+		t.Fatalf("QUIC-хелло с транспортом %d, ждали UDP(17)", quicHello.Key.Proto)
+	}
+	quicApplied := readAndHandle(t, r, control.EvApplied)
+	if quicApplied.Key.Proto != 17 {
+		t.Fatalf("EvApplied с транспортом %d, ждали UDP(17)", quicApplied.Key.Proto)
+	}
+
+	tasks = r.ctrl.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("задача пропала после QUIC-применения: %+v; журнал:\n%s", tasks, r.log)
+	}
+	if tasks[0].AppliedCount != 0 {
+		t.Fatalf("QUIC-применение (Proto=17) увеличило AppliedCount TCP-кандидата: %d",
+			tasks[0].AppliedCount)
+	}
+
+	// Контрольная проверка, без которой предыдущая ничего не доказывает:
+	// то же самое применение, но по-настоящему TCP, ОБЯЗАНО посчитаться —
+	// иначе тест мог бы проходить просто потому, что ветка вообще ничего не
+	// считает. Новый "hello" — свежий порт, тот же адрес и имя: обычная
+	// вторая вкладка браузера к той же цели.
+	r.say("hello example.com")
+	tcpHello := readAndHandle(t, r, control.EvHello)
+	if tcpHello.Key.Proto != 6 {
+		t.Fatalf("второе TCP-хелло с транспортом %d, ждали TCP(6)", tcpHello.Key.Proto)
+	}
+	tcpApplied := readAndHandle(t, r, control.EvApplied)
+	if tcpApplied.Key.Proto != 6 {
+		t.Fatalf("EvApplied с транспортом %d, ждали TCP(6)", tcpApplied.Key.Proto)
+	}
+
+	tasks = r.ctrl.Tasks()
+	if len(tasks) != 1 || tasks[0].AppliedCount != 1 {
+		t.Fatalf("TCP-применение (Proto=6) обязано было увеличить AppliedCount до 1, получили задачи: %+v",
+			tasks)
 	}
 }

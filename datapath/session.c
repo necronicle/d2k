@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "d2k_plans.h"
+#include "d2k_quic.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
 #include "d2k_session.h"
 #include "d2k_time.h"
 #include "d2k_tls.h"
@@ -23,6 +24,30 @@
 
 struct d2k_session {
     d2k_table   *flows;
+    /* Учёт QUIC/UDP-потоков (задача 4 QUIC-вертикали) — ВТОРАЯ, независимая
+     * таблица того же типа d2k_table/d2k_flow, не общая с flows.
+     *
+     * У ключа потока (d2k_key, d2k_track.h) теперь есть поле proto — по
+     * ревью задачи 4: TCP-поток и UDP-поток с одинаковой парой адрес+порт
+     * получают РАЗНЫЕ ключи и потому не схлопнулись бы в одну ячейку даже в
+     * общей таблице (порты TCP и UDP — независимые пространства нумерации,
+     * совпадение не запрещено ничем, а браузер именно так и делает —
+     * гоняет QUIC и TCP к одному адресу наперегонки). Раздельные таблицы
+     * здесь не ради снятия этой коллизии — её уже снял proto в ключе, — а
+     * ради независимых бюджетов ёмкости: всплеск QUIC-трафика не должен
+     * вытеснять из таблицы TCP-потоки, отняв у них ёмкость, которую
+     * оператор выделил под TCP (--flows), и наоборот.
+     *
+     * Почему тот же d2k_flow, а не свой маленький тип: d2k_plan_apply()
+     * принимает `const d2k_flow *` (d2k_plan.h) — эта сигнатура не в
+     * периметре задачи 4, и подменить её другим типом означало бы менять
+     * plan_apply.c. Поля d2k_flow, нужные UDP (key, first_ns/last_ns,
+     * dir_known/init_low, fwd_pkts, saw_hello, plan_done, damaged), уже
+     * названы и уже значат ровно то, что нужно; TCP-специфичные поля
+     * (saw_syn, rst_dropped, типы TLS-записей) для UDP-записей просто
+     * никогда не трогаются и остаются нулём — это честно: у ЭТОГО потока
+     * действительно не было ни SYN, ни TCP-сброса. */
+    d2k_table   *uflows;
     d2k_plantab *plans;
     /* Запасной план — на все цели сразу. В продукте его быть не должно: §2.6
      * закрепляет план за контекстом, на котором он подтверждён, а один план
@@ -69,11 +94,17 @@ d2k_session *d2k_session_new(size_t capacity, size_t journal) {
         return NULL;
     }
     s->flows = d2k_track_new(capacity);
+    /* Тот же capacity, что у TCP-таблицы: это не новое число, а
+       унаследованное — оператор уже выбрал бюджет числа потоков одним
+       параметром (--flows), заводить второй знак специально под UDP было бы
+       придуманной величиной без замера. */
+    s->uflows = d2k_track_new(capacity);
     s->jrn = d2k_journal_new(journal);
     s->plans = d2k_plantab_new(256);
-    if (!s->flows || !s->plans || (journal > 0 && !s->jrn)) {
+    if (!s->flows || !s->uflows || !s->plans || (journal > 0 && !s->jrn)) {
         d2k_plantab_free(s->plans);
         d2k_journal_free(s->jrn);
+        d2k_track_free(s->uflows);
         d2k_track_free(s->flows);
         free(s);
         return NULL;
@@ -87,6 +118,7 @@ void d2k_session_free(d2k_session *s) {
     }
     d2k_plantab_free(s->plans);
     d2k_journal_free(s->jrn);
+    d2k_track_free(s->uflows);
     d2k_track_free(s->flows);
     d2k_plan_free(s->plan);
     free(s);
@@ -160,6 +192,328 @@ static uint32_t rd32(const uint8_t *p) {
            (uint32_t)p[2] << 8 | (uint32_t)p[3];
 }
 
+/* --- QUIC/UDP: та же склейка, что и для TCP выше, для другого транспорта --
+ *
+ * У UDP нет соединения — «поток» здесь пятёрка адрес+порт с истечением по
+ * времени (s->uflows, вторая независимая таблица, см. её объявление в
+ * struct d2k_session). Разбор QUIC (core/quic.c, задача 2 этой же
+ * вертикали) не хранит НИЧЕГО между вызовами и не выделяет память: ключи на
+ * каждый вызов выводятся заново из DCID именно ЭТОЙ датаграммы. Отсюда
+ * прямое следствие для окна поиска: клиент повторяет Initial, а после Retry
+ * шлёт НОВЫЙ Initial с ДРУГИМ DCID — вторая датаграмма расшифровывается
+ * другими ключами, и попытка обязана повториться на ней, а не остановиться
+ * после первой неудачи. Поэтому здесь, в отличие от TCP-ветки, «похоже на
+ * Initial, но не расшифровалось» НЕ взводит saw_hello — взводит только
+ * УСПЕШНОЕ d2k_quic_sni (см. по тексту ниже).
+ *
+ * Разрезы/перекрытие плана здесь неприменимы иначе, чем для TCP: датаграмма
+ * атомарна, пересборки потока у UDP нет, и попытка плана нарезать payload на
+ * несколько посылок для UDP означает не «разрезанный поток», а два огрызка
+ * одного QUIC-пакета, которые ничей сборщик не соединит. Это ловится
+ * отдельно, ниже, до обращения к сборщику на провод. */
+static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
+                       size_t ihl, uint64_t now_ns,
+                       uint8_t *buf, size_t bufcap, d2k_result *out) {
+    /* Минимум для UDP — 8 байт заголовка, а не унаследованные от TCP 20: у
+       UDP нет ни номеров последовательности, ни опций, и датаграмма с пустой
+       нагрузкой (total == ihl + 8) уже целиком помещается. Раньше эта
+       проверка не была своей — общий пролог TCP-ветки отвергал короткую, но
+       честную UDP-датаграмму С ЧУЖИМ ОБЪЯСНЕНИЕМ («заголовок не помещается»
+       про TCP-заголовок, которого тут нет), см. ревью задачи 4. */
+    if (len < ihl + 8) {
+        out->skipped = "заголовок UDP не помещается";
+        return;
+    }
+    /* Тот же фрагмент-контроль, что в общем прологе TCP-ветки чуть ниже — не
+       вынесен в общий код, чтобы правка UDP-ветки не могла задеть уже
+       проверенный путь TCP ни при каких условиях. */
+    if ((rd16(pkt + 6) & 0x1fff) != 0) {
+        out->skipped = "фрагмент";
+        return;
+    }
+    size_t total = rd16(pkt + 2);
+    if (total > len || total < ihl + 8) {
+        out->skipped = "поле длины не сходится";
+        return;
+    }
+
+    const uint8_t *u = pkt + ihl;
+    size_t payload_off = ihl + 8;
+    size_t payload_len = total - payload_off;
+
+    d2k_key key;
+    int src_is_low = d2k_key_make(&key, 17, pkt + 12, pkt + 16, u + 0, u + 2);
+
+    d2k_flow *fl = d2k_track_get(s->uflows, &key, now_ns);
+    if (!fl) {
+        /* Таблица полна — тот же честный исход, что и у TCP: обработать
+           пакет без учёта потока значит применить план второй раз к тому же
+           потоку. */
+        out->skipped = "таблица потоков полна";
+        return;
+    }
+
+    /* Направление — из ПОРТА, а не из содержимого (ревью задачи 4, круг 3).
+     *
+     * Было (круг 2): направление ставилось по успеху d2k_quic_sni —
+     * «раскрылось ключами client in, значит датаграмма от клиента». Это
+     * неверно. Ключи QUIC Initial выводятся из ПУБЛИЧНОГО DCID (RFC 9001
+     * §5.4.1/5.4.2, см. d2k_crypto.h), поэтому раскрытие доказывает только,
+     * что БАЙТЫ ПОЛЕЗНОЙ НАГРУЗКИ — это содержимое клиентского Initial, и
+     * ничего не говорит о том, куда едет ЭТА КОНКРЕТНАЯ датаграмма:
+     * побайтовая копия тех же самых байт, пущенная в обратную сторону,
+     * раскроется теми же ключами и даст то же самое «доказательство».
+     * Ревьюер показал это стендом, не рассуждением: датаграмма
+     * 1.2.3.4:443 -> LAN:50000 с байтами клиентского Initial при
+     * поставленном плане давала приветствие, применение и поддельную
+     * посылку В СТОРОНУ СОБСТВЕННОГО ПОЛЬЗОВАТЕЛЯ, а настоящий клиентский
+     * Initial следом отбрасывался как «поток уже показывал приветствие» —
+     * обход на этом потоке не срабатывал вовсе. Это НЕ регресс круга 2:
+     * тот же стенд против dea3790 ведёт себя побайтно так же — дорожка была
+     * открыта раньше, просто причина, написанная как факт, была написана
+     * раньше, чем её проверили стендом.
+     *
+     * Улика — в самом пакете, а не в его содержимом: правила, которые вообще
+     * кладут датаграмму в очередь (files/S99d2k), сами различают стороны
+     * портом — исходящее (клиент -> сервер) по --dports 443, входящее
+     * (сервер -> клиент) по --sports 443. Значит:
+     *   порт назначения 443, порт источника НЕ 443  -> клиентская сторона;
+     *   порт источника 443, порт назначения НЕ 443  -> серверная сторона;
+     *   оба 443 или ни одного                        -> направление
+     *                                                    неизвестно.
+     * Серверную и неизвестную стороны нельзя разбирать как клиентский
+     * Initial ни при каком результате раскрытия — доказательство по
+     * содержимому вопроса «откуда» не покрывает вовсе, и гадать здесь так
+     * же нельзя, как гадать «имени нет» по -1 у d2k_quic_sni (см.
+     * комментарий у вызова ниже).
+     *
+     * ГРАНИЦА ПРИЁМА: он верен ровно настолько, насколько правила экрана
+     * привязаны к фиксированному порту 443 — а весь периметр задачи 4
+     * сегодня именно на этом и стоит (files/S99d2k). Когда датапат научится
+     * обслуживать произвольные порты, порт перестанет быть уликой
+     * направления, и общий ответ там другой — номер крючка netfilter из
+     * NFQA_PACKET_HDR (поле hook в nfqnl_msg_packet_hdr ядра): очередь на
+     * POSTROUTING значит исходящее, на INPUT или FORWARD — входящее. nfq.c
+     * сегодня это поле не разбирает вовсе, и вводить его в этой задаче не
+     * нужно — но тот, кто в будущем возьмётся за не-443-порты, обязан
+     * заменить порт на крючок здесь, а не унаследовать привязку к 443 по
+     * инерции молча. */
+    int dst_is_443 = (rd16(u + 2) == 443);
+    int src_is_443 = (rd16(u + 0) == 443);
+    if (!dst_is_443 || src_is_443) {
+        out->skipped = (src_is_443 && !dst_is_443)
+                           ? "датаграмма едет от сервера — не клиентский Initial"
+                           : "направление по порту неизвестно";
+        return;
+    }
+
+    /* Дальше — попытки разбора СОДЕРЖИМОГО. Направление уже доказано портом
+       выше; счётчик попыток и окно поиска — про то, что Initial приходит в
+       первых датаграммах клиентской стороны потока (сама датаграмма, её
+       повтор, новый Initial после Retry), а дальше разбор ничего не найдёт
+       и будет чистой тратой на каждом пакете загрузки. */
+    fl->fwd_pkts++; /* счётчик попыток разбора клиентской стороны потока */
+
+    if (fl->saw_hello || fl->fwd_pkts > D2K_HELLO_WINDOW) {
+        out->skipped = fl->saw_hello ? "поток уже показывал приветствие"
+                                      : "за окном поиска";
+        return;
+    }
+
+    if (payload_len == 0) {
+        out->skipped = "нет полезной нагрузки";
+        return;
+    }
+
+    if (!d2k_quic_is_initial(pkt + payload_off, payload_len)) {
+        out->skipped = "не QUIC Initial";
+        return;
+    }
+
+    /* d2k_quic_sni осознанно не различает «не расшифровалось этими ключами»
+       и «расшифровалось, но server_name нет» (см. d2k_quic.h) — оба случая
+       возвращают -1. Различать их здесь тоже нельзя: объявить второе как
+       факт значило бы дописать модулю определённость, которой у него нет, а
+       расшифровка могла не сойтись из-за ловушки Retry выше. Направление
+       здесь ни при чём — оно доказано портом до этого места, а не
+       расшифровкой (см. большой комментарий выше). Поэтому -1 не взводит
+       saw_hello и не пишет в журнал НИЧЕГО — ни узнанного имени, ни «имени
+       нет»: со следующей датаграммой этого же потока попытка честно
+       повторится, пока не кончится окно. */
+    char name[256];
+    if (d2k_quic_sni(pkt + payload_off, payload_len, name, sizeof name) != 0) {
+        out->skipped = "имя не извлечено из Initial";
+        return;
+    }
+    size_t name_len = strlen(name);
+
+    /* Направление уже доказано портом выше, ДО попытки разбора содержимого;
+       успешный разбор здесь доказывает отдельный, независимый факт — что
+       содержимое ДЕЙСТВИТЕЛЬНО клиентский Initial, а не мусор со случайно
+       правильной стороны. Два независимых доказательства, а не одно на
+       двоих. */
+    fl->init_low = src_is_low;
+    fl->dir_known = 1;
+    fl->saw_hello = 1;
+    fl->hello_ns = now_ns;
+    fl->had_sni = 1;
+    /* Те же счётчики и то же событие журнала, что и для TLS (D2K_JRN_HELLO_SNI,
+       s->hellos, s->with_sni) — по требованию задачи 4: имя есть имя для
+       контроллера независимо от транспорта, который его принёс. */
+    s->hellos++;
+    s->with_sni++;
+    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0, NULL,
+                    (const uint8_t *)name, name_len, NULL);
+
+    uint32_t dst_be;
+    memcpy(&dst_be, pkt + 16, 4);
+    const d2k_plan *use = d2k_plantab_find(s->plans, (const uint8_t *)name,
+                                           name_len, dst_be);
+    if (!use) {
+        use = s->plan;
+    }
+    if (!use) {
+        out->skipped = "плана для этой цели нет";
+        return;
+    }
+    if (fl->plan_done) {
+        out->skipped = "план уже применён к этому потоку";
+        return;
+    }
+    if (fl->damaged) {
+        out->skipped = "поток испорчен предыдущей отменой";
+        refuse(s, now_ns, &key, out->skipped);
+        return;
+    }
+
+    d2k_pkt in;
+    memset(&in, 0, sizeof in);
+    in.payload = pkt + payload_off;
+    in.payload_len = payload_len;
+    in.seq = 0;      /* у UDP нет номера последовательности */
+    /* have_sni = 0 НАМЕРЕННО, хотя имя выше уже найдено. Имя d2k_quic_sni
+       достаёт из ClientHello, пересобранного ВНУТРИ core/quic.c по смещениям
+       CRYPTO-кадров расшифрованного потока — оно не лежит смещением в этом
+       payload (тот всё ещё шифротекст). Якоря ANCHOR_SNI_START/END
+       исполнителя (plan_apply.c) вычисляют смещение именно В payload; для
+       QUIC такого смещения не существует ни при каком значении. Подставить
+       сюда 0 «на всякий случай» значило бы дать исполнителю МОЛЧА вычислить
+       заведомо неверный якорь вместо честного отказа — d2k_wire.h прямо
+       запрещает подменять запрошенное на похожее. have_sni=0 — единственно
+       честное значение: план, которому нужен якорь по SNI, получит отказ
+       ниже (d2k_plan_apply вернёт -1 и пакет пройдёт как есть), а не тихую
+       порчу. */
+    in.have_sni = 0;
+    in.sni_off = 0;
+    in.sni_len = 0;
+
+    d2k_actions acts;
+    memset(&acts, 0, sizeof acts);
+    if (d2k_plan_apply(use, fl, &in, &acts) != 0) {
+        out->skipped = "план неприменим к этому пакету";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return;
+    }
+
+    /* Датаграмма атомарна: у UDP нет пересборки потока. План, который режет
+       payload на несколько кусков (якоря ANCHOR_PAYLOAD_START/HELLO_MIDDLE
+       это позволяют НЕЗАВИСИМО от have_sni — см. anchor_offset в
+       plan_apply.c), для одной датаграммы неисполним честно: сервер получит
+       два огрызка одного QUIC-пакета вместо целого, и это не то же самое,
+       что разрез TCP-потока, который сервер пересобирает сам. wire_udp.c
+       ловит только перекрытие (pre_len/seq_shift) — оно единственное метит
+       себя этими полями; обычный разрез никакого признака не ставит и
+       пройдёт сборщик как обычная нагрузка. Различить это может только тот,
+       кто знает про транспорт, — то есть здесь, до обращения к сборщику. */
+    size_t payload_emits = 0;
+    for (size_t i = 0; i < acts.n; i++) {
+        if (acts.v[i].kind == D2K_EMIT_PAYLOAD) {
+            payload_emits++;
+        }
+    }
+    if (payload_emits > 1) {
+        out->skipped = "план режет датаграмму на части — для UDP это порча, не разрез";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return;
+    }
+
+    d2k_conn c;
+    memset(&c, 0, sizeof c);
+    memcpy(&c.src_ip, pkt + 12, 4);
+    memcpy(&c.dst_ip, pkt + 16, 4);
+    memcpy(&c.src_port, u + 0, 2);
+    memcpy(&c.dst_port, u + 2, 2);
+    c.ttl = pkt[8];
+    c.ip_id = rd16(pkt + 4);
+    /* c.ack и c.window остаются нулями: полей TCP у UDP нет, а
+       d2k_wire_build_udp их не читает (см. d2k_wire.h). */
+
+    if (acts.n > sizeof out->out / sizeof out->out[0]) {
+        /* План описывает больше посылок, чем вмещает d2k_result.out[]
+           (ревью задачи 4, круг 2): repeats фальшивки приходит из TLV одним
+           байтом без потолка (до 255), а out[] — фиксированные 16. Раньше n
+           тихо обрезался до 16: план "применялся" целиком (plan_done,
+           applied++, PLAN_APPLIED), а на провод уходило МЕНЬШЕ посылок, чем
+           он описывал, — то же самое расхождение с планом, которое здесь же
+           ловит ветка made==0 чуть ниже, только раньше нужного места и без
+           единого слова об этом. Честный исход тот же, что там: отказ
+           целиком, а не обрезанное исполнение, выданное за полное. */
+        out->skipped = "план описывает больше посылок, чем вмещает буфер результата";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return;
+    }
+    size_t used = 0;
+    size_t n = acts.n;
+    for (size_t i = 0; i < n; i++) {
+        size_t made = d2k_wire_build_udp(&c, &acts.v[i], buf + used, bufcap - used);
+        if (made == 0) {
+            /* d2k_wire_build_udp возвращает 0 в двух случаях: посылка не
+               поместилась в буфер и «эту порчу для UDP честно не исполнить»
+               (pre_len/seq_shift/TCPTS_BACK/BADSUM, см. шапку d2k_wire.h).
+               Оба — отказ, и его нельзя проглотить: отправить меньше, чем
+               описал план, и промолчать значит приписать результат плану,
+               который не исполнялся. Обработка — слово в слово как в
+               TCP-ветке: спросить исполнитель, что делать с уже ушедшим. */
+            d2k_cancel cancel;
+            d2k_actions_cancel(&acts, i, &cancel);
+            out->n_out = i;
+            out->verdict = (cancel.fate == D2K_ORIG_DROP) ? D2K_VERDICT_DROP
+                                                          : D2K_VERDICT_ACCEPT;
+            if (cancel.stream_damaged) {
+                fl->damaged = 1;
+            }
+            out->skipped = "посылка невыполнима для UDP";
+            refuse(s, now_ns, &key, out->skipped);
+            d2k_actions_free(&acts);
+            return;
+        }
+        out->out[i].delay_us = acts.v[i].delay_us;
+        out->out[i].off = used;
+        out->out[i].len = made;
+        used += made;
+    }
+    if (acts.fate == D2K_ORIG_HOLD) {
+        /* Как и в TCP-ветке: удержание оригинала датапат не умеет вовсе. */
+        out->n_out = 0;
+        out->verdict = D2K_VERDICT_ACCEPT;
+        out->skipped = "удержание оригинала не поддержано";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return;
+    }
+    out->n_out = n;
+    out->verdict = (acts.fate == D2K_ORIG_DROP) ? D2K_VERDICT_DROP
+                                                : D2K_VERDICT_ACCEPT;
+    fl->plan_done = 1;
+    fl->guards = d2k_plan_guards(use);
+    s->applied++;
+    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, NULL, 0, NULL);
+    d2k_actions_free(&acts);
+}
+
 int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
                        d2k_result *out) {
@@ -179,12 +533,29 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
     size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
-    if (ihl < 20 || len < ihl + 20) {
+    if (ihl < 20) {
+        /* Нарушение самого IPv4: IHL короче 20 байт не бывает ни при каком
+           транспорте — эта проверка делится TCP и UDP честно, а не по
+           TCP-инерции (ниже — наоборот, минимум под конкретный L4). */
         out->skipped = "заголовок не помещается";
+        return 0;
+    }
+    if (pkt[9] == 17) {
+        /* UDP — своя ветка, см. handle_udp выше. Дальше в этой функции всё
+           написано под TCP-заголовок и трогать эти байты как UDP нельзя.
+           Проверка «хватает ли len на минимальный заголовок» — внутри
+           handle_udp, СВОИМ порогом (8 байт UDP, а не унаследованным TCP-20:
+           см. ревью задачи 4 — короткая, но честная UDP-датаграмма получала
+           TCP-объяснение «заголовок не помещается» ровно из-за этого). */
+        handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out);
         return 0;
     }
     if (pkt[9] != 6) {
         out->skipped = "не TCP";
+        return 0;
+    }
+    if (len < ihl + 20) {
+        out->skipped = "заголовок не помещается";
         return 0;
     }
     /* Фрагмент без нулевого смещения не несёт заголовка TCP. Собирать
@@ -208,7 +579,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     }
 
     d2k_key key;
-    int src_is_low = d2k_key_make(&key, pkt + 12, pkt + 16, t + 0, t + 2);
+    int src_is_low = d2k_key_make(&key, 6, pkt + 12, pkt + 16, t + 0, t + 2);
 
     uint8_t flags = t[13];
     const int fin = (flags & 0x01) != 0;
@@ -559,11 +930,20 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     c.ttl = pkt[8];
     c.ip_id = rd16(pkt + 4);
 
+    if (acts.n > sizeof out->out / sizeof out->out[0]) {
+        /* Тот же класс отказа, что и made==0 чуть ниже (ревью задачи 4,
+           круг 2): repeats фальшивки приходит из TLV байтом без потолка (до
+           255), а out[] — фиксированные 16. Обрезать n молча значило бы
+           "применить" план и отправить на провод меньше посылок, чем он
+           описывает, — то есть план, который не исполнялся. Честный исход —
+           отказ целиком. */
+        out->skipped = "план описывает больше посылок, чем вмещает буфер результата";
+        refuse(s, now_ns, &key, out->skipped);
+        d2k_actions_free(&acts);
+        return 0;
+    }
     size_t used = 0;
     size_t n = acts.n;
-    if (n > sizeof out->out / sizeof out->out[0]) {
-        n = sizeof out->out / sizeof out->out[0];
-    }
     for (size_t i = 0; i < n; i++) {
         size_t made = d2k_wire_build(&c, &acts.v[i], buf + used, bufcap - used);
         if (made == 0) {
@@ -733,12 +1113,25 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
 }
 
 size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
-    return s ? d2k_track_expire(s->flows, now_ns, idle_ns,
-                                on_flow_expire, s) : 0;
+    if (!s) {
+        return 0;
+    }
+    /* Ровно требование задачи 4: «таблице нужна чистка, иначе она растёт без
+       границ» — тем же способом, что и у TCP, не своим: d2k_track_expire уже
+       обходит ВСЕ живые записи своей таблицы и снимает молчавшие дольше
+       idle_ns, и он не заботится о том, что лежит в d2k_flow — вызов для
+       s->uflows отличается только отсутствием колбэка, потому что для UDP
+       здесь нет наблюдения «приветствие было, ответа не было» (см. большой
+       комментарий у handle_udp: d2k_quic_sni не даёт достаточно уверенности,
+       чтобы делать выводы даже о наличии имени, не то что о молчании
+       сервера). NULL как on_expire — штатный случай самого d2k_track_expire. */
+    size_t freed = d2k_track_expire(s->flows, now_ns, idle_ns, on_flow_expire, s);
+    freed += d2k_track_expire(s->uflows, now_ns, idle_ns, NULL, NULL);
+    return freed;
 }
 
 size_t d2k_session_flows(const d2k_session *s) {
-    return s ? d2k_track_count(s->flows) : 0;
+    return s ? d2k_track_count(s->flows) + d2k_track_count(s->uflows) : 0;
 }
 
 uint64_t d2k_session_applied(const d2k_session *s) {
@@ -746,11 +1139,35 @@ uint64_t d2k_session_applied(const d2k_session *s) {
 }
 
 uint64_t d2k_session_refusals(const d2k_session *s) {
-    return s ? d2k_track_refusals(s->flows) : 0;
+    return s ? d2k_track_refusals(s->flows) + d2k_track_refusals(s->uflows) : 0;
 }
 
 size_t d2k_session_capacity(const d2k_session *s) {
+    return s ? d2k_track_capacity(s->flows) + d2k_track_capacity(s->uflows) : 0;
+}
+
+size_t d2k_session_flows_tcp(const d2k_session *s) {
+    return s ? d2k_track_count(s->flows) : 0;
+}
+
+size_t d2k_session_flows_udp(const d2k_session *s) {
+    return s ? d2k_track_count(s->uflows) : 0;
+}
+
+size_t d2k_session_capacity_tcp(const d2k_session *s) {
     return s ? d2k_track_capacity(s->flows) : 0;
+}
+
+size_t d2k_session_capacity_udp(const d2k_session *s) {
+    return s ? d2k_track_capacity(s->uflows) : 0;
+}
+
+uint64_t d2k_session_refusals_tcp(const d2k_session *s) {
+    return s ? d2k_track_refusals(s->flows) : 0;
+}
+
+uint64_t d2k_session_refusals_udp(const d2k_session *s) {
+    return s ? d2k_track_refusals(s->uflows) : 0;
 }
 
 uint64_t d2k_session_hellos(const d2k_session *s) {
