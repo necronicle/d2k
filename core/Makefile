@@ -20,25 +20,37 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c
-HDR     = include/d2k_meas.h
+SRC     = meas.c verdict.c
+HDR     = include/d2k_meas.h include/d2k_verdict.h
+# Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
+# test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
+TESTHDR = test_stand.h
 
-TESTS   = test_meas
+TESTS   = test_meas test_verdict
 
-.PHONY: all check san gcc-warn cross clean test-meas
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict
 
-all: meas.o
+all: meas.o verdict.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_meas: test_meas.c meas.o $(HDR)
+verdict.o: verdict.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
+
+test_verdict: test_verdict.c meas.o verdict.o $(HDR) $(TESTHDR)
+	$(CC) $(CFLAGS) -o $@ test_verdict.c meas.o verdict.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
 
-check: all test-meas
+test-verdict: test_verdict
+	./test_verdict
+
+check: all test-meas test-verdict
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -79,7 +91,12 @@ cross:
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_meas-a64 \
 		test_meas.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_meas-mipsel test_meas.c meas.c -lpthread || exit 1
-	@echo "переносимость: aarch64 и mipsel собираются, тест линкуется"
+	@echo "== test_verdict целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verdict-a64 \
+		test_verdict.c meas.c verdict.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verdict-mipsel \
+		test_verdict.c meas.c verdict.c -lpthread || exit 1
+	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
 	rm -f *.o $(TESTS)

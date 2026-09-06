@@ -1,17 +1,20 @@
 /* test_meas.c — проверки оракула.
  *
  * Стенд ведёт себя как коробка: молчит, если ПЕРВЫЙ сегмент начинается с
- * сигнатуры. Меряем правила, а не чужую линию.
+ * сигнатуры. Меряем правила, а не чужую линию. Сам стенд вынесен в
+ * test_stand.h и общий с test_verdict.c (см. его шапку про источник этого
+ * решения — не бриф, а сопроводительное письмо к задаче 2); у задачи 2 те
+ * же режимы 0 и 1, что и здесь.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <string.h>
-#include <pthread.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 #include "d2k_meas.h"
+#include "test_stand.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -21,8 +24,6 @@ static int fails;
             fails++;                                       \
         }                                                  \
     } while (0)
-
-static const uint8_t sig[4] = { 0x16, 0x03, 0x01, 0x00 };
 
 /* Подставные реализации d2k_mark_hook для проверки И-семантики метки без
  * зависимости от CAP_NET_ADMIN на машине проверки (см. блок теста в main). */
@@ -40,81 +41,10 @@ static int mark_fail_on_second(int fd, uint32_t mark) {
     return mark_fail_calls == 2 ? -1 : 0;
 }
 
-struct stand { int fd; uint16_t port; int mode; size_t want; };
-/* mode: 0 отвечает всегда; 1 молчит на сигнатуру в первом сегменте;
-   2 копит байты до want и только тогда шлёт ack — если отправитель замолчал
-   раньше срока (потерял хвост куска на короткой записи), ack не придёт
-   никогда, и это наблюдаемое отличие «долечили короткую запись» от «нет». */
-
-static void *stand_run(void *arg) {
-    struct stand *s = arg;
-    for (;;) {
-        int c = accept(s->fd, NULL, NULL);
-        if (c < 0) { return NULL; }
-        if (s->mode == 2) {
-            /* Пауза дольше d2k_send_timeout_s обязательна и вот почему:
-               замером на этой же машине показано, что короткая запись
-               НАБЛЮДАЕТСЯ только когда SO_SNDTIMEO успевает истечь при
-               недренирующем приёмнике (send() 16 МиБ пассивному получателю
-               вернул 1 135 204 из 16 777 216 за это время) — если приёмник
-               начинает читать РАНЬШЕ истечения таймаута, ядро само
-               дотягивает всю запись за один вызов, и короткой записи
-               снаружи не видно вовсе. Тест уменьшает d2k_send_timeout_s до
-               1 с; здесь пауза 1.5 с — заведомо за его пределами. */
-            struct timespec pause_ts = { 1, 500000000L }; /* 1.5 с */
-            nanosleep(&pause_ts, NULL);
-            uint8_t buf[65536];
-            size_t got = 0;
-            while (got < s->want) {
-                ssize_t n = recv(c, buf, sizeof buf, 0);
-                if (n <= 0) { break; }
-                got += (size_t)n;
-            }
-            if (got == s->want) {
-                const uint8_t ans[7] = { 0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00 };
-                (void)send(c, ans, sizeof ans, 0);
-            }
-            close(c);
-            continue;
-        }
-        uint8_t buf[8192];
-        ssize_t n = recv(c, buf, sizeof buf, 0);
-        int blocked = 0;
-        if (s->mode == 1 && n >= (ssize_t)sizeof sig &&
-            memcmp(buf, sig, sizeof sig) == 0) {
-            blocked = 1;
-        }
-        if (!blocked) {
-            const uint8_t ans[7] = { 0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00 };
-            (void)send(c, ans, sizeof ans, 0);
-        }
-        close(c);
-    }
-}
-
-static uint16_t stand_start(struct stand *s, int mode) {
-    s->fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(0x7f000001);
-    a.sin_port = 0;
-    bind(s->fd, (struct sockaddr *)&a, sizeof a);
-    socklen_t l = sizeof a;
-    getsockname(s->fd, (struct sockaddr *)&a, &l);
-    listen(s->fd, 8);
-    s->mode = mode;
-    s->port = ntohs(a.sin_port);
-    pthread_t t;
-    pthread_create(&t, NULL, stand_run, s);
-    pthread_detach(t);
-    return s->port;
-}
-
 int main(void) {
     uint8_t hello[64];
     memset(hello, 0xAA, sizeof hello);
-    memcpy(hello, sig, sizeof sig);
+    memcpy(hello, d2k_test_sig, sizeof d2k_test_sig);
     d2k_hello h = { hello, sizeof hello };
 
     /* --- чистая мишень: все три повтора проходят -------------------------- */
@@ -253,13 +183,16 @@ int main(void) {
     {
         static uint8_t big[16 * 1024 * 1024];
         memset(big, 0xBB, sizeof big);
-        memcpy(big, sig, sizeof sig);
+        memcpy(big, d2k_test_sig, sizeof d2k_test_sig);
         d2k_hello bh = { big, sizeof big };
 
         struct stand s;
         memset(&s, 0, sizeof s);
         s.want = sizeof big;
-        uint16_t p = stand_start(&s, 2);
+        /* Режим 4 — «копит ровно want байт» (см. test_stand.h). Раньше был
+           под номером 2; сдвинут, чтобы 2 в общем стенде досталось
+           пересборке, которую использует test_verdict.c. */
+        uint16_t p = stand_start(&s, 4);
 
         /* Сокращаем потолок записи на время этого блока: короткая запись —
            наблюдаемое следствие истечения SO_SNDTIMEO при недренирующем
