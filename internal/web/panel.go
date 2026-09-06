@@ -124,7 +124,12 @@ func (p *Panel) snapshot() status.Snapshot {
 		// ошибке отдельным полем.
 		c = p.cfg
 	}
-	return status.Collect(c, p.started)
+	s := status.Collect(c, p.started)
+	// Звенья обработки — из ЖИВОГО состояния, а не из зашитых умолчаний.
+	// Панель, показывающая «датапат не написан» при работающей очереди,
+	// обесценивает всё, что через неё смотрят.
+	s.ApplyChain(p.knowledge())
+	return s
 }
 
 func (p *Panel) page(w http.ResponseWriter, r *http.Request) {
