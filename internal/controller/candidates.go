@@ -110,111 +110,32 @@ func wrap(p plan.Plan, proto string) (catalog.Plan, error) {
 	return catalog.Plan{ID: planID(text), Proto: proto, Text: text}, nil
 }
 
-// generate строит лестницу кандидатов ИЗ НАБЛЮДЕНИЯ.
+// splitPlan — план «просто разрез», без приманки и без порчи.
 //
-// Порядок не фиксирован и не угадан: он выводится из того, что видно на линии.
-// Сброс и молчание требуют разного, и предлагать защиту от сброса там, где
-// сброса не было, значит тратить попытку пользователя впустую.
-//
-//	виден сброс          защита дешевле всего и прямо показана;
-//	молчание или повтор  защита бесполезна, показана приманка;
-//	и то и другое        сперва пара, она закрывает оба наблюдения.
-//
-// Ни один отказ отсюда не попадает на диск (§2.3): лестница строится заново
-// при каждом поиске.
-func generate(fp catalog.Fingerprint, decoy, passing string) ([]Candidate, error) {
-	sawRST, sawQuiet, sawVolume := false, false, false
-	for _, s := range fp.Signals {
-		switch s.Kind {
-		case "rst":
-			sawRST = true
-		case "silent", "repeat":
-			sawQuiet = true
-		case "volume":
-			sawVolume = true
-		}
+// Позиция — ЧИСЛОМ, а не якорем (в отличие от остальных планов пакета —
+// сравни с комментарием у plan.Anchor: «якорь переносится, число — нет»).
+// Здесь это оправдано: число не позаимствовано у чужого хоста, оно измерено
+// classify.Run НА ЭТОЙ цели, тем же триггером, что и настоящее приветствие
+// (см. verdictCandidates в controller.go). AnchorPayloadStart даёт базу 0,
+// и датапат режет по «база + смещение» (datapath/plan_apply.c,
+// anchor_offset/split_points) — то есть ровно там же, где резал сам замер
+// (internal/classify/measure.go, spans()).
+func splitPlan(pos int) (catalog.Plan, error) {
+	p := plan.Plan{
+		Schema: plan.SchemaCurrent, MinExec: 1,
+		Transport: 6, Proto: 1,
+		Splits: []plan.Position{{Anchor: plan.AnchorPayloadStart, Offset: int16(pos)}},
 	}
+	return wrap(p, "tls")
+}
 
-	type step struct {
-		guard   bool
-		fake    bool
-		ttl     uint8
-		repeats uint8
-		gap     uint32
+// decoyFor — какое имя приманки использовать: измеренное (Traits.PassingName)
+// точнее заготовки (fallback), потому что подтверждено пробой объёма НА ЭТОЙ
+// линии, а не взято алфавитом инструмента. Общее место для buildQueue и
+// askClassify — раньше это правило дублировалось бы в обоих порознь.
+func decoyFor(t *Task, fallback string) string {
+	if t.Traits.PassingName != "" {
+		return t.Traits.PassingName
 	}
-	var steps []step
-	switch {
-	case sawRST && sawQuiet:
-		steps = []step{
-			{guard: true, fake: true, ttl: 3, repeats: 2, gap: 78000},
-			{guard: true},
-			{fake: true, ttl: 3, repeats: 2, gap: 78000},
-		}
-	case sawRST:
-		// Пара первой, а не «дешёвая» защита.
-		//
-		// Рассуждение «дешевле всего — значит первым» стоило замера: защита
-		// в одиночку снимает подделанный сброс, но сервер всё равно не
-		// отвечает, и мгновенный отказ превращается в ШЕСТИСЕКУНДНОЕ
-		// зависание. Три таких подряд — восемнадцать секунд ожидания у
-		// человека вместо мгновенного отказа, к которому он привык.
-		//
-		// Цена кандидата измеряется не числом выпущенных пакетов, а тем, во
-		// что обходится его неудача. Порядок здесь именно по этой цене.
-		steps = []step{
-			{guard: true, fake: true, ttl: 3, repeats: 2, gap: 78000},
-			{fake: true, ttl: 3, repeats: 2, gap: 78000},
-			{guard: true},
-		}
-	default:
-		// Молчание, повтор или наблюдение, которого мы ещё не различаем.
-		// Защита от сброса тут ничего не даст: сбрасывать некому.
-		steps = []step{
-			{fake: true, ttl: 3, repeats: 2, gap: 78000},
-			{fake: true, ttl: 6, repeats: 2, gap: 78000},
-			{fake: true, ttl: 3, repeats: 4, gap: 0},
-		}
-	}
-
-	// Обрыв по объёму — отдельная ось, и она про ИМЯ, а не про разрез.
-	//
-	// Перебора имён здесь нет: его делает активная проба на самой цели, за
-	// секунды и без участия человека. Сюда приходит уже подобранное имя.
-	var out []Candidate
-	if sawVolume && passing != "" {
-		p, err := fakePlan(passing, 3, 2, 78000, sawRST)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Candidate{Source: "имя " + passing, Plan: p, Decoy: passing})
-
-		// Дальше — обычный синтез, и он идёт с ИЗМЕРЕННЫМ именем.
-		//
-		// Одна цель может быть закрыта сразу двумя способами: объём режется, и
-		// вдобавок имя в настоящем приветствии не пропускают. Остановиться на
-		// подстановке имени значило бы бросить такую цель на полпути.
-		//
-		// Имя для приманки берём подобранное, а не постоянное: замер
-		// 06.09.2026 показал сети, где неподходящее имя не просто бесполезно —
-		// с ним не встаёт рукопожатие вовсе. Постоянная приманка отравила бы
-		// там каждый следующий кандидат.
-		decoy = passing
-	}
-
-	for _, s := range steps {
-		var (
-			p   catalog.Plan
-			err error
-		)
-		if s.fake {
-			p, err = fakePlan(decoy, s.ttl, s.repeats, s.gap, s.guard)
-		} else {
-			p, err = guardPlan()
-		}
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Candidate{Source: "поиск", Plan: p})
-	}
-	return out, nil
+	return fallback
 }

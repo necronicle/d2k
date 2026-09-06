@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/catalog"
+	"github.com/necronicle/d2k/internal/classify"
 	"github.com/necronicle/d2k/internal/conntrack"
 	"github.com/necronicle/d2k/internal/control"
 	"github.com/necronicle/d2k/internal/plan"
@@ -114,6 +115,21 @@ type Task struct {
 	// Объём, на котором потоки к этой цели кончаются раз за разом. Ноль —
 	// не наблюдали.
 	VolumeCutAt int64
+
+	// classifying — идёт измерение функции решения коробки (classify.Run).
+	// Как и объём, оно уходит в сеть на секунды и не должно задерживать
+	// очередь кандидатов (см. askClassify в classify_probe.go).
+	classifying bool
+	// classifyAsked — вопрос уже задан либо спросить было нечем. Отдельно от
+	// classifying: «не спрашивали» и «спросили, ждём» — разные состояния
+	// (§2.4). Не поле Traits, а именно Task — по той же причине, что и
+	// scanning: это бухгалтерия ОДНОГО прогона, а не измеренное свойство
+	// коробки.
+	classifyAsked bool
+	// Classified — вердикт classify.Run, когда он пришёл. Пустой Verdict
+	// ("") — измерение либо ещё не завершилось, либо не задавалось вовсе
+	// (стенд без классификатора, цель без имени).
+	Classified classify.Result
 }
 
 // Prober — то, чем контроллер стучится в цель. Интерфейс, а не структура,
@@ -148,6 +164,11 @@ type Controller struct {
 	// nameHits — сколько раз имя уже проводило объём на этой линии. Только в
 	// памяти: это ускоритель порядка перебора, а не знание о цели.
 	nameHits map[string]int
+
+	// Измерение функции решения коробки: своя проба, свой канал ответов —
+	// по тому же образцу, что и объём (см. classify_probe.go).
+	classifier      Classifier
+	classifyResults chan classifyDone
 
 	// Наблюдение за объёмом: обрыв, который не виден в окне первых пакетов.
 	volume   map[string]*volumeWatch
@@ -194,6 +215,9 @@ func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 		volResults: make(chan volumeScanDone, 8),
 		volVerify:  make(chan volumeVerifyDone, 8),
 		nameHits:   map[string]int{},
+
+		classifier:      liveClassifier{},
+		classifyResults: make(chan classifyDone, 8),
 	}
 	c.seedNameHits()
 	return c
@@ -339,6 +363,10 @@ func (c *Controller) Run() error {
 			if err := c.onVolumeVerify(r); err != nil {
 				return err
 			}
+		case r := <-c.classifyResults:
+			if err := c.onClassify(r); err != nil {
+				return err
+			}
 		case <-tick.C:
 			c.pollVolume(c.now())
 		case err := <-fail:
@@ -366,6 +394,10 @@ func (c *Controller) Pump() error {
 			}
 		case r := <-c.volVerify:
 			if err := c.onVolumeVerify(r); err != nil {
+				return err
+			}
+		case r := <-c.classifyResults:
+			if err := c.onClassify(r); err != nil {
 				return err
 			}
 		default:
@@ -454,7 +486,7 @@ func (c *Controller) expire(now time.Time) {
 		}
 	}
 	for k, t := range c.tasks {
-		if t.scanning {
+		if t.scanning || t.classifying {
 			// Незавершённое измерение нельзя выбрасывать по часам: ответ уже
 			// оплачен временем человека.
 			continue
@@ -637,6 +669,12 @@ func (c *Controller) step(t *Task) error {
 	if !t.Traits.VolumeAsked && t.Traits.ByName == TraitYes {
 		c.askVolume(t)
 	}
+	// Функция решения коробки — тем же образом: фоном, не задерживая очередь
+	// (см. askClassify в classify_probe.go). Ответ, когда придёт, перебьёт
+	// очередь кандидатов вердиктом — так же, как объём перебивает её именем.
+	if !t.classifyAsked && t.Traits.ByName == TraitYes {
+		c.askClassify(t)
+	}
 	if q, ok := nextQuestion(t.Traits); ok {
 		return c.ask(t, q)
 	}
@@ -691,10 +729,6 @@ func answerUnknown(tr Traits, q Question) Traits {
 	switch q.Name {
 	case "встаёт ли транспорт":
 		tr.ByName = TraitYes // не смогли спросить — работаем как обычно
-	case "первое приветствие или последнее":
-		tr.ReadsFirstHello = TraitNo
-	case "собирает ли сегменты":
-		tr.Reassembles = TraitYes
 	}
 	return tr
 }
@@ -772,12 +806,22 @@ func (c *Controller) advance(t *Task) error {
 		return nil
 	}
 
-	if t.scanning {
-		// Измерение объёма ещё идёт. Закрыть поиск сейчас значит выбросить
-		// ответ, за который уже заплачено временем: при блоке по объёму
-		// подстановка имени — единственное, что поможет, а лестница до него
-		// добраться и не могла.
-		c.sayf("по %s кандидаты кончились, но измерение объёма ещё идёт — жду его",
+	if t.scanning || t.classifying {
+		// Хотя бы одно фоновое измерение (объём или функция решения коробки)
+		// ещё не ответило. Закрыть поиск сейчас значит выбросить ответ, за
+		// который уже заплачено временем: при блоке по объёму подстановка
+		// имени — единственное, что поможет, а до вердикта classify.Run
+		// очередь умеет предложить только запасной план (см.
+		// verdictCandidates) — ни то ни другое лестница «сама по себе» дать
+		// не могла.
+		//
+		// Обе оси — в одном условии, а не только scanning, как было до
+		// classify: единственный запасной кандидат кончается за один зонд, и
+		// без второй половины условия задача закрывалась бы РАНЬШЕ, чем
+		// придёт вердикт classify.Run — тот приходил бы уже в удалённую
+		// задачу и терялся молча (onClassify проверяет t == nil и просто
+		// выходит).
+		c.sayf("по %s кандидаты кончились, но измерение ещё идёт — жду его",
 			t.Target)
 		t.Current = nil
 		return nil
@@ -834,7 +878,12 @@ func (c *Controller) buildQueue(t *Task) ([]Candidate, error) {
 	}
 	known := len(out)
 
-	gen, err := generate(t.Fingerprint, c.decoy, t.Traits.PassingName)
+	// Кандидаты приходят ИЗ ЗАМЕРА, а не из лестницы. Порядок задан
+	// вердиктом classify.Run: для префиксного матчера это разрез на
+	// измеренной позиции, для пересобирающей коробки — вопросы о её
+	// свойствах в заданном ими порядке. Лестницы «попробуем это, потом то»
+	// здесь нет и быть не должно (§3.5).
+	gen, err := c.verdictCandidates(t, decoyFor(t, c.decoy))
 	if err != nil {
 		return nil, err
 	}
@@ -845,6 +894,87 @@ func (c *Controller) buildQueue(t *Task) ([]Candidate, error) {
 			t.Target, known, len(gen))
 	}
 	return out, nil
+}
+
+// verdictCandidates превращает измеренный вердикт classify.Run в очередь
+// кандидатов поиска.
+//
+// classify.Run меряется в фоне (см. askClassify) и может ещё не ответить к
+// моменту сборки очереди — тогда t.Classified.Verdict пуст, и единственный
+// честный кандидат берётся из classify.Compose на ПУСТОМ векторе свойств
+// (classify.Properties{}, нулевое значение t.Traits.Props). Он останется
+// пустым на этом пути ВСЕГДА, и это не недосмотр, а прямое следствие §4.2:
+// заполнить вектор может только полный проход всех пяти вопросов
+// PropProbes, а любой ПРОШЕДШИЙ вопрос сам обрывает поиск обменом — обмен и
+// есть критерий успеха, найденный план сохраняется, задача закрывается, и
+// до «собрать несколько подтверждённых свойств в одну комбинацию» дело
+// физически не доходит. Фоновое дообогащение модели коробки оставшимися
+// вопросами (после того как поиск уже закрылся успехом) — ОТДЕЛЬНАЯ задача,
+// не эта; здесь Compose честно вызывается на пустом векторе и возвращает
+// единственный запасной план (everythingPlan).
+func (c *Controller) verdictCandidates(t *Task, decoy string) ([]Candidate, error) {
+	switch t.Classified.Verdict {
+	case classify.VerdictPrefix, classify.VerdictWholePacket:
+		// Оба вердикта значат одно и то же для выбора стратегии: разрез
+		// работает. VerdictWholePacket отличает от VerdictPrefix только то,
+		// ЧТО измерено про границу сигнатуры (см. classify.Run, диагностика
+		// по запросу) — на решение «резать» это не влияет: SplitPos у обоих
+		// уже посчитан замером.
+		p, err := splitPlan(t.Classified.SplitPos)
+		if err != nil {
+			return nil, err
+		}
+		return []Candidate{{
+			Source: fmt.Sprintf("разрез на байте %d (измерено)", t.Classified.SplitPos),
+			Plan:   p,
+		}}, nil
+
+	case classify.VerdictOpaque:
+		// Разрез эту коробку не берёт (иначе вердикт был бы Prefix). Очередь
+		// — пять вопросов о свойствах, В ИХ СОБСТВЕННОМ ПОРЯДКЕ
+		// (classify.PropProbes, порядок задан ценой таймаута, а не вкусом —
+		// см. её же комментарий), а не в порядке classify.Compose (тот
+		// порядок свой, для сборки уже измеренного, и здесь неприменим).
+		// Каждый вопрос двойного назначения: тот же план, которым спросили,
+		// и есть стратегия, если он пройдёт.
+		probes := classify.PropProbes()
+		out := make([]Candidate, 0, len(probes))
+		for _, pp := range probes {
+			p, err := pp.Plan(decoy)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, Candidate{Source: "вопрос «" + pp.Name + "»", Plan: p})
+		}
+		return out, nil
+
+	default:
+		// Вердикта либо ещё нет (classify.Run в полёте), либо он не даёт
+		// решения — clear/inconclusive/flaky/unreachable закрывают поиск
+		// сразу в onClassify и сюда, к сборке очереди, уже не доходят.
+		gen, err := classify.Compose(t.Traits.Props, decoy)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]Candidate, 0, len(gen))
+		for _, p := range gen {
+			cand := Candidate{Source: "запасной план", Plan: p}
+			if t.Traits.PassingName != "" {
+				// decoy здесь — ИЗМЕРЕННОЕ пробой объёма имя (см. askVolume),
+				// а не заготовка c.decoy: подписываем кандидата им, чтобы
+				// подтверждение (onVolumeVerify/onVolumePassed) могло
+				// назвать имя, которое сработало, а не молчать о нём.
+				// Candidate.Decoy — тот же контракт, что был у прежнего
+				// generate(): помечает ИМЕННО кандидата, для которого имя
+				// было ОСЬЮ, а не любой план, где оно просто оказалось
+				// параметром сборки.
+				cand.Source = "имя " + t.Traits.PassingName
+				cand.Decoy = t.Traits.PassingName
+			}
+			out = append(out, cand)
+		}
+		return out, nil
+	}
 }
 
 func (c *Controller) onExchange(ev control.Event, now time.Time) error {

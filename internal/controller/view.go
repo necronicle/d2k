@@ -49,6 +49,12 @@ func (c *Controller) Knowledge() status.Knowledge {
 			// почему поиск «стоит», когда он не стоит.
 			v.Phase += ", попутно спрашиваем: " + questionVolume
 		}
+		if t.Classifying() {
+			// Та же причина, что и у объёма: измерение может занимать до
+			// минуты (см. classify_probe.go, classifyBudget), и молчать о
+			// нём значило бы снова оставить человека гадать.
+			v.Phase += ", попутно спрашиваем: " + questionClassify
+		}
 		if t.Current != nil {
 			v.Candidate = t.Current.Plan.ID
 			v.Source = t.Current.Source

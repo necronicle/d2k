@@ -1,5 +1,7 @@
 package controller
 
+import "github.com/necronicle/d2k/internal/classify"
+
 // Различающие вопросы к коробке.
 //
 // Смысл здесь не в наборе готовых плеч, а в поиске РАСХОЖДЕНИЯ между тем, как
@@ -71,15 +73,16 @@ type Traits struct {
 	// удачное имя объявляется универсальным и потом «чинит» то, что и так
 	// работало.
 	PassingName string
-	// ReadsFirstHello — берёт ли она первое приветствие в соединении. Если
-	// да, приманка впереди перекрывает настоящее имя.
-	ReadsFirstHello Trait
-	// ChecksSum — проверяет ли контрольную сумму TCP. Если нет, приманку
-	// можно сделать невидимой для сервера испорченной суммой.
-	ChecksSum Trait
-	// Reassembles — собирает ли она сегменты. Если нет, имя можно разрезать
-	// по границе сегмента: сервер соберёт, коробка нет.
-	Reassembles Trait
+
+	// Props — вектор ответов на пять вопросов о свойствах пересобирающей
+	// коробки (classify.PropProbes). Раньше здесь стояли три поля
+	// (ReadsFirstHello, ChecksSum, Reassembles) — свои, доморощенные вопросы
+	// о том же самом. Их ответы нигде не читались: nextQuestion их
+	// СПРАШИВАЛ, а ни один синтез план из них не выводил — вопрос без
+	// потребителя не измерение, а ритуал. classify.Properties — тот же
+	// вопрос, но заданный настоящим зондом (classify.Run) и действительно
+	// потребляемый: см. classify.Compose и verdictCandidates в controller.go.
+	Props classify.Properties
 }
 
 // Question — один различающий вопрос.
@@ -124,17 +127,10 @@ func nextQuestion(t Traits) (Question, bool) {
 		// лишнее ожидание у человека.
 		return Question{}, false
 	}
-	if t.ReadsFirstHello == TraitUnknown {
-		return Question{
-			Name: "первое приветствие или последнее",
-			Why:  "если первое, приманка впереди перекроет настоящее имя",
-		}, true
-	}
-	if t.Reassembles == TraitUnknown {
-		return Question{
-			Name: "собирает ли сегменты",
-			Why:  "если нет, имя можно разрезать по границе сегмента",
-		}, true
-	}
+	// Вопросов про разбор (первое приветствие, буфер пересборки) здесь больше
+	// нет: их место занял classify.Run — настоящий зонд вместо двух вопросов
+	// без потребителя (см. комментарий у Traits.Props). Он тоже меряется
+	// ФОНОМ, как и объём (см. askClassify в classify_probe.go), и здесь,
+	// среди вопросов очереди, места не занимает.
 	return Question{}, false
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/necronicle/d2k/internal/classify"
 	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/probe"
 	"github.com/necronicle/d2k/internal/volume"
@@ -280,12 +281,25 @@ func TestПорядокИмёнСогреваетсяИзКаталога(t *tes
 }
 
 func TestНеПрошедшийПланУступаетМестоСледующему(t *testing.T) {
-	// Цель бывает закрыта сразу двумя способами: объём режется, и вдобавок имя
-	// в настоящем приветствии не пропускают. Остановиться на подстановке имени
-	// значило бы бросить такую цель на полпути.
+	// Цель бывает закрыта сразу двумя способами: объём режется, и вдобавок
+	// матчер требует разрез. Остановиться на подстановке имени значило бы
+	// бросить такую цель на полпути.
+	//
+	// До задачи 5 вторая ось была лестницей generate() «на всякий случай»:
+	// после неудачи имени та просто перебирала ещё несколько НЕизмеренных
+	// комбинаций (§3.5 это и запрещает). Здесь вторая ось — вердикт
+	// classify.Run, измеренный НЕЗАВИСИМО от объёма и своим каналом. Порядок
+	// между осями в жизни — гонка двух фоновых измерений (см. комментарий у
+	// fakeClassify.hold); здесь он зафиксирован намеренно — classify держится,
+	// пока не провалится подстановка имени, — чтобы проверить ИМЕННО «после
+	// неудачи одной оси подхватывается другая», а не то, какая из двух горутин
+	// в этом прогоне оказалась быстрее.
 	r := newRig(t)
 	r.vol.set(volume.ScanFound, "passing.example", 19)
 	r.vol.verifyVerdict = volume.VerdictCut
+	r.classify.set(classify.VerdictPrefix, 4)
+	hold := make(chan struct{})
+	r.classify.hold = hold
 	ct := filepath.Join(t.TempDir(), "ct")
 	r.ctrl.SetConntrackPath(ct)
 	writeCT(t, ct)
@@ -301,12 +315,23 @@ func TestНеПрошедшийПланУступаетМестоСледующ�
 
 	logs := r.log.String()
 	if !strings.Contains(logs, "объём не провёл") {
-		t.Fatalf("неудача проверки не записана:\n%s", logs)
+		close(hold)
+		t.Fatalf("неудача проверки имени не записана:\n%s", logs)
 	}
-	if n := strings.Count(logs, "пробую"); n < 2 {
+	if strings.Contains(candidateLines(logs), "разрез") {
+		close(hold)
+		t.Fatalf("ось разреза подхвачена раньше своего вердикта:\n%s", logs)
+	}
+
+	// Классификация отвечает ПОСЛЕ того, как имя от объёма уже провалилось.
+	close(hold)
+	r.pump(6)
+
+	logs = r.log.String()
+	if n := strings.Count(candidateLines(logs), "пробую"); n < 2 {
 		t.Fatalf("поставлен %d кандидат: после неудачи имени поиск не продолжен:\n%s", n, logs)
 	}
-	if !strings.Contains(logs, "(поиск)") {
-		t.Fatalf("после оси имени не пробовалась ось разреза:\n%s", logs)
+	if !strings.Contains(candidateLines(logs), "разрез") {
+		t.Fatalf("после оси имени не пробовалась ось разреза, измеренная classify.Run:\n%s", logs)
 	}
 }

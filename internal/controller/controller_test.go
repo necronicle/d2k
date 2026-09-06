@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/catalog"
+	"github.com/necronicle/d2k/internal/classify"
 	"github.com/necronicle/d2k/internal/control"
 	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/plan"
@@ -32,18 +33,76 @@ import (
 )
 
 type rig struct {
-	t     *testing.T
-	cmd   *exec.Cmd
-	in    io.WriteCloser
-	out   *bufio.Scanner
-	conn  *control.Conn
-	ctrl  *controller.Controller
-	store *catalog.Store
-	log   *bytes.Buffer
-	clock time.Time
-	path  string
-	probe *fakeProber
-	vol   *fakeVolume
+	t        *testing.T
+	cmd      *exec.Cmd
+	in       io.WriteCloser
+	out      *bufio.Scanner
+	conn     *control.Conn
+	ctrl     *controller.Controller
+	store    *catalog.Store
+	log      *bytes.Buffer
+	clock    time.Time
+	path     string
+	probe    *fakeProber
+	vol      *fakeVolume
+	classify *fakeClassify
+}
+
+// fakeClassify — измерение функции решения коробки по сценарию. Настоящее
+// classify.Run уходит в сеть и занимает секунды; проверять здесь надо то,
+// что очередь кандидатов зависит от вердикта, а не чужую линию.
+//
+// Зеркало fakeVolume: нулевое значение (verdict == "") — стенд для теста, ещё
+// не заданный сценарием, а не измерение с ответом «вердикта нет». Настоящий
+// classify.Run пустой Verdict не возвращает никогда — это следует не
+// повторять как боевое поведение, а держать возможным ТОЛЬКО в стенде: см.
+// комментарий у этого случая в onClassify (classify_probe.go).
+type fakeClassify struct {
+	mu       sync.Mutex
+	verdict  classify.Verdict
+	splitPos int
+	calls    int
+	// hold — задержать ответ. Классификация и подбор по объёму меряются
+	// независимо и параллельно (обе — фоном, см. askVolume/askClassify), и
+	// который из двух ответит раньше — гонка двух горутин без единого
+	// внешнего замедления. Там, где тесту важен порядок между осями, а не
+	// сам факт «обе работают», гонку разрешает это поле — по образцу
+	// fakeVolume.hold.
+	hold chan struct{}
+}
+
+func (f *fakeClassify) Run(_ context.Context, _ string, _ classify.Trigger, _ classify.Options) classify.Result {
+	f.mu.Lock()
+	hold := f.hold
+	f.calls++
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return classify.Result{
+		Verdict:  f.verdict,
+		SplitPos: f.splitPos,
+		Reason:   "стенд: вердикт задан сценарием теста",
+	}
+}
+
+// set задаёт вердикт следующего (и любого дальнейшего) вызова Run. boundary
+// — позиция разреза: она же ложится в Result.SplitPos, ровно то поле, из
+// которого verdictCandidates строит план (см. controller.go) — Result.
+// Boundary в дереве classify отдельный и диагностический (граница сигнатуры,
+// а не место разреза), здесь он не нужен.
+func (f *fakeClassify) set(v classify.Verdict, boundary int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verdict, f.splitPos = v, boundary
+}
+
+func (f *fakeClassify) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 // fakeVolume — проба на объём по сценарию. Настоящая уходит в сеть на десятки
@@ -267,12 +326,18 @@ func newRig(t *testing.T) *rig {
 	}
 	r.probe = &fakeProber{}
 	r.vol = &fakeVolume{verdict: volume.ScanNoBlock, verifyVerdict: volume.VerdictPassed}
+	// Нулевое значение: вердикта нет, пока сценарий теста явно не задаст его
+	// через r.classify.set(...) — см. комментарий у fakeClassify. Тесты, для
+	// которых вердикт не важен, ничего не задают, и очередь идёт так, как
+	// будто классификации не было вовсе (onClassify, случай пустого Verdict).
+	r.classify = &fakeClassify{}
 	r.ctrl = controller.New(conn, store, log)
 	r.ctrl.SetClock(func() time.Time { return r.clock })
 	r.ctrl.SetProber(r.probe)
 	// Проба на объём по умолчанию говорит «блока нет»: проверка не должна
 	// ходить в сеть и не должна зависеть от политики чужой линии.
 	r.ctrl.SetVolumeProber(r.vol)
+	r.ctrl.SetClassifier(r.classify)
 
 	t.Cleanup(func() {
 		_ = conn.Close()
