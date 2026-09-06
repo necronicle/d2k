@@ -338,6 +338,15 @@ void d2k_hkdf_extract(const uint8_t *salt, size_t slen,
     d2k_hmac_sha256(salt, slen, ikm, ilen, out);
 }
 
+/* Префикс HkdfLabel.label (RFC 8446 §7.1) — "tls13 ", ровно 6 байт. Именованная
+ * величина вместо литерала "6" в трёх разных объявлениях буферов ниже:
+ * full_label/info/buf иначе могли бы разъехаться друг с другом при следующей
+ * правке точно так же, как чуть не разъехались размер D2K_HKDF_LABEL_MAX и
+ * буфер под него, — sizeof(строка)-1 гарантированно синхронен с самой
+ * строкой, ручного удержания в уме не требует. */
+#define HKDF_LABEL_PREFIX     "tls13 "
+#define HKDF_LABEL_PREFIX_LEN (sizeof(HKDF_LABEL_PREFIX) - 1)
+
 int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
                            uint8_t *out, size_t out_len) {
     /* HkdfLabel (RFC 8446 §7.1): length(2, big-endian) || len(full_label)(1)
@@ -347,18 +356,19 @@ int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
      * вызывающего (ревью 2026-09-06: без неё strlen(label) > D2K_HKDF_LABEL_MAX
      * переполняет full_label ниже; воспроизведено меткой в 110 байт под
      * санитайзерами). Нарушение контракта — сразу отказ, ДО первого memcpy:
-     * ни один из буферов ниже ещё не тронут. */
+     * ни один из буферов ниже ещё не тронут. Почему это проверка времени
+     * выполнения, а не сборки, — см. d2k_crypto.h у объявления. */
     size_t label_len = strlen(label);
     if (label_len > D2K_HKDF_LABEL_MAX) {
         return -1;
     }
 
-    uint8_t full_label[6 + D2K_HKDF_LABEL_MAX];
-    memcpy(full_label, "tls13 ", 6);
-    memcpy(full_label + 6, label, label_len);
-    size_t full_len = 6 + label_len;
+    uint8_t full_label[HKDF_LABEL_PREFIX_LEN + D2K_HKDF_LABEL_MAX];
+    memcpy(full_label, HKDF_LABEL_PREFIX, HKDF_LABEL_PREFIX_LEN);
+    memcpy(full_label + HKDF_LABEL_PREFIX_LEN, label, label_len);
+    size_t full_len = HKDF_LABEL_PREFIX_LEN + label_len;
 
-    uint8_t info[2 + 1 + (6 + D2K_HKDF_LABEL_MAX) + 1];
+    uint8_t info[2 + 1 + (HKDF_LABEL_PREFIX_LEN + D2K_HKDF_LABEL_MAX) + 1];
     info[0] = (uint8_t)(out_len >> 8);
     info[1] = (uint8_t)(out_len);
     info[2] = (uint8_t)full_len;
@@ -374,7 +384,7 @@ int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
     size_t written = 0;
     uint8_t counter = 1;
     while (written < out_len) {
-        uint8_t buf[32 + (2 + 1 + (6 + D2K_HKDF_LABEL_MAX) + 1) + 1];
+        uint8_t buf[32 + (2 + 1 + (HKDF_LABEL_PREFIX_LEN + D2K_HKDF_LABEL_MAX) + 1) + 1];
         size_t buf_len = 0;
         memcpy(buf, t_prev, t_prev_len);
         buf_len += t_prev_len;

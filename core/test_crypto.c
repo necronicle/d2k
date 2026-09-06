@@ -275,10 +275,25 @@ static const uint8_t crypto_frame[245] = {
 static void check_rfc9001_a2_packet(void) {
     uint8_t initial_secret[32], cis[32], key[16], iv[12], hp[16];
     d2k_hkdf_extract(initial_salt, sizeof initial_salt, dcid, sizeof dcid, initial_secret);
-    d2k_hkdf_expand_label(initial_secret, "client in", cis, sizeof cis);
-    d2k_hkdf_expand_label(cis, "quic key", key, sizeof key);
-    d2k_hkdf_expand_label(cis, "quic iv", iv, sizeof iv);
-    d2k_hkdf_expand_label(cis, "quic hp", hp, sizeof hp);
+
+    /* Тот же образец, что и у d2k_aes128_gcm_decrypt ниже: возврат проверен
+     * и используется как страж, а не отброшен — ревью 2026-09-06 нашло, что
+     * смена void на int сама по себе ничего не гарантирует, если ни один
+     * вызывающий не смотрит на результат. */
+    int rc_cis = d2k_hkdf_expand_label(initial_secret, "client in", cis, sizeof cis);
+    CHECK(rc_cis == 0, "HKDF-Expand-Label отказал на валидной метке 'client in'");
+    if (rc_cis != 0) {
+        return; /* без cis дальше нечего проверять — ключи из него */
+    }
+    int rc_key = d2k_hkdf_expand_label(cis, "quic key", key, sizeof key);
+    int rc_iv  = d2k_hkdf_expand_label(cis, "quic iv", iv, sizeof iv);
+    int rc_hp  = d2k_hkdf_expand_label(cis, "quic hp", hp, sizeof hp);
+    CHECK(rc_key == 0, "HKDF-Expand-Label отказал на валидной метке 'quic key'");
+    CHECK(rc_iv == 0, "HKDF-Expand-Label отказал на валидной метке 'quic iv'");
+    CHECK(rc_hp == 0, "HKDF-Expand-Label отказал на валидной метке 'quic hp'");
+    if (rc_key != 0 || rc_iv != 0 || rc_hp != 0) {
+        return; /* без key/iv/hp расшифровка ниже бессмысленна */
+    }
 
     /* Смещение номера пакета В ЭТОМ КОНКРЕТНОМ векторе: первый байт(1) +
      * версия(4) + длина DCID(1) + DCID(8) + длина SCID(1, SCID пуст) + длина
@@ -356,17 +371,32 @@ static void check_rfc9001_a2_packet(void) {
 int main(void) {
     uint8_t initial_secret[32], cis[32];
     d2k_hkdf_extract(initial_salt, sizeof initial_salt, dcid, sizeof dcid, initial_secret);
-    d2k_hkdf_expand_label(initial_secret, "client in", cis, sizeof cis);
-    CHECK(memcmp(cis, want_cis, sizeof cis) == 0,
-          "client_initial_secret не сошёлся с вектором RFC 9001 A.1");
 
-    uint8_t key[16], iv[12], hp[16];
-    d2k_hkdf_expand_label(cis, "quic key", key, sizeof key);
-    d2k_hkdf_expand_label(cis, "quic iv",  iv,  sizeof iv);
-    d2k_hkdf_expand_label(cis, "quic hp",  hp,  sizeof hp);
-    CHECK(memcmp(key, want_key, sizeof key) == 0, "ключ не сошёлся с вектором");
-    CHECK(memcmp(iv, want_iv, sizeof iv) == 0, "iv не сошёлся с вектором");
-    CHECK(memcmp(hp, want_hp, sizeof hp) == 0, "hp не сошёлся с вектором");
+    /* Возврат проверен и используется как страж (см. тот же приём у
+     * d2k_aes128_gcm_decrypt ниже и в check_rfc9001_a2_packet) — ревью
+     * 2026-09-06 указало, что голый вызов делает контракт "не пишем в выход
+     * при отказе" бесполезным на практике: сегодняшние метки-литералы
+     * никогда не откажут, но образец в тесте — это то, что скопирует
+     * следующий вызывающий. */
+    int rc_cis = d2k_hkdf_expand_label(initial_secret, "client in", cis, sizeof cis);
+    CHECK(rc_cis == 0, "HKDF-Expand-Label отказал на валидной метке 'client in'");
+    if (rc_cis == 0) {
+        CHECK(memcmp(cis, want_cis, sizeof cis) == 0,
+              "client_initial_secret не сошёлся с вектором RFC 9001 A.1");
+
+        uint8_t key[16], iv[12], hp[16];
+        int rc_key = d2k_hkdf_expand_label(cis, "quic key", key, sizeof key);
+        int rc_iv  = d2k_hkdf_expand_label(cis, "quic iv",  iv,  sizeof iv);
+        int rc_hp  = d2k_hkdf_expand_label(cis, "quic hp",  hp,  sizeof hp);
+        CHECK(rc_key == 0, "HKDF-Expand-Label отказал на валидной метке 'quic key'");
+        CHECK(rc_iv == 0, "HKDF-Expand-Label отказал на валидной метке 'quic iv'");
+        CHECK(rc_hp == 0, "HKDF-Expand-Label отказал на валидной метке 'quic hp'");
+        if (rc_key == 0 && rc_iv == 0 && rc_hp == 0) {
+            CHECK(memcmp(key, want_key, sizeof key) == 0, "ключ не сошёлся с вектором");
+            CHECK(memcmp(iv, want_iv, sizeof iv) == 0, "iv не сошёлся с вектором");
+            CHECK(memcmp(hp, want_hp, sizeof hp) == 0, "hp не сошёлся с вектором");
+        }
+    }
 
     check_generic_vectors();
     check_hkdf_label_length_guard();
