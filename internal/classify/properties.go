@@ -354,7 +354,18 @@ func badsumFakePlan(payload []byte, repeats uint8, gapUS uint32) (catalog.Plan, 
 // закреплена тестом на связку целиком
 // (TestЛабораторияВсёСразуИсполняетТриПриёмаВместе, properties_test.go):
 // фальшивки уходят первыми, не тронутые переворотом, затем хвост, затем
-// голова с приставкой перекрытия и сдвинутым назад номером.
+// середина (не тронута переворотом — крайние куски меняются местами вокруг
+// неё), затем голова с приставкой перекрытия и сдвинутым назад номером.
+//
+// Разрез — тот же {AnchorPayloadStart+1, AnchorSNIMiddle}, что и у
+// reorderPlan (задача reorder-cut, ревью 2026-09-06). Раньше здесь стоял
+// AnchorHelloMiddle — та же реализация, что reorderPlan признал неверной по
+// замеру донора (raw_linux.go:667-690): everythingPlan — единственный
+// выстрел вслепую по каждой НОВОЙ, ещё не измеренной коробке, второго шанса
+// на разведку без нового измерения не даётся (Compose не позовёт другой
+// план на ту же цель), и один из трёх приёмов внутри плана систематически
+// бил мимо на коробках именно того типа, ради которого вопрос о порядке
+// сегментов и задаётся.
 func everythingPlan(decoy string) (catalog.Plan, error) {
 	hello, err := plan.Hello(decoy, 0)
 	if err != nil {
@@ -373,8 +384,11 @@ func everythingPlan(decoy string) (catalog.Plan, error) {
 			Repeats: 2, GapUS: 20000, Placement: plan.PlaceBefore,
 		}},
 		Seqovls: []plan.Seqovl{{PayloadID: 2}},
-		Splits:  []plan.Position{{Anchor: plan.AnchorHelloMiddle}},
-		Order:   plan.OrderReverse,
+		Splits: []plan.Position{
+			{Anchor: plan.AnchorPayloadStart, Offset: 1},
+			{Anchor: plan.AnchorSNIMiddle},
+		},
+		Order: plan.OrderReverse,
 	}
 	return build(p, "tls")
 }
