@@ -23,6 +23,13 @@ const (
 	AnchorSNIEnd       Anchor = 2
 	AnchorHelloMiddle  Anchor = 3
 	AnchorRecordEnd    Anchor = 4
+	// AnchorSNIMiddle — середина ИМЕНИ хоста (sni_off+sni_len/2), а не
+	// середина пакета: датапат вычисляет её из sni_off/sni_len ТЕКУЩЕГО
+	// пакета (anchor_offset, datapath/plan_apply.c), потому что план
+	// переиспользуется на других именах. См. reorderPlan
+	// (internal/classify/properties.go) и раскладку в
+	// z2k-detect/internal/classify/raw_linux.go:667-690.
+	AnchorSNIMiddle Anchor = 5
 )
 
 // Placement — где стоит фальшивка. Не косметика: замер донора показал, что

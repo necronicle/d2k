@@ -40,6 +40,27 @@ static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out) {
     case ANCHOR_HELLO_MIDDLE:
         *out = in->payload_len / 2;
         return 0;
+    case ANCHOR_SNI_MIDDLE:
+        /* Середина ИМЕНИ хоста, а не середина пакета. Коробка ищет имя
+           целиком; ANCHOR_HELLO_MIDDLE чаще оставляет имя нетронутым в одном
+           куске (осмысленное начало записи), и коробка спокойно ждёт
+           остаток — разрез не срабатывает. Донор наступил на эту же ошибку
+           и исправил её тем же замером: боевое плечо режет на midsld,
+           середине домена второго уровня, а не на n/2
+           (z2k-detect/internal/classify/raw_linux.go:667-690). */
+        if (!in->have_sni) {
+            return -1;
+        }
+        /* Зажимы дословно донорские: без них короткое имя даёт вырожденный
+           (меньше 2) или пустой/переполненный (>= длины нагрузки) кусок. */
+        *out = in->sni_off + in->sni_len / 2;
+        if (*out < 2) {
+            *out = 2;
+        }
+        if (*out >= in->payload_len) {
+            *out = in->payload_len - 1;
+        }
+        return 0;
     case ANCHOR_RECORD_END:
         /* Границу записи TLS обязан передать протокольный модуль. Пока он не
            написан, честный ответ — отказ, а не догадка о длине. */

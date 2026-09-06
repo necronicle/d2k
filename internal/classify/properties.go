@@ -241,15 +241,35 @@ func overlapPlan(string) (catalog.Plan, error) {
 	return build(p, "tls")
 }
 
-// reorderPlan — вопрос 3 (task-4-plans.md, п.2, «Порядок сегментов»): разрез
-// посередине приветствия, куски уходят хвостом вперёд. decoy не используется
-// по той же причине, что и в overlapPlan.
+// reorderPlan — вопрос 3 (task-4-plans.md, п.2, «Порядок сегментов»): резы в
+// 1 и на середине ИМЕНИ хоста, куски уходят хвостом вперёд. decoy не
+// используется по той же причине, что и в overlapPlan — якорь середины имени
+// вычисляется датапатом из sni_off/sni_len ТЕКУЩЕГО пакета, а не контроллером
+// под конкретное имя (см. AnchorSNIMiddle, internal/plan/plan.go).
+//
+// Первая редакция резала одним AnchorHelloMiddle — серединой ВСЕГО
+// приветствия. Донор (z2k-detect/internal/classify/raw_linux.go:667-690,
+// ветка disorder) сделал ту же ошибку раньше и исправил её тем же замером:
+// боевое плечо на живой линии — три куска (seq 268:344, seq 2:268, seq 1:2),
+// рез приходится на middle домена второго уровня. Деление ВСЕГО пакета
+// пополам чаще оставляет имя нетронутым в одном куске — коробка получает
+// осмысленное начало записи и спокойно ждёт остаток, разрез не срабатывает.
+// Разрыв ИМЕНИ между кусками — вот что отличает «сработало» от «нет» у
+// коробки, которая ищет имя целиком.
+//
+// Резы в 1 и на middle дают три куска: [0,1), [1,mid), [mid,n). Обратный
+// порядок кладёт их на провод как [mid,n), [1,mid), [0,1) — ровно донорская
+// последовательность (datapath/test_plan_apply.c проверяет это прогоном
+// исполнителя, а не рассуждением).
 func reorderPlan(string) (catalog.Plan, error) {
 	p := plan.Plan{
 		Schema: plan.SchemaCurrent, MinExec: 1,
 		Transport: 6, Proto: 1,
-		Splits: []plan.Position{{Anchor: plan.AnchorHelloMiddle}},
-		Order:  plan.OrderReverse,
+		Splits: []plan.Position{
+			{Anchor: plan.AnchorPayloadStart, Offset: 1},
+			{Anchor: plan.AnchorSNIMiddle},
+		},
+		Order: plan.OrderReverse,
 	}
 	return build(p, "tls")
 }

@@ -32,7 +32,11 @@ enum {
     ANCHOR_SNI_START     = 1,
     ANCHOR_SNI_END       = 2,
     ANCHOR_HELLO_MIDDLE  = 3,
-    ANCHOR_RECORD_END    = 4
+    ANCHOR_RECORD_END    = 4,
+    /* Середина ИМЕНИ хоста (sni_off + sni_len/2), а не середина пакета —
+       см. anchor_offset в plan_apply.c и reorderPlan в
+       internal/classify/properties.go. */
+    ANCHOR_SNI_MIDDLE    = 5
 };
 
 enum { PLACE_BEFORE = 0, PLACE_BETWEEN = 1 };

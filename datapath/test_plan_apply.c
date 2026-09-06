@@ -141,6 +141,33 @@ static const uint8_t plan_everything_reverse[] = {
     0x01, 0x03, 0x00, 0x01, 0x01
 };
 
+/* Разрез по середине ИМЕНИ (ANCHOR_SNI_MIDDLE = 5), а не по середине пакета.
+   Задача reorder-cut: боевое плечо донора режет на midsld — середине домена
+   второго уровня, а не на n/2 (z2k-detect/internal/classify/raw_linux.go:
+   667-690). Анкор здесь сырой числовой байт 0x05, а не символ из
+   plan_internal.h: тест собирает канонический TLV напрямую, как и остальные
+   планы в этом файле, и обязан отличать «якорь не разрешился» от «датапат
+   его вовсе не знает» — оба случая обязаны вести себя одинаково (отказ), но
+   первое проверяется реальным разбором, а не догадкой о числе. */
+static const uint8_t plan_split_sni_middle[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+    0x01, 0x00, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+/* Два реза — единица и середина имени — с обратным порядком. Ровно то, чем
+   reorderPlan (internal/classify/properties.go) обязан отвечать на вопрос
+   «порядок сегментов» после фикса: резы в 1 и mid дают куски [0,1), [1,mid),
+   [mid,n), а обратный порядок кладёт их на провод как [mid,n), [1,mid),
+   [0,1) — донорская последовательность (seq 268:344, затем 2:268, затем 1:2,
+   первый байт последним). */
+static const uint8_t plan_reorder_by_name[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 3,
+    0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01,
+    0x01, 0x00, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00,
+    0x01, 0x03, 0x00, 0x01, 0x01
+};
+
 static uint8_t hello[64];
 
 static void init_pkt(d2k_pkt *in, int have_sni) {
@@ -491,6 +518,134 @@ int main(void) {
                       "приставка перекрытия обязана остаться у головы");
                 CHECK(a.v[2].seq == in.seq - 2,
                       "номер головы обязан остаться сдвинутым назад на длину приставки");
+            }
+            CHECK(a.fate == D2K_ORIG_DROP, "нагрузку выпустили сами — оригинал обязан сниматься");
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- разрез по середине ИМЕНИ, а не середине пакета (reorder-cut) ----- */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_split_sni_middle, sizeof plan_split_sni_middle, &p, err, sizeof err) == 0,
+              "план с разрезом по середине имени не загрузился");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            /* sni_off=10, sni_len=8 (init_pkt) → середина имени = 10+8/2 = 14. */
+            init_pkt(&in, 1);
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "разрез по середине имени не применился");
+            CHECK(a.n == 2, "разрез по середине имени обязан дать два куска");
+            if (a.n == 2) {
+                CHECK(a.v[0].seq == 1000 && a.v[0].len == 14, "первый кусок не по середине ИМЕНИ");
+                CHECK(a.v[1].seq == 1014 && a.v[1].len == 50, "второй кусок не по середине ИМЕНИ");
+            }
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- та же середина имени: без SNI якорь ОТКАЗЫВАЕТ, а не подменяется
+       серединой ПАКЕТА молча — §2.5, тот же довод, что у ANCHOR_SNI_START. */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_split_sni_middle, sizeof plan_split_sni_middle, &p, err, sizeof err) == 0,
+              "план не загрузился повторно (середина имени без SNI)");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            init_pkt(&in, 0); /* SNI в пакете нет */
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) != 0,
+                  "середина имени без SNI обязана давать отказ, а не середину пакета");
+            CHECK(a.n == 0, "при отказе действий быть не должно");
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- зажим снизу: короткое имя не даёт вырожденный кусок --------------- */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_split_sni_middle, sizeof plan_split_sni_middle, &p, err, sizeof err) == 0,
+              "план не загрузился повторно (зажим снизу)");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            memset(&in, 0, sizeof in);
+            in.payload = hello; /* содержимое не важно — проверяем смещения */
+            in.payload_len = 20;
+            in.seq = 5000;
+            in.have_sni = 1;
+            in.sni_off = 0;
+            in.sni_len = 2; /* сырая середина = 0+2/2 = 1; донор зажимает в 2 */
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "зажатый снизу разрез не применился");
+            CHECK(a.n == 2, "зажатый снизу разрез обязан дать два куска");
+            if (a.n == 2) {
+                CHECK(a.v[0].len == 2, "зажим снизу не сработал: рез обязан быть в 2, а не в 1");
+                CHECK(a.v[1].seq == 5002 && a.v[1].len == 18, "второй кусок не от зажатой позиции");
+            }
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- зажим сверху: середина не уходит в конец нагрузки или дальше ------ */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_split_sni_middle, sizeof plan_split_sni_middle, &p, err, sizeof err) == 0,
+              "план не загрузился повторно (зажим сверху)");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            memset(&in, 0, sizeof in);
+            in.payload = hello;
+            in.payload_len = 10;
+            in.seq = 6000;
+            in.have_sni = 1;
+            in.sni_off = 8;
+            in.sni_len = 4; /* сырая середина = 8+4/2 = 10, не меньше длины нагрузки (10) */
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "зажатый сверху разрез не применился");
+            CHECK(a.n == 2, "зажатый сверху разрез обязан дать два куска");
+            if (a.n == 2) {
+                CHECK(a.v[0].len == 9, "зажим сверху не сработал: рез обязан быть в payload_len-1=9");
+                CHECK(a.v[1].seq == 6009 && a.v[1].len == 1, "второй кусок не от зажатой позиции");
+            }
+            d2k_actions_free(&a);
+            d2k_plan_free(p);
+        }
+    }
+
+    /* --- порядок: резы в 1 и на середине имени дают донорские три куска ---- */
+    {
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_reorder_by_name, sizeof plan_reorder_by_name, &p, err, sizeof err) == 0,
+              "план разреза по имени с обратным порядком не загрузился");
+        if (p) {
+            d2k_pkt in;
+            d2k_actions a;
+            /* sni_off=10, sni_len=8 (init_pkt) → середина имени = 14. Резы в 1
+               и 14 дают [0,1), [1,14), [14,64); обратный порядок кладёт их на
+               провод как [14,64), [1,14), [0,1) — ровно донорская
+               последовательность (raw_linux.go:667-690: seq 268:344, затем
+               seq 2:268, затем seq 1:2, одинокий первый байт последним).
+               Проверяем СМЕЩЕНИЯМИ и ПОРЯДКОМ, а не числом кусков: порядок
+               здесь и есть предмет проверки. */
+            init_pkt(&in, 1);
+            CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0, "применение не удалось");
+            CHECK(a.n == 3, "два реза обязаны дать три куска");
+            if (a.n == 3) {
+                CHECK(a.v[0].kind == D2K_EMIT_PAYLOAD && a.v[0].seq == 1014 && a.v[0].len == 50,
+                      "первым обязан идти хвост [mid,n)");
+                CHECK(a.v[1].kind == D2K_EMIT_PAYLOAD && a.v[1].seq == 1001 && a.v[1].len == 13,
+                      "вторым обязана идти середина [1,mid)");
+                CHECK(a.v[2].kind == D2K_EMIT_PAYLOAD && a.v[2].seq == 1000 && a.v[2].len == 1,
+                      "последним обязан идти одинокий первый байт [0,1)");
             }
             CHECK(a.fate == D2K_ORIG_DROP, "нагрузку выпустили сами — оригинал обязан сниматься");
             d2k_actions_free(&a);

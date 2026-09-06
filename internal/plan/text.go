@@ -15,6 +15,7 @@ var anchorNames = map[Anchor]string{
 	AnchorSNIEnd:       "sni_end",
 	AnchorHelloMiddle:  "hello_middle",
 	AnchorRecordEnd:    "record_end",
+	AnchorSNIMiddle:    "sni_middle",
 }
 
 func anchorByName(s string) (Anchor, bool) {

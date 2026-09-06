@@ -329,14 +329,21 @@ func TestЛабораторияПерекрытиеСдвигаетНомерИ�
 	}
 }
 
-// TestЛабораторияПорядокШлётХвостРаньшеГоловы — заявленное поведение:
-// «порядок шлёт хвост раньше головы».
-func TestЛабораторияПорядокШлётХвостРаньшеГоловы(t *testing.T) {
+// TestЛабораторияПорядокШлётТриКускаПоИмени — задача reorder-cut: резы стоят
+// в 1 и на середине ИМЕНИ (а не в 1 и на середине ВСЕГО приветствия, как было
+// до фикса), и на провод они кладутся хвостом вперёд — донорская
+// последовательность (z2k-detect/internal/classify/raw_linux.go:667-690):
+// [mid,n), затем [1,mid), затем одинокий первый байт [0,1) последним.
+//
+// sni_off=2, sni_len=4 → середина имени = 2+4/2 = 4, что нарочно отличается
+// от n/2=10 у этого же 20-байтового сценария: если бы план по-прежнему резал
+// середину пакета, а не имени, числа ниже разошлись бы.
+func TestЛабораторияПорядокШлётТриКускаПоИмени(t *testing.T) {
 	cp, err := reorderPlan("отвод.example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := runPlanLab(t, cp.Text, "pkt 2000 none 0 000102030405060708090a0b0c0d0e0f1011121314\n")
+	out := runPlanLab(t, cp.Text, "pkt 2000 2 4 aabbccddeeff00112233445566778899aabbccdd\n")
 	if strings.HasPrefix(out, "reject") || strings.Contains(out, "refuse") {
 		t.Fatalf("план порядка отвергнут либо неприменим: %s", out)
 	}
@@ -348,12 +355,56 @@ func TestЛабораторияПорядокШлётХвостРаньшеГо�
 			payloadLines = append(payloadLines, f)
 		}
 	}
-	if len(payloadLines) != 2 {
-		t.Fatalf("кусков нагрузки %d, ожидалось 2: %s", len(payloadLines), out)
+	if len(payloadLines) != 3 {
+		t.Fatalf("кусков нагрузки %d, ожидалось 3 (резы в 1 и в 4): %s", len(payloadLines), out)
 	}
-	// Хвост (более поздний номер) обязан уйти ПЕРВОЙ строкой.
-	if payloadLines[0][3] <= payloadLines[1][3] {
-		t.Errorf("первым уходит не хвост: номера %s затем %s", payloadLines[0][3], payloadLines[1][3])
+	// [mid,n) = seq 2004, len 16 — первым (хвост).
+	if payloadLines[0][3] != "2004" {
+		t.Errorf("первым обязан идти хвост [mid,n): seq %s, ожидался 2004", payloadLines[0][3])
+	}
+	// [1,mid) = seq 2001, len 3 — вторым.
+	if payloadLines[1][3] != "2001" {
+		t.Errorf("вторым обязана идти середина [1,mid): seq %s, ожидался 2001", payloadLines[1][3])
+	}
+	// [0,1) = seq 2000, len 1 — последним, одинокий первый байт.
+	if payloadLines[2][3] != "2000" {
+		t.Errorf("последним обязан идти одинокий первый байт [0,1): seq %s, ожидался 2000", payloadLines[2][3])
+	}
+}
+
+// TestПорядокРежетПоИмениАНеПоСерединеПриветствия — задача reorder-cut:
+// донор (raw_linux.go:667-690) резал середину ВСЕГО приветствия и получал
+// провал — коробка искала имя целиком, а деление пополам чаще оставляет имя
+// в одном куске нетронутым. Splits обязаны быть {1 от начала, середина
+// ИМЕНИ}, а не одним резом по AnchorHelloMiddle.
+//
+// Проверка идёт через Text() → ParseText(), а не прямым чтением полей
+// plan.Plan: build() отдаёт наружу только текстовую форму catalog.Plan, и тот
+// же путь заодно ловит отсутствие "sni_middle" в anchorNames (см.
+// internal/plan/text.go) — без него строка "split  +0" не разберётся назад.
+func TestПорядокРежетПоИмениАНеПоСерединеПриветствия(t *testing.T) {
+	cp, err := reorderPlan("отвод.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp, err := plan.ParseText(cp.Text)
+	if err != nil {
+		t.Fatalf("план не разобрался обратно из текста: %v\n%s", err, cp.Text)
+	}
+	want := []plan.Position{
+		{Anchor: plan.AnchorPayloadStart, Offset: 1},
+		{Anchor: plan.AnchorSNIMiddle, Offset: 0},
+	}
+	if len(pp.Splits) != len(want) {
+		t.Fatalf("резов %d, ожидалось %d (единица и середина имени): %+v", len(pp.Splits), len(want), pp.Splits)
+	}
+	for i, w := range want {
+		if pp.Splits[i] != w {
+			t.Errorf("рез %d: %+v, ожидался %+v", i, pp.Splits[i], w)
+		}
+	}
+	if pp.Order != plan.OrderReverse {
+		t.Error("порядок обязан остаться обратным — хвост уходит раньше головы")
 	}
 }
 
