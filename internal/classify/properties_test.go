@@ -36,14 +36,27 @@ func TestИзПромахаСвойствоНеВыводится(t *testing.T) 
 
 func TestПроходЗаписываетСвойствоОднозначно(t *testing.T) {
 	var pr Properties
-	for _, p := range PropProbes() {
-		if p.Name == "контрольная сумма" {
-			p.Set(&pr, true)
-		}
-	}
+	setByName(t, PropProbes(), &pr, "контрольная сумма", true)
 	if pr.ValidatesChecksum == nil || *pr.ValidatesChecksum {
 		t.Fatal("проглоченная битая сумма обязана означать «сумму не сверяет»")
 	}
+}
+
+// setByName находит вопрос по имени и передаёт ему passed. По ревью:
+// тест с фильтром по имени, который ни разу не совпал, проходит вхолостую
+// (pr остаётся нулевым) — имена вопросов ничем не типизированы, и опечатка
+// или переименование не должны тихо проглатываться пустым циклом. Все тесты
+// ниже, что раньше фильтровали PropProbes() по Name внутри собственного
+// цикла, переведены на этот помощник.
+func setByName(t *testing.T, probes []PropProbe, pr *Properties, name string, passed bool) {
+	t.Helper()
+	for _, p := range probes {
+		if p.Name == name {
+			p.Set(pr, passed)
+			return
+		}
+	}
+	t.Fatalf("вопрос %q не найден среди PropProbes — фильтр по имени разошёлся с реализацией", name)
 }
 
 func TestСборкаИдётИзВектораАНеИзСписка(t *testing.T) {
@@ -106,11 +119,7 @@ func TestПорядокВопросовЗаданЗамером(t *testing.T) {
 // структурно невозможной, а не случайно избегнутой.
 func TestРазборПротоколаНеЗависитОтИсходаВопросаОСумме(t *testing.T) {
 	var pr Properties
-	for _, p := range PropProbes() {
-		if p.Name == "разбор протокола" {
-			p.Set(&pr, true)
-		}
-	}
+	setByName(t, PropProbes(), &pr, "разбор протокола", true)
 	if pr.ParsesL7 == nil || !*pr.ParsesL7 {
 		t.Fatal("проход вопроса о разборе протокола обязан записать ParsesL7=true")
 	}
@@ -124,13 +133,57 @@ func TestРазборПротоколаНеЗависитОтИсходаВоп�
 // вообще ничем, и проход вопроса о сумме не имеет права трогать ParsesL7.
 func TestКонтрольнаяСуммаНеОбъявляетРазборПротокола(t *testing.T) {
 	var pr Properties
-	for _, p := range PropProbes() {
-		if p.Name == "контрольная сумма" {
-			p.Set(&pr, true)
-		}
-	}
+	setByName(t, PropProbes(), &pr, "контрольная сумма", true)
 	if pr.ParsesL7 != nil {
 		t.Fatal("проход вопроса о сумме (мусор, не приветствие) не доказывает разбор протокола")
+	}
+}
+
+// TestРазборПротоколаНеТянетНепройденныйПланСуммы — ревью: «разбор протокола»
+// пишет ОБА поля (ParsesL7, ValidatesChecksum) из одного прохода (см. выше).
+// Compose не имеет права читать ValidatesChecksum=false как «checksumPlan
+// тоже проходил» — сам checksumPlan (голая набивка) здесь ни разу не
+// запускался, а по модели task-4-plans.md (п.3) на коробке, что РАЗБИРАЕТ
+// TLS, набивка заведомо не сработает. Единственный кандидат обязан быть
+// parseProtocolPlan — планом, который реально прошёл.
+func TestРазборПротоколаНеТянетНепройденныйПланСуммы(t *testing.T) {
+	var pr Properties
+	setByName(t, PropProbes(), &pr, "разбор протокола", true)
+
+	got, err := Compose(pr, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := parseProtocolPlan("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("кандидатов %d, ожидался ровно один (parseProtocolPlan): %+v", len(got), got)
+	}
+	if got[0].Text != want.Text {
+		t.Fatal("единственный кандидат обязан быть parseProtocolPlan — планом, который реально прошёл")
+	}
+}
+
+// TestКонтрольнаяСуммаОднаДобавляетСвойПлан — обратная сторона предыдущего
+// теста: когда ValidatesChecksum=false пришёл САМ ПО СЕБЕ (вопрос «разбор
+// протокола» вовсе не задавался, ParsesL7 == nil), новый гейт не имеет права
+// выбросить план заодно с ложноположительным случаем выше.
+func TestКонтрольнаяСуммаОднаДобавляетСвойПлан(t *testing.T) {
+	var pr Properties
+	setByName(t, PropProbes(), &pr, "контрольная сумма", true)
+
+	got, err := Compose(pr, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := checksumPlan("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Text != want.Text {
+		t.Fatalf("вопрос о сумме прошёл сам по себе — Compose обязан предложить checksumPlan: %+v", got)
 	}
 }
 
@@ -376,5 +429,67 @@ func TestЛабораторияПриманкиНеОтвергаютсяИРа�
 	fp := strings.Fields(strings.Split(parseOut, "\n")[0])
 	if !strings.HasPrefix(fp[6], "160301") {
 		t.Errorf("приманка разбора протокола не похожа на TLS-приветствие: %s", fp[6])
+	}
+}
+
+// TestЛабораторияВсёСразуИсполняетТриПриёмаВместе — everythingPlan едет по
+// умолчанию при КАЖДОМ первом контакте с незнакомой коробкой (пустой вектор
+// свойств) и был единственным из шести планов без поведенческой проверки
+// через planlab (по ревью). Комбинация «seqovl + split + fake + reverse»
+// стала возможной только с коммитом 898ea00 (переворот по kind, а не по
+// сравнению указателей из разных выделений памяти) — до него эта же
+// проверка была бы недостоверна: план собрался бы, но исполнитель мог
+// увести фальшивку в перевёрнутый диапазон вместе с кусками.
+func TestЛабораторияВсёСразуИсполняетТриПриёмаВместе(t *testing.T) {
+	cp, err := everythingPlan("отвод.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Тот же 20-байтовый сценарий, что и у остальных лабораторных тестов:
+	// середина на байте 10 даёт хвост длиной 10 (сдвиг +10) и голову длиной
+	// 10 (сдвиг -1 из-за приставки перекрытия) — числа проверены planlab'ом
+	// вручную перед тем, как их здесь закрепить.
+	out := runPlanLab(t, cp.Text, "pkt 1000 none 0 aabbccddeeff00112233445566778899aabbccdd\n")
+	if strings.HasPrefix(out, "reject") {
+		t.Fatalf("план «всё сразу» отвергнут: %s", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 5 { // 2 фальшивки + хвост + голова + fate
+		t.Fatalf("строк %d, ожидалось 5 (2 фальшивки, 2 куска, fate): %s", len(lines), out)
+	}
+
+	fake0, fake1 := strings.Fields(lines[0]), strings.Fields(lines[1])
+	tail, head := strings.Fields(lines[2]), strings.Fields(lines[3])
+
+	if fake0[1] != "fake" || fake1[1] != "fake" {
+		t.Fatalf("первыми обязаны идти две фальшивки: %v / %v", fake0, fake1)
+	}
+	if fake0[2] != "0" || fake1[2] != "20000" {
+		t.Errorf("задержки фальшивок %s/%s, ожидались 0/20000 (разнесённая пара)", fake0[2], fake1[2])
+	}
+	if fake0[5] != "poison=01" || fake1[5] != "poison=01" {
+		t.Errorf("фальшивки без битой суммы: %s / %s", fake0[5], fake1[5])
+	}
+
+	if tail[1] != "payload" || head[1] != "payload" {
+		t.Fatalf("после фальшивок ожидались куски нагрузки: %v / %v", tail, head)
+	}
+	// Обратный порядок: хвост уходит ПЕРВЫМ, без приставки перекрытия — она
+	// стоит на куске, что при построении был первым (см. head ниже), а
+	// переворот меняет местами ОТПРАВКУ, а не то, к какому куску приставлена
+	// приставка.
+	if tail[3] != "1010" {
+		t.Errorf("хвост с номером %s, ожидался 1010 (1000+10, середина 20-байтового сценария)", tail[3])
+	}
+	// Голова уходит ВТОРОЙ и несёт приставку перекрытия — номер сдвинут
+	// назад на длину приставки (1 байт).
+	if head[3] != "999" {
+		t.Errorf("голова с номером %s, ожидался 999 (1000 минус байт приставки)", head[3])
+	}
+	if !strings.HasPrefix(head[6], "41") {
+		t.Errorf("приставка перекрытия не найдена впереди головы: %s", head[6])
+	}
+	if lines[4] != "fate drop" {
+		t.Errorf("fate %q, ожидался drop — нагрузку выпустили сами", lines[4])
 	}
 }
