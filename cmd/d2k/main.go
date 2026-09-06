@@ -246,6 +246,7 @@ func cmdServe(args []string, out, errOut *os.File) int {
 		} else {
 			ctrl := controller.New(conn, store, out)
 			ctrl.SetDecoy(c.DecoySNI)
+			ctrl.SetMark(c.Mark)
 			if err := ctrl.Sync(); err != nil {
 				fmt.Fprintf(errOut, "не поставить планы подтверждённых привязок: %v\n", err)
 			}

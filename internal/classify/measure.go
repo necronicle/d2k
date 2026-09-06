@@ -21,7 +21,22 @@ type tally struct {
 	// для СЛЕДУЮЩЕГО вопроса (см. classify.go). Внутри одной серии значение
 	// не используется — measure ждёт одно и то же wait все repeats попыток.
 	rtt time.Duration
+	// markOK — подтвердила ли постановка метки SO_MARK КАЖДЫЙ из repeats
+	// дозвонов этой серии. true, если метку не просили (mark==0) — тогда
+	// подтверждать нечего, см. once(). §5.5: провал метки не должен путаться
+	// с решением коробки, поэтому это отдельное поле, а не часть err/pass.
+	markOK bool
 }
+
+// markFunc — как метить исходящий сокет зонда (SO_MARK). Платформенная
+// реализация по умолчанию — mark_linux.go (настоящая разметка) или
+// mark_other.go (SO_MARK недоступен физически, метка молча игнорируется).
+// Package-переменная, а не прямой вызов markControl: тесту «помеченный clear
+// остаётся clear» (classify_test.go) нужно подтверждение метки, а получить
+// его настоящим SO_MARK можно только под Linux и с CAP_NET_ADMIN — тест
+// подменяет markFunc, чтобы проверить ПОЛИТИКУ вердикта отдельно от
+// доступности привилегии на машине, где идёт проверка.
+var markFunc = markControl
 
 // connectTimeout — потолок ожидания TCP-соединения.
 //
@@ -51,13 +66,26 @@ const transportCeiling = 8 * time.Second
 // устанавливается, и отдельный замер был бы лишним раундом сверх бюджета.
 // Значение возвращается наружу для дерева (см. Run в classify.go) — само
 // once() и measure() его не используют, они лишь передают его дальше.
-func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait time.Duration) (bool, time.Duration, error) {
+//
+// mark — метка SO_MARK, которой обязан идти зонд (§5.5: исключение из
+// собственного преобразования; files/S99d2k, `-m mark --mark "$MARK" -j
+// RETURN`). Ноль значит «не метить» — законно для разового ручного вызова,
+// где плана на цели ещё нет. Провал постановки метки НЕ прерывает Dial и не
+// становится ошибкой опыта (err) — это отдельное наблюдение о достоверности,
+// возвращаемое отдельным булем и обрабатываемое в Run (см. Result.Marked):
+// сетевая ошибка и недоказанное исключение зонда — разные вещи, и путать их
+// значило бы снова смешивать наблюдение с диагнозом (§2.4).
+func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait time.Duration, mark uint32) (bool, time.Duration, bool, error) {
 	d := net.Dialer{Timeout: connectTimeout}
+	markOK := mark == 0
+	if mark != 0 {
+		d.Control = markFunc(mark, &markOK)
+	}
 	dialStart := time.Now()
 	c, err := d.DialContext(ctx, "tcp", addr)
 	rtt := time.Since(dialStart)
 	if err != nil {
-		return false, rtt, err
+		return false, rtt, markOK, err
 	}
 	defer c.Close()
 	if tc, ok := c.(*net.TCPConn); ok {
@@ -69,7 +97,7 @@ func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait ti
 
 	for _, part := range spans(tr.Payload, cuts) {
 		if _, err := c.Write(part); err != nil {
-			return false, rtt, nil // сброс на записи — это «убито», а не ошибка опыта
+			return false, rtt, markOK, nil // сброс на записи — это «убито», а не ошибка опыта
 		}
 		if gap > 0 {
 			time.Sleep(gap)
@@ -83,10 +111,10 @@ func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait ti
 		// §6.2 п.3: начало ServerHello НЕ доказывает завершённый сеанс. Здесь
 		// это и не утверждается — оракул отвечает лишь на вопрос «коробка
 		// пропустила байты или убила соединение».
-		return true, rtt, nil
+		return true, rtt, markOK, nil
 	}
 	_ = rerr
-	return false, rtt, nil
+	return false, rtt, markOK, nil
 }
 
 // measure повторяет опыт и считает исходы.
@@ -98,13 +126,19 @@ func once(ctx context.Context, addr string, tr Trigger, cuts []int, gap, wait ti
 // не заново на каждый measure()). Здесь только исполнение и отчёт: сколько
 // прошло, сколько нет, и какой RTT показал последний удавшийся Dial —
 // вызывающий сам решает, что с ним делать дальше.
-func measure(ctx context.Context, addr string, tr Trigger, cuts []int, gap time.Duration, repeats int, wait time.Duration) tally {
-	var t tally
+func measure(ctx context.Context, addr string, tr Trigger, cuts []int, gap time.Duration, repeats int, wait time.Duration, mark uint32) tally {
+	t := tally{markOK: true}
 	for i := 0; i < repeats; i++ {
 		if ctx.Err() != nil {
 			break
 		}
-		ok, rtt, err := once(ctx, addr, tr, cuts, gap, wait)
+		ok, rtt, markOK, err := once(ctx, addr, tr, cuts, gap, wait, mark)
+		if !markOK {
+			// АНД по всей серии: если хоть один дозвон не подтвердил метку,
+			// про серию в целом нельзя сказать, что зонд был исключён из
+			// собственного обхода (§5.5) — а именно это утверждает markOK.
+			t.markOK = false
+		}
 		if err != nil {
 			t.err = err
 			t.fail++

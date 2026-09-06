@@ -83,6 +83,14 @@ type Options struct {
 	// ветка дерева, которая одна способна съесть весь бюджет, поэтому она
 	// диагностика под флагом, а не всегда исполняемый шаг.
 	Diagnose bool
+	// Mark — метка SO_MARK для исходящего сокета зонда. §5.5: зонды
+	// помечаются и исключаются из собственного преобразования — цепочка
+	// firewall (files/S99d2k) отпускает помеченный пакет мимо очереди
+	// нетронутым. Ноль значит «не метить» — законное состояние для разового
+	// ручного вызова (`d2k classify`), где никакого нашего плана на цели ещё
+	// нет и исключать зонд не из чего; при активном поиске вызывающий обязан
+	// передать ненулевую метку (см. internal/controller/classify_probe.go).
+	Mark uint32
 }
 
 // clearConfirmRepeats — сколько ДОПОЛНИТЕЛЬНЫХ повторов задать базовому
@@ -121,6 +129,14 @@ type Result struct {
 	Reassembles *bool
 	Probes      int
 	Trace       []Step
+	// Marked — подтверждено ли, что зонд ходил с меткой SO_MARK (§5.5:
+	// исключение из собственного преобразования). false и при Options.Mark
+	// == 0 (метку не просили — нечего подтверждать), и при Options.Mark !=
+	// 0, но постановка не подтвердилась (провал сокета либо платформа без
+	// SO_MARK) — Result сам по себе не отличает эти два случая, отличие
+	// смотрят по Options.Mark вызывающего. true — только когда метку
+	// запросили И она подтверждена на каждом дозвоне прогона.
+	Marked bool
 }
 
 // stopOnErr — если у опыта t есть ошибка транспорта (не решение коробки, а
@@ -148,9 +164,36 @@ func (res *Result) stopOnErr(what string, t tally) bool {
 // вообще → контроль → (по запросу) граница двоичным поиском. Каждый вопрос
 // меняет ТОЛЬКО способ записи одного и того же триггера — из формы отклика
 // читается структура матчера.
-func Run(ctx context.Context, addr string, tr Trigger, opt Options) Result {
+func Run(ctx context.Context, addr string, tr Trigger, opt Options) (res Result) {
 	opt.withDefaults()
-	var res Result
+
+	// markedOK — подтвердила ли постановка метки SO_MARK каждый дозвон этого
+	// прогона (см. once/measure, tally.markOK), пока не знаем результата
+	// вообще ни одного вопроса — начинаем с «да», сбрасывается первым же
+	// неподтвердившим дозвоном.
+	markedOK := true
+	// Именованный возврат и defer, а не проставление Result.Marked перед
+	// каждым из многих return ниже: у дерева больше десятка точек выхода
+	// (unreachable/flaky на любом шаге, clear, opaque, inconclusive, prefix,
+	// whole_packet, и сама граница), и переписывать Marked в каждой было бы
+	// тем самым дублированием, которое однажды забудут обновить в новой
+	// ветке. Здесь ровно одно место.
+	defer func() {
+		res.Marked = opt.Mark != 0 && markedOK
+		if res.Verdict == VerdictClear && opt.Mark != 0 && !res.Marked {
+			// §5.5 дословно: «ошибка установки метки — явное снижение
+			// достоверности, если исключение обхода не гарантировано».
+			// Непомеченный clear самоподтверждается: зонд мог получить
+			// «отпущено» потому, что уже стоящий (возможно, ещё не
+			// проверенный) план пропустил его как обычный трафик, а не
+			// потому что цель и правда чиста. Понизить до inconclusive —
+			// не диагноз «коробка блокирует», а честное «не измерено
+			// надёжно» (§2.4): утверждать «обходить нечего» здесь нельзя,
+			// но и утверждать обратное тоже не на чем.
+			res.Reason += "; зонд шёл БЕЗ подтверждённой метки SO_MARK — исключение из собственного обхода не гарантировано (§5.5), доверять «обходить нечего» нельзя"
+			res.Verdict = VerdictInconclusive
+		}
+	}()
 
 	if h, p, err := net.SplitHostPort(addr); err != nil || h == "" || p == "" {
 		res.Verdict = VerdictFlaky
@@ -179,9 +222,12 @@ func Run(ctx context.Context, addr string, tr Trigger, opt Options) Result {
 				wait = waitCeiling // самый первый вопрос прогона — RTT неоткуда взять
 			}
 		}
-		t := measure(ctx, addr, trig, cuts, gap, repeats, wait)
+		t := measure(ctx, addr, trig, cuts, gap, repeats, wait, opt.Mark)
 		if opt.Wait <= 0 && t.rtt > 0 {
 			knownRTT = t.rtt
+		}
+		if !t.markOK {
+			markedOK = false
 		}
 		res.Probes += repeats
 		res.Trace = append(res.Trace, Step{What: what, Pass: t.pass, Fail: t.fail})

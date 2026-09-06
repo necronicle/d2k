@@ -62,6 +62,11 @@ type fakeClassify struct {
 	verdict  classify.Verdict
 	splitPos int
 	calls    int
+	// lastMark — метка (Options.Mark), с которой пришёл ПОСЛЕДНИЙ вызов
+	// Run. §5.5 требует, чтобы зонд активного поиска шёл помеченным, —
+	// проверить это можно, только увидев, что реально долетело до
+	// classify.Options, а не подразумевая это.
+	lastMark uint32
 	// hold — задержать ответ. Классификация и подбор по объёму меряются
 	// независимо и параллельно (обе — фоном, см. askVolume/askClassify), и
 	// который из двух ответит раньше — гонка двух горутин без единого
@@ -71,10 +76,11 @@ type fakeClassify struct {
 	hold chan struct{}
 }
 
-func (f *fakeClassify) Run(_ context.Context, _ string, _ classify.Trigger, _ classify.Options) classify.Result {
+func (f *fakeClassify) Run(_ context.Context, _ string, _ classify.Trigger, opt classify.Options) classify.Result {
 	f.mu.Lock()
 	hold := f.hold
 	f.calls++
+	f.lastMark = opt.Mark
 	f.mu.Unlock()
 	if hold != nil {
 		<-hold
@@ -86,6 +92,12 @@ func (f *fakeClassify) Run(_ context.Context, _ string, _ classify.Trigger, _ cl
 		SplitPos: f.splitPos,
 		Reason:   "стенд: вердикт задан сценарием теста",
 	}
+}
+
+func (f *fakeClassify) mark() uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMark
 }
 
 // set задаёт вердикт следующего (и любого дальнейшего) вызова Run. boundary

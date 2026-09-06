@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -89,13 +90,13 @@ func TestОракулОтличаетОтветОтМолчания(t *testing.T
 	sig := tr.Payload[:8]
 
 	clear := stand(t, "clear", sig)
-	got := measure(context.Background(), clear, tr, nil, 0, 3, time.Second)
+	got := measure(context.Background(), clear, tr, nil, 0, 3, time.Second, 0)
 	if got.pass != 3 {
 		t.Fatalf("чистая мишень: прошло %d из 3", got.pass)
 	}
 
 	blocked := stand(t, "prefix", sig)
-	got = measure(context.Background(), blocked, tr, nil, 0, 3, time.Second)
+	got = measure(context.Background(), blocked, tr, nil, 0, 3, time.Second, 0)
 	if got.pass != 0 {
 		t.Fatalf("блокирующая мишень: прошло %d из 3, ожидалось 0", got.pass)
 	}
@@ -119,8 +120,8 @@ func TestРазрезЛомаетПрефиксныйМатчер(t *testing.T) 
 	sig := tr.Payload[:8]
 	addr := stand(t, "prefix", sig)
 
-	whole := measure(context.Background(), addr, tr, nil, 0, 3, time.Second)
-	cut := measure(context.Background(), addr, tr, []int{1}, loopbackGap, 3, time.Second)
+	whole := measure(context.Background(), addr, tr, nil, 0, 3, time.Second, 0)
+	cut := measure(context.Background(), addr, tr, []int{1}, loopbackGap, 3, time.Second, 0)
 	if whole.pass != 0 {
 		t.Fatal("целиком обязано блокироваться")
 	}
@@ -133,7 +134,47 @@ func TestПересборкуРазрезомНеВзять(t *testing.T) {
 	tr, _ := TLSTrigger("заблокировано.example")
 	sig := tr.Payload[:8]
 	addr := stand(t, "reasm", sig)
-	if got := measure(context.Background(), addr, tr, []int{1}, 0, 3, time.Second); got.pass != 0 {
+	if got := measure(context.Background(), addr, tr, []int{1}, 0, 3, time.Second, 0); got.pass != 0 {
 		t.Fatalf("пересобирающая коробка взята разрезом: %d из 3", got.pass)
+	}
+}
+
+// TestMeasureСводитМеткуПоВсейСерии — tally.markOK обязан быть И по всем
+// repeats попыткам (§5.5: если хоть один дозвон серии не подтвердил метку,
+// про серию нельзя сказать, что зонд был исключён из собственного обхода).
+// markFunc подменяется на симулятор: настоящий SO_MARK — привилегия Linux,
+// здесь проверяется агрегация в measure(), а не платформа.
+func TestMeasureСводитМеткуПоВсейСерии(t *testing.T) {
+	tr, _ := TLSTrigger("заблокировано.example")
+	addr := stand(t, "clear", tr.Payload[:8])
+
+	old := markFunc
+	t.Cleanup(func() { markFunc = old })
+
+	markFunc = func(_ uint32, ok *bool) func(string, string, syscall.RawConn) error {
+		return func(string, string, syscall.RawConn) error { *ok = true; return nil }
+	}
+	if got := measure(context.Background(), addr, tr, nil, 0, 2, time.Second, 0x2d); !got.markOK {
+		t.Fatal("markOK=false, хотя markFunc подтвердил метку на обеих попытках")
+	}
+
+	calls := 0
+	markFunc = func(_ uint32, ok *bool) func(string, string, syscall.RawConn) error {
+		calls++
+		return func(string, string, syscall.RawConn) error {
+			*ok = calls != 2 // вторая из двух попыток проваливает метку
+			return nil
+		}
+	}
+	if got := measure(context.Background(), addr, tr, nil, 0, 2, time.Second, 0x2d); got.markOK {
+		t.Fatal("markOK=true, хотя одна из двух попыток метку не подтвердила")
+	}
+
+	markFunc = func(uint32, *bool) func(string, string, syscall.RawConn) error {
+		t.Fatal("markFunc вызван при mark=0 — метку не просили, звать было незачем")
+		return nil
+	}
+	if got := measure(context.Background(), addr, tr, nil, 0, 2, time.Second, 0); !got.markOK {
+		t.Fatal("markOK=false при mark=0 — подтверждать нечего")
 	}
 }

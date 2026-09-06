@@ -31,6 +31,12 @@ const questionClassify = "чем именно режут"
 // classifyBudget — жёсткий предел на один прогон classify.Run.
 const classifyBudget = 60 * time.Second
 
+// DefaultMark — метка SO_MARK по умолчанию, если её не переопределит
+// SetMark. Совпадает с MARK=0x2d в files/S99d2k: firewall-цепочка отпускает
+// пакет с этой меткой мимо очереди нетронутым (§5.5) — расхождение здесь
+// значило бы, что зонд метится числом, которое правило не узнаёт.
+const DefaultMark uint32 = 0x2d
+
 // Classifier — чем контроллер измеряет функцию решения коробки. Интерфейс, а
 // не прямой вызов classify.Run, чтобы проверки не ходили в сеть.
 type Classifier interface {
@@ -101,7 +107,11 @@ func (c *Controller) askClassify(t *Task) {
 		return
 	}
 
-	var opt classify.Options
+	// Mark — §5.5: активный поиск обязан метить зонд, иначе датапат (или уже
+	// поставленный, ещё не проверенный план) может обработать его как
+	// обычный трафик, и вердикт (особенно clear) окажется недостоверным
+	// (см. classify.Run — Options.Mark, Result.Marked).
+	opt := classify.Options{Mark: c.mark}
 	if name := controlName(t, c.decoy); name != "" {
 		if ctl, err := classify.Control(name); err == nil {
 			opt.Control = ctl

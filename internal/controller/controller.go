@@ -151,6 +151,11 @@ type Controller struct {
 	now    func() time.Time
 	decoy  string
 	prober Prober
+	// mark — метка SO_MARK, с которой должны идти зонды классификации
+	// (§5.5, см. classify_probe.go, askClassify). Умолчание — DefaultMark,
+	// то же число, что и в files/S99d2k; SetMark переопределяет его из
+	// конфигурации (см. cmd/d2k).
+	mark uint32
 
 	// Подтверждения приходят без имени цели: датапат отвечает в том порядке,
 	// в каком получил, поэтому очередь ожидающих — обычная FIFO.
@@ -203,6 +208,7 @@ func New(conn *control.Conn, store *catalog.Store, out io.Writer) *Controller {
 		out:      out,
 		now:      time.Now,
 		decoy:    DecoySNI,
+		mark:     DefaultMark,
 		prober:   probe.New(),
 		tasks:    map[string]*Task{},
 		names:    map[control.Key]string{},
@@ -238,6 +244,11 @@ func (c *Controller) SetClock(f func() time.Time) { c.now = f }
 // SetDecoy меняет имя приманки. Имя, работающее на одной линии, не обязано
 // работать на другой — это часть поиска, а не константа.
 func (c *Controller) SetDecoy(s string) { c.decoy = s }
+
+// SetMark меняет метку SO_MARK для зондов классификации (§5.5). Из
+// конфигурации (config.Config.Mark), а не константа: тот же файл читает и
+// firewall-скрипт, и оба значения обязаны совпадать.
+func (c *Controller) SetMark(m uint32) { c.mark = m }
 
 func (c *Controller) sayf(format string, a ...any) {
 	if c.out != nil {

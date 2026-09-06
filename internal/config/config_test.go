@@ -94,4 +94,37 @@ func TestОбратнаяЗаписьЧитаетсяОбратно(t *testing.T
 	if c2.Mode != c1.Mode || c2.QueueNum != c1.QueueNum || c2.Unknown["ЧУЖОЙ"] != "да" {
 		t.Errorf("круг не сошёлся: %+v против %+v", c2, c1)
 	}
+	if c2.Mark != c1.Mark {
+		t.Errorf("MARK не пережил круг: %#x против %#x", c2.Mark, c1.Mark)
+	}
+}
+
+// TestМеткаПоУмолчаниюСовпадаетСFirewallСкриптом — §5.5: конфигурация и
+// files/S99d2k читают ОДИН файл (/opt/d2k/config), и умолчание обязано быть
+// тем же числом, что MARK=0x2d в скрипте, — иначе до первой явной записи в
+// файл зонды и правило firewall расходились бы молча.
+func TestМеткаПоУмолчаниюСовпадаетСFirewallСкриптом(t *testing.T) {
+	if Default().Mark != 0x2d {
+		t.Fatalf("умолчание MARK = %#x, а files/S99d2k объявляет 0x2d", Default().Mark)
+	}
+}
+
+// TestМеткаПринимаетШестнадцатеричнуюИДесятичнуюЗапись — S99d2k пишет
+// MARK=0x2d шестнадцатеричным; конфигурация обязана читать ровно ту же
+// запись, а не только десятичную.
+func TestМеткаПринимаетШестнадцатеричнуюИДесятичнуюЗапись(t *testing.T) {
+	c, err := Load(write(t, "MARK=0x99\n"))
+	if err != nil || c.Mark != 0x99 {
+		t.Errorf("шестнадцатеричная запись не прочитана: %v, MARK=%#x", err, c.Mark)
+	}
+	c, err = Load(write(t, "MARK=45\n"))
+	if err != nil || c.Mark != 45 {
+		t.Errorf("десятичная запись не прочитана: %v, MARK=%#x", err, c.Mark)
+	}
+}
+
+func TestОпечаткаВМеткеЭтоОшибка(t *testing.T) {
+	if _, err := Load(write(t, "MARK=не-число\n")); err == nil {
+		t.Fatal("нечисловой MARK должен быть ошибкой, а не поводом молча взять умолчание")
+	}
 }

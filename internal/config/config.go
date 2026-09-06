@@ -67,6 +67,19 @@ type Config struct {
 	// Умолчание измерено донором (замер 2026-08-29).
 	DecoySNI string
 
+	// Mark — метка SO_MARK для зондов. §5.5: зонды исключаются из
+	// собственного преобразования, и делает это цепочка firewall
+	// (files/S99d2k):
+	//
+	//	iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN
+	//
+	// Тот же файл, что и здесь (/opt/d2k/config): shell-скрипт читает
+	// переменную MARK ИЗ НЕГО ЖЕ. Ключ конфигурации назван так же намеренно
+	// — разойдись имена, и правка одного значения перестала бы значить одно
+	// и то же для правил firewall и для зондов classify.Run. Умолчание —
+	// константа скрипта, а не число «на глаз».
+	Mark uint32
+
 	// Unknown — ключи, которых этот код не знает. Сохраняются, чтобы откат на
 	// предыдущую версию не терял настройки следующей.
 	Unknown map[string]string
@@ -89,7 +102,10 @@ func Default() Config {
 		// там пережил бы перезагрузку только по случайности.
 		ControlSocket: "/opt/d2k/run/d2kd.sock",
 		DecoySNI:      "disk.rzd.ru",
-		Unknown:       map[string]string{},
+		// Совпадает с MARK=0x2d в files/S99d2k — оба читают один файл, и
+		// умолчания обязаны совпадать, даже когда файла ещё нет вовсе.
+		Mark:    0x2d,
+		Unknown: map[string]string{},
 	}
 }
 
@@ -161,6 +177,14 @@ func Load(path string) (Config, error) {
 			c.ControlSocket = val
 		case "DECOY_SNI":
 			c.DecoySNI = val
+		case "MARK":
+			// База 0: ParseUint сама распознаёт префикс 0x (как в S99d2k) и
+			// десятичную запись, не заставляя выбрать одну форму записи.
+			n, err := strconv.ParseUint(val, 0, 32)
+			if err != nil {
+				return c, fmt.Errorf("%s:%d: MARK=%q, нужно число (например 0x2d)", path, line, val)
+			}
+			c.Mark = uint32(n)
 		case "QUEUE_NUM":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 0 || n > 65535 {
@@ -214,7 +238,10 @@ func (c Config) Render() string {
 	fmt.Fprintf(&b, "CONTROL_SOCKET=%s\n\n", c.ControlSocket)
 	b.WriteString("# Имя в приманке. Не константа: имя, работающее на одной линии,\n")
 	b.WriteString("# не обязано работать на другой — подбор его часть поиска.\n")
-	fmt.Fprintf(&b, "DECOY_SNI=%s\n", c.DecoySNI)
+	fmt.Fprintf(&b, "DECOY_SNI=%s\n\n", c.DecoySNI)
+	b.WriteString("# Метка SO_MARK для зондов (§5.5) — тот же ключ, что читает firewall-\n")
+	b.WriteString("# скрипт (files/S99d2k) из этого же файла. Меняйте оба значения вместе.\n")
+	fmt.Fprintf(&b, "MARK=0x%x\n", c.Mark)
 	if len(c.Unknown) > 0 {
 		b.WriteString("\n# Ключи, которых эта сборка не знает. Сохранены намеренно:\n")
 		b.WriteString("# откат на предыдущую версию не должен терять настройки следующей.\n")

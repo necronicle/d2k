@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/necronicle/d2k/internal/classify"
+	"github.com/necronicle/d2k/internal/controller"
 )
 
 // TestКандидатыНеБерутсяИзСписка — защита от возврата лестницы.
@@ -160,5 +161,73 @@ func TestКлассификацияЗапрашиваетсяОдинРаз(t *t
 
 	if n := r.classify.count(); n != 1 {
 		t.Fatalf("classify.Run вызван %d раз, а задача одна:\n%s", n, r.log)
+	}
+}
+
+// TestЗондКлассификацииИдётСМеткой — §5.5: активный поиск обязан метить
+// зонд классификации SO_MARK'ом (иначе датапат может преобразовать его как
+// обычный трафик, и вердикт, особенно clear, окажется недостоверным — см.
+// classify.Options.Mark, Result.Marked, onClassify). Проверяем то, что
+// РЕАЛЬНО дошло до classify.Options, а не то, что должно было дойти.
+func TestЗондКлассификацииИдётСМеткой(t *testing.T) {
+	r := newRig(t)
+	r.classify.set(classify.VerdictOpaque, 0)
+
+	r.say("hello marked.example")
+	r.say("rst")
+	r.pump(10)
+
+	if got := r.classify.mark(); got != controller.DefaultMark {
+		t.Fatalf("зонд классификации ушёл с меткой %#x, а умолчание — %#x", got, controller.DefaultMark)
+	}
+
+	// SetMark переопределяет умолчание — из конфигурации (cmd/d2k), не
+	// константа контроллера.
+	r2 := newRig(t)
+	r2.classify.set(classify.VerdictOpaque, 0)
+	r2.ctrl.SetMark(0x99)
+
+	r2.say("hello marked2.example")
+	r2.say("rst")
+	r2.pump(10)
+
+	if got := r2.classify.mark(); got != 0x99 {
+		t.Fatalf("SetMark(0x99) не дошёл до зонда: получено %#x", got)
+	}
+}
+
+// TestЗапасногоПланаБезВердиктаОжидаетсяЯвно — путь «вердикта ещё нет →
+// единственный кандидат из classify.Compose на пустом векторе свойств»
+// исполняется почти в каждом тесте этого файла как побочный эффект гонки
+// между classify и постановкой первого кандидата, но ни один тест не
+// утверждает этого явно. classify.hold держит вердикт бесконечно, пока
+// тест не отпустит его сам, — единственная кандидатура, доступная
+// контроллеру всё это время, обязана быть ИМЕННО тем планом, который
+// строит classify.Compose(classify.Properties{}, decoy).
+func TestЗапасногоПланаБезВердиктаОжидаетсяЯвно(t *testing.T) {
+	r := newRig(t)
+	hold := make(chan struct{})
+	r.classify.hold = hold
+	t.Cleanup(func() { close(hold) })
+
+	r.say("hello fallback.example")
+	r.say("rst")
+	r.pump(5)
+
+	logs := r.log.String()
+	if !strings.Contains(candidateLines(logs), "запасной план") {
+		t.Fatalf("без вердикта не предложен запасной план:\n%s", logs)
+	}
+
+	want, err := classify.Compose(classify.Properties{}, controller.DecoySNI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 1 {
+		t.Fatalf("classify.Compose на пустом векторе дал %d планов, ожидался один", len(want))
+	}
+	if !strings.Contains(candidateLines(logs), want[0].ID) {
+		t.Fatalf("предложенный план не совпадает с classify.Compose(Properties{}, decoy) (%s):\n%s",
+			want[0].ID, logs)
 	}
 }

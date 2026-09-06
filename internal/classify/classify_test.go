@@ -3,6 +3,8 @@ package classify
 import (
 	"context"
 	"net"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -177,5 +179,78 @@ func TestОшибкаОпытаНеПутаетсяСБлокировкой(t *t
 	}
 	if r.Reason == "" {
 		t.Fatal("вердикт без причины")
+	}
+}
+
+// withMarkFunc подменяет markFunc на симулятор с фиксированным исходом и
+// возвращает функцию отмены. Настоящий SO_MARK проверить можно только под
+// Linux и с CAP_NET_ADMIN (обоих на машине, где идёт этот тест, может не
+// быть) — здесь проверяется ПОЛИТИКА вердикта (§5.5: непомеченный clear не
+// проходит, помеченный — проходит), а не доступность привилегии.
+func withMarkFunc(t *testing.T, ok bool) {
+	t.Helper()
+	old := markFunc
+	markFunc = func(_ uint32, gotOK *bool) func(string, string, syscall.RawConn) error {
+		return func(string, string, syscall.RawConn) error {
+			*gotOK = ok
+			return nil
+		}
+	}
+	t.Cleanup(func() { markFunc = old })
+}
+
+// TestНепомеченныйClearСтановитсяInconclusive — §5.5 дословно: «ошибка
+// установки метки — явное снижение достоверности, если исключение обхода не
+// гарантировано». Непомеченный clear самоподтверждается: зонд мог получить
+// «отпущено» потому, что уже стоящий план пропустил его как обычный трафик,
+// а не потому, что цель и правда чиста, — доверять такому «обходить нечего»
+// нельзя.
+func TestНепомеченныйClearСтановитсяInconclusive(t *testing.T) {
+	withMarkFunc(t, false)
+	tr, _ := TLSTrigger("любое.example")
+	ctl, _ := Control("контроль.example")
+	o := opts(ctl)
+	o.Mark = 0x2d
+	r := Run(context.Background(), stand(t, "clear", tr.Payload[:8]), tr, o)
+	if r.Verdict != VerdictInconclusive {
+		t.Fatalf("вердикт %q, ожидался inconclusive (метка не подтвердилась): %s", r.Verdict, r.Reason)
+	}
+	if r.Marked {
+		t.Fatal("Marked=true, хотя markFunc сообщил о провале постановки")
+	}
+	if !strings.Contains(r.Reason, "БЕЗ подтверждённой метки") {
+		t.Fatalf("причина не называет отсутствие метки: %s", r.Reason)
+	}
+}
+
+// TestНольНеТребуетМетки — законный путь разового ручного вызова (`d2k
+// classify` без плана на цели, см. Options.Mark): Mark=0 не требует
+// подтверждения, и clear остаётся clear.
+func TestНольНеТребуетМетки(t *testing.T) {
+	tr, _ := TLSTrigger("любое.example")
+	ctl, _ := Control("контроль.example")
+	r := Run(context.Background(), stand(t, "clear", tr.Payload[:8]), tr, opts(ctl)) // Mark не задан — 0
+	if r.Verdict != VerdictClear {
+		t.Fatalf("вердикт %q, ожидался clear (метку не просили): %s", r.Verdict, r.Reason)
+	}
+	if r.Marked {
+		t.Fatal("Marked=true при Options.Mark=0 — подтверждать было нечего")
+	}
+}
+
+// TestПомеченныйClearОстаётсяClear — когда метка ПОДТВЕРЖДЕНА, понижать
+// вердикт не за что.
+func TestПомеченныйClearОстаётсяClear(t *testing.T) {
+	withMarkFunc(t, true)
+	tr, _ := TLSTrigger("любое.example")
+	ctl, _ := Control("контроль.example")
+	o := opts(ctl)
+	o.Mark = 0x2d
+	r := Run(context.Background(), stand(t, "clear", tr.Payload[:8]), tr, o)
+	if r.Verdict != VerdictClear {
+		t.Fatalf("вердикт %q, ожидался clear (метка подтверждена): %s", r.Verdict, r.Reason)
+	}
+	if !r.Marked {
+		t.Fatal("Marked=false, хотя markFunc подтвердил метку на каждом дозвоне")
 	}
 }

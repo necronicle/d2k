@@ -71,6 +71,7 @@ func cmdControl(args []string, out, errOut *os.File) int {
 
 	ctrl := controller.New(conn, store, out)
 	ctrl.SetDecoy(*decoy)
+	ctrl.SetMark(c.Mark)
 
 	boxes := len(store.Catalog().Boxes)
 	fmt.Fprintf(out, "контроллер: каталог %s, изученных коробок %d\n", *catPath, boxes)
