@@ -13,7 +13,7 @@ ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = plan_parse.c plan_apply.c tls.c wire.c track.c session.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = plan_parse.c plan_apply.c tls.c wire.c wire_udp.c track.c session.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
@@ -24,9 +24,9 @@ HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_tr
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_track test_session test_nl test_sched test_journal test_plans test_ctl
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nl test_sched test_journal test_plans test_ctl
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans test-ctl cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl cross clean
 
 all: planlab ctlprobe
 
@@ -78,6 +78,9 @@ test_track: test_track.c track.o $(HDR)
 wire.o: wire.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+wire_udp.o: wire_udp.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 nl.o: nl.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -92,6 +95,9 @@ test_sched: test_sched.c sched.o $(HDR)
 
 test_wire: test_wire.c wire.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_wire.c wire.o $(LDFLAGS)
+
+test_wire_udp: test_wire_udp.c wire_udp.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_wire_udp.c wire_udp.o $(LDFLAGS)
 
 test_plan_apply: test_plan_apply.c plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_plan_apply.c plan_parse.o plan_apply.o $(LDFLAGS)
@@ -116,6 +122,9 @@ test-tls: test_tls
 
 test-wire: test_wire
 	./test_wire
+
+test-wire-udp: test_wire_udp
+	./test_wire_udp
 
 test-track: test_track
 	./test_track
@@ -210,7 +219,7 @@ d2kd-aarch64:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-track test-session test-nl test-sched test-journal test-plans test-ctl
+check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl
 
 clean:
 	rm -f *.o $(TESTS) planlab ctlprobe
