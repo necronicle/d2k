@@ -23,3 +23,10 @@ datapath/*
 !datapath/Makefile
 !datapath/include/
 !datapath/testdata/
+
+# Ядро: тот же белый список и по той же причине.
+core/*
+!core/*.c
+!core/*.h
+!core/Makefile
+!core/include/
