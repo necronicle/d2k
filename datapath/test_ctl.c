@@ -103,6 +103,14 @@ static size_t set_name_body(uint8_t *body, const char *name,
     return 1 + nl + planlen;
 }
 
+/* Минимальный годный план: только порядок. Общий для обоих блоков разбора
+   команд ниже (заполнение таблицы и проверка давности) — раньше жил внутри
+   первого, локальной static-переменной. */
+static const uint8_t tiny[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 1,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
 int main(void) {
     char err[160];
     d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
@@ -263,11 +271,6 @@ int main(void) {
            это отдельно проверено в internal/control/bridge_test.go. */
         cx.send_limits = 0;
 
-        static const uint8_t tiny[] = {
-            'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 1,
-            0x01, 0x03, 0x00, 0x01, 0x00
-        };
-
         /* Предыдущий блок закрыл своего cli, но ни разу не поллил c после
            этого — сервер узнаёт об уходе собеседника только через
            d2k_ctl_poll/d2k_ctl_flush (см. drop_peer в ctl.c), а не сам
@@ -390,6 +393,116 @@ int main(void) {
             CHECK(d2k_session_plan_count(sess) == cap,
                   "вытеснение изменило число записей в таблице");
         }
+
+        close(cli);
+        d2k_session_free(sess);
+    }
+
+    /* --- давность приходит из cx.now_ns, а не подменяется константой --------
+     *
+     * Ревьюер поймал мутацией: замени cx->now_ns на литеральный 0 в местах,
+     * где ctlsrv.c зовёт d2k_plantab_set_name/set_addr (:99, :103) — и весь
+     * гейт остаётся зелёным. Причина в том, что ни один прогон до этого не
+     * проводил давность через НАСТОЯЩИЙ разбор команды (d2k_ctlsrv_command)
+     * с ДВУМЯ различающимися отметками: test_plans.c зовёт
+     * d2k_plantab_set_addr напрямую, минуя ctlsrv.c целиком, а блок выше
+     * заполняет таблицу через один и тот же cx, чьё now_ns ни разу не
+     * менялся (в исходном виде — оставался нулём с memset) — обе стороны
+     * подмены выглядят одинаково, когда времени всего одно значение.
+     *
+     * Расстановка ниже — НЕ по возрастанию вставки: "fresh.example" стоит
+     * ПЕРВОЙ (то есть на наименьшем индексе — том самом, что побеждает при
+     * разрыве ничьей по plans.c/oldest), но получает САМУЮ БОЛЬШУЮ отметку;
+     * "filler1.example" вставлена ВТОРОЙ и получает САМУЮ МАЛЕНЬКУЮ. Если
+     * давность не доходит до таблицы (то есть после подмены на 0), все
+     * отметки равны, и вытесняется "fresh.example" — она с наименьшим
+     * индексом; если доходит — "filler1.example", она старше по факту.
+     * Настоящая давность и разрыв ничьей по индексу указывают на РАЗНЫЕ
+     * записи — ровно то расхождение, которого не было в проверке выше. */
+    {
+        d2k_session *sess = d2k_session_new(2, 0);
+        CHECK(sess != NULL, "сессия для проверки давности не создалась");
+
+        d2k_ctlsrv cx;
+        memset(&cx, 0, sizeof cx);
+        cx.sess = sess;
+        cx.ctl = c;
+        cx.send_limits = 0;
+
+        /* Старый собеседник блока выше закрыт, но сервер узнаёт об этом
+           только через d2k_ctl_poll/d2k_ctl_flush — тот же приём, что и
+           перед первым переподключением этого файла (см. комментарий там). */
+        d2k_ctl_poll(c, on_cmd, NULL);
+        cli = dial();
+        CHECK(cli >= 0, "клиент для проверки давности не подключился");
+        d2k_ctl_accept(c);
+
+        size_t cap = d2k_session_plan_capacity(sess);
+        CHECK(cap == 16, "вместимость таблицы давности не 16 (см. round_pow2 выше)");
+
+        /* Первая цель — с индексом 0, но с давностью заведомо больше всех
+           остальных: если бы разрыв ничьей по индексу решал дело (давность
+           не дошла), вытеснилась бы именно она. */
+        cx.now_ns = 1000000;
+        {
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, "fresh.example", tiny, sizeof tiny);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "первая цель давности не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "первая цель давности не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "первая цель давности отвергнута");
+        }
+
+        /* Остальные до вместимости: filler1 получает давность 1 — самую
+           маленькую из ВСЕХ, включая fresh.example; filler2..filler15 —
+           давность 2..15, тоже меньше fresh.example, но больше filler1. */
+        for (size_t i = 1; i < cap; i++) {
+            char nm[64];
+            snprintf(nm, sizeof nm, "filler%zu.example", i);
+            cx.now_ns = (uint64_t)i;
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, nm, tiny, sizeof tiny);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "наполнитель давности не отправился");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "наполнитель давности не разобрался");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "наполнитель давности отвергнут");
+        }
+        CHECK(d2k_session_plan_count(sess) == cap,
+              "таблица давности не заполнилась ровно до вместимости");
+
+        /* Таблица полна. Новая цель обязана вытеснить "filler1.example" —
+           самую старую ПО ФАКТУ, а не "fresh.example", которая старше
+           только по индексу. */
+        cx.now_ns = 2000000;
+        {
+            uint8_t body[64], f[80];
+            size_t blen = set_name_body(body, "overflow2.example", tiny, sizeof tiny);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель поверх давности не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель поверх давности не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
+                  "цель поверх давности отвергнута");
+        }
+
+        /* Проверяем ПОВЕДЕНИЕМ (что реально находится в таблице), как и
+           тест выше и test_plans.c — внутреннее поле давности наружу не
+           выставлено и не должно быть. */
+        d2k_plantab *tab = d2k_session_plans(sess);
+        CHECK(d2k_plantab_find(tab, (const uint8_t *)"fresh.example",
+                               strlen("fresh.example"), 0, 9999999) != NULL,
+              "давность не дошла до таблицы: вытеснена свежая запись вместо старой "
+              "(похоже на cx->now_ns, подменённый константой в ctlsrv.c)");
+        CHECK(d2k_plantab_find(tab, (const uint8_t *)"filler1.example",
+                               strlen("filler1.example"), 0, 9999999) == NULL,
+              "самая старая по факту запись пережила вытеснение вместо свежей");
 
         close(cli);
         d2k_session_free(sess);

@@ -10,6 +10,7 @@ package control_test
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -111,6 +112,29 @@ func dial(t *testing.T, sock string) *control.Conn {
 	return c
 }
 
+// nextHello читает события до ближайшего EvHello, пропуская мимо EvRefused:
+// сценарии этого файла в основном не ставят план перед "hello"/"quic", а
+// значит, по ревью п.3, следом за приветствием честно идёт «плана для этой
+// цели нет» (D2K_JRN_PLAN_REFUSED -> EvRefused, session.c) — раньше это
+// событие вообще не доезжало до провода, и тесты, писавшие
+// `ev, _ := c.Next()` сразу после "hello", могли рассчитывать, что
+// приветствие — единственное, что придёт. Три попытки — с запасом: между
+// двумя "hello" здесь ложится не больше одной такой пары.
+func nextHello(t *testing.T, c *control.Conn) control.Event {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("событие приветствия не прочиталось: %v", err)
+		}
+		if ev.Type == control.EvHello {
+			return ev
+		}
+	}
+	t.Fatal("приветствие не пришло")
+	return control.Event{}
+}
+
 func TestСобытиеПриветствияДоезжает(t *testing.T) {
 	p, sock := start(t)
 	c := dial(t, sock)
@@ -153,22 +177,10 @@ func TestTCPИQUICСОдинаковымАдресомИПортомДаютРа
 	c := dial(t, sock)
 
 	p.say(t, "hello example.com")
-	tcpEv, err := c.Next()
-	if err != nil {
-		t.Fatalf("TCP-событие не прочиталось: %v", err)
-	}
-	if tcpEv.Type != control.EvHello {
-		t.Fatalf("тип TCP-события %#04x, а ждали приветствие", tcpEv.Type)
-	}
+	tcpEv := nextHello(t, c)
 
 	p.say(t, "quic")
-	quicEv, err := c.Next()
-	if err != nil {
-		t.Fatalf("QUIC-событие не прочиталось: %v", err)
-	}
-	if quicEv.Type != control.EvHello {
-		t.Fatalf("тип QUIC-события %#04x, а ждали приветствие", quicEv.Type)
-	}
+	quicEv := nextHello(t, c)
 
 	// Оба приветствия — от одного и того же имени (ctlprobe шлёт QUIC Initial
 	// с example.com внутри, см. шапку ctlprobe.c) и с одного и того же адреса
@@ -568,8 +580,17 @@ func TestФормаПриветствияЛовитсяПоЗапросу(t *tes
 	}
 
 	// И она обязана доехать до контроллера целиком.
+	//
+	// Бюджет попыток — 130, не 12: по ревью п.3 у КАЖДОГО "hello" без
+	// плана (а плана здесь ни у одной цели нет) следом идёт ещё и EvRefused
+	// (session.c, refuse()) — раньше это событие на провод не выходило
+	// вовсе. Цикл ожидания ловушки формы выше повторяет "hello
+	// other.example" до 50 раз, то есть в очереди перед EvShape может
+	// накопиться до 50×2 таких пар плюс горстка от "before.example" и
+	// подтверждения самой команды ARM_SHAPE — с запасом это чуть больше
+	// сотни, не дюжина.
 	var shape []byte
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 130; i++ {
 		ev, err := c.Next()
 		if err != nil {
 			break
@@ -674,4 +695,180 @@ func TestНегоднаяКомандаПодтверждаетсяОтказо�
 		return
 	}
 	t.Fatal("отказ не подтверждён")
+}
+
+// waitAckReason читает события до EvAck на команду cmd и возвращает код
+// причины (AckReason). Общий хвост TestКомандаПодтверждается и
+// TestНегоднаяКомандаПодтверждаетсяОтказом выше, вынесенный сюда для новой
+// проверки ниже — им самим трогать незачем.
+func waitAckReason(t *testing.T, c *control.Conn, cmd uint16) uint8 {
+	t.Helper()
+	for i := 0; i < 8; i++ {
+		ev, err := c.Next()
+		if err != nil {
+			t.Fatalf("подтверждение не пришло: %v", err)
+		}
+		if ev.Type == control.EvAck && ev.AckOf == cmd {
+			return ev.AckReason
+		}
+	}
+	t.Fatal("подтверждение на нужную команду не пришло")
+	return 0
+}
+
+// sendRawGetAckReason открывает СЫРОЕ соединение (без обёртки control.Conn —
+// нужно для кадра, который легальный клиент собрать не может, см. ниже),
+// шлёт body как кадр типа typ и возвращает код причины из ответного
+// D2K_EV_ACK. Раскладка кадра — [длина payload u32 BE][тип u16 BE][ключ
+// потока 13 байт, нулевой у подтверждения][тип команды u16 BE][признак
+// успеха u8][код причины u8] — та же, что разбирает control.Conn.Next()
+// изнутри (control.go, случай EvAck), развёрнутая тут вручную: у сырого
+// соединения нет обёртки, которая сделала бы это сама.
+//
+// Тело функции — ОДНА попытка, без ретраев: повтор на переподключение решается
+// снаружи, в вызывающем коде, потому что там же виден весь бюджет попыток и
+// его исчерпание можно честно завалить тестом с понятной причиной, а не
+// прятать за t.Fatal внутри хелпера.
+func sendRawGetAckReason(sock string, typ uint16, body []byte) (uint8, error) {
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		return 0, fmt.Errorf("подключение: %w", err)
+	}
+	defer c.Close()
+	if err := c.SetDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		return 0, err
+	}
+	frame := make([]byte, 6+len(body))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(2+len(body)))
+	binary.BigEndian.PutUint16(frame[4:6], typ)
+	copy(frame[6:], body)
+	if _, err := c.Write(frame); err != nil {
+		// Гонка принятия: старое соединение могло ещё не отвалиться со
+		// стороны сервера, когда мы дозвонились до нового, — accept()
+		// ctlprobe увидит наше как «второго контроллера» и закроет его,
+		// пока d2k_ctl_poll в основном цикле (poll(200), ctlprobe.c) не
+		// заметил уход прежнего. Гонка не гипотетическая: без ретраев на
+		// вызывающей стороне именно это ловится как "write: broken pipe"
+		// на прогоне полного набора тестов пакета (не при одиночном
+		// запуске — там сервер обычно успевает).
+		return 0, fmt.Errorf("запись: %w", err)
+	}
+	hdr := make([]byte, 6)
+	if _, err := io.ReadFull(c, hdr); err != nil {
+		return 0, fmt.Errorf("заголовок ответа: %w", err)
+	}
+	plen := binary.BigEndian.Uint32(hdr[0:4])
+	rtyp := binary.BigEndian.Uint16(hdr[4:6])
+	if rtyp != control.EvAck {
+		return 0, fmt.Errorf("тип кадра %#04x, а ждали подтверждение (%#04x)", rtyp, control.EvAck)
+	}
+	if plen < 2 {
+		return 0, fmt.Errorf("кадр подтверждения короче собственного заголовка: %d", plen)
+	}
+	rbody := make([]byte, plen-2)
+	if _, err := io.ReadFull(c, rbody); err != nil {
+		return 0, fmt.Errorf("тело ответа: %w", err)
+	}
+	// 13 — ширина ключа потока НА ПРОВОДЕ (D2K_KEY_WIRE_LEN,
+	// datapath/include/d2k_ctlsrv.h); control.go держит то же число под
+	// именем keyLen, непубличным, поэтому здесь оно повторено, а не
+	// импортировано — сверяет их bridge-тест в целом, не эта строка.
+	const keyWireLen = 13
+	if len(rbody) < keyWireLen+4 {
+		return 0, fmt.Errorf("тело подтверждения короче ожидаемого (ключ+тип+успех+причина): %d байт", len(rbody))
+	}
+	return rbody[keyWireLen+3], nil
+}
+
+// TestКодыПодтвержденияСовпадаютУGoИC — сверка констант D2K_ACK_* (C,
+// datapath/include/d2k_ctl.h) и control.Ack* (Go, control.go) по образцу
+// TestКодыЗаписейСовпадаютУGoИC (internal/plan/lab_test.go): расхождение
+// здесь — та же по цене ошибка, что и там (обе стороны собираются, тесты
+// каждой стороны проходят по отдельности, а смысл байта на проводе разный),
+// и до этой проверки её не было вовсе — только комментарий «обязаны
+// совпадать» по обе стороны, который сам себя не проверяет.
+//
+// D2K_ACK_NO_ROOM сюда осознанно не входит и не может: вместимость таблицы
+// планов после округления round_pow2 (datapath/track.c) не бывает меньше 16,
+// а с вытеснением по давности (datapath/plans.c) полная таблица вытесняет
+// самую давнюю запись вместо отказа — этот код больше не проезжает по
+// проводу ни при какой настоящей команде (см. большой комментарий у
+// D2K_ACK_NO_ROOM, d2k_ctl.h). Он остаётся непроверенным здесь честно, а не
+// по недосмотру: сводить его сюда значило бы либо ломать инвариант нарочно
+// ради теста, либо звать внутренности datapath, которых у Go нет и не будет.
+func TestКодыПодтвержденияСовпадаютУGoИC(t *testing.T) {
+	p, sock := start(t)
+	_ = p
+	c := dial(t, sock)
+
+	src, err := os.ReadFile("../plan/testdata/rzd_arm.plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodPlan, err := plan.ParseText(string(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodTLV, err := goodPlan.MarshalTLV()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// OK: годная команда с исполнимым планом.
+	if err := c.SetPlanName("ack-ok.example", goodTLV); err != nil {
+		t.Fatalf("годная команда не отправилась: %v", err)
+	}
+	if reason := waitAckReason(t, c, control.CmdSetName); reason != control.AckOK {
+		t.Fatalf("код подтверждения годной команды %d, а ждали control.AckOK (%d)",
+			reason, control.AckOK)
+	}
+
+	// BAD_PLAN: план, неисполнимый содержательно — ipid_zero сырым сокетом
+	// не распорядиться, ядро подставит свой (см. TestНегоднаяКомандаПодтверждаетсяОтказом).
+	badPlan := plan.Plan{
+		Schema: plan.SchemaCurrent, MinExec: 1, Transport: 6, Proto: 1,
+		Payloads: []plan.Payload{{ID: 1, Bytes: []byte{0xDE, 0xAD}}},
+		Poisons:  []plan.Poison{{ID: 1, Flags: plan.PoisonIPIDZero}},
+		Fakes:    []plan.Fake{{PayloadID: 1, PoisonID: 1, Repeats: 1}},
+	}
+	badTLV, err := badPlan.MarshalTLV()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPlanName("ack-badplan.example", badTLV); err != nil {
+		t.Fatalf("неисполнимый план не отправился: %v", err)
+	}
+	if reason := waitAckReason(t, c, control.CmdSetName); reason != control.AckBadPlan {
+		t.Fatalf("код подтверждения неисполнимого плана %d, а ждали control.AckBadPlan (%d)",
+			reason, control.AckBadPlan)
+	}
+
+	// BAD_ARGS: незнакомый тип команды — d2k_ctlsrv_command бьёт по ветке
+	// default отказом именно с этой причиной, какая бы команда ни пришла
+	// (см. ctlsrv.c). control.Conn такую не собрать: все экспортированные
+	// Set*/Del* проверяют аргументы на СВОЕЙ стороне раньше, чем дошло бы
+	// до провода, — и это не случайно, просто не про эту причину отказа.
+	// Кадр собран в обход клиента на ОТДЕЛЬНОМ соединении: старое закрыто,
+	// а не разделяет сокет с новым — второй ОДНОВРЕМЕННЫЙ контроллер
+	// отвергается самим протоколом (см. TestВторойКонтроллерОтвергается).
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var reason uint8
+	var lastErr error
+	for i := 0; i < 50; i++ {
+		reason, lastErr = sendRawGetAckReason(sock, 0x00FE, nil) // тип вне D2K_CMD_*/D2K_EV_*
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Fatalf("незнакомая команда не прошла за 50 попыток: %v", lastErr)
+	}
+	if reason != control.AckBadArgs {
+		t.Fatalf("код подтверждения незнакомой команды %d, а ждали control.AckBadArgs (%d)",
+			reason, control.AckBadArgs)
+	}
 }
