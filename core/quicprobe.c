@@ -113,6 +113,12 @@
  * заводить копию только ради другого имени типа.
  */
 #define _POSIX_C_SOURCE 200809L
+/* IP_TTL (задача 6, приманка с укороченным TTL — см. qp_send_one) не POSIX:
+ * на macOS <netinet/in.h> прячет его за этим переключателем при строгом
+ * _POSIX_C_SOURCE (проверено эмпирически на машине разработки), на Linux/glibc
+ * определение IP_TTL от этого переключателя не зависит — макрос там просто
+ * не распознаётся и ни на что не влияет. */
+#define _DARWIN_C_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -192,12 +198,49 @@ uint32_t d2k_quic_budget_s = 120;
  * и это самая дорогая из возможных ошибок. */
 #define D2K_QUIC_CLEAR_CONFIRM_REPEATS 2
 
-/* Пул адресов назначения. 8 — трём вопросам дерева (устройство/плечо после
- * прямого зонда используют по одному свежему каждый, база и прямой зонд —
- * первый) с большим запасом; цена лишних слотов на стеке нулевая, как и у
- * аналогичных констант в quic.c (D2K_QUIC_MAX_CRYPTO_CHUNKS). Потолок и на
- * ПАРАЛЛЕЛЬНЫЕ попытки одного вопроса — общий, см. quic_ask. */
-#define D2K_QUIC_MAX_ADDRS 8
+/* D2K_QUIC_MAX_ADDRS теперь в d2k_quicprobe.h (перенесена оттуда сюда) —
+ * задаче 6 (props.c) нужно знать тот же предел, чтобы завести пул того же
+ * размера для d2k_quic_build_pool; значение и обоснование там же. */
+
+/* Общая сборка пула для d2k_quic_classify и d2k_quic_pick_arm (задача 6) —
+ * см. её контракт в d2k_quicprobe.h. Вынесена сюда (не статическая), а не
+ * продублирована в props.c, по той же причине, что qp_parse_hdr не дублирует
+ * quic.c целиком, а берёт из него только согласие в вопросе "это Initial":
+ * расходиться может НАБОР полей, которые нужны разным вызывающим, но не
+ * сама логика "первый гарантированный + дедуп резолвера". */
+size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC_ADDR_LEN], size_t cap) {
+    if (cap == 0) {
+        return 0;
+    }
+    memset(pool, 0, cap * D2K_QUIC_ADDR_LEN); /* хвосты слотов детерминированы (нули), а не читаются как есть */
+    (void)strncpy(pool[0], ip, D2K_QUIC_ADDR_LEN - 1); /* длина уже проверена вызывающим */
+    size_t n_pool = 1;
+
+    char extra[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
+    memset(extra, 0, sizeof extra);
+    size_t n_extra = d2k_quic_resolve_hook(sni, extra, D2K_QUIC_MAX_ADDRS);
+    if (n_extra > D2K_QUIC_MAX_ADDRS) {
+        /* Хук обязан был вернуть не больше cap (D2K_QUIC_MAX_ADDRS), но
+           буферу всё равно, кто ошибся: без этого зажима цикл ниже читал бы
+           extra[i] за границей массива — порча памяти, а не мелочь (находка
+           9 ревью, круг 2, quic_classify). */
+        n_extra = D2K_QUIC_MAX_ADDRS;
+    }
+    for (size_t i = 0; i < n_extra && n_pool < cap; i++) {
+        int dup = 0;
+        for (size_t j = 0; j < n_pool; j++) {
+            if (strcmp(pool[j], extra[i]) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            memcpy(pool[n_pool], extra[i], D2K_QUIC_ADDR_LEN);
+            n_pool++;
+        }
+    }
+    return n_pool;
+}
 
 /* ---------------------------------------------------------------------
  * Разбор заголовка Initial — минимальное подмножество parse_initial_header
@@ -656,9 +699,17 @@ static void nap_us(uint32_t us) {
    сокета/адреса/отправки — тогда это "опыт не состоялся", d2k_tally.err, а
    не тишина). *marked — 1, если метка подтверждена или не запрошена
    (mark==0). Общая для quic_ask_ex (AEAD) и qp_ask_vn (VN) — байты есть
-   байты, отправка не знает и не обязана знать, что внутри. */
+   байты, отправка не знает и не обязана знать, что внутри.
+   prefix_ttl<=0 — TTL сокета не трогать (обычная приманка, умолчание
+   системы); prefix_ttl>0 — задача 6 (d2k_quic_ask_ttl_hook): выставить
+   IP_TTL ПЕРЕД отправкой приманки и вернуть исходное значение сокета
+   ПЕРЕД отправкой msg — trigger обязан уйти обычным TTL, иначе он тоже
+   рискует не дойти до настоящего сервера, а нам нужен его настоящий ответ.
+   IP_TTL, а не сырой сокет: это управление TTL ИСХОДЯЩЕГО сокета уровня
+   ядра, доступно на обычном SOCK_DGRAM без CAP_NET_RAW — сырой сокет в
+   этом файле нужен только фрагментации (props.c), не приманке с TTL. */
 static int qp_send_one(const char *addr, uint16_t port,
-                        const uint8_t *prefix, size_t prefix_len,
+                        const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                         d2k_hello msg, uint32_t mark, int *marked) {
     *marked = (mark == 0);
     if (!addr || !msg.bytes || msg.len == 0) {
@@ -687,9 +738,24 @@ static int qp_send_one(const char *addr, uint16_t port,
         return -1;
     }
     if (prefix && prefix_len > 0) {
+        int orig_ttl = -1;
+        if (prefix_ttl > 0) {
+            socklen_t ttl_len = sizeof orig_ttl;
+            if (getsockopt(fd, IPPROTO_IP, IP_TTL, &orig_ttl, &ttl_len) != 0) {
+                orig_ttl = -1; /* не узнали исходный — восстанавливать будет нечем, см. ниже */
+            }
+            int want = prefix_ttl;
+            (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &want, sizeof want);
+        }
         if (send(fd, prefix, prefix_len, 0) < 0) {
             close(fd);
             return -1;
+        }
+        if (prefix_ttl > 0 && orig_ttl >= 0) {
+            /* Восстановить ДО отправки trigger — иначе он тоже уйдёт с
+               укороченным TTL и рискует не дойти до настоящего сервера
+               (см. doc-комментарий d2k_quic_ask_ttl_fn). */
+            (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &orig_ttl, sizeof orig_ttl);
         }
         nap_us(D2K_QUIC_GAP_US); /* §7: пауза между кусками ВНУТРИ этой попытки */
     }
@@ -718,6 +784,16 @@ static int qp_verify_aead(const uint8_t *p, size_t n, d2k_hello msg) {
     return qp_verify_server_response(p, n, msg.bytes + dcid_off, dcid_len, version);
 }
 
+/* Тонкая публичная обёртка над qp_verify_aead — задаче 6 (props.c, реальный
+ * отправитель фрагментации) нужна та же проверка подлинности ответа, что и
+ * обычным вопросам дерева, а не собственная копия расшифровки: это ровно тот
+ * код, что уже прошёл несколько кругов ревью (см. qp_verify_server_response),
+ * дублировать его для одного вызывающего было бы тем самым риском
+ * расхождения, который в проекте уже отмечен для других копий. */
+int d2k_quic_verify_response(const uint8_t *p, size_t n, d2k_hello msg) {
+    return qp_verify_aead(p, n, msg);
+}
+
 static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
     (void)msg;
     return qp_looks_like_vn(p, n) ? 0 : -1;
@@ -739,9 +815,14 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    величины считают ВСЕ repeats попыток, просто по разным категориям), значит
    "измеренное вместо литерала" был тем же литералом другими словами;
    sent_out — единственное поле, которое на самом деле отличает "запрошено"
-   от "запрошено И отправлено". */
+   от "запрошено И отправлено".
+   prefix_ttl — см. qp_send_one; статический параметр этого файла, НЕ часть
+   типажа d2k_quic_ask_fn (все существующие вызовы дерева вопросов передают
+   0 — "не трогать", им TTL-приём не нужен, а расширять уже рассмотренный
+   ревью публичный контракт ради одного вызывающего задачи 6 значило бы
+   тащить лишний параметр через всё дерево). */
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
-                              const uint8_t *prefix, size_t prefix_len,
+                              const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, qp_verify_fn verify) {
@@ -800,7 +881,7 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     int pending = 0;
 
     for (int i = 0; i < repeats; i++) {
-        fds[i] = qp_send_one(addr, port, prefix, prefix_len, msg, mark, &marked[i]);
+        fds[i] = qp_send_one(addr, port, prefix, prefix_len, prefix_ttl, msg, mark, &marked[i]);
         if (!marked[i]) {
             t.marked = 0;
         }
@@ -918,7 +999,7 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, msg, wait_ms, mark, repeats, rtt_ms_out,
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, msg, wait_ms, mark, repeats, rtt_ms_out,
                         refused_out, sent_out, qp_verify_aead);
 }
 
@@ -943,9 +1024,22 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     d2k_hello msg;
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
-    return quic_ask_ex(addr, port, NULL, 0, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
+    return quic_ask_ex(addr, port, NULL, 0, 0, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
                         sent_out, qp_verify_vn);
 }
+
+/* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
+   см. doc-комментарий d2k_quic_ask_ttl_fn в d2k_quicprobe.h. rtt/refused не
+   нужны ни одному вызывающему d2k_quic_pick_arm (RTT там берётся из уже
+   пройденного d2k_quic_classify, refused — различие, нужное только базовой
+   живости дерева вопросов). */
+static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
+                               int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
+                               int repeats, int *sent_out) {
+    return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, msg, wait_ms, mark, repeats, NULL,
+                        NULL, sent_out, qp_verify_aead);
+}
+d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
 /* Реальный оракул — умолчание d2k_quic_ask_hook (см. d2k_quicprobe.h про то,
    зачем этот хук вообще существует). Дерево ниже зовёт ИСКЛЮЧИТЕЛЬНО хук, не
@@ -1102,35 +1196,10 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
     /* Пул адресов: ip — первый и гарантированный (это ровно тот адрес, для
        которого нас позвали), остальное — из резолвера, с отбросом дублей
        (иначе "свежий" адрес мог бы совпасть с уже использованным, и ротация
-       была бы фиктивной). */
+       была бы фиктивной). Сборка общая с d2k_quic_pick_arm (задача 6) — см.
+       d2k_quic_build_pool. */
     char pool[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
-    memset(pool, 0, sizeof pool); /* хвосты слотов детерминированы (нули), а не читаются как есть */
-    (void)strncpy(pool[0], ip, D2K_QUIC_ADDR_LEN - 1); /* длина уже проверена guard'ом выше */
-    size_t n_pool = 1;
-
-    char extra[D2K_QUIC_MAX_ADDRS][D2K_QUIC_ADDR_LEN];
-    memset(extra, 0, sizeof extra);
-    size_t n_extra = d2k_quic_resolve_hook(sni, extra, D2K_QUIC_MAX_ADDRS);
-    if (n_extra > D2K_QUIC_MAX_ADDRS) {
-        /* Хук обязан был вернуть не больше cap (D2K_QUIC_MAX_ADDRS), но
-           буферу всё равно, кто ошибся: без этого зажима цикл ниже читал бы
-           extra[i] за границей массива — порча памяти, а не мелочь (находка
-           9 ревью, круг 2). */
-        n_extra = D2K_QUIC_MAX_ADDRS;
-    }
-    for (size_t i = 0; i < n_extra && n_pool < D2K_QUIC_MAX_ADDRS; i++) {
-        int dup = 0;
-        for (size_t j = 0; j < n_pool; j++) {
-            if (strcmp(pool[j], extra[i]) == 0) {
-                dup = 1;
-                break;
-            }
-        }
-        if (!dup) {
-            memcpy(pool[n_pool], extra[i], D2K_QUIC_ADDR_LEN);
-            n_pool++;
-        }
-    }
+    size_t n_pool = d2k_quic_build_pool(ip, sni, pool, D2K_QUIC_MAX_ADDRS);
     size_t next_addr = 1; /* pool[0] занят базовой живостью/прямым зондом/шагом 2 — см. шапку файла */
 
     int all_marked = 1;
