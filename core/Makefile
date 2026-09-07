@@ -20,23 +20,24 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
-          include/d2k_quicprobe.h
+          include/d2k_quicprobe.h include/d2k_hello.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
 # QUIC не трогают сеть, вход — байтовые вектора RFC, а не петля-мишень.
 # test_quicprobe и test_quic_arms заводят СВОЙ стенд каждый (датаграммный, не
 # потоковый — см. их шапки) и в TESTHDR не входят: они не общие ни с кем и
-# друг с другом (задача 6 подменяет ДРУГИЕ крючки, чем задача 5).
+# друг с другом (задача 6 подменяет ДРУГИЕ крючки, чем задача 5). test_hello
+# тоже без стенда: вход — снятые байты и встроенные профили, не сеть.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -65,6 +66,31 @@ quicprobe.o: quicprobe.c $(HDR)
 props.o: props.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# core/hello_profiles.inc — приветствия холодного старта, встроенные в
+# бинарник (см. шапку hello.c про то, почему не путь к файлу). Собирается
+# ИЗ profiles/*.hex МЕХАНИЧЕСКИ: вырезаются комментарии (строки на '#') и все
+# пробелы/переводы строк, остаётся чистая шестнадцатеричная строка — эта
+# цель не решает, что внутри профиля, только переносит текст в компилируемый
+# вид. Сам .inc в git не идёт (core/* в .gitignore, .hex — намеренное
+# исключение из него, .inc — нет): это вывод сборки, источник — только .hex.
+hello_profiles.inc: profiles/modern.hex profiles/legacy.hex
+	@rm -f $@
+	@echo "/* Сгенерировано из profiles/ (*.hex) core/Makefile'ом. Правь исходники, не этот файл. */" > $@
+	@for name in modern legacy; do \
+		hex=$$(grep -v '^#' profiles/$$name.hex | tr -cd '0-9a-fA-F'); \
+		len=$${#hex}; \
+		if [ $$((len % 2)) -ne 0 ]; then \
+			echo "profiles/$$name.hex: нечётное число шестнадцатеричных цифр" >&2; \
+			exit 1; \
+		fi; \
+		printf 'static const char d2k_profile_%s_hex[] = "%s";\n' "$$name" "$$hex" >> $@; \
+	done
+
+# hello.c #include'ит hello_profiles.inc напрямую (см. его шапку) — без
+# этого правила предыдущей сборки объектник просто не найдёт файл.
+hello.o: hello.c $(HDR) hello_profiles.inc
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -82,6 +108,9 @@ test_quicprobe: test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(HDR)
 
 test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
+
+test_hello: test_hello.c hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_hello.c hello.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
@@ -101,13 +130,16 @@ test-quicprobe: test_quicprobe
 test-quic-arms: test_quic_arms
 	./test_quic_arms
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms
+test-hello: test_hello
+	./test_hello
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude
-san:
+san: hello_profiles.inc
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
@@ -120,7 +152,7 @@ san:
 # расходятся в предупреждениях (см. датапат). Компиляция без запуска: тут
 # важны предупреждения, а исполняются те же тесты обычной целью check.
 GCC ?= mipsel-unknown-linux-gnu-gcc
-gcc-warn:
+gcc-warn: hello_profiles.inc
 	@for f in $(SRC) $(TESTS:=.c); do \
 		$(GCC) $(CFLAGS) -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
 	done
@@ -132,7 +164,7 @@ gcc-warn:
 # той же причине, что d2kd в датапате: раздельная компиляция объектников не
 # доказывает, что именно эта комбинация (включая pthread на musl и glibc)
 # слинкуется.
-cross:
+cross: hello_profiles.inc
 	@for f in $(SRC); do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-core-a64.o $$f || exit 1; \
@@ -167,7 +199,12 @@ cross:
 		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
 		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+	@echo "== test_hello целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
+		test_hello.c hello.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_hello-mipsel \
+		test_hello.c hello.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
-	rm -f *.o $(TESTS)
+	rm -f *.o $(TESTS) hello_profiles.inc
