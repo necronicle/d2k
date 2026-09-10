@@ -20,9 +20,9 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
-          include/d2k_quicprobe.h include/d2k_hello.h
+          include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -31,13 +31,15 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # потоковый — см. их шапки) и в TESTHDR не входят: они не общие ни с кем и
 # друг с другом (задача 6 подменяет ДРУГИЕ крючки, чем задача 5). test_hello
 # тоже без стенда: вход — снятые байты и встроенные профили, не сеть.
+# test_catalog тоже без стенда: вход — файл на диске (testdata/catalog-real.json,
+# снимок с роутера) и синтетические JSON-обрывки, которые тест пишет сам, не сеть.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -91,6 +93,13 @@ hello_profiles.inc: profiles/modern.hex profiles/legacy.hex
 hello.o: hello.c $(HDR) hello_profiles.inc
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Каталог (задача 1): свой разбор JSON поверх файла, который читает и
+# Go-панель (см. шапку d2k_catalog.h). Ни от одного другого модуля ядра не
+# зависит и ни один не зависит от него — планировщик (задача 5) свяжет его
+# с остальными.
+catalog.o: catalog.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -111,6 +120,9 @@ test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(HD
 
 test_hello: test_hello.c hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_hello.c hello.o $(TEST_LDFLAGS)
+
+test_catalog: test_catalog.c catalog.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_catalog.c catalog.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
@@ -133,7 +145,10 @@ test-quic-arms: test_quic_arms
 test-hello: test_hello
 	./test_hello
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello
+test-catalog: test_catalog
+	./test_catalog
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -204,6 +219,11 @@ cross: hello_profiles.inc
 		test_hello.c hello.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_hello-mipsel \
 		test_hello.c hello.c -lpthread || exit 1
+	@echo "== test_catalog целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_catalog-a64 \
+		test_catalog.c catalog.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_catalog-mipsel \
+		test_catalog.c catalog.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:

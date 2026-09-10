@@ -1,0 +1,3163 @@
+{
+  "schema": 1,
+  "updated": "2026-09-07T07:13:56.07020056Z",
+  "boxes": [
+    {
+      "id": "box-fb5f3532",
+      "created": "2026-09-06T04:08:02.8376028Z",
+      "updated": "2026-09-07T07:03:57.719928Z",
+      "fingerprint": {
+        "method": 2,
+        "signals": [
+          {
+            "kind": "rst",
+            "ttl": 126,
+            "ttl_delta": 40,
+            "tos": 136,
+            "ipid": 54321,
+            "seen": 105
+          }
+        ]
+      },
+      "plans": [
+        {
+          "id": "plan-e2ebe9cd",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npayload 2 41\npoison 1 badsum\nsplit hello_middle +0\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\nseqovl payload=2 poison=0\norder reverse\n",
+          "added": "2026-09-06T04:08:02.8376028Z",
+          "successes": 4,
+          "enabled": true
+        },
+        {
+          "id": "plan-87bbf136",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 41\nseqovl payload=1 poison=0\norder forward\n",
+          "added": "2026-09-06T04:09:29.08957744Z",
+          "successes": 48,
+          "enabled": true
+        }
+      ],
+      "bindings": [
+        {
+          "kind": "name",
+          "target": "www.instagram.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T08:08:05.97337096Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.facebook.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T04:09:03.37994432Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static.cdninstagram.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T18:36:42.09963088Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "scontent-arn2-1.cdninstagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:11:19.53179824Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "graph.facebook.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T04:30:28.0812348Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.bdsmhole.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T05:08:30.03901144Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "z-m-gateway.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T20:05:33.97021264Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "yt3.ggpht.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T20:10:34.85070936Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "graph.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T10:05:15.58096792Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "1174c17d-30cb-4341-8b25-72607aac62cb-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T10:06:39.83632312Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "60d494a5-777b-4487-b91f-703eaede0f24-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T10:18:13.08254624Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "96c6df85-808b-4082-a218-b35905c4b87a-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T10:39:51.34790192Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "81df610e-9611-43a7-aaab-ca28d48410eb-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T11:03:10.34524552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "767fd4d1-cf66-457f-87e5-8f3769a8db75-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T11:16:05.71845336Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "test-gateway.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T16:59:59.69566152Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-07T01:00:32.68339032Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "68a6eb6c-76c8-46a9-99d0-700959fa556a-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T12:18:40.64744952Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "scontent-arn2-1.xx.fbcdn.net",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T12:35:42.68616128Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "i.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:22:58.49059344Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static.xx.fbcdn.net",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:01:34.23273952Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.fbsbx.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:02:48.65264352Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "reg-e2ee.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:03:00.21057008Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "gateway.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:03:03.41541344Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "web-chat-e2ee.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:03:33.44733008Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "edge-chat.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:05:07.14435624Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "gateway.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:11:21.14048224Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "meduza.io",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:08:39.99657688Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "flowerpower.meduza.io",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:11:06.02841056Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "scontent.xx.fbcdn.net",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T18:36:33.52859048Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "edge-chat.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:11:58.3150552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "rutor.info",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:18:02.96452192Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "api.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:40:00.49446232Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "v4.xz.fbcdn.net",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:40:12.87207696Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "784188c4-5cf1-430e-8593-938d2bfa4b07-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T16:01:16.1707756Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "4393d1b8-d834-4415-aa2a-9598b34f8ef0-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T16:52:15.4047196Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "edge-mqtt.facebook.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T17:14:26.93083368Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "2edaa5c6-f43d-4157-b367-a627ee2e69ab-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T17:19:45.0499996Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "scontent-hel3-1.cdninstagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T18:23:02.58809232Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "53af4ccf-665b-4205-a74f-7e83fdf8441a-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T18:27:39.93549872Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "cdn.fbsbx.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T18:53:42.17068288Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "53e7cba2-5511-47d3-b83c-b8e3292335da-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T18:40:35.82313928Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "50f0b8bc-6328-4f46-a0ab-0ff1b34ee5a4-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T18:48:57.00764584Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "bbbac3ea-3ebf-4db8-ba8a-11165d46a7c7-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T18:57:19.34093016Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "0da53eec-ff7d-48db-8fd9-bdc24726c7d2-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T19:05:39.88775264Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "api.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-07T01:00:38.66668208Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "instagram.c10r.instagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T01:00:39.669542Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "scontent.cdninstagram.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-07T05:49:45.81326432Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "0edae43b-06dd-4046-96c3-e718be8b5640-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T06:25:29.84258968Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "5fcf2527-43c8-46b7-bf2e-dd17336e90d8-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T07:03:57.719928Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "box-2457aa8f",
+      "created": "2026-09-06T04:08:07.95694392Z",
+      "updated": "2026-09-07T07:13:56.07020056Z",
+      "fingerprint": {
+        "method": 2,
+        "signals": [
+          {
+            "kind": "repeat",
+            "seen": 473
+          },
+          {
+            "kind": "silent",
+            "seen": 3540
+          },
+          {
+            "kind": "rst",
+            "ttl": 55,
+            "tos": 112,
+            "ipid": 9296,
+            "seen": 1
+          }
+        ]
+      },
+      "plans": [
+        {
+          "id": "plan-e2ebe9cd",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npayload 2 41\npoison 1 badsum\nsplit hello_middle +0\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\nseqovl payload=2 poison=0\norder reverse\n",
+          "added": "2026-09-06T04:08:07.95694392Z",
+          "successes": 110,
+          "enabled": true
+        },
+        {
+          "id": "plan-8485f6d4",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npoison 1 badsum\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\norder forward\n",
+          "added": "2026-09-06T04:38:54.42539312Z",
+          "successes": 1994,
+          "enabled": true
+        },
+        {
+          "id": "plan-87bbf136",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 41\nseqovl payload=1 poison=0\norder forward\n",
+          "added": "2026-09-06T04:55:42.31193184Z",
+          "successes": 68,
+          "enabled": true
+        },
+        {
+          "id": "plan-16cf1120",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\nsplit hello_middle +0\norder reverse\n",
+          "added": "2026-09-06T07:30:55.75457464Z",
+          "successes": 12,
+          "enabled": true
+        },
+        {
+          "id": "plan-24ef7fca",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 41414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141\npoison 1 badsum\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n",
+          "added": "2026-09-06T14:23:04.02112216Z",
+          "successes": 36,
+          "enabled": true
+        },
+        {
+          "id": "plan-8aa11a82",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\nsplit payload_start +1\nsplit sni_middle +0\norder reverse\n",
+          "added": "2026-09-06T20:09:17.10454456Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "id": "plan-b8d4f81b",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npoison 1 badsum\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n",
+          "added": "2026-09-07T00:27:24.5012904Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ],
+      "bindings": [
+        {
+          "kind": "addr",
+          "target": "157.240.0.174",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T14:01:36.75377424Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static.whatsapp.net",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T10:06:36.15563288Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "dit.whatsapp.net",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T06:25:28.24262968Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.35",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T13:59:42.884856Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "play.google.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T14:12:57.31428256Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.253.152.138",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:26.90635968Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "34.110.196.231",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:45.87791104Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "abp.telemetry.adblockplus.org",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:26.91844032Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.244.192",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T14:11:19.05792392Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.72.53",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:30.02845848Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "discord.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:48.31358904Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.0.13",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:14:47.828964Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "moonbabeats.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:51:16.11021312Z",
+          "successes": 5,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.mylifesxthunder.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T10:29:43.62882248Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "graph.whatsapp.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T14:01:31.4572816Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "crashlogs.whatsapp.net",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:38:07.77748896Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.organicskymobilmotor.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:38:12.13551808Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "2.16.20.35",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:38:12.24299152Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "146.75.118.132",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:38:13.30702632Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.245.32",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-07T05:46:00.73781832Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "23.219.36.140",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-06T04:38:18.16613576Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ps1.blockme.site",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:13:56.07020056Z",
+          "successes": 342,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "i.ytimg.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T19:11:54.61963288Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "107.189.5.83",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:08:57.01276448Z",
+          "successes": 411,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "2gis.ru",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-07T06:35:39.25930048Z",
+          "successes": 97,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ad.adriver.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:35:38.71066984Z",
+          "successes": 97,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "300.ya.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T05:45:42.0003032Z",
+          "successes": 91,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "742231.ms.ok.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:35:48.77816672Z",
+          "successes": 115,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "hcaptcha.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T05:45:36.26908232Z",
+          "successes": 90,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a1-eu.iot334.com",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T05:13:45.16976832Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "165.154.143.244",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T05:13:49.47750592Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "vk.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:35:02.57328408Z",
+          "successes": 83,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "adm.mp.rzd.ru",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-07T04:21:50.46733896Z",
+          "successes": 90,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.119.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:10:57.0142924Z",
+          "successes": 3,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.115.4",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T05:44:33.10667696Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "3475482542.mc.yandex.ru",
+          "plan_id": "plan-24ef7fca",
+          "level": 3,
+          "confirmed": "2026-09-07T05:53:09.40370112Z",
+          "successes": 129,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "2gis.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:04:34.07368008Z",
+          "successes": 87,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "trs-drru.push.hihonorcloud.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T08:25:51.5633232Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.40",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:16:18.9975284Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ad.mail.ru",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-07T05:45:56.89393136Z",
+          "successes": 80,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "backapi-m.rustore.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:22:38.1251576Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "disk.rzd.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:04:21.37318696Z",
+          "successes": 75,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a.wb.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:35:56.59701576Z",
+          "successes": 87,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "tvax1.sinaimg.cn",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:22:46.51574568Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "199.232.174.137",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:22:49.63935672Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.18.167.46",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T10:52:03.21485032Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "yastatic.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T08:30:58.51949984Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.199.37.229",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:39:58.5929816Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.23.230",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:40:34.53491024Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ru.nextlgsdp.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T06:42:40.99525568Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.161.198",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T19:14:36.104348Z",
+          "successes": 5,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.117.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:43:17.71537896Z",
+          "successes": 5,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "web.whatsapp.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T01:00:45.08758848Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.249.32",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T07:45:49.46619432Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "http-intake.logs.us5.datadoghq.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:15:08.58910128Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "87.245.200.82",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:03:41.50539752Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static-ww.cdn.ubi.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:16:57.74541992Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.googleadservices.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:44:32.69800032Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a281.dscw7.akamai.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T09:15:54.13827784Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "reef.vk-cdn.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:43:09.70828Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "199.232.174.132",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:16:04.18773608Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.248.141",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:53:40.27583344Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a1796.dscd.akamai.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:08:09.32092784Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "23.196.236.25",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T09:56:01.31594248Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.0.63",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:04:04.03642184Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.163.156",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:05:25.53961256Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ad.doubleclick.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:02:11.84473304Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.250.180.2",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:05:39.49467696Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.236.32",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:06:48.33474376Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "23.73.2.136",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:08:12.54342624Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "18.225.185.242",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:08:45.52312912Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.235.174.212",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T10:10:00.54588456Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.238.41",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:18:19.4338112Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "87.245.198.138",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:29:55.25114104Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.18.166.46",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T15:59:39.36571208Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "cdn.discordapp.com",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T12:57:12.0143512Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.25.39",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:40:00.0141088Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "rootsyngrey.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T10:51:13.24559096Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "wx2.sinaimg.cn",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T10:51:13.2963424Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "79.127.216.112",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:51:21.41541984Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "159.223.244.34",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:51:21.41544712Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.122.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T10:51:21.86920488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.greatpractice.org",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T10:51:24.50031112Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "139.59.201.18",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T10:51:30.43223744Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "2.16.21.75",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T10:51:30.4785936Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.26.33",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:03:17.85842352Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "188.72.103.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:05:18.4923072Z",
+          "successes": 5,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.18.165.46",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T16:09:36.5378428Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.16.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:16:11.79665152Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "gw.alicdn.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:37:51.27171184Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "3.96.67.186",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:16:38.89368464Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.199.37.225",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:16:40.16809192Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "novaroutelocalbell.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T11:22:54.35746848Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "82.163.78.26",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T11:23:00.26918664Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "209.85.233.154",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:24:49.4142968Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "s3.amazonaws.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:44:01.23216376Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "basket-16.wbbasket.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T11:44:01.64182016Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "79.127.216.111",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:44:07.15322384Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "16.15.199.3",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:44:07.27206288Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "shp.gtimg.cn",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T11:49:51.01140688Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "3.148.202.18",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T11:49:56.8077388Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "pss.bdstatic.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:03:40.26175344Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.234.111.122",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:03:46.26907512Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.142",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:05:00.15584224Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.253.174",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:05:45.15992552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.leepartschecks.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:05:52.28117488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "34.245.56.1",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:18:32.80006576Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.72.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:18:48.4243128Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.72.12",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:34:24.81857496Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "chatgpt.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T23:43:54.45110824Z",
+          "successes": 4,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "70.34.211.185",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:41:39.9170128Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "b-cdn.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:01:13.49058848Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.199.37.227",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:43:12.03053096Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.68.204.218",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T12:46:55.5357108Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.youtube.com",
+          "plan_id": "plan-8aa11a82",
+          "level": 2,
+          "confirmed": "2026-09-06T20:09:17.10454456Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.182.247.132",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:54:17.88082312Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "16.148.53.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T12:54:24.56409688Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "gateway.discord.gg",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T15:01:12.82727224Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "caddydantemplate.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T13:03:11.86202088Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "51.20.119.58",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T13:03:16.22527464Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "fonts.gstatic.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:48:57.8286276Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.233.233.33",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:04:38.95267592Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "logs.ads.vungle.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:26:27.61153736Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.248.192",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:03.70965304Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.250.150.155",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:40.48342408Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "easylist-downloads.adblockplus.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:11:06.501872Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "173.194.221.138",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:49.22578128Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "212.188.39.51",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:52.29536816Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "pagead2.googlesyndication.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T13:58:55.22126664Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.11",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T13:58:58.40151312Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.67.200.226",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T13:59:21.56613456Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.1",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:01:54.5641016Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.21",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:03:01.4339848Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.55",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:03:09.47911712Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.248.1",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:03:21.16101648Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.21.44.147",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:04:38.8388116Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.63",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:05:12.23121688Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "meduza.io",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:20:01.49362504Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "8.47.69.0",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:08:12.73566824Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "stats.g.doubleclick.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:18:47.68405224Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "8.6.112.6",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:11:09.97389536Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.72.36",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:11:19.30515488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "173.194.221.113",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:11:24.23957688Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "209.85.233.157",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:13:19.40771424Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "whatsapp.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:14:30.0418528Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.67.152.117",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T14:17:34.05212944Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "193.46.255.29",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:18:07.36652392Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.251.150.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:51:24.84372144Z",
+          "successes": 26,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "74.125.131.154",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:19:34.1727828Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static.doubleclick.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T20:10:35.1414924Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.21.74.5",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:20:37.3931316Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "czhkhrf.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:20:46.41861304Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "188.43.78.64",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:20:55.2972612Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "api16-access-wf-sg.pangle.io",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:21:25.30160048Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "api.x.com",
+          "plan_id": "plan-24ef7fca",
+          "level": 3,
+          "confirmed": "2026-09-06T14:40:25.04460896Z",
+          "successes": 3,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "video.twimg.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:40:28.29678336Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "pbs.twimg.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T14:40:37.47086936Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.amateurpicscoopdashboard.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:29:22.16109104Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "54.92.45.234",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:31:36.13016536Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.38",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:40:19.37023504Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "pubads.g.doubleclick.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T14:41:00.48065632Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "cdn1.unrealengine.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T14:53:48.4232568Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.18.168.46",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-06T16:36:01.49776336Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.197.242.100",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T15:14:14.91945648Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "mmbiz.qpic.cn",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T15:39:34.39067016Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.24.229.90",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T15:39:40.45587736Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "209.38.116.242",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T15:44:06.28945384Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "i.scdn.co",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T15:46:31.63008312Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.twitterteacher.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T15:59:24.97818168Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "3.145.114.138",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T15:59:33.30284456Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "18.141.200.114",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:00:39.96477504Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "avatars.mds.yandex.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:34:14.65710616Z",
+          "successes": 4,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "159.65.210.218",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:01:21.9494396Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.96.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:01:25.46529096Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "puui.gtimg.cn",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:07:13.10576408Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "79.72.19.2",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:07:19.16986176Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "m701.music.126.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:09:42.0498024Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "169.150.247.33",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:09:48.16498552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.allianceedu.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:11:43.53161152Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "138.199.37.231",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:11:55.48665472Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "12559c3a-926f-47dd-9043-607a3f76079b-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:25:22.30732528Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.224.41",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:25:28.56874648Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.164.156",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:39:55.23303504Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "3.38.207.97",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T16:33:30.90912888Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.80.35",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T16:52:24.1901288Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "104.18.164.46",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T16:52:27.23741672Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a642.na.akamai.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:00:09.0435996Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "62.210.237.124",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T17:00:12.30409824Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "2.16.168.117",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:00:15.15158552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "www.classifiedsmix.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:12:38.9559772Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "51.159.118.66",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:12:43.38861544Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.205.19",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:14:30.01658624Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "8.6.112.0",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:18:46.6003884Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.72.35",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:19:50.73294912Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.113.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:47:59.8414528Z",
+          "successes": 4,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.251.151.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T20:11:06.62158648Z",
+          "successes": 12,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "173.194.221.102",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:21:49.04687512Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.251.157.6",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:22:22.59758192Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.253.152.154",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:25:15.04871272Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.114.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:30:16.03774176Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "lol.secure.dyn.riotcdn.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:38:13.48357784Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "49b8e58f-a897-450f-abf7-feca7683bdd8-netseer-ipaddr-assoc.xz.fb",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T17:40:20.70296048Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.196.38",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T17:40:26.901248Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.116.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:16:20.28703304Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "cjllu.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T18:18:00.78881864Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.234.109.34",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:16:04.14806552Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.212.38",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:27:46.00536696Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "googleads.g.doubleclick.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:31:19.31208672Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.238.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:40:42.24356032Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.80.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:49:04.47685944Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.82.35",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T18:57:27.44461064Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "51.159.176.100",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T19:01:08.55314744Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "31.13.73.34",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:05:46.00303864Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "157.240.27.33",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:11:34.01432096Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.251.156.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:15:41.87994536Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "142.251.157.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T19:47:41.57869264Z",
+          "successes": 18,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.165.149",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-06T20:40:34.9022512Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.162.119",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T20:59:25.72940984Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.112.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:43:35.63753992Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "144.31.38.0",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-06T23:57:17.11895488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "54.196.100.238",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:30:35.92387488Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "62.4.10.75",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T00:30:32.96276488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "185.112.82.170",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 3,
+          "confirmed": "2026-09-07T00:35:39.2237852Z",
+          "successes": 3,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "cs.avito.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:32:54.92861088Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "eh.vk.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:32:54.92871696Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "dzen.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:32:54.93942184Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "94.136.190.9",
+          "plan_id": "plan-87bbf136",
+          "level": 3,
+          "confirmed": "2026-09-07T00:33:10.01643776Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "mediafeeds.yandex.com",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T00:33:16.0524256Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "mddc.tinkoff.ru",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T00:33:16.05250424Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "mediafeeds.yandex.ru",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T00:33:16.05254736Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "mc.yandex.ru",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T00:33:16.05259456Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "metrics.alfabank.ru",
+          "plan_id": "plan-87bbf136",
+          "level": 2,
+          "confirmed": "2026-09-07T00:33:16.05266808Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "speller.yandex.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:35:21.94567544Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "sfd.gosuslugi.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:35:21.97114136Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "splitter.wb.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T00:35:21.97824456Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "media.discordapp.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T04:04:56.93129488Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "13.60.104.88",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:34:50.4329996Z",
+          "successes": 10,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "54.179.148.226",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T05:50:56.41420544Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "vincatholicgrab.org",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T05:55:54.02456088Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "79.76.38.42",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T05:56:00.0520056Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "172.217.118.4",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:01:06.67796264Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "dc1-cf.ksn.kaspersky-labs.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T06:08:36.4570736Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ae-pic-a1.aliexpress-media.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:18:14.36766576Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "57.144.84.5",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:25:39.11219984Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "64.233.163.149",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T06:29:00.85106192Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "castluxuryglass.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T06:36:14.594068Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "159.89.220.114",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T07:05:22.04702528Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "2.19.181.88",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:05:26.93075856Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "static.wbstatic.net",
+          "plan_id": "plan-8485f6d4",
+          "level": 2,
+          "confirmed": "2026-09-07T07:06:23.77862472Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "47.128.72.194",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:06:26.78327224Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "169.150.247.39",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T07:06:28.06282744Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "box-3764d22a",
+      "created": "2026-09-06T04:08:26.14378408Z",
+      "updated": "2026-09-07T05:46:54.53736184Z",
+      "fingerprint": {
+        "method": 2,
+        "signals": [
+          {
+            "kind": "silent",
+            "seen": 388
+          },
+          {
+            "kind": "volume",
+            "volume": 19,
+            "seen": 76
+          },
+          {
+            "kind": "repeat",
+            "seen": 1
+          },
+          {
+            "kind": "rst",
+            "ttl": 55,
+            "tos": 112,
+            "ipid": 51451,
+            "seen": 1
+          }
+        ]
+      },
+      "plans": [
+        {
+          "id": "plan-e2ebe9cd",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npayload 2 41\npoison 1 badsum\nsplit hello_middle +0\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\nseqovl payload=2 poison=0\norder reverse\n",
+          "added": "2026-09-06T04:08:26.14378408Z",
+          "successes": 43,
+          "enabled": true
+        },
+        {
+          "id": "plan-8485f6d4",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npoison 1 badsum\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\norder forward\n",
+          "added": "2026-09-06T04:14:10.40504488Z",
+          "successes": 107,
+          "enabled": true
+        },
+        {
+          "id": "plan-87bbf136",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 41\nseqovl payload=1 poison=0\norder forward\n",
+          "added": "2026-09-06T04:24:20.10444888Z",
+          "successes": 5,
+          "enabled": true
+        },
+        {
+          "id": "plan-16cf1120",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\nsplit hello_middle +0\norder reverse\n",
+          "added": "2026-09-06T22:16:09.13009384Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "id": "plan-b8d4f81b",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npoison 1 badsum\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n",
+          "added": "2026-09-07T00:48:11.18775224Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "id": "plan-24ef7fca",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 41414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141\npoison 1 badsum\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n",
+          "added": "2026-09-07T03:05:53.97156616Z",
+          "successes": 2,
+          "enabled": true
+        },
+        {
+          "id": "plan-8aa11a82",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\nsplit payload_start +1\nsplit sni_middle +0\norder reverse\n",
+          "added": "2026-09-07T05:46:28.68943888Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ],
+      "bindings": [
+        {
+          "kind": "name",
+          "target": "hcaptcha.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-06T23:16:25.07596592Z",
+          "successes": 9,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "2.19.181.97",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:24.1587248Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "easylist-downloads.adblockplus.org",
+          "plan_id": "plan-e2ebe9cd",
+          "level": 2,
+          "confirmed": "2026-09-06T04:09:29.05973984Z",
+          "successes": 1,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ps1.blockme.site",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-06T04:35:26.1871528Z",
+          "successes": 6,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "3475482542.mc.yandex.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T03:03:41.10783432Z",
+          "successes": 10,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "742231.ms.ok.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T05:45:19.07615968Z",
+          "successes": 17,
+          "enabled": true
+        },
+        {
+          "kind": "addr",
+          "target": "107.189.5.83",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T05:46:54.53736184Z",
+          "successes": 39,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "disk.rzd.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T04:16:37.0757824Z",
+          "successes": 8,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "vk.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-06T23:19:27.12917232Z",
+          "successes": 11,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "300.ya.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T03:05:31.74833456Z",
+          "successes": 9,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "2gis.com",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T01:15:04.0754748Z",
+          "successes": 9,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ad.adriver.ru",
+          "plan_id": "plan-8aa11a82",
+          "level": 4,
+          "confirmed": "2026-09-07T05:46:28.68943888Z",
+          "successes": 10,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "a.wb.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T03:05:00.934058Z",
+          "successes": 8,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "ad.mail.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T04:21:46.07585896Z",
+          "successes": 7,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "adm.mp.rzd.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T03:25:04.07552856Z",
+          "successes": 10,
+          "enabled": true
+        },
+        {
+          "kind": "name",
+          "target": "2gis.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 4,
+          "confirmed": "2026-09-07T04:20:35.57731816Z",
+          "successes": 6,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "box-ebdd4506",
+      "created": "2026-09-07T00:30:39.875926Z",
+      "updated": "2026-09-07T00:30:39.875926Z",
+      "fingerprint": {
+        "method": 2,
+        "signals": [
+          {
+            "kind": "rst",
+            "ttl": 55,
+            "tos": 112,
+            "ipid": 33988,
+            "seen": 1
+          },
+          {
+            "kind": "rst",
+            "ttl": 52,
+            "tos": 112,
+            "ipid": 5739,
+            "seen": 1
+          },
+          {
+            "kind": "rst",
+            "ttl": 55,
+            "tos": 112,
+            "ipid": 48320,
+            "seen": 1
+          },
+          {
+            "kind": "rst",
+            "ttl": 55,
+            "tos": 112,
+            "ipid": 22080,
+            "seen": 1
+          },
+          {
+            "kind": "silent",
+            "seen": 2
+          }
+        ]
+      },
+      "plans": [
+        {
+          "id": "plan-8485f6d4",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 16030100520100004e0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000a130113021303c02bc02f0100001b00000010000e00000b6469736b2e727a642e7275002b0003020304\npoison 1 badsum\nfake payload=1 poison=1 repeats=2 gap_us=20000 place=before\norder forward\n",
+          "added": "2026-09-07T00:30:39.875926Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ],
+      "bindings": [
+        {
+          "kind": "name",
+          "target": "disk.rzd.ru",
+          "plan_id": "plan-8485f6d4",
+          "level": 3,
+          "confirmed": "2026-09-07T00:30:42.64994888Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "box-c8f6a39d",
+      "created": "2026-09-07T06:23:09.78481168Z",
+      "updated": "2026-09-07T06:23:09.78481168Z",
+      "fingerprint": {
+        "method": 2,
+        "signals": [
+          {
+            "kind": "rst",
+            "ttl": 58,
+            "tos": 112,
+            "seen": 1
+          }
+        ]
+      },
+      "plans": [
+        {
+          "id": "plan-8e1f58c7",
+          "proto": "tls",
+          "text": "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\nsplit payload_start +1\norder forward\n",
+          "added": "2026-09-07T06:23:09.78481168Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ],
+      "bindings": [
+        {
+          "kind": "name",
+          "target": "avatars.mds.yandex.net",
+          "plan_id": "plan-8e1f58c7",
+          "level": 2,
+          "confirmed": "2026-09-07T06:23:09.78481168Z",
+          "successes": 1,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
