@@ -20,7 +20,7 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
@@ -33,13 +33,16 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # тоже без стенда: вход — снятые байты и встроенные профили, не сеть.
 # test_catalog тоже без стенда: вход — файл на диске (testdata/catalog-real.json,
 # снимок с роутера) и синтетические JSON-обрывки, которые тест пишет сам, не сеть.
+# test_match тоже без стенда: сравнивает уже разобранные d2k_cat_fp (свои,
+# сконструированные inline, и настоящие — из того же testdata/catalog-real.json),
+# сети и файловой записи не касается вовсе.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -100,6 +103,13 @@ hello.o: hello.c $(HDR) hello_profiles.inc
 catalog.o: catalog.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Узнавание коробки (задача 2): сравнение d2k_cat_fp с допуском поверх типов
+# catalog.c (задача 1) — см. шапку match.c и d2k_fp_same/d2k_catalog_match в
+# d2k_catalog.h. От catalog.c зависит только по заголовку (типы), не по
+# символам, поэтому .o собирается отдельно; связывает их только тест ниже.
+match.o: match.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -123,6 +133,12 @@ test_hello: test_hello.c hello.o $(HDR)
 
 test_catalog: test_catalog.c catalog.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_catalog.c catalog.o $(TEST_LDFLAGS)
+
+# Проверка каталога d2k_catalog_load настоящим testdata/catalog-real.json
+# (задача 2, шаг "поиск по каталогу находит и не находит") — вот откуда
+# catalog.o в этом связывании, а не только match.o.
+test_match: test_match.c match.o catalog.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
@@ -148,7 +164,10 @@ test-hello: test_hello
 test-catalog: test_catalog
 	./test_catalog
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog
+test-match: test_match
+	./test_match
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -224,6 +243,11 @@ cross: hello_profiles.inc
 		test_catalog.c catalog.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_catalog-mipsel \
 		test_catalog.c catalog.c -lpthread || exit 1
+	@echo "== test_match целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_match-a64 \
+		test_match.c match.c catalog.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_match-mipsel \
+		test_match.c match.c catalog.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
