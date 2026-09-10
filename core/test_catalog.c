@@ -16,6 +16,7 @@
  *      обход, обрубок JSON отвергается с причиной.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "d2k_catalog.h"
@@ -282,6 +283,66 @@ static void check_surrogate_and_nul_rejected(void) {
     CHECK(err[0] != 0, "отказ на \\u0000 без причины");
 }
 
+/* Ревью 2026-09-10: jskip_value рекурсировал без предела на незнакомом
+ * поле — санитайзер поймал stack-overflow на ~200 000 уровнях (между
+ * 80 000 и 100 000 падает при стеке 8 МБ; файл ~180-200 КБ, не экзотика).
+ * Проверяем отказ на глубине, заведомо превышающей предел (см.
+ * D2K_JSON_MAX_DEPTH в catalog.c), но далёкой от порога краха: защита
+ * действует ПОСТЕПЕННО по мере разбора и отказывает на одном и том же
+ * уровне что при глубине 200, что при 200 000 — глубже эта версия просто
+ * никогда не заходит, и 200 000 одинаковых символов здесь ничего не
+ * доказали бы сверх этого, только замедлили бы обычный прогон. */
+static void check_depth_limit_rejects_not_crashes(void) {
+    size_t depth = 200;
+    size_t cap = 64 + depth * 2;
+    char *json = malloc(cap);
+    CHECK(json != NULL, "не удалось выделить буфер для теста глубины");
+    if (!json) return;
+
+    size_t pos = 0;
+    memcpy(json + pos, "{\"future\":", 10); pos += 10;
+    for (size_t i = 0; i < depth; i++) json[pos++] = '[';
+    for (size_t i = 0; i < depth; i++) json[pos++] = ']';
+    memcpy(json + pos, ",\"boxes\":[]}", 12); pos += 12;
+    json[pos] = '\0';
+
+    write_tmp("/tmp/d2k-cat-deep.json", json);
+    free(json);
+
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-deep.json", &c, err, sizeof err) != 0,
+          "вложенность в 200 уровней внутри незнакомого поля принята без отказа");
+    CHECK(err[0] != 0, "отказ на превышении глубины разбора без причины");
+}
+
+/* Ревью 2026-09-10: после успешного разбора верхнего объекта курсор не
+ * проверялся против конца буфера — "{}x" (см. ниже) грузился как валидный
+ * пустой каталог, хвост терялся молча. Go в этой же точке отказывает
+ * ("invalid character 'x' after top-level value") — разбор был регрессией
+ * относительно эталона на этом входе. Тот же класс — склейка двух валидных
+ * каталогов подряд в одном файле: файл, расширенный лишними байтами, —
+ * реальный класс порчи, не гипотетический. */
+static void check_rejects_trailing_garbage(void) {
+    write_tmp("/tmp/d2k-cat-trail1.json", "{\"boxes\":[]}x");
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-trail1.json", &c, err, sizeof err) != 0,
+          "байт 'x' после конца каталога принят молча");
+    CHECK(err[0] != 0, "отказ на мусоре после каталога без причины");
+
+    write_tmp("/tmp/d2k-cat-trail2.json", "{\"boxes\":[]}{\"boxes\":[]}");
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-trail2.json", &c, err, sizeof err) != 0,
+          "склейка двух каталогов подряд принята за один");
+    CHECK(err[0] != 0, "отказ на склейке каталогов без причины");
+
+    /* Законный хвост — то, чем сам Go завершает файл (store.go:
+       b = append(b, '\n')) — обязан ПРОХОДИТЬ: отказ на любом байте после
+       '}' легко перепутать с отказом на настоящих файлах. */
+    write_tmp("/tmp/d2k-cat-trail-ok.json", "{\"boxes\":[]}\n");
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-trail-ok.json", &c, err, sizeof err) == 0,
+          "законный завершающий перевод строки принят за мусор");
+    d2k_catalog_free(&c);
+}
+
 /* Go маршалит nil-срез как null (encoding/json) — свежий каталог
  * Catalog{Schema:1} без единой Confirm() даёт "boxes":null, а не
  * "boxes":[]. Обе формы — валидный пустой каталог, и пустой каталог
@@ -335,6 +396,8 @@ int main(void) {
     check_surrogate_and_nul_rejected();
     check_null_boxes_is_empty_catalog();
     check_free_is_safe();
+    check_depth_limit_rejects_not_crashes();
+    check_rejects_trailing_garbage();
 
     /* ===================================================================
      * Дальше — ДОСЛОВНО из брифа задачи (шаг 2): круговой обход настоящего

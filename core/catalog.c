@@ -493,8 +493,35 @@ static int jparse_rfc3339(jctx *j, int64_t *out, const char *field, char *err, s
 }
 
 /* --------------------------------------------------------------------
- * Пропуск незнакомого значения.
- * -------------------------------------------------------------------- */
+ * Пропуск незнакомого значения и предел вложенности.
+ *
+ * Ревью 2026-09-10 (круг 1): jskip_value рекурсировал без предела — на
+ * незнакомом поле с вложенностью ~200 000 ("future": [[[[...]]]]) это
+ * стек-оверфлоу, пойманный санитайзером (падение между 80 000 и 100 000
+ * уровней при стеке 8 МБ; сам файл — около 180-200 КБ, не экзотика). Схема
+ * этого файла собственной глубины не задаёт — она известна только для
+ * ЗНАКОМЫХ ключей (см. дальше по файлу), а jskip_value обязан пройти
+ * ЛЮБУЮ форму под незнакомым ключом, в том числе бесконечно вложенную.
+ *
+ * D2K_JSON_MAX_DEPTH — общий предел для всех трёх мест рекурсивного
+ * спуска (jskip_value, parse_object, parse_array): один счётчик, а не три
+ * раздельных, потому что известная и незнакомая вложенность считаются с
+ * одной и той же точки отсчёта (незнакомое поле внутри coробки уже сидит
+ * на глубине этой коробки, а не с нуля).
+ *
+ * Число: Go (encoding/json), с которым этот код обязан читать одни и те
+ * же файлы, отказывает на глубине около 10000 ("exceeded max depth",
+ * проверено эмпирически ревьюером) — то есть по этому входу наш разбор до
+ * фикса был регрессией относительно эталона, а не просто небезопасным
+ * сам по себе. Настоящая вложенность каталога, если считать КАЖДЫЙ { и [
+ * отдельным уровнем (см. ниже, как считает эта версия): catalog{1 ->
+ * boxes[2 -> box{3 -> fingerprint{4 -> signals[5 -> signal{6 — глубже 6
+ * схема не уходит нигде (plans/bindings мельче — 5). 64 — что оставляет
+ * десятикратный запас над настоящей вложенностью и при этом на четыре
+ * порядка меньше глубины, на которой падает стек, а не "на всякий
+ * случай": оба факта проверены (test_catalog.c,
+ * check_depth_limit_rejects_not_crashes), а не приняты на слово. */
+#define D2K_JSON_MAX_DEPTH 64
 
 /* Пропускает одно JSON-значение произвольной формы — единственный
  * честный способ "не знать" незнакомое поле: прочитать и отбросить по
@@ -502,8 +529,20 @@ static int jparse_rfc3339(jctx *j, int64_t *out, const char *field, char *err, s
  * jparse_raw_int, что и известные поля: дробное число в пропускаемом поле
  * — такой же отказ, как в известном (см. jparse_raw_int — "плавающей
  * арифметики нет" про файл целиком, а не только про то, что эта версия
- * понимает). */
-static int jskip_value(jctx *j, char *err, size_t errcap) {
+ * понимает).
+ *
+ * depth — глубина ЭТОГО значения (сколько { и [ его уже окружает,
+ * считая его собственную пару, если это объект/массив). Вызывающий
+ * обязан посчитать её: при спуске в значение одного ключа объекта или
+ * элемента массива — depth+1 относительно СВОЕЙ. */
+static int jskip_value(jctx *j, int depth, char *err, size_t errcap) {
+    if (depth > D2K_JSON_MAX_DEPTH) {
+        set_err(err, errcap,
+                "JSON вложен глубже %d уровней — отказ вместо риска переполнения стека "
+                "(настоящая вложенность каталога не превышает 6)",
+                D2K_JSON_MAX_DEPTH);
+        return -1;
+    }
     int c = jpeek(j);
     if (c < 0) { set_err(err, errcap, "неожиданный конец файла"); return -1; }
 
@@ -523,9 +562,9 @@ static int jskip_value(jctx *j, char *err, size_t errcap) {
             }
             char *key = NULL;
             if (jparse_string_dyn(j, &key, err, errcap) != 0) return -1;
-            free(key);
+            free(key); /* ключ нужен был только сдвинуть курсор — не храним */
             if (jeat(j, ':', err, errcap) != 0) return -1;
-            if (jskip_value(j, err, errcap) != 0) return -1;
+            if (jskip_value(j, depth + 1, err, errcap) != 0) return -1;
             int cc = jpeek(j);
             if (cc == ',') { j->i++; continue; }
             if (cc == '}') { j->i++; break; }
@@ -538,7 +577,7 @@ static int jskip_value(jctx *j, char *err, size_t errcap) {
         j->i++;
         if (jpeek(j) == ']') { j->i++; return 0; }
         for (;;) {
-            if (jskip_value(j, err, errcap) != 0) return -1;
+            if (jskip_value(j, depth + 1, err, errcap) != 0) return -1;
             int cc = jpeek(j);
             if (cc == ',') { j->i++; continue; }
             if (cc == ']') { j->i++; break; }
@@ -568,14 +607,24 @@ static int jskip_value(jctx *j, char *err, size_t errcap) {
  * Общий скелет объектов и массивов.
  * -------------------------------------------------------------------- */
 
-typedef int (*key_handler)(jctx *j, const char *key, void *ctx, char *err, size_t errcap);
+typedef int (*key_handler)(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap);
 
 /* Общий разбор JSON-объекта: скобки, запятые и чтение ключа — в одном
  * месте, а не в шести похожих функциях по отдельности (signal/
  * fingerprint/plan/binding/box/каталог). Обработчик решает только СВОЁ —
  * что делать со значением ДАННОГО ключа; неизвестный ключ — его забота
- * позвать jskip_value, не забота parse_object. */
-static int parse_object(jctx *j, key_handler handle, void *ctx, char *err, size_t errcap) {
+ * позвать jskip_value, не забота parse_object.
+ *
+ * depth — глубина ЭТОГО объекта (см. D2K_JSON_MAX_DEPTH и шапку
+ * jskip_value про общий счётчик на все три места спуска). Проверяется
+ * ДО потребления '{': пустой вызов на уже недопустимой глубине не должен
+ * даже начинать читать байты, которых, может, и нет. */
+static int parse_object(jctx *j, key_handler handle, void *ctx, int depth, char *err, size_t errcap) {
+    if (depth > D2K_JSON_MAX_DEPTH) {
+        set_err(err, errcap, "JSON вложен глубже %d уровней — отказ вместо риска переполнения стека",
+                D2K_JSON_MAX_DEPTH);
+        return -1;
+    }
     if (jeat(j, '{', err, errcap) != 0) return -1;
     if (jpeek(j) == '}') { j->i++; return 0; }
     for (;;) {
@@ -586,7 +635,7 @@ static int parse_object(jctx *j, key_handler handle, void *ctx, char *err, size_
         char *key = NULL;
         if (jparse_string_dyn(j, &key, err, errcap) != 0) return -1;
         if (jeat(j, ':', err, errcap) != 0) { free(key); return -1; }
-        int rc = handle(j, key, ctx, err, errcap);
+        int rc = handle(j, key, ctx, depth, err, errcap);
         free(key);
         if (rc != 0) return -1;
         int c = jpeek(j);
@@ -621,17 +670,26 @@ static void *grow(void *arr, size_t *cap, size_t count, size_t elemsize,
     return p;
 }
 
-typedef int (*elem_parser)(jctx *j, void *out_elem, char *err, size_t errcap);
+typedef int (*elem_parser)(jctx *j, void *out_elem, int depth, char *err, size_t errcap);
 
 /* Общий разбор JSON-массива в растущий буфер элементов фиксированного
  * размера. null — валидный пустой массив (см. jeat_null_if_present).
  * Слот резервируется (*n += 1) ДО разбора элемента — см. шапку файла про
  * инвариант очистки при отказе: это единственный способ гарантировать,
  * что d2k_catalog_free найдёт и освободит частично разобранный элемент,
- * а не только полностью разобранные. */
+ * а не только полностью разобранные.
+ *
+ * depth — глубина ЭТОГО массива (см. parse_object про тот же параметр и
+ * D2K_JSON_MAX_DEPTH про общий предел). Элементы массива на один уровень
+ * глубже самого массива — parse_elem зовётся с depth+1. */
 static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap,
                         size_t elemsize, elem_parser parse_elem,
-                        const char *what, char *err, size_t errcap) {
+                        const char *what, int depth, char *err, size_t errcap) {
+    if (depth > D2K_JSON_MAX_DEPTH) {
+        set_err(err, errcap, "JSON вложен глубже %d уровней — отказ вместо риска переполнения стека",
+                D2K_JSON_MAX_DEPTH);
+        return -1;
+    }
     if (jeat_null_if_present(j)) return 0;
     if (jeat(j, '[', err, errcap) != 0) return -1;
     if (jpeek(j) == ']') { j->i++; return 0; }
@@ -641,7 +699,7 @@ static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap,
         *arr = p;
         memset((char *)*arr + (*n) * elemsize, 0, elemsize);
         (*n)++;
-        if (parse_elem(j, (char *)*arr + (*n - 1) * elemsize, err, errcap) != 0) return -1;
+        if (parse_elem(j, (char *)*arr + (*n - 1) * elemsize, depth + 1, err, errcap) != 0) return -1;
         int c = jpeek(j);
         if (c == ',') { j->i++; continue; }
         if (c == ']') { j->i++; break; }
@@ -655,7 +713,7 @@ static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap,
  * Приметы и отпечаток.
  * -------------------------------------------------------------------- */
 
-static int handle_signal_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+static int handle_signal_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_signal *out = (d2k_cat_signal *)ctx;
     if (strcmp(key, "kind") == 0)
         return jparse_string_fixed(j, out->kind, sizeof out->kind, "signal.kind", err, errcap);
@@ -671,11 +729,11 @@ static int handle_signal_key(jctx *j, const char *key, void *ctx, char *err, siz
         return jparse_i32(j, &out->volume, "signal.volume", err, errcap);
     if (strcmp(key, "seen") == 0)
         return jparse_i32(j, &out->seen, "signal.seen", err, errcap);
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
-static int parse_signal(jctx *j, d2k_cat_signal *out, char *err, size_t errcap) {
+static int parse_signal(jctx *j, d2k_cat_signal *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_signal_key, out, err, errcap);
+    return parse_object(j, handle_signal_key, out, depth, err, errcap);
 }
 
 /* fingerprint.signals — единственный массив каталога, который НЕ растёт:
@@ -683,12 +741,19 @@ static int parse_signal(jctx *j, d2k_cat_signal *out, char *err, size_t errcap) 
  * "Produces" задания и d2k_catalog.h), и девятая примета — отказ, а не
  * рост за пределы буфера или молчаливая потеря одной из девяти. Поэтому
  * этот цикл — не parse_array (которому есть куда расти), а bespoke, но
- * тот же приём "слот резервируется до разбора элемента". */
-static int handle_fp_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+ * тот же приём "слот резервируется до разбора элемента" — и тот же приём
+ * "depth+1 на каждый спуск", что и в parse_array, хоть массив и не растёт:
+ * предел вложенности общий на весь файл, а не только на растущие массивы. */
+static int handle_fp_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_fp *out = (d2k_cat_fp *)ctx;
     if (strcmp(key, "method") == 0)
         return jparse_i32(j, &out->method, "fingerprint.method", err, errcap);
     if (strcmp(key, "signals") == 0) {
+        if (depth + 1 > D2K_JSON_MAX_DEPTH) {
+            set_err(err, errcap, "JSON вложен глубже %d уровней — отказ вместо риска переполнения стека",
+                    D2K_JSON_MAX_DEPTH);
+            return -1;
+        }
         if (jeat_null_if_present(j)) return 0;
         if (jeat(j, '[', err, errcap) != 0) return -1;
         if (jpeek(j) == ']') { j->i++; return 0; }
@@ -701,7 +766,7 @@ static int handle_fp_key(jctx *j, const char *key, void *ctx, char *err, size_t 
             }
             memset(&out->sig[out->n_sig], 0, sizeof out->sig[0]);
             out->n_sig++;
-            if (parse_signal(j, &out->sig[out->n_sig - 1], err, errcap) != 0) return -1;
+            if (parse_signal(j, &out->sig[out->n_sig - 1], depth + 2, err, errcap) != 0) return -1;
             int c = jpeek(j);
             if (c == ',') { j->i++; continue; }
             if (c == ']') { j->i++; break; }
@@ -710,18 +775,18 @@ static int handle_fp_key(jctx *j, const char *key, void *ctx, char *err, size_t 
         }
         return 0;
     }
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
-static int parse_fp(jctx *j, d2k_cat_fp *out, char *err, size_t errcap) {
+static int parse_fp(jctx *j, d2k_cat_fp *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_fp_key, out, err, errcap);
+    return parse_object(j, handle_fp_key, out, depth, err, errcap);
 }
 
 /* --------------------------------------------------------------------
  * Планы и привязки.
  * -------------------------------------------------------------------- */
 
-static int handle_plan_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+static int handle_plan_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_plan *out = (d2k_cat_plan *)ctx;
     if (strcmp(key, "id") == 0)
         return jparse_string_fixed(j, out->id, sizeof out->id, "plan.id", err, errcap);
@@ -738,14 +803,14 @@ static int handle_plan_key(jctx *j, const char *key, void *ctx, char *err, size_
         return jparse_i32(j, &out->successes, "plan.successes", err, errcap);
     if (strcmp(key, "enabled") == 0)
         return jparse_bool_i(j, &out->enabled, "plan.enabled", err, errcap);
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
-static int parse_plan(jctx *j, d2k_cat_plan *out, char *err, size_t errcap) {
+static int parse_plan(jctx *j, d2k_cat_plan *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_plan_key, out, err, errcap);
+    return parse_object(j, handle_plan_key, out, depth, err, errcap);
 }
-static int elem_plan(jctx *j, void *o, char *err, size_t errcap) {
-    return parse_plan(j, (d2k_cat_plan *)o, err, errcap);
+static int elem_plan(jctx *j, void *o, int depth, char *err, size_t errcap) {
+    return parse_plan(j, (d2k_cat_plan *)o, depth, err, errcap);
 }
 
 /* transport — поле, которого нет в Go-структуре Binding (см. d2k_catalog.h
@@ -754,7 +819,7 @@ static int elem_plan(jctx *j, void *o, char *err, size_t errcap) {
  * отсутствует — handle_binding_key на него не попадёт, а memset в
  * parse_binding уже оставил 0 ("не записано"), см. testdata и
  * check_transport_default_zero_on_old_file. */
-static int handle_binding_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_binding *out = (d2k_cat_binding *)ctx;
     if (strcmp(key, "kind") == 0)
         return jparse_string_fixed(j, out->kind, sizeof out->kind, "binding.kind", err, errcap);
@@ -772,21 +837,21 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, char *err, si
         return jparse_bool_i(j, &out->enabled, "binding.enabled", err, errcap);
     if (strcmp(key, "transport") == 0)
         return jparse_u8(j, &out->transport, "binding.transport", err, errcap);
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
-static int parse_binding(jctx *j, d2k_cat_binding *out, char *err, size_t errcap) {
+static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_binding_key, out, err, errcap);
+    return parse_object(j, handle_binding_key, out, depth, err, errcap);
 }
-static int elem_binding(jctx *j, void *o, char *err, size_t errcap) {
-    return parse_binding(j, (d2k_cat_binding *)o, err, errcap);
+static int elem_binding(jctx *j, void *o, int depth, char *err, size_t errcap) {
+    return parse_binding(j, (d2k_cat_binding *)o, depth, err, errcap);
 }
 
 /* --------------------------------------------------------------------
  * Коробка и каталог целиком.
  * -------------------------------------------------------------------- */
 
-static int handle_box_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+static int handle_box_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_box *out = (d2k_cat_box *)ctx;
     if (strcmp(key, "id") == 0)
         return jparse_string_fixed(j, out->id, sizeof out->id, "box.id", err, errcap);
@@ -795,44 +860,47 @@ static int handle_box_key(jctx *j, const char *key, void *ctx, char *err, size_t
     if (strcmp(key, "updated") == 0)
         return jparse_rfc3339(j, &out->updated, "box.updated", err, errcap);
     if (strcmp(key, "fingerprint") == 0)
-        return parse_fp(j, &out->fp, err, errcap);
+        return parse_fp(j, &out->fp, depth + 1, err, errcap);
     if (strcmp(key, "plans") == 0) {
         size_t cap = out->n_plans; /* см. grow() про то, почему не 0 */
         return parse_array(j, (void **)&out->plans, &out->n_plans, &cap,
-                            sizeof(d2k_cat_plan), elem_plan, "plans", err, errcap);
+                            sizeof(d2k_cat_plan), elem_plan, "plans", depth + 1, err, errcap);
     }
     if (strcmp(key, "bindings") == 0) {
         size_t cap = out->n_binds;
         return parse_array(j, (void **)&out->binds, &out->n_binds, &cap,
-                            sizeof(d2k_cat_binding), elem_binding, "bindings", err, errcap);
+                            sizeof(d2k_cat_binding), elem_binding, "bindings", depth + 1, err, errcap);
     }
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
-static int parse_box(jctx *j, d2k_cat_box *out, char *err, size_t errcap) {
+static int parse_box(jctx *j, d2k_cat_box *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_box_key, out, err, errcap);
+    return parse_object(j, handle_box_key, out, depth, err, errcap);
 }
-static int elem_box(jctx *j, void *o, char *err, size_t errcap) {
-    return parse_box(j, (d2k_cat_box *)o, err, errcap);
+static int elem_box(jctx *j, void *o, int depth, char *err, size_t errcap) {
+    return parse_box(j, (d2k_cat_box *)o, depth, err, errcap);
 }
 
-/* "schema" и верхнеуровневый "updated" пропускаются жskip_value: в
+/* "schema" и верхнеуровневый "updated" пропускаются jskip_value: в
  * d2k_catalog им нет соответствующего поля (см. d2k_catalog.h — подробно
  * о том, почему это не потеря: schema всегда константа 1, updated Go
  * перезаписывает текущим временем на каждой записи независимо от
  * прочитанного). */
-static int handle_catalog_key(jctx *j, const char *key, void *ctx, char *err, size_t errcap) {
+static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_catalog *out = (d2k_catalog *)ctx;
     if (strcmp(key, "boxes") == 0) {
         size_t cap = out->n_boxes;
         return parse_array(j, (void **)&out->boxes, &out->n_boxes, &cap,
-                            sizeof(d2k_cat_box), elem_box, "boxes", err, errcap);
+                            sizeof(d2k_cat_box), elem_box, "boxes", depth + 1, err, errcap);
     }
-    return jskip_value(j, err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_catalog_obj(jctx *j, d2k_catalog *out, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
-    return parse_object(j, handle_catalog_key, out, err, errcap);
+    /* Вершина спуска: глубина 1 (мы вот-вот войдём в самую внешнюю '{').
+       Дальше глубина считается ОТСЮДА на каждый вложенный уровень — см.
+       D2K_JSON_MAX_DEPTH про весь путь catalog{1->boxes[2->box{3->... */
+    return parse_object(j, handle_catalog_key, out, 1, err, errcap);
 }
 
 /* --------------------------------------------------------------------
@@ -918,14 +986,34 @@ int d2k_catalog_load(const char *path, d2k_catalog *out, char *err, size_t errca
 
     jctx j; j.s = buf; j.len = len; j.i = 0;
     int rc = parse_catalog_obj(&j, out, err, errcap);
+
+    /* Ревью 2026-09-10 (круг 1): курсор после успешного разбора не
+       проверялся против конца буфера — "{}x" грузился как валидный пустой
+       каталог, хвост терялся молча, и так же прошла бы склейка двух
+       каталогов подряд (файл, расширенный лишними байтами, — реальный
+       класс порчи). Go в этой же точке отказывает ("invalid character 'x'
+       after top-level value") — без этой проверки наш разбор был мягче
+       эталона на входах, где мягкость ничего хорошего не значит. jpeek
+       пропускает пробелы САМ (см. его шапку) — законный завершающий
+       перевод строки (store.go: b = append(b, '\n')) поэтому проходит, а
+       любой РЕАЛЬНЫЙ байт после '}' — нет. */
+    if (rc == 0) {
+        int trailing = jpeek(&j);
+        if (trailing >= 0) {
+            set_err(err, errcap, "мусор после конца каталога: '%c' (позиция %zu)",
+                    (char)trailing, j.i);
+            rc = -1;
+        }
+    }
     free(buf);
 
     if (rc != 0) {
-        /* Незакрытая структура/дробное число/переполнение — отказ разбора
-           ЦЕЛИКОМ, а не результат с потерянной частью (см. шапку файла и
-           d2k_catalog.h). Всё, что успело выделиться до отказа, найдено
-           и освобождено здесь же, вызывающему звать free не на чем и не
-           нужно (см. d2k_catalog.h и test_catalog.c, блок про обрубок). */
+        /* Незакрытая структура/дробное число/переполнение/мусор в хвосте —
+           отказ разбора ЦЕЛИКОМ, а не результат с потерянной частью (см.
+           шапку файла и d2k_catalog.h). Всё, что успело выделиться до
+           отказа, найдено и освобождено здесь же, вызывающему звать free
+           не на чем и не нужно (см. d2k_catalog.h и test_catalog.c, блок
+           про обрубок). */
         d2k_catalog_free(out);
         return -1;
     }
