@@ -396,7 +396,16 @@ static uint16_t peerstand_start(peerstand *s) {
     return s->port;
 }
 
-static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_port) {
+/* ВОЗВРАЩАЕТ принятый сокет открытым (out_c): живой прогон 11.09 показал, что
+ * зонд закрывал своё соединение сразу после посылки приветствия, а датапат по
+ * FIN удаляет ячейку потока (datapath/session.c: `if (rst || fin) {
+ * d2k_track_remove(...) }`) — ответ сервера приходить было уже некуда, и НИ
+ * ОДИН вопрос не мог быть отвечен. Прежняя версия этой функции закрывала
+ * принятый сокет здесь же и потому такое поведение не замечала: чтобы
+ * проверить, что зонд ДЕРЖИТ соединение до самого события обмена, стенд
+ * обязан держать свою половину открытой и посмотреть на неё позже. */
+static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_port,
+                                int *out_c) {
     struct sockaddr_in pa;
     socklen_t pl = sizeof pa;
     int c = accept(s->listen_fd, (struct sockaddr *)&pa, &pl);
@@ -405,8 +414,25 @@ static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_p
     *peer_port = ntohs(pa.sin_port);
     uint8_t buf[4096];
     (void)recv(c, buf, sizeof buf, 0); /* осушить присланное — содержимое здесь не проверяем */
-    close(c);
+    if (out_c) {
+        *out_c = c;
+    } else {
+        close(c);
+    }
     return 0;
+}
+
+/* Отвалилась ли половина зонда? EOF на чтении = он закрыл сокет (FIN). Ноль
+ * означает "ещё держит": либо данных нет (EAGAIN/пусто), либо что-то пришло —
+ * оба случая означают, что соединение живо. Потолок ожидания короткий: к
+ * этому моменту зонд либо уже закрыл, либо ждёт события обмена. */
+static int peer_closed(int c) {
+    struct pollfd pfd;
+    pfd.fd = c; pfd.events = POLLIN; pfd.revents = 0;
+    if (poll(&pfd, 1, 200) <= 0) { return 0; }
+    uint8_t b[1];
+    ssize_t n = recv(c, b, sizeof b, MSG_PEEK);
+    return n == 0 ? 1 : 0;
 }
 
 /* Читает и отбрасывает РОВНО один кадр команды (заголовок [длина
@@ -512,6 +538,7 @@ typedef struct {
     size_t n;
     int foreign_before_round;
     int extra_round_seen;
+    int closed_early;   /* зонд закрыл соединение до события обмена */
 } fakeend_args;
 
 static void *fakeend_run(void *arg) {
@@ -521,7 +548,11 @@ static void *fakeend_run(void *arg) {
         send_ack_ok(a->fd, D2K_CMD_SET_NAME);
 
         uint8_t peer_ip[4]; uint16_t peer_port = 0;
-        if (peerstand_accept_one(a->ps, peer_ip, &peer_port) != 0) { return NULL; }
+        int peer_c = -1;
+        if (peerstand_accept_one(a->ps, peer_ip, &peer_port, &peer_c) != 0) { return NULL; }
+        /* Зонд обязан ДЕРЖАТЬ соединение до события обмена — см. большой
+           комментарий у peerstand_accept_one. */
+        if (peer_closed(peer_c)) { a->closed_early = 1; }
 
         if ((int)i == a->foreign_before_round) {
             /* Чужое — ДАЖЕ с appdata — шлётся независимо от исхода этого
@@ -532,10 +563,12 @@ static void *fakeend_run(void *arg) {
             send_exchange(a->fd, foreign_ip, 9999, LOOPBACK4, a->target_port, 6, 0x08);
         }
         if (a->outcomes[i] == -1) {
+            close(peer_c);
             continue; /* настоящего обмена не шлём вовсе — честный тайм-аут у wait_for_event */
         }
         uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
         send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen);
+        close(peer_c);
     }
 
     struct pollfd pfd;
@@ -1070,6 +1103,9 @@ int main(void) {
         d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
         close(sv[0]); close(sv[1]); close(ps.listen_fd);
+        CHECK(!fa.closed_early, "зонд закрыл соединение с целью ДО события обмена — "
+              "датапат по FIN удаляет ячейку потока, и обмену не с чем связаться "
+              "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(!fa.extra_round_seen, "b1: опрос продолжился после первого прохода — лишняя команда");
         CHECK(pr.tolerates_left_overlap == D2K_P_NO, "b1: перекрытие не записано по проходу");
@@ -1101,6 +1137,9 @@ int main(void) {
         d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
         close(sv[0]); close(sv[1]); close(ps.listen_fd);
+        CHECK(!fa.closed_early, "зонд закрыл соединение с целью ДО события обмена — "
+              "датапат по FIN удаляет ячейку потока, и обмену не с чем связаться "
+              "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(!fa.extra_round_seen, "b2: опрос продолжился после второго прохода — лишняя команда");
         CHECK(pr.counts_duplicates == D2K_P_YES, "b2: счёт дубликатов не записан по проходу");
@@ -1140,6 +1179,9 @@ int main(void) {
         d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
         close(sv[0]); close(sv[1]); close(ps.listen_fd);
+        CHECK(!fa.closed_early, "зонд закрыл соединение с целью ДО события обмена — "
+              "датапат по FIN удаляет ячейку потока, и обмену не с чем связаться "
+              "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
               "c1: чужое событие обмена (appdata, чужой ключ) засчитано за свой зонд — находка 1 не закрыта");
@@ -1170,6 +1212,9 @@ int main(void) {
         d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
         close(sv[0]); close(sv[1]); close(ps.listen_fd);
+        CHECK(!fa.closed_early, "зонд закрыл соединение с целью ДО события обмена — "
+              "датапат по FIN удаляет ячейку потока, и обмену не с чем связаться "
+              "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(pr.tolerates_left_overlap == D2K_P_NO,
               "c2: своё событие обмена, пришедшее ПОСЛЕ чужого, не признано — фильтр отбрасывает лишнее");
@@ -1314,6 +1359,9 @@ int main(void) {
         d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
         close(sv[0]); close(sv[1]); close(ps.listen_fd);
+        CHECK(!fa.closed_early, "зонд закрыл соединение с целью ДО события обмена — "
+              "датапат по FIN удаляет ячейку потока, и обмену не с чем связаться "
+              "(docs/field/2026-09-11-first-c-ask.md)");
 
         CHECK(!fa.extra_round_seen, "b4: опрос продолжился после пятого раунда — лишняя команда");
         CHECK(pr.parses_l7 == D2K_P_YES, "b4: разбор протокола не записан по проходу");

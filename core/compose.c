@@ -383,8 +383,26 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
  * теперь делает поставленный план на пакетном пути, а не эта функция.
  * Возвращает 0 при успехе (местные адрес и порт заполнены), -1 иначе —
  * тот же смысл отказа, что у d2k_meas_once. */
+/* ВОЗВРАЩАЕТ ОТКРЫТЫЙ СОКЕТ, а не закрывает его сам (out_fd) — иначе ни один
+   вопрос не мог быть отвечен НИКОГДА, и это не домысел, а разобранный живой
+   прогон 11.09 (docs/field/2026-09-11-first-c-ask.md): все пять зондов
+   вернули "события обмена не пришло" при принятых датапатом планах и
+   состоявшемся обращении. Причина в датапате, datapath/session.c:
+
+       if (rst || fin) { ... d2k_track_remove(s->flows, &key); ... }
+
+   close() сразу после send() шлёт FIN через микросекунды после приветствия,
+   датапат по нему УДАЛЯЕТ ячейку потока, и ответ сервера, пришедший через
+   RTT, попадает уже в чистую ячейку с saw_hello == 0 — а D2K_JRN_EXCHANGE
+   журналируется ТОЛЬКО при saw_hello. Ждать после этого события обмена
+   бессмысленно по устройству, а не по невезению.
+
+   Читать из сокета по-прежнему не нужно (судит датапат по проводу, см. шапку
+   файла): держать открытым и читать — разные вещи, и здесь нужно первое.
+   Закрывает вызывающий, ПОСЛЕ ожидания обмена. */
 static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
-                             uint8_t *local_ip4, uint16_t *local_port) {
+                             uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
+    if (out_fd) { *out_fd = -1; }
     if (!ip || !h.bytes || h.len == 0) { return -1; }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -439,9 +457,19 @@ static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
         sent += (size_t)n;
     }
     /* Локальный recv не читается вовсе — судит только датапат по
-       D2K_EV_EXCHANGE (см. шапку файла и wait_for_event выше). */
-    close(fd);
-    return (sent == h.len) ? 0 : -1;
+       D2K_EV_EXCHANGE (см. шапку файла и wait_for_event выше). Сокет при
+       этом остаётся ОТКРЫТЫМ: см. doc-комментарий выше про FIN и
+       d2k_track_remove. */
+    if (sent != h.len) {
+        close(fd);
+        return -1;
+    }
+    if (out_fd) {
+        *out_fd = fd;
+    } else {
+        close(fd);
+    }
+    return 0;
 }
 
 /* --------------------------------------------------------------------
@@ -588,7 +616,8 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            наружу (иначе обмен чужого потока неотличим от своего). */
         uint8_t local_ip4[4];
         uint16_t local_port = 0;
-        if (props_ask_contact(ip, port, trigger, local_ip4, &local_port) != 0) {
+        int contact_fd = -1;
+        if (props_ask_contact(ip, port, trigger, local_ip4, &local_port, &contact_fd) != 0) {
             step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
         }
@@ -606,6 +635,11 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         d2k_ev exch;
         int got = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
                                  D2K_PROPS_ASK_WAIT_MS, &exch, err, sizeof err) == 0;
+        /* Только теперь — соединение было живо ровно столько, сколько длилось
+           ожидание обмена (см. doc-комментарий props_ask_contact). */
+        if (contact_fd >= 0) {
+            close(contact_fd);
+        }
         if (got && steps) {
             steps[i].seen_types = exch.seen_types;
             steps[i].first_type = exch.code;
