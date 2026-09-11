@@ -59,11 +59,15 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link
+# test_d2kask — ЧЁРНЫЙ ЯЩИК (см. её шапку): не общий стенд test_stand.h сам
+# по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
+# настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
+# (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o d2kask
 
 
 meas.o: meas.c $(HDR)
@@ -208,6 +212,31 @@ test_compose: test_compose.c compose.o hello.o meas.o link.o $(HDR) $(TESTHDR)
 test_link: test_link.c link.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_link.c link.o $(TEST_LDFLAGS)
 
+# d2kask (задача 5в) — командная утилита: спросить настоящую коробку с
+# командной строки. Собирается ПРЯМО в свой бинарник, тем же приёмом, что
+# ctlprobe/planlab в datapath/Makefile (main() есть только там, файл с ним
+# не превращается во второй объектник для линковки с чужим main()). Связка
+# compose.o hello.o meas.o link.o — та же, что у test_compose выше: d2kask
+# зовёт ровно то же ядро (d2k_props_ask/d2k_compose из compose.o,
+# d2k_hello_shape/d2k_hello_sni из hello.o), никакой собственной логики
+# замера. Без pthread — сам d2kask однопоточный (arm+wait — обычный
+# последовательный цикл по d2k_link_next, тем же приёмом, что
+# wait_for_event в compose.c).
+d2kask: d2kask.c compose.o hello.o meas.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ d2kask.c compose.o hello.o meas.o link.o $(LDFLAGS)
+
+# test_d2kask зовёт настоящий d2kask подпроцессом (execv "./d2kask" — см. её
+# шапку) — hello.o нужен ей САМОЙ (build_hello_hex_file собирает настоящее
+# приветствие профилем d2k_hello_from_profile, тем же приёмом, что
+# build_trigger в test_compose.c), link.o — чтобы вычистить очередь событий
+# настоящего управляющего сокета между сценариями (drain_all_events) и
+# разобрать D2K_EV_* константы. pthread — ведущий поток, что параллельно
+# диктует ctlprobe "hello"/"reply", пока d2kask синхронно блокируется внутри
+# d2k_props_ask (тот же приём, что driver_run в test_compose.c), И поток,
+# что читает трубы d2kask, не блокируя основной поток теста.
+test_d2kask: test_d2kask.c hello.o link.o $(HDR) $(TESTHDR)
+	$(CC) $(CFLAGS) -o $@ test_d2kask.c hello.o link.o $(TEST_LDFLAGS)
+
 test-meas: test_meas
 	./test_meas
 
@@ -250,7 +279,15 @@ test-compose: test_compose ../datapath/ctlprobe ../datapath/planlab
 test-link: test_link ../datapath/ctlprobe
 	./test_link
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link
+# d2kask как зависимость запуска (не только сборки test_d2kask): test_d2kask
+# запускает "./d2kask" подпроцессом по относительному пути (см. её шапку) —
+# без этой зависимости make мог бы прогнать тест со СТАРЫМ бинарником, если
+# d2kask.c поменялся, а сам тест не тронут. ../datapath/ctlprobe — тот же
+# смысл, что у test-compose/test-link выше.
+test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
+	./test_d2kask
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -260,14 +297,22 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude -I../datapath/include
 # ../datapath/ctlprobe и ../datapath/planlab — test_link и test_compose здесь
 # не просто собираются, а сразу ЗАПУСКАЮТСЯ (см. цикл ниже), значит нужны
-# свежие бинарники заранее, как и у test-link/test-compose выше.
-san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab
+# свежие бинарники заранее, как и у test-link/test-compose выше. d2kask —
+# по той же причине для test_d2kask: она запускает "./d2kask" подпроцессом
+# (см. её шапку), и цикл ниже собирает test_d2kask.c под санитайзером, но
+# сам d2kask здесь пока обычный — эту половину закрывает отдельный блок
+# ниже (D2KASK_BIN), иначе санитайзер проверял бы только ТЕСТ, а не саму
+# утилиту, которую он должен ловить прежде всего.
+san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
 			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
 	done
+	@echo "== d2kask (санитайзер самой утилиты, не только теста) =="
+	@$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-d2kask d2kask.c compose.c hello.c meas.c link.c
+	@D2KASK_BIN=/tmp/d2k-core-san-d2kask /tmp/d2k-core-san-test_d2kask
 	@echo "санитайзеры: все проверки прошли"
 
 # Тот же набор ЧУЖИМ компилятором. Локально собирает clang, CI — gcc, и они
@@ -275,7 +320,7 @@ san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab
 # важны предупреждения, а исполняются те же тесты обычной целью check.
 GCC ?= mipsel-unknown-linux-gnu-gcc
 gcc-warn: hello_profiles.inc
-	@for f in $(SRC) $(TESTS:=.c); do \
+	@for f in $(SRC) d2kask.c $(TESTS:=.c); do \
 		$(GCC) $(CFLAGS) -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
 	done
 	@echo "чужой компилятор: предупреждений нет"
@@ -287,7 +332,7 @@ gcc-warn: hello_profiles.inc
 # доказывает, что именно эта комбинация (включая pthread на musl и glibc)
 # слинкуется.
 cross: hello_profiles.inc
-	@for f in $(SRC); do \
+	@for f in $(SRC) d2kask.c; do \
 		echo "== $$f =="; \
 		$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-core-a64.o $$f || exit 1; \
 		$(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-core-mipsel.o $$f || exit 1; \
@@ -346,7 +391,29 @@ cross: hello_profiles.inc
 		test_link.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_link-mipsel \
 		test_link.c link.c -lpthread || exit 1
+	@echo "== d2kask целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
+		d2kask.c compose.c hello.c meas.c link.c || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kask-mipsel \
+		d2kask.c compose.c hello.c meas.c link.c || exit 1
+	@echo "== test_d2kask целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
+		test_d2kask.c hello.c link.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_d2kask-mipsel \
+		test_d2kask.c hello.c link.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
+# Утилита для целевого устройства (задача 5в) — тот же приём, что
+# d2kd-aarch64 в datapath/Makefile: статическая musl, потому что на роутере
+# нет ни нужной libc, ни желания зависеть от той, что там есть. d2kask не
+# нуждается ни в чём из datapath/ (LINUXSRC там свой, NFQUEUE/raw сокеты) —
+# только в четырёх файлах ядра, тех же, что у d2kask/test_compose выше.
+BUILDDIR ?= ../builds
+d2kask-aarch64:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
+		-o $(BUILDDIR)/d2kask-aarch64 d2kask.c compose.c hello.c meas.c link.c
+	@ls -l $(BUILDDIR)/d2kask-aarch64
+
 clean:
-	rm -f *.o $(TESTS) hello_profiles.inc
+	rm -f *.o $(TESTS) d2kask hello_profiles.inc
