@@ -25,13 +25,15 @@
  * задачи 3). Задача 4 эту связь дала (слияние 308cc44), и зависимость,
  * не объявленная в плане, закрывается здесь явно: d2k_props_ask ставит
  * план датапату командой SET_NAME (d2k_link_set_name), дожидается
- * подтверждения (D2K_EV_ACK), делает ОДНО обращение к цели тем же
- * приёмом, что d2k_meas_once (connect+одна посылка, без собственных
- * разрезов — сегментацию теперь делает датапат по плану, а не эта
- * функция), и читает исход СТРОГО по событию обмена датапата
- * (D2K_EV_EXCHANGE, порог d2k_ev_has_appdata) — НЕ по тому, что вернул
- * локальный recv(): обратное направление почти всегда слепо для
- * аппаратной разгрузки роутера, а датапат (NFQUEUE) стоит ДО неё
+ * подтверждения (D2K_EV_ACK), делает ОДНО обращение к цели СВОИМ вариантом
+ * connect+одна посылка (props_ask_contact — не d2k_meas_once напрямую: тот
+ * метит зонд, а этот обязан идти НЕПОМЕЧЕННЫМ, иначе план мимо очереди —
+ * см. её большой комментарий и находку 2 ревью 11.09), и читает исход
+ * СТРОГО по событию обмена ЭТОГО ЖЕ ПОТОКА (D2K_EV_EXCHANGE с ключом,
+ * сверенным против местных и целевых адреса:порта — находка 1 того же
+ * ревью, — и порог d2k_ev_has_appdata) — НЕ по тому, что вернул локальный
+ * recv(): обратное направление почти всегда слепо для аппаратной разгрузки
+ * роутера, а датапат (NFQUEUE) стоит ДО неё
  * (см. большой комментарий у seen_types/d2k_ev_has_appdata, d2k_link.h).
  *
  * ПОЧЕМУ ПЛАНЫ СОБИРАЮТСЯ В TLV ЗДЕСЬ, А НЕ ЧЕРЕЗ *_plan_text НИЖЕ.
@@ -76,10 +78,19 @@
  * измеренное.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "d2k_compose.h"
 #include "d2k_compose_internal.h" /* прототипы четырёх сборщиков TLV ниже — не наложением, а для planlab, см. её шапку */
@@ -255,14 +266,57 @@ static void to_hex(const uint8_t *b, size_t n, char *out) {
     out[2 * n] = '\0';
 }
 
-/* Ждёт событие вида want (и, если code_filter >= 0, с этим кодом ev.code) не
+/* Ключ потока — НЕУПОРЯДОЧЕННАЯ пара адрес:порт плюс транспорт, а не
+ * канонический d2k_key (datapath/include/d2k_track.h): у события уже есть
+ * канонический ключ (низкий/высокий конец, см. d2k_ev), но переносить сюда
+ * саму канонизацию (d2k_key_make, datapath/track.c — сравнение шести байт
+ * адреса и порта в сетевом порядке) означало бы её ВТОРУЮ реализацию, а
+ * §2.5 запрещает вторую реализацию преобразований ровно за то, что они
+ * расходятся молча. Сравнение НЕУПОРЯДОЧЕННОЙ пары даёт тот же ответ на
+ * вопрос «это мой поток?» без канонизации вовсе: событию всё равно, какой
+ * его конец досталось назвать низким. Тип d2k_flowkey и объявление этой
+ * функции — в d2k_compose_internal.h (не наложением, а чтобы test_compose.c
+ * проверял ЕЁ САМУ, а не копию, см. шапку заголовка). */
+int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k) {
+    if (ev->transport != k->transport) { return 0; }
+    if (memcmp(ev->low_ip, k->a_ip, 4) == 0 && ev->low_port == k->a_port &&
+        memcmp(ev->high_ip, k->b_ip, 4) == 0 && ev->high_port == k->b_port) {
+        return 1;
+    }
+    if (memcmp(ev->low_ip, k->b_ip, 4) == 0 && ev->low_port == k->b_port &&
+        memcmp(ev->high_ip, k->a_ip, 4) == 0 && ev->high_port == k->a_port) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Ждёт событие вида want (и, если code_filter >= 0, с этим кодом ev.code), не
  * дольше deadline_ms суммарно, пропуская мимо остальное — тот же приём, что
  * next_of_kind в test_link.c, но с бюджетом по ВРЕМЕНИ, а не по числу попыток:
  * число попыток ничего не говорит о реальной длительности, а датапат волен
  * прислать сколько угодно посторонних событий (HELLO/SUSPECT от чужого
- * трафика) между нужными нам ACK/EXCHANGE. Возвращает 0 при находке (*out
- * заполнен), -1 иначе (тайм-аут всего бюджета, ошибка связи, обрыв). */
+ * трафика) между нужными нам ACK/EXCHANGE.
+ *
+ * flow — ДОПОЛНИТЕЛЬНЫЙ фильтр по ключу потока, NULL отключает его. ОБЯЗАН
+ * быть задан для D2K_EV_EXCHANGE (ревью 11.09, круг правок 2, находка 1):
+ * D2K_EV_EXCHANGE — НЕ адресный ответ на команду, а наблюдение датапата за
+ * ЛЮБЫМ потоком, у которого было приветствие и пришла обратная нагрузка
+ * (datapath/session.c: `if (fl->saw_hello && fl->rev_payload_after_hello >
+ * 0) ...`, независимо от того, стоит ли на этом имени наш план), и ctlsrv.c
+ * проталкивает его единственному клиенту без фильтрации по имени или плану.
+ * Без ключа потока фоновый HTTPS-трафик того же роутера (обычное дело, не
+ * край) засчитывался бы за ответ на СВОЙ зонд — ревьюер воспроизвёл это 5 из
+ * 5 на недостижимом адресе, который ни разу не ответил. Для D2K_EV_ACK
+ * ключ, наоборот, ВСЕГДА нулевой (ctlsrv.c: `ack()` заполняет тело
+ * `memset(body, 0, sizeof body)` — подтверждение не про поток), и flow там
+ * передаётся NULL: фильтровать по заведомо нулевому ключу бессмысленно, а
+ * kind+code уже достаточно точны — на этом fd в это время нет никого, кто
+ * мог бы прислать чужой ACK на нашу же команду.
+ *
+ * Возвращает 0 при находке (*out заполнен), -1 иначе (тайм-аут всего
+ * бюджета, ошибка связи, обрыв). */
 static int wait_for_event(int fd, uint16_t want, int code_filter,
+                          const d2k_flowkey *flow,
                           uint32_t deadline_ms, d2k_ev *out,
                           char *err, size_t errcap) {
     struct timespec t0;
@@ -276,20 +330,119 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
         if (elapsed_ms >= (long)deadline_ms) { return -1; }
         int rc = d2k_link_next(fd, out, (int)((long)deadline_ms - elapsed_ms), err, errcap);
         if (rc != 0) { return -1; } /* тайм-аут этого чтения = тайм-аут всего бюджета, либо ошибка */
-        if (out->kind == want && (code_filter < 0 || out->code == (uint16_t)code_filter)) {
-            return 0;
-        }
+        if (out->kind != want) { continue; }
+        if (code_filter >= 0 && out->code != (uint16_t)code_filter) { continue; }
+        if (flow && !ev_matches_flow(out, flow)) { continue; }
+        return 0;
     }
 }
 
-/* Потолок ожидания ОДНОГО шага (ack SET_NAME, событие обмена) — то же число,
- * что WAIT_CEIL_MS в meas.c (5000мс), то же происхождение (connectTimeout/
- * transportCeiling Go-стороны) и тот же смысл: страховка, а не ожидаемая
- * длительность. Ack по AF_UNIX между двумя процессами на одной машине —
- * миллисекунды; обмен с целью — сеть, которая может молчать. Одно число на
- * оба шага осознанно: изобретать второе без замера запрещено (проектное
- * правило "числа только из замера или наследования"). */
+/* Потолок ожидания ОДНОГО шага (ack SET_NAME, connect цели, событие обмена)
+ * — то же число, что WAIT_CEIL_MS в meas.c (5000мс), то же происхождение
+ * (connectTimeout/transportCeiling Go-стороны) и тот же смысл: страховка, а
+ * не ожидаемая длительность. Ack по AF_UNIX между двумя процессами на одной
+ * машине — миллисекунды; connect и обмен с целью — сеть, которая может
+ * молчать. Одно число на все три шага осознанно: изобретать второе-третье
+ * без замера запрещено (проектное правило "числа только из замера или
+ * наследования") — если на живой линии этот потолок окажется мал именно
+ * для connect() или именно для обмена, чинить нужно здесь, числом из
+ * замера, а не молчаливым дублированием константы. */
 #define D2K_PROPS_ASK_WAIT_MS 5000
+
+/* Одно обращение к цели — СВОЙ вариант d2k_meas_once (meas.c), а не он сам:
+ * два отличия, и оба обязательны для смысла измерения (ревью 11.09, круг
+ * правок 2, находки 1 и 2), а не удобства.
+ *
+ * 1. НЕПОМЕЧЕННЫЙ ПАКЕТ. d2k_meas_once метит зонд (d2k_mark_hook) — там это
+ *    верно: дереву вердиктов метка нужна, чтобы датапат отпустил зонд БЕЗ
+ *    очереди и измерил ГОЛУЮ линию, не искажённую уже действующим планом
+ *    (files/S99d2k, ПЕРВОЕ правило исходящей цепочки: "iptables -t mangle
+ *    -A $CHAIN_OUT -m mark --mark $MARK -j RETURN" — помеченный пакет уходит
+ *    из цепочки ДО правила NFQUEUE). Опрос свойств спрашивает ОБРАТНОЕ: он
+ *    сам только что поставил план-кандидат и должен дать датапату его
+ *    применить — а не только что поставленный, отмеченный той же меткой,
+ *    план прошёл бы мимо очереди НЕТРОНУТЫМ, и любой ответ был бы ответом
+ *    на голое приветствие, выданным за ответ на приём (тот же класс ошибки,
+ *    что в docs/field/2026-09-05-active-probe.md, с обратным знаком: там
+ *    без метки мерили линию с обходом вместо голой, здесь с меткой мерили
+ *    бы голую линию вместо линии с планом). §5.2/§7 требуют метку на ВСЕХ
+ *    зондах ДЕРЕВА ВЕРДИКТОВ, чтобы не смешать два разных замера — опрос
+ *    свойств не дерево вердиктов, у него другой вопрос, и правило сюда не
+ *    относится, а не нарушается.
+ *
+ * 2. МЕСТНЫЙ АДРЕС И ПОРТ НАРУЖУ. d2k_meas_once закрывает сокет изнутри и
+ *    ничего не отдаёт вызывающему, а wait_for_event выше обязан отличить
+ *    обмен ПО ЭТОМУ соединению от обмена любого другого потока к тому же
+ *    адресу и порту (см. её большой комментарий; браузер держит много
+ *    параллельных потоков к одному хосту разом, и local — единственное,
+ *    что делает пару адрес:порт уникальной ДО следующего connect()).
+ *    Местные адрес и порт назначаются ядром внутри connect() и не
+ *    существуют до этого момента — их нужно снять сразу же, getsockname().
+ *
+ * Без собственных разрезов, как d2k_meas_once с cuts=NULL: сегментацию
+ * теперь делает поставленный план на пакетном пути, а не эта функция.
+ * Возвращает 0 при успехе (местные адрес и порт заполнены), -1 иначе —
+ * тот же смысл отказа, что у d2k_meas_once. */
+static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
+                             uint8_t *local_ip4, uint16_t *local_port) {
+    if (!ip || !h.bytes || h.len == 0) { return -1; }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+    int one = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    struct timeval tv = { (time_t)(D2K_PROPS_ASK_WAIT_MS / 1000u),
+                          (suseconds_t)(D2K_PROPS_ASK_WAIT_MS % 1000u) * 1000 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return -1; }
+
+    /* Неблокирующий connect с явным потолком — тот же смысл, что
+       connect_bounded в meas.c (не она сама: static там, и вариант здесь не
+       нуждается в её остальном контракте): SYN-чёрная-дыра без потолка
+       съела бы умолчание ядра (минуты), а не D2K_PROPS_ASK_WAIT_MS. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return -1; }
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        if (errno != EINPROGRESS) { close(fd); return -1; }
+        struct pollfd pfd;
+        pfd.fd = fd; pfd.events = POLLOUT; pfd.revents = 0;
+        int pr = poll(&pfd, 1, (int)D2K_PROPS_ASK_WAIT_MS);
+        if (pr <= 0) { close(fd); return -1; }
+        int soerr = 0;
+        socklen_t soerr_len = sizeof soerr;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) < 0 || soerr != 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    (void)fcntl(fd, F_SETFL, flags);
+
+    struct sockaddr_in local;
+    socklen_t local_len = sizeof local;
+    if (getsockname(fd, (struct sockaddr *)&local, &local_len) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (local_ip4) { memcpy(local_ip4, &local.sin_addr, 4); }
+    if (local_port) { *local_port = ntohs(local.sin_port); }
+
+    size_t sent = 0;
+    while (sent < h.len) {
+        ssize_t n = send(fd, h.bytes + sent, h.len - sent, 0);
+        if (n <= 0) { break; }
+        sent += (size_t)n;
+    }
+    /* Локальный recv не читается вовсе — судит только датапат по
+       D2K_EV_EXCHANGE (см. шапку файла и wait_for_event выше). */
+    close(fd);
+    return (sent == h.len) ? 0 : -1;
+}
 
 /* --------------------------------------------------------------------
  * d2k_props_ask — см. большой комментарий в шапке файла.
@@ -300,10 +453,24 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
     d2k_props pr;
     memset(&pr, 0, sizeof pr);
 
+    /* mark принят контрактом интерфейса (см. doc-комментарий d2k_props_ask,
+       d2k_compose.h — там же честно названо, ПОЧЕМУ он здесь не идёт в
+       сеть), а не мёртвый груз молча: props_ask_contact ниже ЗАВЕДОМО не
+       метит зонд — та же явная развилка, что и в остальном ядре про
+       параметры, которые не участвуют в наблюдении ни при каких условиях. */
+    (void)mark;
+
     if (link_fd < 0 || !ip || ip[0] == '\0' || !trigger.bytes || trigger.len == 0) {
         /* Нечем спросить: без связи с датапатом или без адреса и байт
            триггера ни один из пяти вопросов не задать — тройственная
            логика: не измерено, а не «нет» (§2.4). */
+        return pr;
+    }
+    uint8_t target_ip4[4];
+    if (inet_pton(AF_INET, ip, target_ip4) != 1) {
+        /* ip не разобрался как IPv4-литерал — тем же самым не разберётся и
+           props_ask_contact ниже, а без адреса цели не собрать и ключ потока
+           для wait_for_event. Не измерено, а не «нет». */
         return pr;
     }
 
@@ -366,7 +533,7 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
             continue; /* план не отправился вовсе — не измерено */
         }
         d2k_ev ack;
-        if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME,
+        if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME, NULL,
                            D2K_PROPS_ASK_WAIT_MS, &ack, err, sizeof err) != 0) {
             continue; /* ack не пришёл в срок — не измерено */
         }
@@ -379,17 +546,25 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
             continue;
         }
 
-        /* Одно обращение к цели — connect + одна посылка целиком, как
-           d2k_meas_once без собственных разрезов (n_cuts=0): сегментацию
-           теперь делает датапат по только что поставленному плану, а не
-           эта функция. Собственный вердикт d2k_meas_once (вернулось что-то
-           по ЭТОМУ сокету локально или нет) здесь не читается — см. шапку
-           файла про то, почему судит только датапат. */
-        (void)d2k_meas_once(ip, port, trigger, NULL, 0, 0,
-                            D2K_PROPS_ASK_WAIT_MS, mark, NULL);
+        /* Одно обращение к цели — см. большой комментарий у
+           props_ask_contact про то, почему СВОЙ вариант, а не d2k_meas_once:
+           непомеченный зонд (иначе план мимо очереди) и местные адрес+порт
+           наружу (иначе обмен чужого потока неотличим от своего). */
+        uint8_t local_ip4[4];
+        uint16_t local_port = 0;
+        if (props_ask_contact(ip, port, trigger, local_ip4, &local_port) != 0) {
+            continue; /* обращение не состоялось (транспорт) — не измерено */
+        }
+
+        d2k_flowkey fk;
+        memcpy(fk.a_ip, target_ip4, 4);
+        fk.a_port = port;
+        memcpy(fk.b_ip, local_ip4, 4);
+        fk.b_port = local_port;
+        fk.transport = 6;
 
         d2k_ev exch;
-        int passed = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1,
+        int passed = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
                                     D2K_PROPS_ASK_WAIT_MS, &exch, err, sizeof err) == 0 &&
                      d2k_ev_has_appdata(&exch);
         if (!passed) {

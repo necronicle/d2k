@@ -44,11 +44,13 @@
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -56,6 +58,11 @@
 #include "d2k_compose.h"
 #include "d2k_compose_internal.h"
 #include "d2k_link.h"
+/* Только ради D2K_KEY_WIRE_LEN — поддельный конец связи (fakeend_run ниже)
+ * строит кадры событий руками, тем же приёмом, что test_link.c и datapath/
+ * test_ctl.c: ширина ключа нужна настоящая, а не переизобретённая здесь
+ * копией. */
+#include "d2k_ctlsrv.h"
 #include "test_stand.h"
 
 static int fails;
@@ -342,6 +349,199 @@ static void *driver_run(void *arg) {
             snprintf(cmd, sizeof cmd, "reply %d", d->replies[i]);
             (void)probe_say(d->p, cmd);
         }
+    }
+    return NULL;
+}
+
+/* ========================================================================
+ * ПОДДЕЛЬНЫЙ КОНЕЦ СВЯЗИ — нужен РОВНО для находки 1 ревью 11.09 (круг
+ * правок 2): D2K_EV_EXCHANGE не адресован нашей команде, его несёт ключ
+ * потока (свой адрес:порт против адреса:порта цели), а настоящий ctlprobe
+ * строит синтетические пакеты с ЖЁСТКО ЗАШИТЫМ адресом клиента (LAN
+ * 192.168.1.67, datapath/ctlprobe.c: build_pkt) — тем же для ЛЮБОГО теста,
+ * что даёт test_link.c проверять КОНСТАНТУ (её же тесты на key.low_ip и
+ * т.п.). d2k_props_ask, наоборот, соединяется с целью НАСТОЯЩИМ сокетом
+ * (props_ask_contact, compose.c) — местный порт назначает ядро при
+ * connect(), заранее его не знает НИКТО, включая ctlprobe, и подделать
+ * событие с ключом, который действительно совпадёт, через её "hello"/
+ * "reply" нечем: порт там свой, внутренний, auto-increment, без ручки
+ * снаружи. Проверять фильтр по ключу можно только на конце связи, которым
+ * управляет сам тест, — отсюда socketpair() вместо ctlprobe для B1/B2/B4 и
+ * новых проверок находки 1 (C1/C2) ниже; B3 остаётся на настоящем ctlprobe
+ * (там фильтр никакого "прохода" не даёт увидеть — все ответы намеренно
+ * без прикладных данных, а имя проверяется её собственным, отдельным
+ * приёмом APPLIED/REFUSED).
+ * ==================================================================== */
+
+/* Слушает на локалхосте и отдаёт РЕАЛЬНЫЙ адрес клиента, принявшего РОВНО
+ * одно подключение, — getpeername() с принявшей стороны это тот же самый
+ * местный адрес, что выбрал props_ask_contact и что легло бы в ключ
+ * настоящего события на живом датапате. Сам props_ask_contact его наружу
+ * не отдаёт (не часть её контракта, compose.c) — единственный способ узнать
+ * порт вовремя это спросить у того, кто его увидел. */
+typedef struct { int listen_fd; uint16_t port; } peerstand;
+
+static uint16_t peerstand_start(peerstand *s) {
+    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    a.sin_port = 0;
+    bind(s->listen_fd, (struct sockaddr *)&a, sizeof a);
+    socklen_t l = sizeof a;
+    getsockname(s->listen_fd, (struct sockaddr *)&a, &l);
+    listen(s->listen_fd, 4);
+    s->port = ntohs(a.sin_port);
+    return s->port;
+}
+
+static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_port) {
+    struct sockaddr_in pa;
+    socklen_t pl = sizeof pa;
+    int c = accept(s->listen_fd, (struct sockaddr *)&pa, &pl);
+    if (c < 0) { return -1; }
+    memcpy(peer_ip, &pa.sin_addr, 4);
+    *peer_port = ntohs(pa.sin_port);
+    uint8_t buf[4096];
+    (void)recv(c, buf, sizeof buf, 0); /* осушить присланное — содержимое здесь не проверяем */
+    close(c);
+    return 0;
+}
+
+/* Читает и отбрасывает РОВНО один кадр команды (заголовок [длина
+ * payload BE32][тип BE16], затем длина-2 байт тела) — та же раскладка,
+ * что и у события (d2k_ctl.h: "Кадр: [длина payload u32 BE][тип u16
+ * BE][payload]", общая для обоих направлений), поэтому разбирать ВНУТРЕННЕЕ
+ * устройство SET_NAME здесь незачем: границы кадра снаружи одни на всех. */
+static int drain_one_command(int fd) {
+    uint8_t hdr[6];
+    size_t got = 0;
+    while (got < sizeof hdr) {
+        ssize_t n = read(fd, hdr + got, sizeof hdr - got);
+        if (n <= 0) { return -1; }
+        got += (size_t)n;
+    }
+    uint32_t plen = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
+                    (uint32_t)hdr[2] << 8 | hdr[3];
+    if (plen < 2) { return -1; }
+    size_t remaining = (size_t)plen - 2;
+    uint8_t buf[4096];
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof buf ? remaining : sizeof buf;
+        ssize_t n = read(fd, buf, chunk);
+        if (n <= 0) { return -1; }
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Пишет один кадр события руками — та же раскладка, что send_synthetic в
+ * test_link.c: [длина payload BE32][тип BE16][ключ 13 байт][rest]. ip
+ * может быть NULL (ключ нулевой, как у настоящего ACK — ctlsrv.c: ack()
+ * зовёт memset ровно по этой причине, событие не про поток). */
+static void send_event_frame(int fd, uint16_t kind,
+                             const uint8_t *low_ip, uint16_t low_port,
+                             const uint8_t *high_ip, uint16_t high_port,
+                             uint8_t transport,
+                             const uint8_t *rest, size_t rest_len) {
+    uint8_t frame[6 + D2K_KEY_WIRE_LEN + 32];
+    size_t body_len = D2K_KEY_WIRE_LEN + rest_len;
+    uint32_t plen = (uint32_t)(2 + body_len);
+    frame[0] = (uint8_t)(plen >> 24); frame[1] = (uint8_t)(plen >> 16);
+    frame[2] = (uint8_t)(plen >> 8);  frame[3] = (uint8_t)plen;
+    frame[4] = (uint8_t)(kind >> 8);  frame[5] = (uint8_t)kind;
+    uint8_t *k = frame + 6;
+    if (low_ip) { memcpy(k, low_ip, 4); } else { memset(k, 0, 4); }
+    if (high_ip) { memcpy(k + 4, high_ip, 4); } else { memset(k + 4, 0, 4); }
+    k[8] = (uint8_t)(low_port >> 8); k[9] = (uint8_t)low_port;
+    k[10] = (uint8_t)(high_port >> 8); k[11] = (uint8_t)high_port;
+    k[12] = transport;
+    if (rest_len) { memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len); }
+    (void)write(fd, frame, 6 + body_len);
+}
+
+static void send_ack_ok(int fd, uint16_t cmd) {
+    uint8_t rest[4];
+    rest[0] = (uint8_t)(cmd >> 8); rest[1] = (uint8_t)cmd;
+    rest[2] = 1; /* признак успеха */
+    rest[3] = 0; /* D2K_ACK_OK */
+    send_event_frame(fd, D2K_EV_ACK, NULL, 0, NULL, 0, 0, rest, sizeof rest);
+}
+
+/* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
+ * (1<<(22-20))=0x04 (см. d2k_ev_has_appdata, d2k_link.h). code/num — тут не
+ * важны для порога (см. её же большой комментарий про липкое поле code),
+ * заполнены правдоподобно, не нулём, чтобы не полагаться на memset. */
+static void send_exchange(int fd, const uint8_t *ip_a, uint16_t port_a,
+                          const uint8_t *ip_b, uint16_t port_b,
+                          uint8_t transport, uint8_t seen_types) {
+    uint8_t rest[6];
+    rest[0] = 22;
+    rest[1] = seen_types;
+    rest[2] = 0; rest[3] = 0; rest[4] = 0; rest[5] = 64;
+    send_event_frame(fd, D2K_EV_EXCHANGE, ip_a, port_a, ip_b, port_b, transport, rest, sizeof rest);
+}
+
+static const uint8_t LOOPBACK4[4] = { 127, 0, 0, 1 };
+
+/* Обслуживает N раундов SET_NAME→ack→(подключение цели)→обмен, каждый ПОД
+ * СВОЙ, настоящий местный порт (peerstand_accept_one) — синхронно, без
+ * сна "на авось" (круг правок 1 гонял hello/reply с фиксированной паузой
+ * 300мс; здесь пауз нет вовсе, каждый шаг блокируется РОВНО до своего
+ * события на уровне ОС).
+ *
+ * outcomes[i]: -1 — тайм-аут (обмена не шлём совсем, props_ask_contact всё
+ * равно подключится к настоящей peerstand — сама цель "жива", просто ответа
+ * от датапата не будет НИКОГДА, честная проверка тайм-аута); 0 — обмен без
+ * прикладных данных (промах); 1 — обмен с прикладными данными (проход).
+ * foreign_before_round: если раунд с этим индексом дошёл до обмена, ПЕРЕД
+ * настоящим событием шлётся ОДНО чужое — с appdata, но с чужим ключом
+ * (адрес 10.0.0.9:9999, к делу не относится) — находка 1: opros обязан его
+ * пропустить, не засчитав за свой. -1 выключает это для всех раундов.
+ *
+ * extra_round_seen: выставляется в 1, если ПОСЛЕ всех настроенных раундов
+ * пришла ЕЩЁ одна команда — опрос не остановился по первому проходу или по
+ * исчерпании раундов, хотя обязан был (короткий poll, не полный тайм-аут:
+ * если что-то есть, оно уже в буфере ядра). */
+typedef struct {
+    int fd;
+    peerstand *ps;
+    uint16_t target_port;
+    const int *outcomes;
+    size_t n;
+    int foreign_before_round;
+    int extra_round_seen;
+} fakeend_args;
+
+static void *fakeend_run(void *arg) {
+    fakeend_args *a = (fakeend_args *)arg;
+    for (size_t i = 0; i < a->n; i++) {
+        if (drain_one_command(a->fd) != 0) { return NULL; }
+        send_ack_ok(a->fd, D2K_CMD_SET_NAME);
+
+        uint8_t peer_ip[4]; uint16_t peer_port = 0;
+        if (peerstand_accept_one(a->ps, peer_ip, &peer_port) != 0) { return NULL; }
+
+        if ((int)i == a->foreign_before_round) {
+            /* Чужое — ДАЖЕ с appdata — шлётся независимо от исхода этого
+               раунда: находка 1 именно про то, что такое событие не должно
+               подтвердить наш зонд НИ ПРИ КАКИХ обстоятельствах, включая
+               "своего обмена не будет никогда" (outcomes[i]==-1, C1). */
+            static const uint8_t foreign_ip[4] = { 10, 0, 0, 9 };
+            send_exchange(a->fd, foreign_ip, 9999, LOOPBACK4, a->target_port, 6, 0x08);
+        }
+        if (a->outcomes[i] == -1) {
+            continue; /* настоящего обмена не шлём вовсе — честный тайм-аут у wait_for_event */
+        }
+        uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
+        send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen);
+    }
+
+    struct pollfd pfd;
+    pfd.fd = a->fd; pfd.events = POLLIN; pfd.revents = 0;
+    if (poll(&pfd, 1, 300) > 0) {
+        a->extra_round_seen = 1;
     }
     return NULL;
 }
@@ -813,31 +1013,69 @@ int main(void) {
         drain_all(fd); /* эти вызовы не должны были ничего послать, но убеждаемся, что очередь чиста для дальше */
     }
 
+    /* --- ev_matches_flow напрямую: неупорядоченная пара, транспорт обязан
+     * совпасть — прежде чем гонять сквозь весь d2k_props_ask, проверяем саму
+     * сверку ключа на руками собранных значениях (находка 1 ревью 11.09). -- */
+    {
+        d2k_ev ev; memset(&ev, 0, sizeof ev);
+        memcpy(ev.low_ip, (uint8_t[4]){1,2,3,4}, 4);
+        memcpy(ev.high_ip, (uint8_t[4]){5,6,7,8}, 4);
+        ev.low_port = 100; ev.high_port = 200; ev.transport = 6;
+
+        d2k_flowkey k; memset(&k, 0, sizeof k);
+        memcpy(k.a_ip, (uint8_t[4]){1,2,3,4}, 4); k.a_port = 100;
+        memcpy(k.b_ip, (uint8_t[4]){5,6,7,8}, 4); k.b_port = 200;
+        k.transport = 6;
+        CHECK(ev_matches_flow(&ev, &k) == 1, "прямой порядок (a=low, b=high) не совпал");
+
+        d2k_flowkey k2 = k;
+        memcpy(k2.a_ip, (uint8_t[4]){5,6,7,8}, 4); k2.a_port = 200;
+        memcpy(k2.b_ip, (uint8_t[4]){1,2,3,4}, 4); k2.b_port = 100;
+        CHECK(ev_matches_flow(&ev, &k2) == 1, "обратный порядок (a=high, b=low) не совпал — ключ неупорядоченный");
+
+        d2k_flowkey bad_ip = k; memcpy(bad_ip.a_ip, (uint8_t[4]){1,2,3,9}, 4);
+        CHECK(ev_matches_flow(&ev, &bad_ip) == 0, "отличающийся ОДНИМ байтом адрес засчитан как совпадение");
+
+        d2k_flowkey bad_port = k; bad_port.a_port = 101;
+        CHECK(ev_matches_flow(&ev, &bad_port) == 0, "отличающийся порт засчитан как совпадение");
+
+        d2k_flowkey bad_transport = k; bad_transport.transport = 17;
+        CHECK(ev_matches_flow(&ev, &bad_transport) == 0,
+              "разный транспорт (TCP-событие против UDP-ключа) засчитан как совпадение");
+    }
+
     /* --- B1: первый вопрос (перекрытие) проходит немедленно — опрос
-     * останавливается, второй вопрос не задаётся ---------------------------- */
+     * останавливается, второй вопрос не задаётся. Через поддельный конец
+     * связи (socketpair), не через ctlprobe: см. большой комментарий перед
+     * fakeend_run про то, почему настоящий ctlprobe не может дать событие с
+     * ключом, который действительно совпадёт с настоящим соединением. ----- */
     {
         uint8_t tb[2048], cb[2048];
         d2k_hello trig = build_trigger(tb, sizeof tb, "b1.example");
         d2k_hello ctl = build_trigger(cb, sizeof cb, "b1-control.example");
         CHECK(trig.bytes && ctl.bytes, "build_trigger(b1) не собрался");
 
-        int replies[] = { 23 }; /* прикладные данные — проходит с первого раза */
-        driver_args da = { &p, "b1.example", replies, 1, 300 };
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "b1: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 1 }; /* первый вопрос проходит сразу */
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 1; fa.foreign_before_round = -1;
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b1: ведущий поток не запустился");
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b1: поддельный конец связи не запустился");
 
-        unsigned long long before = query_ok_cmds(&p);
-        d2k_props pr = d2k_props_ask(fd, "127.0.0.1", stand_port, trig, ctl, 0);
+        d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
-        unsigned long long after = query_ok_cmds(&p);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
 
-        CHECK(after - before == 1, "b1: должен был встать ровно один план (первый вопрос), "
-                                    "а не продолжить опрос дальше");
+        CHECK(!fa.extra_round_seen, "b1: опрос продолжился после первого прохода — лишняя команда");
         CHECK(pr.tolerates_left_overlap == D2K_P_NO, "b1: перекрытие не записано по проходу");
         CHECK(pr.tolerates_reorder == D2K_P_UNKNOWN && pr.validates_checksum == D2K_P_UNKNOWN &&
               pr.parses_l7 == D2K_P_UNKNOWN && pr.counts_duplicates == D2K_P_UNKNOWN,
               "b1: опрос не остановился на первом проходе — задал вопрос, до которого не должен дойти");
-        drain_all(fd);
     }
 
     /* --- B2: первый вопрос молчит содержательно (обмен есть, но без
@@ -848,25 +1086,93 @@ int main(void) {
         d2k_hello ctl = build_trigger(cb, sizeof cb, "b2-control.example");
         CHECK(trig.bytes && ctl.bytes, "build_trigger(b2) не собрался");
 
-        int replies[] = { 22, 23 }; /* 1-й вопрос: рукопожатие без appdata — промах; 2-й: проходит */
-        driver_args da = { &p, "b2.example", replies, 2, 300 };
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "b2: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 0, 1 }; /* 1-й вопрос — рукопожатие без appdata (промах), 2-й проходит */
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 2; fa.foreign_before_round = -1;
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b2: ведущий поток не запустился");
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b2: поддельный конец связи не запустился");
 
-        unsigned long long before = query_ok_cmds(&p);
-        d2k_props pr = d2k_props_ask(fd, "127.0.0.1", stand_port, trig, ctl, 0);
+        d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
-        unsigned long long after = query_ok_cmds(&p);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
 
-        CHECK(after - before == 2, "b2: должны были встать ровно два плана (перекрытие промахнулось, "
-                                    "дубликаты прошли)");
+        CHECK(!fa.extra_round_seen, "b2: опрос продолжился после второго прохода — лишняя команда");
         CHECK(pr.counts_duplicates == D2K_P_YES, "b2: счёт дубликатов не записан по проходу");
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
               "b2: промах первого вопроса записал что-то — промах обязан не писать НИЧЕГО (§2.4)");
         CHECK(pr.tolerates_reorder == D2K_P_UNKNOWN && pr.validates_checksum == D2K_P_UNKNOWN &&
               pr.parses_l7 == D2K_P_UNKNOWN,
               "b2: опрос не остановился на втором проходе");
-        drain_all(fd);
+    }
+
+    /* --- C1 (находка 1 ревью 11.09): чужое событие обмена — ДАЖЕ с
+     * прикладными данными — не подтверждает наш зонд, если своего обмена не
+     * будет никогда. Без фильтра по ключу это ровно воспроизведение находки
+     * ревьюера: "цель на недостижимом адресе, которая ни разу не ответила,
+     * даёт tolerates_left_overlap = NO". Здесь цель ДОСТИЖИМА (соединение
+     * состоится — props_ask_contact дойдёт до конца), но ответа от датапата
+     * не будет никогда: разница не в достижимости, а в том, что событие с
+     * чужим ключом лежит в очереди РЯДОМ с ожиданием. ------------------------ */
+    {
+        uint8_t tb[2048], cb[2048];
+        d2k_hello trig = build_trigger(tb, sizeof tb, "c1.example");
+        d2k_hello ctl = build_trigger(cb, sizeof cb, "c1-control.example");
+        CHECK(trig.bytes && ctl.bytes, "build_trigger(c1) не собрался");
+
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "c1: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { -1 }; /* своего обмена не будет никогда */
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 1; fa.foreign_before_round = 0; /* чужое (с appdata) шлём */
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "c1: поддельный конец связи не запустился");
+
+        d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
+        pthread_join(th, NULL);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
+
+        CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN,
+              "c1: чужое событие обмена (appdata, чужой ключ) засчитано за свой зонд — находка 1 не закрыта");
+    }
+
+    /* --- C2 (находка 1 ревью 11.09, продолжение): чужое событие ПЕРЕД
+     * своим не должно "съесть" опрос целиком — фильтр обязан пропустить
+     * мимо чужое и всё равно дождаться СВОЕГО, а не просто отбрасывать все
+     * подряд события без разбора. ------------------------------------------- */
+    {
+        uint8_t tb[2048], cb[2048];
+        d2k_hello trig = build_trigger(tb, sizeof tb, "c2.example");
+        d2k_hello ctl = build_trigger(cb, sizeof cb, "c2-control.example");
+        CHECK(trig.bytes && ctl.bytes, "build_trigger(c2) не собрался");
+
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "c2: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 1 };
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 1; fa.foreign_before_round = 0; /* чужое, затем своё */
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "c2: поддельный конец связи не запустился");
+
+        d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
+        pthread_join(th, NULL);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
+
+        CHECK(pr.tolerates_left_overlap == D2K_P_NO,
+              "c2: своё событие обмена, пришедшее ПОСЛЕ чужого, не признано — фильтр отбрасывает лишнее");
     }
 
     /* --- B3: control недоступен — вопросы 2 и 5 пропускаются целиком (SET_NAME
@@ -921,17 +1227,23 @@ int main(void) {
         d2k_hello ctl = build_trigger(cb, sizeof cb, "b4-control.example");
         CHECK(trig.bytes && ctl.bytes, "build_trigger(b4) не собрался");
 
-        int replies[] = { 22, 22, 22, 22, 23 };
-        driver_args da = { &p, "b4.example", replies, 5, 300 };
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "b4: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 0, 0, 0, 0, 1 };
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 5; fa.foreign_before_round = -1;
         pthread_t th;
-        CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b4: ведущий поток не запустился");
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b4: поддельный конец связи не запустился");
 
-        unsigned long long before = query_ok_cmds(&p);
-        d2k_props pr = d2k_props_ask(fd, "127.0.0.1", stand_port, trig, ctl, 0);
+        d2k_props pr = d2k_props_ask(sv[0], "127.0.0.1", target_port, trig, ctl, 0);
         pthread_join(th, NULL);
-        unsigned long long after = query_ok_cmds(&p);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
 
-        CHECK(after - before == 5, "b4: должны были встать все пять планов подряд");
+        CHECK(!fa.extra_round_seen, "b4: опрос продолжился после пятого раунда — лишняя команда");
         CHECK(pr.parses_l7 == D2K_P_YES, "b4: разбор протокола не записан по проходу");
         CHECK(pr.validates_checksum == D2K_P_NO,
               "b4: разбор протокола обязан писать ОБА поля из одного факта (properties.go), "
@@ -939,7 +1251,6 @@ int main(void) {
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
               pr.counts_duplicates == D2K_P_UNKNOWN,
               "b4: промахи первых четырёх вопросов записали что-то лишнее");
-        drain_all(fd);
     }
 
     d2k_link_close(fd);
