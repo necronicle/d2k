@@ -531,7 +531,10 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
-    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, NULL, 0, NULL);
+    /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
+       отличит применение своего кандидата от применения предыдущего, чьё
+       событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
+    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use));
     d2k_actions_free(&acts);
 }
 
@@ -1032,7 +1035,10 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
-    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL, NULL, 0, NULL);
+    /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
+       отличит применение своего кандидата от применения предыдущего, чьё
+       событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
+    d2k_journal_add_applied(s->jrn, now_ns, &key, d2k_plan_id(use));
 
     d2k_actions_free(&acts);
     return 0;

@@ -48,16 +48,22 @@ const char *d2k_suspect_text(uint8_t code) {
     }
 }
 
-void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
-                     uint8_t kind, uint8_t code, uint32_t num,
-                     const d2k_jrn_detail *det,
-                     const uint8_t *name, size_t name_len, const char *note) {
+/* Общая часть добавления. Возвращает занятую ячейку, чтобы вызывающий дописал
+   в неё то, что есть только у его вида записи (сегодня — идентификатор плана).
+   NULL, когда хранить негде: журнала нет вовсе или он выключен (cap == 0) —
+   добавление при этом всё равно посчитано, «журнал полон» и «ничего не
+   происходило» обязаны различаться. Голова кольца сдвигается здесь же:
+   указатель на ячейку от этого не портится, она никуда не переезжает. */
+static d2k_jrn_entry *add_entry(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                                uint8_t kind, uint8_t code, uint32_t num,
+                                const d2k_jrn_detail *det,
+                                const uint8_t *name, size_t name_len, const char *note) {
     if (!j) {
-        return;
+        return NULL;
     }
     j->added++;
     if (j->cap == 0) {
-        return;
+        return NULL;
     }
     if (j->n == j->cap) {
         j->dropped++;
@@ -97,6 +103,25 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
     j->head = (j->head + 1) % j->cap;
     if (j->n < j->cap) {
         j->n++;
+    }
+    return e;
+}
+
+void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                     uint8_t kind, uint8_t code, uint32_t num,
+                     const d2k_jrn_detail *det,
+                     const uint8_t *name, size_t name_len, const char *note) {
+    (void)add_entry(j, at_ns, key, kind, code, num, det, name, name_len, note);
+}
+
+void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                             const uint8_t *plan_id) {
+    d2k_jrn_entry *e = add_entry(j, at_ns, key, D2K_JRN_PLAN_APPLIED, 0, 0, NULL,
+                                 NULL, 0, NULL);
+    if (e && plan_id) {
+        /* Как есть, байт в байт: идентификатор двоичный, и чистка под печать,
+           которой проходит имя выше, испортила бы его молча. */
+        memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
 }
 

@@ -76,7 +76,7 @@ struct d2k_seqovl {
 struct d2k_plan {
     uint16_t schema;
     uint16_t minexec;
-    uint8_t  id[16];
+    uint8_t  id[D2K_PLAN_ID_LEN];
     uint8_t  transport;
     uint8_t  proto;
     uint8_t  order;

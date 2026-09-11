@@ -212,6 +212,15 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             break;
         case D2K_JRN_PLAN_APPLIED:
             type = D2K_EV_APPLIED;
+            /* Идентификатор применённого плана — тем же приёмом, что и всё
+               остальное здесь: побайтно в тело, без наложения структуры.
+               Едет ВСЕГДА, даже когда он нулевой: у плана без записи REC_ID
+               нули и есть честный ответ «плану нечем представиться», и
+               контроллер читает их так же, как отсутствие поля у старого
+               датапата (см. d2k_plan_id, d2k_plan.h). Постоянная длина тела
+               к тому же избавляет ту сторону от разбора «есть или нет». */
+            memcpy(body + n, e->plan_id, D2K_PLAN_ID_LEN);
+            n += D2K_PLAN_ID_LEN;
             break;
         case D2K_JRN_PLAN_REFUSED:
             type = D2K_EV_REFUSED;

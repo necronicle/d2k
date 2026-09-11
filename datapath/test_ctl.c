@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 
 #include "d2k_ctl.h"
@@ -110,6 +111,124 @@ static const uint8_t tiny[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 1,
     0x01, 0x03, 0x00, 0x01, 0x00
 };
+
+/* Тот же минимальный план плюс запись REC_ID (тип 0x0001, длина 16) — записей
+   в заголовке поэтому две. Идентификатор нарочно НЕпечатный (0xA0..0xAF): он
+   двоичный, и путь от разбора плана до провода не имеет права его чистить под
+   печать — дорога через поле имени журнала заменила бы каждый такой байт
+   точкой (journal.c), и проверка печатным идентификатором прошла бы мимо
+   этого. */
+static const uint8_t want_id[16] = {
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF
+};
+static const uint8_t plan_with_id[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+    0x00, 0x01, 0x00, 0x10,
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static void wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+/* Приветствие TLS с заданным именем и несущий его пакет. Собираются здесь, а
+   не берутся готовыми: разбирать их будет настоящий tls.c настоящим пакетным
+   путём — план обязан примениться так же, как на роутере, иначе события
+   применения взяться неоткуда. Те же сборщики, что в ctlprobe.c и
+   test_session.c. */
+static size_t build_hello(uint8_t *out, const char *sni) {
+    uint8_t body[512];
+    size_t b = 0;
+    body[b++] = 0x03; body[b++] = 0x03;
+    for (int i = 0; i < 32; i++) { body[b++] = (uint8_t)i; }
+    body[b++] = 0;
+    body[b++] = 0x00; body[b++] = 0x02; body[b++] = 0x13; body[b++] = 0x01;
+    body[b++] = 0x01; body[b++] = 0x00;
+
+    size_t nl = strlen(sni);
+    uint8_t ext[320];
+    size_t e = 0;
+    ext[e++] = 0x00; ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(5 + nl);
+    ext[e++] = 0x00; ext[e++] = (uint8_t)(3 + nl);
+    ext[e++] = 0x00;
+    ext[e++] = 0x00; ext[e++] = (uint8_t)nl;
+    memcpy(ext + e, sni, nl); e += nl;
+    body[b++] = 0x00; body[b++] = (uint8_t)e;
+    memcpy(body + b, ext, e); b += e;
+
+    size_t o = 0;
+    out[o++] = 0x16; out[o++] = 0x03; out[o++] = 0x01;
+    out[o++] = (uint8_t)((b + 4) >> 8); out[o++] = (uint8_t)(b + 4);
+    out[o++] = 0x01; out[o++] = 0x00;
+    out[o++] = (uint8_t)(b >> 8); out[o++] = (uint8_t)b;
+    memcpy(out + o, body, b); o += b;
+    return o;
+}
+
+static size_t build_pkt(uint8_t *o, uint16_t sport, const uint8_t *pay, size_t paylen) {
+    size_t total = 20 + 20 + paylen;
+    memset(o, 0, 40);
+    o[0] = 0x45;
+    wr16(o + 2, (uint16_t)total);
+    o[8] = 64;
+    o[9] = 6;
+    uint8_t lan[4] = {192, 168, 1, 67}, wan[4] = {93, 184, 216, 34};
+    memcpy(o + 12, lan, 4);
+    memcpy(o + 16, wan, 4);
+    wr16(o + 20, sport);
+    wr16(o + 22, 443);
+    wr32(o + 24, 1000);
+    wr32(o + 28, 2000);
+    o[32] = 0x50;
+    o[33] = 0x18;
+    wr16(o + 34, 64240);
+    if (paylen) {
+        memcpy(o + 40, pay, paylen);
+    }
+    return total;
+}
+
+static int read_exact(int fd, uint8_t *b, size_t n) {
+    size_t have = 0;
+    while (have < n) {
+        ssize_t r = read(fd, b + have, n - have);
+        if (r <= 0) {
+            return -1;
+        }
+        have += (size_t)r;
+    }
+    return 0;
+}
+
+/* Читает ОДИН кадр события целиком: заголовок, потом ровно объявленное число
+ * байт тела. Одним read() здесь не обойтись, в отличие от read_ack выше: pump
+ * выкладывает подряд несколько событий, и «сколько отдал сокет» не равно
+ * «сколько в кадре». Возвращает длину тела, -1 при обрыве или тайм-ауте
+ * приёма (его ставит вызывающий через SO_RCVTIMEO — иначе непришедшее событие
+ * означало бы вечное ожидание вместо провала). */
+static ssize_t read_event(int fd, uint16_t *type, uint8_t *body, size_t cap) {
+    uint8_t hdr[6];
+    if (read_exact(fd, hdr, sizeof hdr) != 0) {
+        return -1;
+    }
+    uint32_t plen = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
+                    (uint32_t)hdr[2] << 8 | hdr[3];
+    if (plen < 2 || (size_t)(plen - 2) > cap) {
+        return -1;
+    }
+    *type = (uint16_t)((hdr[4] << 8) | hdr[5]);
+    size_t blen = (size_t)plen - 2;
+    if (blen && read_exact(fd, body, blen) != 0) {
+        return -1;
+    }
+    return (ssize_t)blen;
+}
 
 int main(void) {
     char err[160];
@@ -503,6 +622,104 @@ int main(void) {
         CHECK(d2k_plantab_find(tab, (const uint8_t *)"filler1.example",
                                strlen("filler1.example"), 0, 9999999) == NULL,
               "самая старая по факту запись пережила вытеснение вместо свежей");
+
+        close(cli);
+        d2k_session_free(sess);
+    }
+
+    /* --- событие применения несёт ИДЕНТИФИКАТОР плана ------------------------
+     *
+     * d2k_ctl.h объявляет D2K_EV_APPLIED как «ключ + id плана» с самого начала,
+     * а на проводе ехал один ключ: «план применился» было неотличимо от
+     * «применился КАКОЙ-ТО план», и при смене кандидата событие предыдущего
+     * засчиталось бы новому.
+     *
+     * Проверяется БАЙТАМИ на проводе, а не разбором core/link.c: разбор —
+     * вторая сторона того же контракта, и сверять их друг об друга значит не
+     * проверять ни одну.
+     *
+     * Путь настоящий целиком: план приезжает командой, приветствие проходит
+     * через d2k_session_packet, событие выкладывает d2k_ctlsrv_pump. Подделка
+     * журнала здесь ничего бы не доказала — именно на этой дороге
+     * идентификатор и терялся. */
+    {
+        d2k_session *sess = d2k_session_new(2, 16);
+        CHECK(sess != NULL, "сессия для проверки идентификатора не создалась");
+
+        d2k_ctlsrv cx;
+        memset(&cx, 0, sizeof cx);
+        cx.sess = sess;
+        cx.ctl = c;
+        cx.send_limits = 0;
+
+        /* Прошлый блок закрыл своего cli, но сервер узнаёт об уходе
+           собеседника только через poll/flush (см. drop_peer в ctl.c) — иначе
+           accept() ниже отверг бы новое подключение как «второго
+           контроллера». Тот же порядок, что и в блоках выше. */
+        d2k_ctl_poll(c, on_cmd, NULL);
+        cli = dial();
+        CHECK(cli >= 0, "клиент для проверки идентификатора не подключился");
+        d2k_ctl_accept(c);
+        CHECK(d2k_ctl_peer_fd(c) >= 0, "подключение для проверки идентификатора не принято");
+
+        /* Потолок ожидания на приёме: непришедшее событие обязано быть
+           ПРОВАЛОМ, а не вечным чтением. Две секунды — с запасом на любую
+           машину: всё, что читается, уже лежит в сокете к моменту чтения
+           (pump и flush отработали строкой выше). */
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+        {
+            uint8_t body[128], f[160];
+            size_t blen = set_name_body(body, "id.example", plan_with_id, sizeof plan_with_id);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
+                  "команда с планом-носителем идентификатора не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+                  "команда с планом-носителем идентификатора не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на план с идентификатором не пришёл");
+            CHECK(ok == 1, "план с записью REC_ID отвергнут");
+        }
+
+        uint8_t hello[512], pkt[1024], obuf[2048];
+        size_t hl = build_hello(hello, "id.example");
+        size_t pl = build_pkt(pkt, 40100, hello, hl);
+        d2k_result r;
+        d2k_session_packet(sess, pkt, pl, 1000, obuf, sizeof obuf, &r);
+        CHECK(d2k_session_applied(sess) == 1,
+              "план не применился — проверять в событии нечего");
+
+        uint64_t seen = 0;
+        d2k_ctlsrv_pump(c, sess, &seen);
+        d2k_ctl_flush(c);
+
+        /* Pump выкладывает всё, что появилось в журнале: сперва приветствие,
+           затем применение. Чужие виды пропускаем — их порядок не предмет
+           этой проверки. */
+        int found = 0;
+        for (int i = 0; i < 4 && !found; i++) {
+            uint16_t type = 0;
+            uint8_t ev[256];
+            ssize_t n = read_event(cli, &type, ev, sizeof ev);
+            if (n < 0) {
+                break;
+            }
+            if (type != D2K_EV_APPLIED) {
+                continue;
+            }
+            found = 1;
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 16),
+                  "тело APPLIED не «ключ + 16 байт идентификатора»");
+            if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 16)) {
+                CHECK(memcmp(ev + D2K_KEY_WIRE_LEN, want_id, sizeof want_id) == 0,
+                      "идентификатор на проводе не тот, что приехал записью REC_ID");
+            }
+        }
+        CHECK(found, "события применения не пришло вовсе");
 
         close(cli);
         d2k_session_free(sess);

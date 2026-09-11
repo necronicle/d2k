@@ -496,6 +496,65 @@ int main(void) {
         }
     }
     {
+        /* Событие применения обязано нести идентификатор плана: без него
+           «план применился» неотличимо от «применился какой-то план», и при
+           смене кандидата событие предыдущего засчиталось бы новому.
+           Байты нарочно НЕпечатные (0xA0..0xAF): идентификатор двоичный, и
+           путь до провода не имеет права его чистить под печать — именно так
+           его испортила бы дорога через поле имени в журнале датапата
+           (datapath/journal.c заменяет всё вне 0x20..0x7e точкой). */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED с id) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[16];
+            for (int i = 0; i < 16; i++) { rest[i] = (uint8_t)(0xA0 + i); }
+            send_synthetic(sv[1], D2K_EV_APPLIED, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "APPLIED с идентификатором плана должен приниматься");
+            int same = 1;
+            for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != (uint8_t)(0xA0 + i)) { same = 0; } }
+            CHECK(same, "идентификатор плана потерян при разборе события");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
+        /* Короткое событие (только ключ) — законный вход: старый датапат id
+           не слал. Поле обязано остаться нулевым, а не мусором. */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED без id) не создался");
+        if (sv[0] >= 0) {
+            send_synthetic(sv[1], D2K_EV_APPLIED, NULL, 0);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "APPLIED без идентификатора должен приниматься");
+            int zero = 1;
+            for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != 0) { zero = 0; } }
+            CHECK(zero, "идентификатора не было, а поле пришло не нулевым");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
+        /* Обрезанный идентификатор (15 байт вместо 16) — не половина
+           идентификатора, а его отсутствие: половина ключа хуже, чем ничего,
+           её нельзя сверить с кандидатом, а нулём она честно означает «не
+           прислан». Граница отличает проверку «>= 16» от ослабленной. */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED с обрезанным id) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[15];
+            memset(rest, 0xC7, sizeof rest);
+            send_synthetic(sv[1], D2K_EV_APPLIED, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "APPLIED с обрезанным идентификатором должен приниматься");
+            int zero = 1;
+            for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != 0) { zero = 0; } }
+            CHECK(zero, "обрезанный идентификатор принят за настоящий");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (EXCHANGE короче 6) не создался");
         if (sv[0] >= 0) {

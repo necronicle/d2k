@@ -63,7 +63,7 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
 
         switch (typ) {
         case REC_ID:
-            if (ln != 16) { fail(err, errlen, "id не 16 байт"); return -1; }
+            if (ln != D2K_PLAN_ID_LEN) { fail(err, errlen, "id не 16 байт"); return -1; }
             break;
         case REC_PROTO:
             if (ln != 2) { fail(err, errlen, "proto не 2 байта"); return -1; }
@@ -263,7 +263,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
 
         switch (typ) {
         case REC_ID:
-            memcpy(p->id, v, 16);
+            memcpy(p->id, v, D2K_PLAN_ID_LEN);
             break;
         case REC_PROTO:
             p->transport = v[0];
@@ -366,4 +366,13 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
 
 uint8_t d2k_plan_guards(const d2k_plan *p) {
     return p ? p->guards : 0;
+}
+
+const uint8_t *d2k_plan_id(const d2k_plan *p) {
+    /* Указатель внутрь плана, а не копия: живёт он ровно столько же, сколько
+       сам план, а на пакетном пути копировать шестнадцать байт ради возврата
+       незачем. План без записи REC_ID отдаёт нули — calloc в d2k_plan_load
+       обнулил поле, и «идентификатора нет» выглядит так же, как «его не
+       прислали» на той стороне провода (см. d2k_plan.h). */
+    return p ? p->id : NULL;
 }

@@ -53,7 +53,9 @@ enum {
      * ключами» (см. d2k_quic.h) — и то, и другое просто НЕ порождает никакого
      * события журнала (см. session.c, handle_udp), а не этот вид. */
     D2K_JRN_HELLO_NONAME,
-    D2K_JRN_PLAN_APPLIED,      /* план применён */
+    /* План применён. Какой именно — в plan_id записи; кладёт его
+     * d2k_journal_add_applied. */
+    D2K_JRN_PLAN_APPLIED,
     D2K_JRN_PLAN_REFUSED,      /* план не применён, причина в note */
     /* Обмен пошёл: с обратной стороны пришла нагрузка после приветствия.
      * code — тип первой TLS-записи, num — сколько байт. Это НАБЛЮДЕНИЕ, а не
@@ -91,6 +93,14 @@ typedef struct {
     uint8_t  d_ref_ttl;  /* TTL того, что отвечало по этому соединению */
     uint8_t  d_tos;
     uint16_t d_ipid;
+    /* Идентификатор применённого плана (REC_ID). Значим только при
+     * kind == D2K_JRN_PLAN_APPLIED, у остального нули.
+     *
+     * Отдельным полем, а не через name: имя приходит из сети и потому
+     * чистится под печать — всё вне 0x20..0x7e заменяется точкой (см.
+     * d2k_journal_add ниже). Идентификатор двоичный, такая чистка испортила
+     * бы его молча, и «план применился» приписалось бы не тому плану. */
+    uint8_t  plan_id[D2K_PLAN_ID_LEN];
     char     name[D2K_JRN_NAME_MAX + 1];
     /* Строковый литерал причины. Владения нет и не нужно: причины приходят
      * литералами из датапата и живут столько же, сколько программа. */
@@ -118,6 +128,16 @@ void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                      uint8_t kind, uint8_t code, uint32_t num,
                      const d2k_jrn_detail *det,
                      const uint8_t *name, size_t name_len, const char *note);
+
+/* Запись D2K_JRN_PLAN_APPLIED с идентификатором применённого плана
+ * (d2k_plan_id, D2K_PLAN_ID_LEN байт; NULL — идентификатора нет, поле
+ * останется нулевым).
+ *
+ * Своя функция, а не ещё один аргумент d2k_journal_add: идентификатор есть
+ * ровно у одного вида записи, а добавленный всем аргумент пришлось бы
+ * писать нулём в двух десятках вызовов, где он ничего не значит. */
+void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                             const uint8_t *plan_id);
 
 /* Записи от старой к новой. i от 0 до d2k_journal_count()-1. */
 size_t               d2k_journal_count(const d2k_journal *j);
