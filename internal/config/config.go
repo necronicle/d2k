@@ -259,3 +259,9 @@ func (c Config) CatalogPath() string {
 	}
 	return filepath.Join(c.StateDir, "catalog.json")
 }
+
+// LivePath — файл, в который движок (d2kc) пишет вид для панели. Рядом с
+// каталогом и по тем же правилам: это состояние, а не настройка.
+func (c Config) LivePath() string {
+	return filepath.Join(c.StateDir, "live.json")
+}

@@ -17,10 +17,7 @@ import (
 	"time"
 
 	"github.com/necronicle/d2k/internal/buildinfo"
-	"github.com/necronicle/d2k/internal/catalog"
 	"github.com/necronicle/d2k/internal/config"
-	"github.com/necronicle/d2k/internal/control"
-	"github.com/necronicle/d2k/internal/controller"
 	"github.com/necronicle/d2k/internal/status"
 	"github.com/necronicle/d2k/internal/web"
 )
@@ -37,12 +34,11 @@ func usage(w *os.File) {
   version              что за сборка запущена
   config [-write]      показать конфигурацию; -write создать файл с умолчаниями
   status               что программа делает прямо сейчас
-  plan <подкоманда>    перевод плана между текстовой и канонической формой
-  control              контроллер: связь датапата и каталога коробок
-  volume -target H:P   проба на блокировку по объёму соединения
-  cut -target H:P      где резать приветствие, чтобы коробка потеряла имя
-  classify -target H:P  чем именно режут и что из этого следует
-  serve [-log FILE]    запустить службу и локальную панель
+  serve [-log FILE]    запустить локальную панель
+
+Подбором обхода занимается d2kc — отдельный процесс на C. Подкоманды plan,
+control, volume, cut и classify жили на Go-стороне движка и удалены вместе с
+ней 11.09.2026; их работу делает d2kc, а разовые замеры — d2kask.
 
 Путь к конфигурации: переменная D2K_CONFIG, иначе %s
 `, buildinfo.Short(), config.DefaultPath())
@@ -70,21 +66,6 @@ func run(args []string, out, errOut *os.File) int {
 
 	case "status":
 		return cmdStatus(out, errOut)
-
-	case "plan":
-		return cmdPlan(args[1:], out, errOut)
-
-	case "control":
-		return cmdControl(args[1:], out, errOut)
-
-	case "volume":
-		return cmdVolume(args[1:], out, errOut)
-
-	case "cut":
-		return cmdCut(args[1:], out, errOut)
-
-	case "classify":
-		return cmdClassify(args[1:], out, errOut)
 
 	case "serve":
 		return cmdServe(args[1:], out, errOut)
@@ -228,61 +209,19 @@ func cmdServe(args []string, out, errOut *os.File) int {
 		return 1
 	}
 
-	// Каталог и контроллер. Панель работает и без них — просто честно
-	// говорит, что происходящего не видит: показывать прошлое знание за
-	// настоящее нельзя.
-	var stopCtl func()
-	if store, err := catalog.Open(c.CatalogPath()); err != nil && store == nil {
-		panel.SetLinkNote(fmt.Sprintf("каталог %s не читается: %v", c.CatalogPath(), err))
-	} else {
-		if err != nil {
-			// Откат на предыдущую версию каталога. Работать можно, но знать
-			// об этом обязательно.
-			fmt.Fprintf(errOut, "внимание: %v\n", err)
-		}
-		conn, derr := control.Dial(c.ControlSocket)
-		if derr != nil {
-			panel.SetLinkNote(fmt.Sprintf("датапат на %s не отвечает", c.ControlSocket))
-		} else {
-			ctrl := controller.New(conn, store, out)
-			ctrl.SetDecoy(c.DecoySNI)
-			ctrl.SetMark(c.Mark)
-			if err := ctrl.Sync(); err != nil {
-				fmt.Fprintf(errOut, "не поставить планы подтверждённых привязок: %v\n", err)
-			}
-			panel.SetKnowledge(ctrl)
-			go func() {
-				if err := ctrl.Run(); err != nil {
-					fmt.Fprintf(errOut, "контроллер остановлен: %v\n", err)
-				}
-			}()
-			stopCtl = func() {
-				_ = conn.Close()
-				// §5.5: у остановки должен быть описанный путь, и
-				// «накопленное потерялось» им не является.
-				if wrote, err := store.FlushNow(time.Now()); err != nil {
-					fmt.Fprintf(errOut, "каталог не записан при остановке: %v\n", err)
-				} else if wrote {
-					fmt.Fprintf(out, "каталог записан при остановке.\n")
-				}
-			}
-		}
-	}
-	if stopCtl != nil {
-		defer stopCtl()
-	}
+	// Узнанное панель берёт из файла, который пишет движок (d2kc): он
+	// единственный знает и каталог, и живые поиски. Второй читатель каталога
+	// здесь разошёлся бы с ним в первый же день — см. status.LiveSource.
+	panel.SetKnowledge(status.NewLiveSource(c.LivePath()))
 
 	fmt.Fprintf(out, "%s\n", buildinfo.Short())
 	fmt.Fprintf(out, "панель: http://%s/\n", c.PanelListen)
 	// Говорим это при каждом запуске, а не только в панели: человек, поднявший
 	// службу из консоли, должен узнать правду до того, как решит, что обход
 	// заработал.
-	if stopCtl == nil {
-		// Говорим это при каждом запуске, а не только в панели: человек,
-		// поднявший службу из консоли, должен узнать правду до того, как
-		// решит, что обход заработал.
-		fmt.Fprintf(out, "контроллер не подключён к датапату — обход не подбирается.\n")
-	}
+	// Подбором занимается отдельный процесс (d2kc), и панель только
+	// показывает то, что он пишет. Молчание движка она называет прямо — см.
+	// status.LiveSource.
 	if !web.LoopbackOnly(c.PanelListen) {
 		fmt.Fprintf(errOut, "внимание: панель слушает не на петле (%s) и доступна из сети. Аутентификации у неё нет.\n", c.PanelListen)
 	}

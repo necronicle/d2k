@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "d2k_compose.h"
@@ -56,12 +57,29 @@
 /* Отдых цели после неудачи: не долбить одну и ту же цель подряд. */
 #define SCHED_REST_MS (2 * 60 * 1000)
 
-/* Зондов на задачу. ПЕРЕСМОТРЕТЬ ЗАМЕРОМ (задача 6 плана): ревью 06.09
-   показало, что на тяжёлой цели восьми не хватает и поиск обрывается по
-   бюджету при неисчерпанных кандидатах. До замера держим унаследованное
-   значение — назначать новое «на глаз» было бы ровно тем, что правило про
-   числа запрещает. */
-#define SCHED_MAX_PROBES 8
+/* Сколько выведенных планов держит задача. Это же потолок, который
+   d2k_compose получает под свои плечи. */
+#define SCHED_MAX_PLANS 8
+
+/* Зондов на задачу. ЗАМЕРЕНО на живой линии 11.09 (accounts.youtube.com, та
+   самая тяжёлая цель, из-за которой ревью 06.09 сказало «восьми мало»):
+
+     19:28:26  вердикт «решает содержимое» — спрашиваю коробку о свойствах
+     19:28:26  зонд вопроса 1 … 19:28:49 зонд вопроса 5   ← пять зондов
+     19:28:57  поставил план 1 из 8
+     19:29:40  план 1 … 19:30:12 план 2 … 19:30:42 план 3
+     19:30:42  выведенные планы исчерпаны (зондов 8)      ← бюджет кончился
+
+   Пять вопросов съели пять зондов, на планы осталось три из восьми — пять
+   выведенных плечей не попробовали НИ РАЗУ, и «исчерпаны» означало «кончился
+   бюджет», а не «кончились планы». Это и есть та подмена, из-за которой
+   число пересматривалось.
+
+   Новое значение не назначено с запасом, а ВЫВЕДЕНО из того, сколько зондов
+   машина в принципе может потратить: пять вопросов (D2K_PROPS_QUESTIONS) плюс
+   столько планов, сколько влезает в очередь (SCHED_MAX_PLANS). Больше она не
+   израсходует по построению, меньше — обрежет саму себя. */
+#define SCHED_MAX_PROBES (D2K_PROPS_QUESTIONS + SCHED_MAX_PLANS)
 
 /* Сколько раз кандидат может примениться БЕЗ обмена, прежде чем считаться
    плохим. Унаследовано с Go-стороны (controller.go, maxSilentTries) вместе с
@@ -132,7 +150,7 @@ typedef struct {
     int        shape_armed;
 
     /* Кандидаты, собранные d2k_compose по вердикту. */
-    char       plans[8][4096];
+    char       plans[SCHED_MAX_PLANS][4096];
     size_t     n_plans;
     size_t     next_plan;
     int        silent_applied;  /* применений текущего плана без прикладного обмена */
@@ -207,6 +225,12 @@ struct d2k_sched {
        сработало», и если связь в этот момент теряла события, считать молчание
        уликой нельзя (см. on_applied). */
     uint32_t     dropped_seen;
+
+    /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
+       жизнь процесса, и отметка стенных часов, от которой считается «с
+       какого времени идёт поиск» (внутри всё на монотонных). */
+    int          confirms, probes_used;
+    int64_t      wall_base_s;
 
     d2k_sched_say_fn say_fn;
     void            *say_ctx;
@@ -691,6 +715,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         }
         t->props_asked = 1;
         t->probes++;
+        s->probes_used++;
         t->prop_applied = 0;
         /* Подтверждения команды НЕ ждём, и это не спешка.
          *
@@ -754,6 +779,7 @@ static int install_next(d2k_sched *s, task *t) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
         const char *text = t->plans[t->next_plan++];
         t->probes++;
+        s->probes_used++;
         /* План в каталог НЕ пишется здесь: кандидат — ещё не знание (§10).
            Пишется только подтверждённый обменом, в on_exchange ниже. */
         char err[160];
@@ -867,6 +893,7 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     s->link_fd = link_fd;
     s->mark = mark;
     s->wake[0] = s->wake[1] = -1;
+    s->wall_base_s = (int64_t)time(NULL);
     if (pipe(s->wake) != 0) {
         free(s);
         return NULL;
@@ -881,6 +908,172 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
         return NULL;
     }
     return s;
+}
+
+/* --------------------------------------------------------------------
+ * Вид для панели. См. d2k_sched_write_live в d2k_sched.h.
+ * -------------------------------------------------------------------- */
+
+/* Экранирование строки в JSON. Тот же минимум, что и у писателя каталога:
+   кавычка, обратная косая и управляющие. Имена целей приходят ИЗ СЕТИ, и
+   пропустить их в файл как есть значило бы отдать панели то, что она разберёт
+   не так, как мы записали. */
+static void json_str(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (*p == '"' || *p == '\\') { fprintf(f, "\\%c", *p); }
+        else if (*p < 0x20) { fprintf(f, "\\u%04x", *p); }
+        else { fputc(*p, f); }
+    }
+    fputc('"', f);
+}
+
+static void json_time(FILE *f, int64_t unix_s) {
+    if (unix_s <= 0) {
+        fputs("\"0001-01-01T00:00:00Z\"", f); /* нулевое время Go — панель знает его */
+        return;
+    }
+    time_t t = (time_t)unix_s;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    char buf[32];
+    strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+    json_str(f, buf);
+}
+
+/* Уровень доказательства словами — §4.2. Те же слова, что у status.LevelName
+   на Go-стороне: подобраны так, чтобы уровень 2 нельзя было прочитать как
+   уровень 4. Панель берёт готовую строку и не толкует число сама. */
+static const char *level_name(int n) {
+    switch (n) {
+    case 1: return "транспорт установился";
+    case 2: return "сервер ответил";
+    case 3: return "обмен прошёл";
+    case 4: return "прикладной обмен в проверенном объёме";
+    case 5: return "подтверждён последующими соединениями";
+    default: return "не измерено";
+    }
+}
+
+/* Примета словами. Шаблон панели не должен знать, что 0x88 это ToS, а 54321 —
+   идентификатор IP: собирается здесь, как и на Go-стороне. */
+static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
+    if (strcmp(sig->kind, "rst") == 0) {
+        snprintf(out, cap, "подделанный сброс, TTL %u (на %d от сервера), ToS 0x%02x, ip id %u",
+                 (unsigned)sig->ttl, sig->ttl_delta, (unsigned)sig->tos, (unsigned)sig->ipid);
+    } else if (strcmp(sig->kind, "volume") == 0) {
+        snprintf(out, cap, "обрыв по объёму около %d КБ", sig->volume);
+    } else if (strcmp(sig->kind, "silent") == 0) {
+        snprintf(out, cap, "ответа на приветствие не было");
+    } else if (strcmp(sig->kind, "repeat") == 0) {
+        snprintf(out, cap, "приветствие повторено");
+    } else {
+        snprintf(out, cap, "%s", sig->kind);
+    }
+}
+
+/* Чем занята задача прямо сейчас — теми же словами, что показывала панель у
+   Go-контроллера: §8 требует различать «распознаём», «проверяем готовое» и
+   «ищем новое», и сливать их в одно нельзя. */
+static const char *task_phase(const task *t) {
+    switch (t->state) {
+    case T_ASKING:        return "распознаём поведение";
+    case T_PROPS_CONTACT:
+    case T_PROPS_WAIT:    return "спрашиваем коробку о свойствах";
+    case T_PLANNING:      return "выводим планы";
+    case T_WATCHING:      return t->next_plan <= t->n_known
+                                     ? "проверяем готовое узнанной коробки"
+                                     : "проверяем выведенный план";
+    case T_RESTING:       return "цель отдыхает после неудачи";
+    default:              return "заводим поиск";
+    }
+}
+
+int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_path) {
+    if (!s || !path) { return -1; }
+    char tmp[512];
+    int n = snprintf(tmp, sizeof tmp, "%s.new", path);
+    if (n < 0 || (size_t)n >= sizeof tmp) { return -1; }
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { return -1; }
+
+    size_t targets = 0;
+    for (size_t i = 0; i < s->cat->n_boxes; i++) { targets += s->cat->boxes[i].n_binds; }
+
+    fputs("{\n", f);
+    fputs("  \"linked\": true,\n  \"link_note\": \"\",\n  \"catalog_at\": ", f);
+    json_str(f, catalog_path ? catalog_path : "");
+    fputs(",\n  \"boxes\": [", f);
+    for (size_t i = 0; i < s->cat->n_boxes; i++) {
+        const d2k_cat_box *b = &s->cat->boxes[i];
+        fputs(i ? ",\n    {" : "\n    {", f);
+        fputs("\"id\": ", f); json_str(f, b->id);
+        fputs(", \"created\": ", f); json_time(f, b->created);
+        fputs(", \"updated\": ", f); json_time(f, b->updated);
+
+        fputs(", \"signals\": [", f);
+        for (size_t j = 0; j < b->fp.n_sig; j++) {
+            char human[200];
+            signal_human(&b->fp.sig[j], human, sizeof human);
+            fputs(j ? ", {" : "{", f);
+            fputs("\"kind\": ", f); json_str(f, b->fp.sig[j].kind);
+            fputs(", \"human\": ", f); json_str(f, human);
+            fprintf(f, ", \"seen\": %d}", b->fp.sig[j].seen);
+        }
+        fputs("], \"plans\": [", f);
+        for (size_t j = 0; j < b->n_plans; j++) {
+            fputs(j ? ", {" : "{", f);
+            fputs("\"id\": ", f); json_str(f, b->plans[j].id);
+            fputs(", \"proto\": ", f); json_str(f, b->plans[j].proto);
+            fprintf(f, ", \"successes\": %d, \"enabled\": %s",
+                    b->plans[j].successes, b->plans[j].enabled ? "true" : "false");
+            /* Human панель собирает сама из текста — здесь его и отдаём, а
+               второго толкователя плана не заводим. */
+            fputs(", \"human\": \"\", \"text\": ", f);
+            json_str(f, b->plans[j].text ? b->plans[j].text : "");
+            fputc('}', f);
+        }
+        fputs("], \"bindings\": [", f);
+        for (size_t j = 0; j < b->n_binds; j++) {
+            const d2k_cat_binding *bd = &b->binds[j];
+            fputs(j ? ", {" : "{", f);
+            fputs("\"target\": ", f); json_str(f, bd->target);
+            fputs(", \"kind\": ", f); json_str(f, bd->kind);
+            fprintf(f, ", \"level\": %d, ", bd->level);
+            fputs("\"level_name\": ", f); json_str(f, level_name(bd->level));
+            fprintf(f, ", \"successes\": %d, ", bd->successes);
+            fputs("\"confirmed\": ", f); json_time(f, bd->confirmed);
+            fprintf(f, ", \"enabled\": %s}", bd->enabled ? "true" : "false");
+        }
+        fputs("]}", f);
+    }
+    fputs(s->cat->n_boxes ? "\n  ],\n" : "],\n", f);
+
+    fputs("  \"searches\": [", f);
+    int first = 1;
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        const task *t = &s->tasks[i];
+        if (t->state == T_FREE) { continue; }
+        fputs(first ? "\n    {" : ",\n    {", f);
+        first = 0;
+        fputs("\"target\": ", f); json_str(f, t->name);
+        fputs(", \"phase\": ", f); json_str(f, task_phase(t));
+        fputs(", \"since\": ", f); json_time(f, s->wall_base_s + t->started_ms / 1000);
+        fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes);
+        fputs("\"candidate\": ", f);
+        json_str(f, t->next_plan > 0 ? "план поставлен" : "");
+        fputs(", \"source\": ", f);
+        json_str(f, t->n_known > 0 && t->next_plan <= t->n_known
+                        ? "готовый план узнанной коробки" : "выведен из замера");
+        fputc('}', f);
+    }
+    fputs(first ? "],\n" : "\n  ],\n", f);
+    fprintf(f, "  \"targets\": %zu,\n  \"confirms\": %d,\n  \"probes_used\": %d\n}\n",
+            targets, s->confirms, s->probes_used);
+
+    if (fclose(f) != 0) { (void)remove(tmp); return -1; }
+    if (rename(tmp, path) != 0) { (void)remove(tmp); return -1; }
+    return 0;
 }
 
 void d2k_sched_free(d2k_sched *s) {
@@ -1222,6 +1415,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->transport, now_ms, &t->fp);
+    s->confirms++;
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО прикладным обменом: %s, %u байт",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, (unsigned)ev->num);
     task_done(t);

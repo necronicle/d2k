@@ -1,5 +1,0 @@
-d2k-plan 1 1
-id 00000000000000000000000000000002
-proto tcp tls
-split sni_start +0
-order forward

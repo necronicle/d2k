@@ -44,6 +44,11 @@
    запись на флеш, и стоит она одной строки. */
 #define REPORT_EVERY_MS 15000
 
+/* Как часто обновлять вид для панели. Две секунды: человек, открывший панель,
+   ждёт, что идущий поиск на ней виден, а не появится через минуту. Файл
+   маленький и лежит на tmpfs-подобном разделе состояния. */
+#define LIVE_EVERY_MS 2000
+
 static volatile sig_atomic_t stop_asked;
 static void on_signal(int sig) { (void)sig; stop_asked = 1; }
 
@@ -99,18 +104,21 @@ static void usage(void) {
         "использование: d2kc --control <сокет> [--catalog <файл>] [--mark 0x2d]\n"
         "  --control  управляющий сокет датапата (обязателен)\n"
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
+        "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
         "  --mark     метка SO_MARK для зондов поиска (умолчание 0x2d)\n");
 }
 
 int main(int argc, char **argv) {
     const char *sock = NULL;
     const char *catpath = "/opt/d2k/catalog.json";
+    const char *livepath = NULL;
     uint32_t mark = 0x2d;
 
     for (int i = 1; i < argc; i++) {
         const char *f = argv[i];
         if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
+        else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else {
@@ -175,6 +183,20 @@ int main(int argc, char **argv) {
     unsigned long seen_events = 0, seen_hello = 0, seen_suspect = 0;
     unsigned long seen_exchange = 0, seen_applied = 0, seen_refused = 0;
     int64_t last_report = now_ms();
+
+    /* Путь вида для панели: рядом с каталогом, если не задан явно. Панель
+       читает его и больше ничего о движке не знает (см. d2k_sched_write_live). */
+    char livebuf[CATPATH_MAX + 16];
+    if (!livepath) {
+        const char *slash = strrchr(catpath, '/');
+        size_t dirlen = slash ? (size_t)(slash - catpath + 1) : 0;
+        if (dirlen < sizeof livebuf - 10) {
+            memcpy(livebuf, catpath, dirlen);
+            snprintf(livebuf + dirlen, sizeof livebuf - dirlen, "live.json");
+            livepath = livebuf;
+        }
+    }
+    int64_t last_live = 0;
 
     int64_t last_tick = now_ms(), last_save = last_tick;
     size_t dirty = 0;   /* сколько привязок было при последнем сохранении */
@@ -242,6 +264,11 @@ int main(int argc, char **argv) {
                      seen_applied, seen_refused, d2k_sched_active(s));
             sched_say(NULL, line);
             last_report = t;
+        }
+
+        if (livepath && t - last_live >= LIVE_EVERY_MS) {
+            (void)d2k_sched_write_live(s, livepath, catpath);
+            last_live = t;
         }
 
         if (t - last_save >= SAVE_EVERY_MS) {
