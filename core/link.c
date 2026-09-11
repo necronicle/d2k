@@ -256,8 +256,8 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             say(err, errcap, "обмен короче типа записи и длины");
             return -1;
         }
-        out->code = rest[0]; /* тип ПЕРВОЙ TLS-записи — вход d2k_success */
-        out->seen_types = rest[1]; /* маска встреченных типов — см. d2k_link.h */
+        out->code = rest[0]; /* тип ПЕРВОЙ TLS-записи — липкое поле, НЕ порог успеха (см. d2k_link.h) */
+        out->seen_types = rest[1]; /* маска встреченных типов — вход d2k_ev_has_appdata */
         out->num = (uint32_t)rest[2] << 24 | (uint32_t)rest[3] << 16 |
                    (uint32_t)rest[4] << 8 | rest[5];
         break;
@@ -394,7 +394,18 @@ int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
     return 0;
 }
 
-int d2k_success(uint16_t tls_record_type) {
-    /* §8: успех — прикладной обмен, а не любые вернувшиеся байты. */
-    return tls_record_type == D2K_TLS_APPLICATION_DATA ? 1 : 0;
+int d2k_ev_has_appdata(const d2k_ev *ev) {
+    /* §8: успех — прикладной обмен, а не тип ПЕРВОЙ записи (code — липкое
+     * поле, см. большой комментарий у seen_types в d2k_link.h) и не любые
+     * вернувшиеся байты. Зеркало Go-донора HasAppData: маска, а не
+     * сравнение с одним значением — иначе uint8_t seen_types молча
+     * продвинулся бы до uint16_t и сравнился с типом записи, что почти
+     * всегда даёт ложь без единого предупреждения компилятора (см. большой
+     * комментарий у объявления в d2k_link.h). ev == NULL — не событие,
+     * прикладных данных в нём нет по определению, а не неопределённое
+     * поведение. */
+    if (!ev) {
+        return 0;
+    }
+    return (ev->seen_types & (uint8_t)(1u << (D2K_TLS_APPLICATION_DATA - 20))) != 0 ? 1 : 0;
 }
