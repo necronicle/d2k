@@ -8,6 +8,7 @@
 #   D2K_ROUTER   адрес роутера   (обязательно)
 #   D2K_SSH_PORT порт ssh        (222)
 #   D2K_SSH_PASS пароль root     (если нет ключа)
+#   D2K_SSH_CONTROL существующий SSH control socket (без передачи пароля)
 #   D2K_LOAD     команда нагрузки, выполняется локально
 #
 # Что здесь защищает от уже сделанных ошибок:
@@ -80,10 +81,22 @@ LOCAL_LOG="$REPO/docs/field/raw/observe-$STAMP.log"
 # упирается в предел неаутентифицированных сессий dropbear, и очередная
 # команда получает «Permission denied» на верном пароле.
 MUX="-o ControlMaster=auto -o ControlPath=$SCRATCH/m -o ControlPersist=180"
+BORROWED_SSH=0
+if [ -n "${D2K_SSH_CONTROL:-}" ]; then
+    case "$D2K_SSH_CONTROL" in
+        *[!a-zA-Z0-9_./-]*) say "недопустимый путь SSH control socket"; exit 2 ;;
+    esac
+    [ -S "$D2K_SSH_CONTROL" ] || { echo "нет SSH control socket" >&2; exit 2; }
+    MUX="-o ControlMaster=no -o ControlPath=$D2K_SSH_CONTROL -o BatchMode=yes"
+    BORROWED_SSH=1
+fi
 
-if [ -n "${D2K_SSH_PASS:-}" ]; then
-    SSH="sshpass -p $D2K_SSH_PASS ssh -n $MUX -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
-    SSH_IN="sshpass -p $D2K_SSH_PASS ssh $MUX -p $SSH_PORT -o StrictHostKeyChecking=no root@$ROUTER"
+if [ -n "${D2K_SSH_PASS:-}" ] && [ "$BORROWED_SSH" = 0 ]; then
+    # Do not put the password in argv (visible to process listings).
+    SSHPASS=$D2K_SSH_PASS
+    export SSHPASS
+    SSH="sshpass -e ssh -n $MUX -p $SSH_PORT -o StrictHostKeyChecking=yes root@$ROUTER"
+    SSH_IN="sshpass -e ssh $MUX -p $SSH_PORT -o StrictHostKeyChecking=yes root@$ROUTER"
 else
     SSH="ssh -n $MUX -p $SSH_PORT root@$ROUTER"
     SSH_IN="ssh $MUX -p $SSH_PORT root@$ROUTER"
@@ -107,7 +120,10 @@ teardown() {
 cleanup() {
     teardown
     # shellcheck disable=SC2086  # MUX — набор ключей, разворачивается намеренно
-    ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+    if [ "$BORROWED_SSH" = 0 ]; then
+        # shellcheck disable=SC2086
+        ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+    fi
     rm -rf "$SCRATCH"
 }
 trap 'cleanup' EXIT INT TERM

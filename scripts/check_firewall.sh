@@ -63,6 +63,7 @@ fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 
 echo "== fw_up =="
 fw_up
+fw_installed || fail "полный набор правил не распознан"
 RULES=$(iptables -t mangle -S)
 echo "$RULES"
 
@@ -84,8 +85,42 @@ fw_up
 COUNT_OUT=$(iptables -t mangle -S D2K_OUT | wc -l)
 [ "$COUNT_OUT" -eq 4 ] || fail "повторный fw_up размножил правила D2K_OUT (строк: $COUNT_OUT, ждали 4)"
 
+echo "== пустые цепочки с сохранёнными переходами — НЕ работающий firewall =="
+iptables -t mangle -F D2K_OUT
+iptables -t mangle -F D2K_IN
+iptables -t mangle -A D2K_OUT -m mark --mark "$MARK" -j RETURN
+if fw_installed; then fail "переходы в пустые цепочки объявлены рабочими правилами"; fi
+fw_up
+
+echo "== потеря любого обязательного правила должна обнаруживаться =="
+for proto in tcp udp; do
+    for chain in D2K_OUT D2K_IN; do
+        if [ "$chain" = D2K_OUT ]; then
+            ports=--dports; direction=original
+        else
+            ports=--sports; direction=reply
+        fi
+        iptables -t mangle -D "$chain" -p "$proto" -m multiport "$ports" "$PORTS" \
+            -m connbytes --connbytes "$CONNBYTES" --connbytes-dir "$direction" \
+            --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+        if fw_installed; then fail "потеря $proto в $chain не обнаружена"; fi
+        fw_up
+    done
+done
+for hook in POSTROUTING FORWARD INPUT; do
+    chain=D2K_IN
+    [ "$hook" = POSTROUTING ] && chain=D2K_OUT
+    iptables -t mangle -D "$hook" -j "$chain"
+    if fw_installed; then fail "потеря перехода из $hook не обнаружена"; fi
+    fw_up
+done
+iptables -t mangle -D D2K_OUT -m mark --mark "$MARK" -j RETURN
+if fw_installed; then fail "потеря исключения собственных пакетов не обнаружена"; fi
+fw_up
+
 echo "== fw_down =="
 fw_down
+if fw_installed; then fail "после fw_down правила объявлены установленными"; fi
 LEFT=$(iptables -t mangle -S | grep -ic d2k || true)
 [ "$LEFT" -eq 0 ] || fail "fw_down оставил $LEFT правил(о) с упоминанием D2K"
 

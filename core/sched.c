@@ -79,7 +79,9 @@
    машина в принципе может потратить: пять вопросов (D2K_PROPS_QUESTIONS) плюс
    столько планов, сколько влезает в очередь (SCHED_MAX_PLANS). Больше она не
    израсходует по построению, меньше — обрежет саму себя. */
-#define SCHED_MAX_PROBES (D2K_PROPS_QUESTIONS + SCHED_MAX_PLANS)
+/* Reuse and new synthesis have independent bounded queues. Spending the
+   reuse budget must not leave the subsequent research with no trials. */
+#define SCHED_MAX_PROBES (D2K_PROPS_QUESTIONS + 2 * SCHED_MAX_PLANS)
 
 /* Сколько раз кандидат может примениться БЕЗ обмена, прежде чем считаться
    плохим. Унаследовано с Go-стороны (controller.go, maxSilentTries) вместе с
@@ -151,6 +153,7 @@ typedef struct {
 
     /* Кандидаты, собранные d2k_compose по вердикту. */
     char       plans[SCHED_MAX_PLANS][4096];
+    char       plan_boxes[SCHED_MAX_PLANS][40]; /* candidate source, not established identity */
     size_t     n_plans;
     size_t     next_plan;
     int        silent_applied;  /* применений текущего плана без прикладного обмена */
@@ -167,6 +170,8 @@ typedef struct {
        не из синтеза по вердикту: различать их нужно на записи успеха (план
        узнанной коробки не заводит новую) и в логе. */
     size_t     n_known;
+    int        researched;     /* expensive measurement is a fallback, not recognition */
+    int        trial_installed;
 
     /* Вопросы о свойствах коробки (§2.4, d2k_compose.h). Задаются ТОЛЬКО на
        вердикт «решает содержимое»: разрез такую коробку не берёт, берёт её
@@ -714,6 +719,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
         t->props_asked = 1;
+        t->trial_installed = 1;
         t->probes++;
         s->probes_used++;
         t->prop_applied = 0;
@@ -753,13 +759,21 @@ static void prop_finish(d2k_sched *s, task *t) {
            измерение только что сказало «не работает» (см. d2k_props_ask). */
         char err[160];
         (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+        t->trial_installed = 0;
     }
     t->prop_q = -1;
 }
 
-static void task_fail(task *t, int64_t now_ms) {
+static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     join_worker(t);
     prop_close(t);
+    if (t->trial_installed) {
+        char err[160];
+        if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) != 0) {
+            say(s, "по %s не удалось снять пробный план: %s", t->name, err);
+        }
+        t->trial_installed = 0;
+    }
     t->state = T_RESTING;
     t->rest_until_ms = now_ms + SCHED_REST_MS;
     t->n_plans = 0;
@@ -778,6 +792,7 @@ static int install_next(d2k_sched *s, task *t) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
         const char *text = t->plans[t->next_plan++];
+        snprintf(t->box_id, sizeof t->box_id, "%s", t->plan_boxes[t->next_plan - 1]);
         t->probes++;
         s->probes_used++;
         /* План в каталог НЕ пишется здесь: кандидат — ещё не знание (§10).
@@ -792,6 +807,7 @@ static int install_next(d2k_sched *s, task *t) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) == 0) {
+            t->trial_installed = 1;
             return 0;
         }
     }
@@ -806,17 +822,9 @@ static int install_next(d2k_sched *s, task *t) {
  * Возвращает, сколько кандидатов взято из каталога. */
 static size_t known_plans(d2k_sched *s, task *t) {
     if (t->fp.n_sig == 0) { return 0; }
-    int bi = d2k_catalog_match(s->cat, &t->fp);
-    if (bi < 0) { return 0; }
-    const d2k_cat_box *b = &s->cat->boxes[bi];
-    snprintf(t->box_id, sizeof t->box_id, "%s", b->id);
-
-    /* Выбор лучшего по числу успехов прямо на выдаче: планов у коробки
-       десятки, а не тысячи, и отдельный массив индексов стоил бы дороже самой
-       работы. */
+    /* Ambiguity yields candidates, not the identity of the first catalog
+       entry. Order globally by positive evidence; retain each plan's owner. */
     size_t took = 0;
-    int used[64];
-    memset(used, 0, sizeof used);
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     /* proto у плана каталога — протокол УРОВНЯ ПРИЛОЖЕНИЯ ("tls"/"quic"), а
        не транспорт: живой каталог роутера Марка (11.09, 14 коробок, 353
@@ -827,17 +835,28 @@ static size_t known_plans(d2k_sched *s, task *t) {
        оттуда же, а не выдумывается здесь. */
     const char *want = (t->transport == 17) ? "quic" : "tls";
     while (took < cap) {
-        int best = -1;
-        for (size_t i = 0; i < b->n_plans && i < sizeof used / sizeof used[0]; i++) {
-            if (used[i] || !b->plans[i].enabled || !b->plans[i].text) { continue; }
-            if (strcmp(b->plans[i].proto, want) != 0) { continue; }
-            if (best < 0 || b->plans[i].successes > b->plans[best].successes) { best = (int)i; }
+        const d2k_cat_plan *best = NULL;
+        const d2k_cat_box *owner = NULL;
+        for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+            const d2k_cat_box *b = &s->cat->boxes[bi];
+            if (!d2k_fp_same(&b->fp, &t->fp)) { continue; }
+            for (size_t i = 0; i < b->n_plans; i++) {
+                const d2k_cat_plan *p = &b->plans[i];
+                if (!p->enabled || !p->text || strcmp(p->proto, want) != 0 ||
+                    strlen(p->text) >= sizeof t->plans[0]) { continue; }
+                int used = 0;
+                for (size_t k = 0; k < took; k++) {
+                    if (strcmp(t->plans[k], p->text) == 0) { used = 1; break; }
+                }
+                if (!used && (!best || p->successes > best->successes)) {
+                    best = p;
+                    owner = b;
+                }
+            }
         }
-        if (best < 0) { break; }
-        used[best] = 1;
-        size_t n = strlen(b->plans[best].text);
-        if (n + 1 > sizeof t->plans[0]) { continue; } /* не влезает — но не обрезать молча */
-        memcpy(t->plans[took], b->plans[best].text, n + 1);
+        if (!best) { break; }
+        memcpy(t->plans[took], best->text, strlen(best->text) + 1);
+        snprintf(t->plan_boxes[took], sizeof t->plan_boxes[took], "%s", owner->id);
         took++;
     }
     return took;
@@ -858,18 +877,20 @@ static void props_text(const d2k_props *p, char *out, size_t cap) {
 }
 
 static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
+    (void)s;
     t->next_plan = 0;
-    t->n_known = known_plans(s, t);
-    t->n_plans = t->n_known;
+    t->n_known = 0;
+    t->n_plans = 0;
+    memset(t->plan_boxes, 0, sizeof t->plan_boxes);
+    /* Failed reuse does not prove this is the same box. A newly synthesized
+       plan must not silently enlarge the first vaguely matching model. */
+    t->box_id[0] = '\0';
 
-    if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE ||
-        v == D2K_V_INCONCLUSIVE || v == D2K_V_FLAKY) {
-        /* Обходить нечего, либо мерить было нечем. Ни то, ни другое не знание
-           о плане — в каталог не идёт ничего (§10, §13). Готовые планы
-           узнанной коробки при этом ОСТАЮТСЯ: они не вывод из этого вердикта,
-           а уже проверенное знание, и «мерить было нечем» его не отменяет. */
+    if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE) {
         return;
     }
+    /* Inconclusive/flaky classification limits our diagnosis, not the
+       permitted search space. Candidates remain hypotheses until verified. */
     /* Вектор — накопленный вопросами, а не пустой: в этом весь смысл опроса.
        Пустой вектор d2k_compose честно превращает в ОДИН запасной план, и до
        появления вопросов планировщик только его и получал. */
@@ -1254,6 +1275,15 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             t->shape_armed = 1;
         }
     }
+    t->n_known = known_plans(s, t);
+    t->n_plans = t->n_known;
+    if (t->n_known > 0) {
+        t->state = T_PLANNING;
+        say(s, "по %s проверяю %zu готовых планов узнанной коробки / совместимых моделей ДО нового замера",
+            t->name, t->n_known);
+        return 1;
+    }
+    t->researched = 1;
     t->state = T_ASKING;
     if (start_worker(s, t, JOB_CLASSIFY) != 0) {
         task_reset(t);
@@ -1410,6 +1440,9 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
             h ^= fnv1a(b);
             h *= 1099511628211ULL;
         }
+        /* Coarse passive evidence is not enough to merge a NEW solution
+           into an old model whose ready plans failed. Keep it separate. */
+        h ^= fnv1a(text);
         snprintf(box_id, sizeof box_id, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
     }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
@@ -1476,7 +1509,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
         if (t->started_ms == 0) { t->started_ms = now_ms; }
         if (now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
-            task_fail(t, now_ms);
+            task_fail(s, t, now_ms);
             moved++;
             continue;
         }
@@ -1521,7 +1554,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->name, verdict_name(r.verdict), r.reason, t->n_plans);
             }
             if (t->n_plans == 0) {
-                task_fail(t, now_ms);
+                task_fail(s, t, now_ms);
                 moved++;
                 continue;
             }
@@ -1584,11 +1617,26 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_PLANNING) {
             if (install_next(s, t) != 0) {
+                if (!t->researched) {
+                    /* Exhausted known plans: remove the trial before any
+                       baseline measurement. Research happens at most once. */
+                    char err[160];
+                    (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+                    t->trial_installed = 0;
+                    t->researched = 1;
+                    t->box_id[0] = '\0';
+                    t->state = T_ASKING;
+                    if (start_worker(s, t, JOB_CLASSIFY) == 0) {
+                        say(s, "по %s готовые планы не помогли — начинаю новый замер", t->name);
+                        moved++;
+                        continue;
+                    }
+                }
                 say(s, "по %s выведенные планы исчерпаны (зондов %d) — цель отдыхает. "
                        "Это не «перебор кончился»: планы выводятся из замера, и если "
                        "измерить было нечем, их и нет",
                     t->name, t->probes);
-                task_fail(t, now_ms);
+                task_fail(s, t, now_ms);
                 moved++;
                 continue;
             }

@@ -98,7 +98,7 @@ fw_up() {
     # и UDP одинаково: зонды QUIC (задача 4) метятся тем же MARK, что и зонды
     # TCP, и им нужен тот же выход до NFQUEUE, иначе собственные зонды службы
     # вернутся в её же очередь.
-    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN
+    iptables -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -107,11 +107,11 @@ fw_up() {
     iptables -t mangle -A "$CHAIN_OUT" -p tcp -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
-        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     iptables -t mangle -A "$CHAIN_IN" -p tcp -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
-        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
 
     # То же самое для UDP (задача 4: датапат видит QUIC поверх UDP 443).
     # CONNBYTES с тем же порогом, что у TCP, — не для симметрии ради
@@ -121,11 +121,11 @@ fw_up() {
     iptables -t mangle -A "$CHAIN_OUT" -p udp -m multiport --dports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
         --connbytes-mode packets \
-        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
-        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
 
     iptables -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
     iptables -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
@@ -148,7 +148,24 @@ fw_down() {
 }
 
 fw_installed() {
-    iptables -t mangle -S POSTROUTING 2>/dev/null | grep -q -- "-j $CHAIN_OUT"
+    # A jump into an empty chain does not send a single packet to d2kd.
+    # Check the complete contract, including reply traffic and bypass. -C
+    # is supported by the target's iptables 1.4.21 (verified 12.09).
+    iptables -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
+    iptables -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
+    iptables -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
+    iptables -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
+    for proto in tcp udp; do
+        iptables -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$PORTS" \
+            -m connbytes --connbytes "$CONNBYTES" --connbytes-dir original \
+            --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
+            --queue-bypass 2>/dev/null || return 1
+        iptables -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$PORTS" \
+            -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
+            --connbytes-mode packets -j NFQUEUE --queue-num "$QUEUE_NUM" \
+            --queue-bypass 2>/dev/null || return 1
+    done
+    return 0
 }
 
 # --- запуск --------------------------------------------------------------
@@ -237,7 +254,7 @@ status() {
                       || echo "  контроллер: не работает"
     running "$PN_PID" && echo "  панель: работает (pid $(cat $PN_PID))" \
                       || echo "  панель: не работает"
-    fw_installed && echo "  правила: стоят" || echo "  правила: НЕ стоят"
+    fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
     if [ -n "$bound" ] && [ "$bound" != "0" ]; then
@@ -252,7 +269,7 @@ status() {
 # делать вид, что есть, нельзя: команда reapply возвращает правила вручную.
 reapply() {
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
-    fw_up || die "не поставить правила"
+    fw_up || { fw_down; die "не поставить полный набор правил"; }
     say "правила поставлены заново"
 }
 

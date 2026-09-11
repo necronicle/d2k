@@ -512,11 +512,14 @@ int main(void) {
            уйти в кандидаты первым, а успех — лечь в ту же коробку, а не в
            клон. */
         size_t boxes_before = c6.n_boxes;
+        tcp_calls = vol_calls = 0;
         d2k_ev h2 = ev_hello(6, 40051, "вторая.цель");
         d2k_sched_event(s, &h2);
         d2k_ev su2 = ev_suspect(6, 40051);
         d2k_sched_event(s, &su2);
         settle(s);
+        CHECK(tcp_calls == 0 && vol_calls == 0,
+              "узнанная коробка запустила новый замер ДО проверки готового плана");
         d2k_ev x2 = ev_exchange(6, 40051, 1);
         d2k_sched_event(s, &x2);
         CHECK(c6.n_boxes == boxes_before,
@@ -528,6 +531,28 @@ int main(void) {
               strcmp(c6.boxes[0].plans[0].proto, "tls") == 0,
               "proto записанного плана не \"tls\" — в живом каталоге у всех планов именно он, "
               "и сравнение с транспортом отбрасывало бы каждый настоящий план");
+
+        /* A miss on a new target falls back to research ONCE, without
+           discarding the established bindings of the other targets. */
+        tcp_calls = vol_calls = 0;
+        d2k_ev h3 = ev_hello(6, 40052, "третья.цель");
+        d2k_sched_event(s, &h3);
+        d2k_ev su3 = ev_suspect(6, 40052);
+        d2k_sched_event(s, &su3);
+        settle(s);
+        CHECK(tcp_calls == 0 && vol_calls == 0, "повторное использование снова вызвало замер");
+        d2k_ev ap3 = h3;
+        ap3.kind = D2K_EV_APPLIED;
+        ap3.name[0] = '\0';
+        d2k_sched_event(s, &ap3);
+        d2k_sched_event(s, &ap3);
+        settle(s);
+        CHECK(tcp_calls == 1 && vol_calls == 1,
+              "после промаха готового плана исследование не запущено ровно один раз");
+        CHECK(binding_of(&c6, "вторая.цель", 6) != NULL,
+              "промах третьей цели повредил подтверждённую вторую");
+        CHECK(binding_of(&c6, "третья.цель", 6) == NULL,
+              "промах готового плана записан как новая привязка");
         d2k_sched_free(s);
         d2k_catalog_free(&c6);
     }
@@ -734,6 +759,85 @@ int main(void) {
         CHECK(c3.n_boxes == 0, "неудачный поиск завёл коробку");
         d2k_sched_free(s);
         d2k_catalog_free(&c3);
+        tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* Two compatible models are alternatives, not "first match wins". */
+    {
+        d2k_catalog c;
+        memset(&c, 0, sizeof c);
+        c.boxes = calloc(2, sizeof *c.boxes);
+        CHECK(c.boxes != NULL, "не удалось создать две модели");
+        if (c.boxes) {
+            c.n_boxes = 2;
+            int ready = 1;
+            for (size_t i = 0; i < 2; i++) {
+                d2k_cat_box *b = &c.boxes[i];
+                snprintf(b->id, sizeof b->id, "box-alternative-%u", (unsigned)i);
+                b->fp.method = D2K_FP_METHOD;
+                b->fp.n_sig = 1;
+                snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+                b->fp.sig[0].ttl = 127;
+                b->fp.sig[0].tos = 0x88;
+                b->fp.sig[0].ipid = 54321;
+                b->plans = calloc(1, sizeof *b->plans);
+                if (!b->plans) { ready = 0; break; }
+                b->n_plans = 1;
+                b->plans[0].enabled = 1;
+                b->plans[0].successes = (int)(2 - i);
+                snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "tls");
+                char plan[256];
+                snprintf(plan, sizeof plan,
+                         "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                         "proto tcp tls\nsplit payload_start +%u\norder reverse\n",
+                         (unsigned)(i + 1));
+                b->plans[0].text = strdup(plan);
+                if (!b->plans[0].text) { ready = 0; break; }
+            }
+            CHECK(ready, "не удалось создать планы альтернативных моделей");
+            if (ready) {
+                d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+                tcp_calls = vol_calls = 0;
+                d2k_ev h = ev_hello(6, 40101, "неоднозначная.цель");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(6, 40101);
+                d2k_sched_event(s, &su);
+                settle(s);
+                d2k_ev ap = h;
+                ap.kind = D2K_EV_APPLIED;
+                ap.name[0] = '\0';
+                d2k_sched_event(s, &ap);
+                d2k_sched_event(s, &ap);
+                settle(s);
+                CHECK(tcp_calls == 0 && vol_calls == 0,
+                      "первая похожая модель не помогла — вторая пропущена ради исследования");
+                d2k_ev x = ev_exchange(6, 40101, 1);
+                d2k_sched_event(s, &x);
+                CHECK(c.boxes[0].n_binds == 0 && c.boxes[1].n_binds == 1,
+                      "результат второго плана записан не в его модель");
+                d2k_sched_free(s);
+            }
+            d2k_catalog_free(&c);
+        }
+    }
+
+    /* Missing diagnostic control is not permission to abandon synthesis. */
+    {
+        d2k_catalog c;
+        memset(&c, 0, sizeof c);
+        d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        d2k_ev h = ev_hello(6, 40100, "без.контроля");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40100);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(said("поставил план 1 из"), "нет диагноза — генерация ошибочно запрещена");
+        CHECK(c.n_boxes == 0, "непроверенная гипотеза попала в каталог");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
     }
 
