@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include "d2k_compose.h"
+#include "d2k_compose_internal.h"
 #include "d2k_link.h"
 #include "test_stand.h"
 
@@ -86,6 +87,59 @@ static size_t hexrun_after(const char *hay, const char *needle) {
     size_t n = 0;
     while (isxdigit((unsigned char)p[n])) { n++; }
     return n;
+}
+
+/* Считает непересекающиеся вхождения needle в hay — нужно посчитать строки
+ * "emit " в выводе planlab без ещё одного разбора построчно. */
+static int count_substr(const char *hay, const char *needle) {
+    int n = 0;
+    size_t nl = strlen(needle);
+    const char *p = hay;
+    while ((p = strstr(p, needle)) != NULL) { n++; p += nl; }
+    return n;
+}
+
+static int write_file_bytes(const char *path, const uint8_t *b, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { return -1; }
+    size_t wr = n ? fwrite(b, 1, n, f) : 0;
+    fclose(f);
+    return (wr == n) ? 0 : -1;
+}
+
+static int write_file_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "w");
+    if (!f) { return -1; }
+    size_t n = strlen(text);
+    size_t wr = fwrite(text, 1, n, f);
+    fclose(f);
+    return (wr == n) ? 0 : -1;
+}
+
+/* Запускает planlab (лаборатория плана, datapath/planlab.c — тот же
+ * исполнитель, d2k_plan_load+d2k_plan_apply, что и прод) на паре файлов и
+ * возвращает его STDOUT целиком в out (обрезан до cap-1, для пяти зондов
+ * этого с большим запасом достаточно). Возвращает 0, если сам процесс
+ * запустился (даже если planlab написал "reject"/"refuse" — это результат
+ * исполнителя, а не сбой запуска, см. шапку planlab.c), -1 иначе. cwd теста
+ * — core/ (см. Makefile), отсюда относительный путь "../datapath/planlab". */
+static int run_planlab(const char *plan_path, const char *scenario_path,
+                       char *out, size_t cap) {
+    char cmd[600];
+    int n = snprintf(cmd, sizeof cmd, "../datapath/planlab %s %s 2>/dev/null",
+                     plan_path, scenario_path);
+    if (n < 0 || (size_t)n >= sizeof cmd) { return -1; }
+    FILE *pf = popen(cmd, "r");
+    if (!pf) { return -1; }
+    size_t got = 0;
+    while (got + 1 < cap) {
+        size_t r = fread(out + got, 1, cap - 1 - got, pf);
+        if (r == 0) { break; }
+        got += r;
+    }
+    out[got] = '\0';
+    pclose(pf);
+    return 0;
 }
 
 static void nap_ms(int ms) {
@@ -517,6 +571,159 @@ int main(void) {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
         CHECK(d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, NULL, 8) == 0, "out==NULL обязан дать 0, а не падение");
+    }
+
+    /* ======================================================================
+     * planlab: содержимое пяти TLV-планов зонда d2k_props_ask (ревью 11.09,
+     * круг правок 1) — байты и порядок посылок, а не структурная валидность.
+     *
+     * Обмен на настоящем ctlprobe (блок ниже) НЕ зависит от содержимого
+     * установленного плана — ctlprobe отвечает "reply", которую задаёт САМ
+     * ТЕСТ, а не применение плана к синтетическому пакету. Значит порченный
+     * бит порчи или переставленный порядок посылок там пройдёт молча (это
+     * и произошло с мутациями 3 и 6 в первом отчёте задачи). planlab гоняет
+     * ТОТ ЖЕ исполнитель, что и датапат (d2k_plan_load+d2k_plan_apply, см.
+     * её шапку) — единственный способ проверить содержимое без второй его
+     * реализации в тесте (§2.5 запрещает вторую реализацию преобразований).
+     * ==================================================================== */
+    {
+        char tlvpath[128], scnpath[128], out[4096];
+
+        /* --- перекрытие: один кусок, приставка 41 перед ВСЕЙ нагрузкой,
+         * seq на 1 меньше начала — тот же байт, что видел бы сервер, минус
+         * длина приставки. order лежит в TLV (байт-в-байт с Go: MarshalTLV
+         * пишет recOrder БЕЗУСЛОВНО, см. большой комментарий у
+         * overlap_plan_tlv в compose.c), но НАБЛЮДАЕМО НЕЙТРАЛЕН — проверено
+         * ниже отдельно, до и после переворота бита руками. --------------- */
+        {
+            uint8_t plan[256]; size_t plen;
+            CHECK(overlap_plan_tlv(plan, sizeof plan, &plen) == 0, "overlap_plan_tlv не собрался");
+            snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-overlap.tlv", (int)getpid());
+            snprintf(scnpath, sizeof scnpath, "/tmp/d2k-core-planlab-%d-overlap.scn", (int)getpid());
+            CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план перекрытия не записался");
+            CHECK(write_file_text(scnpath, "pkt 5000 none 0 00010203040506070809\n") == 0,
+                  "сценарий перекрытия не записался");
+            CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (перекрытие) не запустился");
+            CHECK(strstr(out, "emit payload 0 4999 ttl=0 poison=00 4100010203040506070809") != NULL,
+                  "перекрытие: смещение/приставка/нагрузка не те, что должен выпустить исполнитель");
+            CHECK(strstr(out, "fate drop") != NULL, "перекрытие: план обязан снять оригинал (fate drop)");
+            CHECK(count_substr(out, "emit ") == 1, "перекрытие: ожидалась ровно одна посылка");
+            unlink(tlvpath); unlink(scnpath);
+
+            /* Мутация 3 (первый отчёт) — order forward→reverse на этом
+               плане — здесь физически не может поймать себя: order у
+               одиночного куска нагрузки нечего переставлять (datapath/
+               plan_apply.c — цикл переворота меняет местами куски, а он
+               ровно один). Утверждаем это, а не считаем на глаз. */
+            uint8_t flipped[256]; size_t flen;
+            memcpy(flipped, plan, plen); flen = plen;
+            flipped[flen - 1] = (uint8_t)(flipped[flen - 1] ? 0 : 1); /* последний байт — значение REC_ORDER */
+            char tlvpath2[128];
+            snprintf(tlvpath2, sizeof tlvpath2, "/tmp/d2k-core-planlab-%d-overlap-flip.tlv", (int)getpid());
+            CHECK(write_file_bytes(tlvpath2, flipped, flen) == 0, "перевёрнутый план перекрытия не записался");
+            snprintf(scnpath, sizeof scnpath, "/tmp/d2k-core-planlab-%d-overlap.scn", (int)getpid());
+            CHECK(write_file_text(scnpath, "pkt 5000 none 0 00010203040506070809\n") == 0,
+                  "сценарий перекрытия (повтор) не записался");
+            char out2[4096];
+            CHECK(run_planlab(tlvpath2, scnpath, out2, sizeof out2) == 0,
+                  "planlab (перекрытие, order перевёрнут) не запустился");
+            CHECK(strcmp(out, out2) == 0,
+                  "перекрытие: order оказался НЕ нейтральным — вывод изменился после переворота бита, "
+                  "а комментарий у overlap_plan_tlv утверждает нейтральность");
+            unlink(tlvpath2); unlink(scnpath);
+        }
+
+        /* --- порядок сегментов: три куска (payload_start+1, sni_middle),
+         * ОБРАТНЫЙ порядок посылки — хвост, середина, голова. Здесь order
+         * не нейтрален (кусков больше одного) — мутация "reverse→forward"
+         * обязана быть видна как смена порядка эмиссии. --------------------- */
+        {
+            uint8_t plan[256]; size_t plen;
+            CHECK(reorder_plan_tlv(plan, sizeof plan, &plen) == 0, "reorder_plan_tlv не собрался");
+            snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-reorder.tlv", (int)getpid());
+            snprintf(scnpath, sizeof scnpath, "/tmp/d2k-core-planlab-%d-reorder.scn", (int)getpid());
+            CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план порядка не записался");
+            /* 20 байт 00..13, sni_off=10 sni_len=6 → sni_middle=10+3=13:
+               разрезы {1,13} дают куски [0,1) [1,13) [13,20). */
+            CHECK(write_file_text(scnpath,
+                    "pkt 5000 10 6 000102030405060708090a0b0c0d0e0f10111213\n") == 0,
+                  "сценарий порядка не записался");
+            CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (порядок) не запустился");
+            CHECK(count_substr(out, "emit ") == 3, "порядок: ожидались ровно три куска");
+            CHECK(strstr(out, "fate drop") != NULL, "порядок: план обязан снять оригинал (fate drop)");
+            /* Порядок эмиссии — хвост [13,20), середина [1,13), голова [0,1) —
+               проверяется через ОТНОСИТЕЛЬНЫЕ позиции подстрок, а не только
+               их наличие: три strstr по отдельности не отличили бы "хвост,
+               середина, голова" от любой другой перестановки тех же трёх строк. */
+            const char *tail = strstr(out, "emit payload 0 5013 ttl=0 poison=00 0d0e0f10111213");
+            const char *mid  = strstr(out, "emit payload 0 5001 ttl=0 poison=00 0102030405060708090a0b0c");
+            const char *head = strstr(out, "emit payload 0 5000 ttl=0 poison=00 00\n");
+            CHECK(tail && mid && head, "порядок: не нашлись все три ожидаемых куска");
+            if (tail && mid && head) {
+                CHECK(tail < mid && mid < head,
+                      "порядок: куски не в порядке хвост→середина→голова — мутация order "
+                      "(или разрезов) обязана быть видна ровно здесь");
+            }
+            unlink(tlvpath); unlink(scnpath);
+        }
+
+        /* --- контрольная сумма/дубликаты/разбор протокола: общая форма
+         * badsum_fake_plan_tlv. Мутация 6 (первый отчёт) — снятый бит
+         * D2K_POISON_BADSUM — здесь виден напрямую в поле poison=, которое
+         * planlab печатает из ТОГО ЖЕ d2k_emit.poison, что уйдёт на провод. */
+        {
+            snprintf(scnpath, sizeof scnpath, "/tmp/d2k-core-planlab-%d-fakes.scn", (int)getpid());
+            CHECK(write_file_text(scnpath, "pkt 7000 none 0 aabbccdd\n") == 0,
+                  "сценарий фальшивок не записался");
+
+            /* контрольная сумма: набивка 64×0x41, один повтор, без разреза
+               нагрузки — оригинал ПРОХОДИТ (fate pass), фальшивка идёт
+               перед ним отдельной посылкой. */
+            uint8_t plan[256]; size_t plen;
+            CHECK(checksum_plan_tlv(plan, sizeof plan, &plen) == 0, "checksum_plan_tlv не собрался");
+            snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-checksum.tlv", (int)getpid());
+            CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план суммы не записался");
+            CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (сумма) не запустился");
+            CHECK(count_substr(out, "emit ") == 1, "сумма: ожидалась ровно одна фальшивка");
+            CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 ") != NULL,
+                  "сумма: фальшивка не помечена битом порчи (poison=01) — мутация 6 обязана быть видна здесь");
+            CHECK(count_substr(out, "41") >= 64, "сумма: набивка не похожа на 64 байта 0x41");
+            CHECK(strstr(out, "fate pass") != NULL,
+                  "сумма: план не разрезает нагрузку — оригинал обязан пройти (fate pass)");
+            unlink(tlvpath);
+
+            /* счёт дубликатов: та же control-приманка, ДВЕ копии, разрыв
+               20000мкс — вторая посылка обязана нести именно эту задержку
+               (первая посылка delay=0 по построению emit_fake). */
+            static const uint8_t ctrl[8] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22 };
+            CHECK(badsum_fake_plan_tlv(ctrl, sizeof ctrl, 2, 20000, plan, sizeof plan, &plen) == 0,
+                  "badsum_fake_plan_tlv (дубликаты) не собрался");
+            snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-dup.tlv", (int)getpid());
+            CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план дубликатов не записался");
+            CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (дубликаты) не запустился");
+            CHECK(count_substr(out, "emit ") == 2, "дубликаты: ожидались ровно две фальшивки");
+            CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
+                  "дубликаты: первая копия не та (задержка/содержимое/порча)");
+            CHECK(strstr(out, "emit fake 20000 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
+                  "дубликаты: вторая копия без разрыва 20000мкс — repeats/gap_us перепутаны");
+            CHECK(strstr(out, "fate pass") != NULL, "дубликаты: оригинал обязан пройти (fate pass)");
+            unlink(tlvpath);
+
+            /* разбор протокола: та же control-приманка, ОДНА копия, без
+               разрыва — отличается от checksumPlan содержимым (control, не
+               набивка), а не формой; здесь это и проверяется. */
+            CHECK(badsum_fake_plan_tlv(ctrl, sizeof ctrl, 1, 0, plan, sizeof plan, &plen) == 0,
+                  "badsum_fake_plan_tlv (разбор протокола) не собрался");
+            snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-parse.tlv", (int)getpid());
+            CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план разбора протокола не записался");
+            CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (разбор протокола) не запустился");
+            CHECK(count_substr(out, "emit ") == 1, "разбор протокола: ожидалась ровно одна фальшивка");
+            CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
+                  "разбор протокола: приманка не та (обязана быть control, не набивка суммы)");
+            CHECK(strstr(out, "fate pass") != NULL, "разбор протокола: оригинал обязан пройти (fate pass)");
+            unlink(tlvpath);
+            unlink(scnpath);
+        }
     }
 
     /* ======================================================================

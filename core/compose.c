@@ -66,6 +66,14 @@
  * причины; этот модуль настаивает на настоящих байтах везде (см. шапку
  * d2k_meas.h про то, чего стоил самодельный hello 06.09.2026) — здесь тот же
  * принцип просто применён к байтам, которые уже есть на руках.
+ *
+ * ДВА ОСОЗНАННЫХ ДОЛГА этой реализации (снять в круге планировщика, задача 5
+ * шаги 1-5, не здесь) — полное рассуждение в doc-комментарии d2k_props_ask,
+ * d2k_compose.h: (1) план последнего проваленного зонда не снимается с
+ * датапата при полном провале — DEL_NAME отсюда не зовётся; (2)
+ * D2K_PROPS_ASK_WAIT_MS ниже — одно унаследованное число на два РАЗНОРОДНЫХ
+ * ожидания (локальный ack и сетевой обмен), для этого применения не
+ * измеренное.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdarg.h>
@@ -74,6 +82,7 @@
 #include <time.h>
 
 #include "d2k_compose.h"
+#include "d2k_compose_internal.h" /* прототипы четырёх сборщиков TLV ниже — не наложением, а для planlab, см. её шапку */
 #include "d2k_hello.h"
 #include "d2k_link.h"
 #include "d2k_plan.h" /* datapath/include — D2K_POISON_BADSUM, тот же публичный контракт, что уже читает d2k_link.h через d2k_ctl.h */
@@ -155,8 +164,20 @@ static int tlv_header(uint8_t *buf, size_t cap, size_t *pos, uint16_t n_records)
 /* Вопрос 1 — перекрытие слева (overlapPlan, properties.go:234-242): та же
  * приставка {0x41}, что и в overlap_plan_text — длина перекрытия равна
  * длине приманки (Seqovl не хранит число, см. её же комментарий в plan.go),
- * decoy не нужен. Записей: ID, PROTO, PAYLOAD, SEQOVL, ORDER = 5. */
-static int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
+ * decoy не нужен. Записей: ID, PROTO, PAYLOAD, SEQOVL, ORDER = 5.
+ *
+ * ORDER ЗДЕСЬ ОСТАВЛЕН, А НЕ УБРАН — ревью 11.09 заподозрило расхождение с
+ * Go (properties.go:234 не задаёт Plan.Order явно), но это про ЛИТЕРАЛ
+ * СТРУКТУРЫ, не про провод: MarshalTLV (internal/plan/tlv.go) пишет recOrder
+ * БЕЗУСЛОВНО, `if` стоит только перед recGuard — незаданный Order Go
+ * сериализует как 0 (forward) точно так же, как здесь. Убрать запись значило
+ * бы БЫТЬ короче настоящего провода Go на одну запись, а не сойтись с ним.
+ * Значение всё равно НАБЛЮДАЕМО НЕЙТРАЛЬНО для этого плана — проверено
+ * planlab (test_compose.c): при нулевом числе разрезов кусок ровно один
+ * (datapath/plan_apply.c: цикл переворота меняет местами куски НАГРУЗКИ,
+ * а без разрезов их физически не два) — но нейтральность значения и его
+ * присутствие на проводе — разные вопросы, путать их нельзя. */
+int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
     if (tlv_header(buf, cap, &pos, 5) != 0) { return -1; }
     uint8_t pid[2]; wr16be(pid, 1);
@@ -175,7 +196,7 @@ static int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
  * порядок reverse. decoy/якорь sni_middle не нужны здесь: якорь вычисляет
  * датапат из sni_off/sni_len ТЕКУЩЕГО пакета (anchor_offset, plan_apply.c).
  * Записей: ID, PROTO, SPLIT, SPLIT, ORDER = 5. */
-static int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
+int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
     if (tlv_header(buf, cap, &pos, 5) != 0) { return -1; }
     uint8_t s1[4]; wr16be(s1, D2K_ANCHOR_PAYLOAD_START); wr16be(s1 + 2, 1);
@@ -192,9 +213,9 @@ static int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
  * приманка с испорченной суммой ПЕРЕД настоящей нагрузкой, без TTL — тот же
  * смысл, что у badsum_fake_plan_text. Записей: ID, PROTO, PAYLOAD, POISON,
  * FAKE, ORDER = 6. */
-static int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
-                                uint8_t repeats, uint32_t gap_us,
-                                uint8_t *buf, size_t cap, size_t *out_len) {
+int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
+                         uint8_t repeats, uint32_t gap_us,
+                         uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
     if (tlv_header(buf, cap, &pos, 6) != 0) { return -1; }
     uint8_t pid[2]; wr16be(pid, 1);
@@ -216,7 +237,7 @@ static int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
  * набивка 64×0x41, а НЕ приветствие — та же причина, что у checksum_plan_text
  * (коробка, что РАЗБИРАЕТ TLS, мусор проигнорирует и продолжит ждать
  * настоящее приветствие). */
-static int checksum_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
+int checksum_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     uint8_t filler[64];
     memset(filler, 0x41, sizeof filler);
     return badsum_fake_plan_tlv(filler, sizeof filler, 1, 0, buf, cap, out_len);

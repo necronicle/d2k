@@ -33,7 +33,7 @@ MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
-          include/d2k_link.h
+          include/d2k_compose_internal.h include/d2k_link.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -162,6 +162,15 @@ link.o: link.c $(HDR)
 # или не собранный вовсе и молча его использовать.
 ../datapath/ctlprobe: FORCE
 	$(MAKE) -C ../datapath ctlprobe
+
+# planlab — лаборатория плана (datapath/planlab.c): тот же исполнитель
+# (d2k_plan_load/d2k_plan_apply), что и прод, печатает точные байты и порядок
+# посылок по плану и сценарию. test_compose.c гоняет через него TLV, что
+# собирает d2k_props_ask (задача 5, шаг 0, ревью 11.09) — обмен на настоящем
+# ctlprobe не зависит от СОДЕРЖИМОГО плана, только planlab его показывает.
+# FORCE по той же причине, что и ctlprobe выше.
+../datapath/planlab: FORCE
+	$(MAKE) -C ../datapath planlab
 FORCE:
 
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
@@ -226,11 +235,12 @@ test-catalog: test_catalog
 test-match: test_match
 	./test_match
 
-# ../datapath/ctlprobe как зависимость запуска (не только сборки test_compose):
-# d2k_props_ask (задача 5, шаг 0) теперь тоже проверяется против настоящего
-# ctlprobe, тем же приёмом, что test_link — см. её комментарий ниже и
-# TESTHDR-блок выше.
-test-compose: test_compose ../datapath/ctlprobe
+# ../datapath/ctlprobe и ../datapath/planlab как зависимости запуска (не
+# только сборки test_compose): d2k_props_ask (задача 5, шаг 0) проверяется
+# против настоящего ctlprobe (обмен) тем же приёмом, что test_link, И против
+# planlab (содержимое плана — байты и порядок посылок, ревью 11.09, круг
+# правок 1) — см. TESTHDR-блок выше.
+test-compose: test_compose ../datapath/ctlprobe ../datapath/planlab
 	./test_compose
 
 # ../datapath/ctlprobe как зависимость запуска (не только сборки test_link):
@@ -248,10 +258,10 @@ check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic
 # и link.c читают протокол оттуда.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude -I../datapath/include
-# ../datapath/ctlprobe — test_link здесь не просто собирается, а сразу
-# ЗАПУСКАЕТСЯ (см. цикл ниже), значит нужен свежий бинарник заранее, как и у
-# test-link выше.
-san: hello_profiles.inc ../datapath/ctlprobe
+# ../datapath/ctlprobe и ../datapath/planlab — test_link и test_compose здесь
+# не просто собираются, а сразу ЗАПУСКАЮТСЯ (см. цикл ниже), значит нужны
+# свежие бинарники заранее, как и у test-link/test-compose выше.
+san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
