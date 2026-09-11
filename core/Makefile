@@ -30,10 +30,11 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
-          include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h
+          include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
+          include/d2k_verify.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -63,11 +64,11 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o volume.o sched.o d2kask d2kc
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o volume.o sched.o verify.o d2kask d2kc
 
 
 meas.o: meas.c $(HDR)
@@ -154,6 +155,16 @@ volume.o: volume.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 plantlv.o: plantlv.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Уровни доказательства (проверка без ложного успеха): зонд ведёт СВОЁ
+# рукопожатие TLS 1.3 (tls13.o) своим ключом и доводит дело до настоящего
+# ответа приложения, а обращается к цели тем же непомеченным сокетом с
+# открытым наружу дескриптором, что и опрос свойств — d2k_props_contact из
+# compose.o (её же оговорки про метку и про FIN, см. d2k_compose_internal.h).
+# Повтор снятого чужого приветствия завершить рукопожатие не может: секретов
+# того клиента у нас нет, и наружу виден только чужой второй полёт.
+verify.o: verify.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sched.o: sched.c $(HDR)
@@ -317,7 +328,7 @@ test-link: test_link ../datapath/ctlprobe
 test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
 	./test_d2kask
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -440,15 +451,22 @@ cross: hello_profiles.inc
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kask-mipsel \
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
+	@echo "== test_verify целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verify-a64 \
+		test_verify.c verify.c compose.c hello.c meas.c link.c tls13.c x25519.c crypto.c \
+		-lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verify-mipsel \
+		test_verify.c verify.c compose.c hello.c meas.c link.c tls13.c x25519.c crypto.c \
+		-lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
-		-lpthread || exit 1
+		verify.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
-		-lpthread || exit 1
+		verify.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
@@ -471,7 +489,7 @@ d2kc-aarch64: hello_profiles.inc
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
 		-o $(BUILDDIR)/d2kc-aarch64 d2kc.c sched.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
-		volume.c tls13.c x25519.c -lpthread
+		volume.c tls13.c x25519.c verify.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-aarch64
 
 d2kask-aarch64: hello_profiles.inc
@@ -497,11 +515,23 @@ test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quic
 	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
 		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o $(TEST_LDFLAGS)
 
+# Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
+# довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
+# доказательства неразличимы (см. её шапку). Отсюда crypto.o и x25519.o в
+# связывании — тем же расписанием ключей, что у клиента, стенд работает с
+# другой стороны. compose.o тянет за собой hello.o/meas.o/link.o: зонд зовёт
+# d2k_props_contact, а она живёт там же, где остальной опрос свойств.
+test_verify: test_verify.c verify.o compose.o hello.o meas.o link.o tls13.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o compose.o hello.o meas.o link.o tls13.o x25519.o crypto.o $(TEST_LDFLAGS)
+
+test-verify: test_verify
+	./test_verify
+
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
 d2kc: d2kc.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
-      hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o $(HDR)
+      hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o $(TEST_LDFLAGS)
+		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(TEST_LDFLAGS)
 
 clean:
 	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc

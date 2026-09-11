@@ -403,7 +403,16 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
 int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
                       uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
     if (out_fd) { *out_fd = -1; }
-    if (!ip || !h.bytes || h.len == 0) { return -1; }
+    if (!ip) { return -1; }
+    /* Пустое приветствие законно, и это не послабление контракта, а второй
+       его законный вход: зонд подтверждения (core/verify.c) ведёт СВОЁ
+       рукопожатие TLS 1.3 своим ключом и чужих байт в начало потока не
+       кладёт — ему от этой функции нужны ровно непомеченный сокет, открытый
+       наружу, и местные адрес с портом. Отказать ему здесь значило бы
+       завести второе обращение к цели рядом, а расходятся такие копии молча
+       (см. шапку d2k_compose_internal.h). Указатель без длины — по-прежнему
+       нарушение: это не «нечего слать», это испорченный вызов. */
+    if (h.len > 0 && !h.bytes) { return -1; }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { return -1; }
