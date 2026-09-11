@@ -632,20 +632,55 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         fk.b_port = local_port;
         fk.transport = 6;
 
+        /* ДВА события на один обмен, а не одно. Датапат сообщает ДВАЖДЫ
+           (datapath/session.c, комментарий у D2K_JRN_EXCHANGE): сперва «обмен
+           вообще пошёл», потом «в нём появились ПРИКЛАДНЫЕ данные» — это
+           разные уровни доказательства (§4.2), и второй наступает ПОЗЖЕ
+           первого. Брать первое попавшееся и судить по нему значит навсегда
+           остаться на первом уровне — ровно то, от чего предостерегает тот
+           комментарий. Живой прогон 11.09 это и показал: по двум вопросам из
+           пяти пришло событие «1380 байт, тип 22, рукопожатие», и опрос счёл
+           это промахом, не дождавшись прикладных данных, которые сервер шлёт
+           следом сам, без единого действия клиента (TLS 1.3, RFC 8446 §5.1:
+           весь второй полёт после ServerHello едет записями типа 23).
+
+           Бюджет один на всё ожидание, а не на каждое событие: потолок
+           D2K_PROPS_ASK_WAIT_MS — страховка от молчания, и продлевать её
+           каждым пришедшим событием значило бы отменить её вовсе. */
         d2k_ev exch;
-        int got = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
-                                 D2K_PROPS_ASK_WAIT_MS, &exch, err, sizeof err) == 0;
+        int got = 0, passed = 0;
+        {
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (;;) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long spent = (now.tv_sec - t0.tv_sec) * 1000L +
+                             (now.tv_nsec - t0.tv_nsec) / 1000000L;
+                if (spent < 0) { spent = 0; }
+                if (spent >= (long)D2K_PROPS_ASK_WAIT_MS) { break; }
+                if (wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
+                                   (uint32_t)((long)D2K_PROPS_ASK_WAIT_MS - spent),
+                                   &exch, err, sizeof err) != 0) {
+                    break;
+                }
+                got = 1;
+                if (steps) {
+                    steps[i].seen_types = exch.seen_types;
+                    steps[i].first_type = exch.code;
+                    steps[i].bytes = exch.num;
+                }
+                if (d2k_ev_has_appdata(&exch)) {
+                    passed = 1;
+                    break;
+                }
+            }
+        }
         /* Только теперь — соединение было живо ровно столько, сколько длилось
            ожидание обмена (см. doc-комментарий props_ask_contact). */
         if (contact_fd >= 0) {
             close(contact_fd);
         }
-        if (got && steps) {
-            steps[i].seen_types = exch.seen_types;
-            steps[i].first_type = exch.code;
-            steps[i].bytes = exch.num;
-        }
-        int passed = got && d2k_ev_has_appdata(&exch);
         if (!passed) {
             step_rc(steps, i, got ? D2K_STEP_NO_APPDATA : D2K_STEP_NO_EXCHANGE,
                     got ? NULL : err);

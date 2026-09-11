@@ -520,7 +520,13 @@ static const uint8_t LOOPBACK4[4] = { 127, 0, 0, 1 };
  * outcomes[i]: -1 — тайм-аут (обмена не шлём совсем, props_ask_contact всё
  * равно подключится к настоящей peerstand — сама цель "жива", просто ответа
  * от датапата не будет НИКОГДА, честная проверка тайм-аута); 0 — обмен без
- * прикладных данных (промах); 1 — обмен с прикладными данными (проход).
+ * прикладных данных (промах); 1 — обмен с прикладными данными (проход);
+ * 2 — ДВА события подряд, как на живом датапате: сперва «обмен пошёл» (тип 22,
+ * без прикладных данных), следом «появились прикладные данные» (§4.2, два
+ * уровня доказательства — datapath/session.c, комментарий у D2K_JRN_EXCHANGE).
+ * Опрос обязан дождаться ВТОРОГО: живой прогон 11.09 показал, что он этого не
+ * делал и считал промахом обмен, в котором сервер ещё просто не успел
+ * дослать свой второй полёт.
  * foreign_before_round: если раунд с этим индексом дошёл до обмена, ПЕРЕД
  * настоящим событием шлётся ОДНО чужое — с appdata, но с чужим ключом
  * (адрес 10.0.0.9:9999, к делу не относится) — находка 1: opros обязан его
@@ -566,8 +572,17 @@ static void *fakeend_run(void *arg) {
             close(peer_c);
             continue; /* настоящего обмена не шлём вовсе — честный тайм-аут у wait_for_event */
         }
-        uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
-        send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen);
+        if (a->outcomes[i] == 2) {
+            /* Первый уровень: рукопожатие пошло, прикладных данных ещё нет. */
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x04);
+            /* Второй уровень приходит ПОЗЖЕ — иначе проверка выродилась бы в
+               «взял первое попавшееся и угадал». */
+            nap_ms(150);
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x0C);
+        } else {
+            uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen);
+        }
         close(peer_c);
     }
 
@@ -1371,6 +1386,43 @@ int main(void) {
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
               pr.counts_duplicates == D2K_P_UNKNOWN,
               "b4: промахи первых четырёх вопросов записали что-то лишнее");
+    }
+
+    /* --- B6: датапат сообщает об обмене ДВАЖДЫ (§4.2) — сперва «пошёл», потом
+     * «появились прикладные данные». Опрос обязан дождаться ВТОРОГО, а не
+     * судить по первому: живой прогон 11.09 (docs/field/2026-09-11-first-c-ask.md)
+     * получил по двум вопросам «1380 байт, тип 22, рукопожатие» и посчитал это
+     * промахом, хотя сервер TLS 1.3 шлёт свой второй полёт (записи типа 23)
+     * сам, без единого действия клиента. ------------------------------------ */
+    {
+        uint8_t tb[2048], cb[2048];
+        d2k_hello trig = build_trigger(tb, sizeof tb, "b6.example");
+        d2k_hello ctl = build_trigger(cb, sizeof cb, "b6-control.example");
+        CHECK(trig.bytes && ctl.bytes, "build_trigger(b6) не собрался");
+
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "b6: socketpair не создался");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 2 };
+        fakeend_args fa; memset(&fa, 0, sizeof fa);
+        fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+        fa.outcomes = outcomes; fa.n = 1; fa.foreign_before_round = -1;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b6: поддельный конец связи не запустился");
+
+        d2k_props_step steps[D2K_PROPS_QUESTIONS];
+        d2k_props pr = d2k_props_ask_traced(sv[0], "127.0.0.1", target_port, trig, ctl, 0, steps);
+        pthread_join(th, NULL);
+        close(sv[0]); close(sv[1]); close(ps.listen_fd);
+
+        CHECK(!fa.closed_early, "b6: зонд закрыл соединение с целью ДО события обмена");
+        CHECK(pr.tolerates_left_overlap == D2K_P_NO,
+              "b6: опрос осудил обмен по ПЕРВОМУ событию, не дождавшись прикладных данных");
+        CHECK(steps[0].rc == D2K_STEP_PASSED, "b6: трасса не отметила проход");
+        CHECK((steps[0].seen_types & 0x08) != 0,
+              "b6: трасса сохранила ПЕРВОЕ событие, а не то, по которому вынесен ответ");
     }
 
     d2k_link_close(fd);
