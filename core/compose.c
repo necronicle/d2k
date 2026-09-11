@@ -450,8 +450,31 @@ static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
 
 d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
                         d2k_hello trigger, d2k_hello control, uint32_t mark) {
+    return d2k_props_ask_traced(link_fd, ip, port, trigger, control, mark, NULL);
+}
+
+/* Записать исход шага в трассу. steps == NULL — вызов без трассы, и тогда это
+   ровно то, чем d2k_props_ask была до трассы: ни одной лишней ветки в самом
+   опросе. */
+static void step_rc(d2k_props_step steps[D2K_PROPS_QUESTIONS], int i,
+                    d2k_step_rc rc, const char *err) {
+    if (!steps) {
+        return;
+    }
+    steps[i].rc = rc;
+    if (err && err[0]) {
+        snprintf(steps[i].err, sizeof steps[i].err, "%s", err);
+    }
+}
+
+d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
+                               d2k_hello trigger, d2k_hello control, uint32_t mark,
+                               d2k_props_step steps[D2K_PROPS_QUESTIONS]) {
     d2k_props pr;
     memset(&pr, 0, sizeof pr);
+    if (steps) {
+        memset(steps, 0, sizeof(d2k_props_step) * D2K_PROPS_QUESTIONS);
+    }
 
     /* mark принят контрактом интерфейса (см. doc-комментарий d2k_props_ask,
        d2k_compose.h — там же честно названо, ПОЧЕМУ он здесь не идёт в
@@ -485,7 +508,8 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
     memcpy(name, trigger.bytes + sni_off, sni_len);
     name[sni_len] = '\0';
 
-    for (int i = 0; i < 5; i++) {
+    int asked_any = 0, passed_any = 0;
+    for (int i = 0; i < D2K_PROPS_QUESTIONS; i++) {
         uint8_t planbuf[2200]; /* control до 2048 байт (потолок D2K_EV_SHAPE.shape,
                                    d2k_link.h) плюс заголовок и записи —
                                    ID(20)+PROTO(6)+PAYLOAD-заголовок(6)+
@@ -522,7 +546,12 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
             break;
         }
         if (built != 0) {
+            step_rc(steps, i, D2K_STEP_NOT_ASKED, NULL);
             continue; /* этот вопрос сегодня не собрать — не измерено, дальше */
+        }
+        asked_any = 1;
+        if (steps) {
+            steps[i].plan_len = plan_len;
         }
 
         char hexbuf[2 * sizeof planbuf + 1];
@@ -530,12 +559,18 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
 
         char err[128];
         if (d2k_link_set_name(link_fd, name, 6, hexbuf, err, sizeof err) != 0) {
+            step_rc(steps, i, D2K_STEP_SEND_FAIL, err);
             continue; /* план не отправился вовсе — не измерено */
         }
         d2k_ev ack;
         if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME, NULL,
                            D2K_PROPS_ASK_WAIT_MS, &ack, err, sizeof err) != 0) {
+            step_rc(steps, i, D2K_STEP_NO_ACK, err);
             continue; /* ack не пришёл в срок — не измерено */
+        }
+        if (steps) {
+            steps[i].ack_ok = (uint8_t)((ack.num >> 8) & 0xFFu);
+            steps[i].ack_code = (uint8_t)(ack.num & 0xFFu);
         }
         if (((ack.num >> 8) & 0xFFu) != 1) {
             /* Датапат отверг план (BAD_PLAN/BAD_ARGS/NO_ROOM) — это не
@@ -543,6 +578,7 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
                спросить (см. онAck в controller.go про то, почему причина
                отказа важна: NO_ROOM не по вине плана, но одинаково не даёт
                задать этот вопрос СЕЙЧАС). */
+            step_rc(steps, i, D2K_STEP_REFUSED, NULL);
             continue;
         }
 
@@ -553,7 +589,11 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
         uint8_t local_ip4[4];
         uint16_t local_port = 0;
         if (props_ask_contact(ip, port, trigger, local_ip4, &local_port) != 0) {
+            step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
+        }
+        if (steps) {
+            steps[i].local_port = local_port;
         }
 
         d2k_flowkey fk;
@@ -564,13 +604,22 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
         fk.transport = 6;
 
         d2k_ev exch;
-        int passed = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
-                                    D2K_PROPS_ASK_WAIT_MS, &exch, err, sizeof err) == 0 &&
-                     d2k_ev_has_appdata(&exch);
+        int got = wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
+                                 D2K_PROPS_ASK_WAIT_MS, &exch, err, sizeof err) == 0;
+        if (got && steps) {
+            steps[i].seen_types = exch.seen_types;
+            steps[i].first_type = exch.code;
+            steps[i].bytes = exch.num;
+        }
+        int passed = got && d2k_ev_has_appdata(&exch);
         if (!passed) {
+            step_rc(steps, i, got ? D2K_STEP_NO_APPDATA : D2K_STEP_NO_EXCHANGE,
+                    got ? NULL : err);
             continue; /* промах — не пишет ничего (§2.4, каждый Set в Go
                           начинается с if !passed { return }) */
         }
+        step_rc(steps, i, D2K_STEP_PASSED, NULL);
+        passed_any = 1;
 
         switch (i) {
         case 0: pr.tolerates_left_overlap = D2K_P_NO; break;
@@ -592,6 +641,18 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
            сбора НЕСКОЛЬКИХ подтверждённых свойств в одном поиске дело
            физически не доходит. */
         break;
+    }
+
+    /* Ни один вопрос не прошёл — снять план последнего заданного. Пока вопрос
+       проходит, оставленный план И ЕСТЬ стратегия (двойное назначение, см.
+       шапку файла), и снимать его было бы вредительством; но когда не прошёл
+       ни один, на датапате оставался стоять план, про который это же
+       измерение только что сказало «не работает» — на боевом роутере он
+       переживал вызов и мешал следующему поиску. Отказ DEL_NAME здесь ничего
+       не меняет в наблюдении о коробке и потому не пишется в вектор. */
+    if (asked_any && !passed_any) {
+        char derr[128];
+        (void)d2k_link_del_name(link_fd, name, derr, sizeof derr);
     }
 
     return pr;

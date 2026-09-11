@@ -1178,9 +1178,11 @@ int main(void) {
     /* --- B3: control недоступен — вопросы 2 и 5 пропускаются целиком (SET_NAME
      * для них не отправляется вовсе), оставшиеся три промахиваются, вектор
      * весь остаётся UNKNOWN; ПОСЛЕ вызова план последнего заданного вопроса
-     * (контрольная сумма) всё ещё стоит РОВНО под этим именем — проверяем
-     * САМОСТОЯТЕЛЬНО, что d2k_hello_sni извлёк то же имя, что использовал
-     * build_trigger, а не подстроку по случайности. -------------------------- */
+     * СНЯТ (DEL_NAME), потому что не прошёл ни один вопрос — иначе на боевом
+     * датапате оставался бы стоять план, про который это же измерение только
+     * что сказало «не работает». Что имя при этом бралось ПРАВИЛЬНОЕ (то, что
+     * дал d2k_hello_sni, а не подстрока по случайности), проверяет B5: там
+     * вопрос проходит, план остаётся, и "hello" по имени получает APPLIED. -- */
     {
         uint8_t tb[2048];
         d2k_hello trig = build_trigger(tb, sizeof tb, "b3.example");
@@ -1197,24 +1199,94 @@ int main(void) {
         pthread_join(th, NULL);
         unsigned long long after = query_ok_cmds(&p);
 
-        CHECK(after - before == 3, "b3: без control должны были встать ровно три плана "
-                                    "(счёт дубликатов и разбор протокола — пропущены целиком)");
+        CHECK(after - before == 4, "b3: без control ожидались три SET_NAME (счёт дубликатов "
+                                    "и разбор протокола — пропущены целиком) и один DEL_NAME "
+                                    "по итогу полного промаха");
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
               pr.validates_checksum == D2K_P_UNKNOWN && pr.parses_l7 == D2K_P_UNKNOWN &&
               pr.counts_duplicates == D2K_P_UNKNOWN,
               "b3: полный промах записал хоть что-то — отрицательный результат не должен сохраняться");
         drain_all(fd);
 
-        /* Последний заданный вопрос — контрольная сумма — не снят: план
-           остался стоять под именем "b3.example". Если бы d2k_props_ask
-           перепутал имя (например, взял НЕ то, что дал d2k_hello_sni), это
-           "hello" получило бы REFUSED, а не APPLIED. */
+        /* Ни один вопрос не прошёл — плана под именем "b3.example" больше нет. */
         (void)probe_say(&p, "hello b3.example");
         d2k_ev ev;
         CHECK(next_of_kind2(fd, D2K_EV_APPLIED, D2K_EV_REFUSED, 6, &ev, err, sizeof err) == 0,
               "b3: ни APPLIED, ни REFUSED не пришли после повторного hello");
+        CHECK(ev.kind == D2K_EV_REFUSED,
+              "b3: план последнего промахнувшегося вопроса остался стоять — DEL_NAME не сработал");
+        drain_all(fd);
+    }
+
+    /* --- B5: имя, под которым d2k_props_ask ставит и снимает план, — РОВНО
+     * то, что даёт d2k_hello_sni из триггера. Проверяется в обе стороны на
+     * НАСТОЯЩЕМ ctlprobe: сперва план ставится под извлечённым именем вручную
+     * и "hello b5.example" получает APPLIED (значит имя извлечено верно и
+     * буквально), затем полный промах d2k_props_ask снимает его и то же
+     * "hello" получает REFUSED (значит DEL_NAME ушёл ПО ТОМУ ЖЕ имени, а не
+     * по какому-нибудь ещё). Проход вопроса здесь показать нечем — ctlprobe
+     * строит событие обмена с жёстко зашитым адресом клиента (см. большой
+     * комментарий про поддельный конец связи выше), а что проход НЕ приводит
+     * к снятию плана, проверяет B4 своим !extra_round_seen. ---------------- */
+    {
+        uint8_t tb[2048];
+        d2k_hello trig = build_trigger(tb, sizeof tb, "b5.example");
+        d2k_hello nodecoy = { NULL, 0 };
+        CHECK(trig.bytes, "build_trigger(b5) не собрался");
+
+        size_t sni_off = 0, sni_len = 0;
+        CHECK(d2k_hello_sni(trig.bytes, trig.len, &sni_off, &sni_len) == 0,
+              "b5: d2k_hello_sni не нашёл имени в собственном триггере теста");
+        char name[256];
+        CHECK(sni_len > 0 && sni_len < sizeof name, "b5: длина имени из триггера вне разумного");
+        memcpy(name, trig.bytes + sni_off, sni_len);
+        name[sni_len] = '\0';
+
+        uint8_t plan[512];
+        size_t plen = 0;
+        CHECK(overlap_plan_tlv(plan, sizeof plan, &plen) == 0, "b5: overlap_plan_tlv не собрался");
+        char hex[2 * sizeof plan + 1];
+        for (size_t i = 0; i < plen; i++) {
+            snprintf(hex + 2 * i, 3, "%02x", plan[i]);
+        }
+        hex[2 * plen] = '\0';
+
+        CHECK(d2k_link_set_name(fd, name, 6, hex, err, sizeof err) == 0,
+              "b5: SET_NAME по имени из триггера не отправился");
+        drain_all(fd);
+        (void)probe_say(&p, "hello b5.example");
+        d2k_ev ev;
+        CHECK(next_of_kind2(fd, D2K_EV_APPLIED, D2K_EV_REFUSED, 6, &ev, err, sizeof err) == 0,
+              "b5: ни APPLIED, ни REFUSED не пришли после первого hello");
         CHECK(ev.kind == D2K_EV_APPLIED,
-              "b3: план стоит НЕ под тем именем, что дал d2k_hello_sni из триггера — REFUSED вместо APPLIED");
+              "b5: d2k_hello_sni дал НЕ то имя, которым построен триггер — REFUSED вместо APPLIED");
+        drain_all(fd);
+
+        int replies[] = { 22, 22, 22 }; /* полный промах — план обязан быть снят */
+        driver_args da = { &p, "b5.example", replies, 3, 300 };
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b5: ведущий поток не запустился");
+        d2k_props_step steps[D2K_PROPS_QUESTIONS];
+        d2k_props pr = d2k_props_ask_traced(fd, "127.0.0.1", stand_port, trig, nodecoy, 0, steps);
+        pthread_join(th, NULL);
+
+        CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
+              pr.validates_checksum == D2K_P_UNKNOWN,
+              "b5: полный промах записал хоть что-то");
+        CHECK(steps[0].plan_len > 0 && steps[0].ack_ok == 1,
+              "b5: трасса первого вопроса без длины плана или без принятого подтверждения");
+        CHECK(steps[0].local_port != 0, "b5: трасса первого вопроса без местного порта обращения");
+        CHECK(steps[1].rc == D2K_STEP_NOT_ASKED && steps[4].rc == D2K_STEP_NOT_ASKED,
+              "b5: вопросы без control должны быть отмечены как незаданные");
+        CHECK(steps[0].rc == D2K_STEP_NO_EXCHANGE || steps[0].rc == D2K_STEP_NO_APPDATA,
+              "b5: промах первого вопроса не отмечен в трассе");
+        drain_all(fd);
+
+        (void)probe_say(&p, "hello b5.example");
+        CHECK(next_of_kind2(fd, D2K_EV_APPLIED, D2K_EV_REFUSED, 6, &ev, err, sizeof err) == 0,
+              "b5: ни APPLIED, ни REFUSED не пришли после второго hello");
+        CHECK(ev.kind == D2K_EV_REFUSED,
+              "b5: DEL_NAME ушёл НЕ по тому имени — план всё ещё стоит");
         drain_all(fd);
     }
 

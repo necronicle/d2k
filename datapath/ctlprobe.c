@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,6 +235,13 @@ static size_t build_udp_pkt(uint8_t *o, uint16_t port, const uint8_t *pay, size_
 }
 
 int main(int argc, char **argv) {
+    /* Тот же приём, что в d2kd.c: сервер не имеет права умирать оттого, что
+       клиент отвалился между его записями. Понадобилось, когда d2k_props_ask
+       научилась снимать план (DEL_NAME) по итогу полного промаха: утилита
+       шлёт команду и почти сразу закрывает сокет, а ctlprobe в этот момент
+       пишет ей подтверждение — до этой строки он на том и умирал, унося с
+       собой и тест, который следом писал ему в стандартный ввод. */
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 2) {
         fprintf(stderr, "использование: ctlprobe <путь сокета>\n");
         return 2;

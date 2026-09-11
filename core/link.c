@@ -359,7 +359,12 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
     return 0;
 }
 
-int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
+/* Общее тело ARM_SHAPE и DEL_NAME: на проводе они отличаются ТОЛЬКО кодом
+   команды (d2k_ctl.h — у обеих тело "длина имени u8, имя"), и держать две
+   копии одного кадра значило бы заводить второе место, где можно разойтись
+   с протоколом. */
+static int send_name_only(int fd, uint16_t cmd, const char *what,
+                          const char *name, char *err, size_t errcap) {
     if (fd < 0) {
         say(err, errcap, "сокет не открыт");
         return -1;
@@ -384,15 +389,24 @@ int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
     g_scratch[1] = (uint8_t)(plen >> 16);
     g_scratch[2] = (uint8_t)(plen >> 8);
     g_scratch[3] = (uint8_t)plen;
-    g_scratch[4] = (uint8_t)(D2K_CMD_ARM_SHAPE >> 8);
-    g_scratch[5] = (uint8_t)D2K_CMD_ARM_SHAPE;
+    g_scratch[4] = (uint8_t)(cmd >> 8);
+    g_scratch[5] = (uint8_t)cmd;
 
     if (write_all(fd, g_scratch, o) != 0) {
-        say(err, errcap, "команда ARM_SHAPE не отправилась: %s", strerror(errno));
+        say(err, errcap, "команда %s не отправилась: %s", what, strerror(errno));
         return -1;
     }
     return 0;
 }
+
+int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
+    return send_name_only(fd, D2K_CMD_ARM_SHAPE, "ARM_SHAPE", name, err, errcap);
+}
+
+int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {
+    return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, err, errcap);
+}
+
 
 int d2k_ev_has_appdata(const d2k_ev *ev) {
     /* §8: успех — прикладной обмен, а не тип ПЕРВОЙ записи (code — липкое

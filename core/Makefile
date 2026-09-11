@@ -409,7 +409,10 @@ cross: hello_profiles.inc
 # нуждается ни в чём из datapath/ (LINUXSRC там свой, NFQUEUE/raw сокеты) —
 # только в четырёх файлах ядра, тех же, что у d2kask/test_compose выше.
 BUILDDIR ?= ../builds
-d2kask-aarch64:
+# hello.c #include'ит hello_profiles.inc (см. hello.o выше) — кросс-сборка
+# компилирует hello.c напрямую, минуя hello.o, и без этой зависимости падала
+# на чистом дереве: "fatal error: 'hello_profiles.inc' file not found".
+d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
 		-o $(BUILDDIR)/d2kask-aarch64 d2kask.c compose.c hello.c meas.c link.c

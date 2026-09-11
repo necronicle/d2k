@@ -63,9 +63,11 @@
  *   (а) потолок ожидания D2K_PROPS_ASK_WAIT_MS (compose.c, 5000мс) — одно
  *       унаследованное число и на локальный ACK (AF_UNIX), и на сетевой
  *       обмен, не измеренное для этого применения;
- *   (б) если ни один из пяти вопросов не прошёл, план ПОСЛЕДНЕГО заданного
- *       зонда остаётся стоять на датапате под именем цели — DEL_NAME отсюда
- *       не зовётся (в этой библиотеке его и нет).
+ *   (б) если ни один из пяти вопросов не прошёл, d2k_props_ask снимает план
+ *       последнего заданного зонда (D2K_CMD_DEL_NAME) — то есть после такого
+ *       прогона на датапате НЕ остаётся плана, про который это же измерение
+ *       только что сказало «не работает». Печатается, потому что это
+ *       изменение состояния БОЕВОГО датапата, а не внутреннее дело утилиты.
  * (б) печатается ТОЛЬКО когда применимо (полностью неизмеренный итоговый
  * вектор при заданном хотя бы одном вопросе) — печатать её всегда было бы
  * тем же самым грехом наоборот: неприменимое предупреждение так же вводит в
@@ -96,6 +98,8 @@ typedef struct {
     const char *control_sni;
     const char *hello_hex_path;
     const char *control_hex_path;
+    const char *save_trigger_path;
+    const char *save_control_path;
     const char *port_raw;
     const char *mark_raw;
     const char *arm_wait_raw;
@@ -107,7 +111,8 @@ typedef struct {
 static const char D2KASK_USAGE[] =
     "использование: d2kask --control <сокет> --ip <адрес> --sni <имя> "
     "(--hello-hex <файл> | --arm-wait-ms <мс>) [--port 443] "
-    "[--control-sni <имя>] [--control-hex <файл>] [--mark 0x2d]";
+    "[--control-sni <имя>] [--control-hex <файл>] [--mark 0x2d] "
+    "[--save-trigger <файл>] [--save-control <файл>]";
 
 /* Проверяет, что у флага f (argv[i]) есть следующий токен-значение.
  * Отсутствие значения — отказ с причиной, а не чтение argv за границей. */
@@ -224,6 +229,12 @@ static int parse_args(int argc, char **argv, cli_args *a, char *err, size_t errc
         } else if (strcmp(f, "--hello-hex") == 0) {
             if (need_value(argc, argv, i, f, err, errcap) != 0) { return -1; }
             a->hello_hex_path = argv[++i];
+        } else if (strcmp(f, "--save-trigger") == 0) {
+            if (need_value(argc, argv, i, f, err, errcap) != 0) { return -1; }
+            a->save_trigger_path = argv[++i];
+        } else if (strcmp(f, "--save-control") == 0) {
+            if (need_value(argc, argv, i, f, err, errcap) != 0) { return -1; }
+            a->save_control_path = argv[++i];
         } else if (strcmp(f, "--control-hex") == 0) {
             if (need_value(argc, argv, i, f, err, errcap) != 0) { return -1; }
             a->control_hex_path = argv[++i];
@@ -305,6 +316,35 @@ static int hex_nibble(int c) {
     if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
     if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
     return -1;
+}
+
+/* Сохраняет снятый снимок в тот же формат, который читает read_hex_file выше
+ * (комментарий на '#', затем шестнадцатеричные цифры) — чтобы следующий
+ * прогон брал его через --hello-hex/--control-hex и не ждал заново живого
+ * трафика. Причина прямая: армирование стоит окна ожидания и РУЧНОГО захода
+ * на цель, и платить эту цену на каждый повтор одного и того же измерения
+ * незачем. Отказ записи не прерывает измерение — снимок уже в памяти, и
+ * потерять из-за него живой прогон было бы хуже, чем не сохранить файл. */
+static void save_hex(const char *path, const char *what, const char *sni,
+                     const uint8_t *b, size_t n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "d2kask: снимок %s не сохранён в %s: %s\n", what, path, strerror(errno));
+        return;
+    }
+    fprintf(f, "# снимок %s, имя %s, %zu байт — снят d2kask с живого датапата\n",
+            what, sni && sni[0] ? sni : "(без имени)", n);
+    for (size_t i = 0; i < n; i++) {
+        fprintf(f, "%02x", b[i]);
+        if ((i + 1) % 32 == 0) { fputc('\n', f); }
+    }
+    if (n % 32 != 0) { fputc('\n', f); }
+    if (fclose(f) != 0) {
+        fprintf(stderr, "d2kask: снимок %s записан не полностью в %s: %s\n",
+                what, path, strerror(errno));
+        return;
+    }
+    printf("снимок %s сохранён: %s (%zu байт)\n", what, path, n);
 }
 
 /* Читает шестнадцатеричный снимок из файла той же условности, что
@@ -493,6 +533,89 @@ static d2k_pval pos_value(const d2k_props *pr, int pos) {
     }
 }
 
+/* Расшифровка шага трассы: КАКИМ местом вопрос не состоялся. Печатается
+ * вместо прежнего "неизвестно снаружи" — первый живой прогон (11.09,
+ * www.instagram.com) вернул "не измерено" по всем трём заданным вопросам, и
+ * различить "коробка заблокировала манипуляцию" от "план вообще не встал"
+ * было нечем. Это диагностика нашего зонда, а не четвёртое состояние
+ * вектора: тройственная логика §2.4 остаётся ровно такой же. */
+static const char *step_rc_str(d2k_step_rc rc) {
+    switch (rc) {
+    case D2K_STEP_NOT_ASKED:    return "вопрос не собран";
+    case D2K_STEP_SEND_FAIL:    return "SET_NAME не ушёл в сокет";
+    case D2K_STEP_NO_ACK:       return "подтверждение SET_NAME не пришло в срок";
+    case D2K_STEP_REFUSED:      return "датапат отверг план";
+    case D2K_STEP_CONTACT_FAIL: return "обращение к цели не состоялось";
+    case D2K_STEP_NO_EXCHANGE:  return "своего обмена не было в срок";
+    case D2K_STEP_NO_APPDATA:   return "обмен был, но без прикладных данных (§8)";
+    case D2K_STEP_PASSED:       return "прошёл";
+    }
+    return "неизвестно";
+}
+
+/* Код отказа датапата словами (d2k_ctl.h). Печатается только при ack_ok==0 —
+ * на проводе reason значим ровно там же. */
+static const char *ack_code_str(uint8_t code) {
+    switch (code) {
+    case D2K_ACK_OK:        return "принято";
+    case D2K_ACK_BAD_PLAN:  return "план не разобрался";
+    case D2K_ACK_BAD_ARGS:  return "аргументы команды не разобрались";
+    case D2K_ACK_NO_ROOM:   return "нет места в таблице планов";
+    }
+    return "неизвестная причина";
+}
+
+/* Типы TLS-записей, встреченных в обмене, — из маски в текст. §8: порог —
+ * запись типа 23; остальные типы печатаются, потому что именно они
+ * отличают "коробка молчит" от "сервер ответил, но до прикладных данных
+ * дело не дошло". */
+static void print_seen_types(uint8_t mask) {
+    static const struct { uint8_t t; const char *n; } names[] = {
+        { 20, "20 смена шифра" }, { 21, "21 тревога" },
+        { 22, "22 рукопожатие" }, { 23, "23 прикладные данные" },
+    };
+    int first = 1;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (mask & (uint8_t)(1u << (names[i].t - 20))) {
+            printf("%s%s", first ? "" : ", ", names[i].n);
+            first = 0;
+        }
+    }
+    if (first) {
+        printf("ни одной");
+    }
+}
+
+/* Печатает строки "план"/"обмен" одного вопроса по его трассе. */
+static void print_step(const d2k_props_step *st) {
+    if (st->plan_len == 0) {
+        printf("  план: не собрался\n");
+    } else if (st->ack_ok == 1) {
+        printf("  план: %zu байт, датапат принял\n", st->plan_len);
+    } else if (st->rc == D2K_STEP_REFUSED) {
+        printf("  план: %zu байт, датапат ОТВЕРГ — %s\n", st->plan_len, ack_code_str(st->ack_code));
+    } else {
+        printf("  план: %zu байт, подтверждения нет\n", st->plan_len);
+    }
+
+    if (st->local_port == 0) {
+        printf("  обмен: до обращения к цели дело не дошло\n");
+    } else if (st->rc == D2K_STEP_NO_EXCHANGE) {
+        printf("  обмен: обращение с местного порта %u, события обмена не пришло\n",
+              (unsigned)st->local_port);
+    } else {
+        printf("  обмен: с местного порта %u, %u байт, первая запись типа %u, встречены типы: ",
+              (unsigned)st->local_port, (unsigned)st->bytes, (unsigned)st->first_type);
+        print_seen_types(st->seen_types);
+        printf("\n");
+    }
+    if (st->err[0]) {
+        printf("  причина остановки: %s (%s)\n", step_rc_str(st->rc), st->err);
+    } else {
+        printf("  причина остановки: %s\n", step_rc_str(st->rc));
+    }
+}
+
 /* Печатает один из пяти вопросов: заголовок с полем, потом ровно одно из
  * трёх: "спрошен: нет" с причиной, "спрошен: да" с планом/обменом/меткой и
  * решённым ответом, либо "спрошен: да" с тем же скелетом, но НЕ ИЗМЕРЕНО в
@@ -500,7 +623,8 @@ static d2k_pval pos_value(const d2k_props *pr, int pos) {
  * ветками этой функции, а не общим "неизвестно" (главное требование к
  * выводу, task-5v-brief.md). */
 static void print_question(int idx1, int pos, const char *field, const char *doc_phrase,
-                           const d2k_props *pr, int have_control) {
+                           const d2k_props *pr, int have_control,
+                           const d2k_props_step *st) {
     printf("\n[%d/5] %s (%s):\n", idx1, field, doc_phrase);
 
     for (int q = 0; q < pos; q++) {
@@ -517,18 +641,15 @@ static void print_question(int idx1, int pos, const char *field, const char *doc
     }
 
     printf("  спрошен: да\n");
+    print_step(st);
+    printf("  метка: не ставится (см. предупреждение выше)\n");
     if (!pos_decided(pr, pos)) {
-        printf("  план: неизвестно снаружи (d2k_props_ask не отдаёт трассировку одного зонда)\n"
-              "  обмен: неизвестно снаружи\n"
-              "  метка: не ставится (см. предупреждение выше)\n"
-              "  ответ: не измерено — зонд не прошёл однозначно (коробка могла заблокировать "
-              "манипуляцию, а мог не дойти обмен/подтверждение — снаружи не различить)\n");
+        printf("  ответ: не измерено — зонд не прошёл (строки выше говорят, каким именно "
+              "местом; «обмен без прикладных данных» и «обмена не было» — это про коробку, "
+              "остальное — про нас)\n");
         return;
     }
 
-    printf("  план: встал (по контракту d2k_props_ask: поле пишется только на прошедшем зонде)\n"
-          "  обмен: был, с прикладными данными\n"
-          "  метка: не ставится (см. предупреждение выше)\n");
     d2k_pval v = pos_value(pr, pos);
     printf("  ответ: %s\n", pval_str(v));
     if (pos == POS_CHECKSUM && pr->parses_l7 == D2K_P_YES) {
@@ -607,7 +728,10 @@ static void print_plans(char plans[][4096], size_t n, const char *decoy, const c
 
 int main(int argc, char **argv) {
     cli_args a;
-    char err[256];
+    /* Вмещает D2KASK_USAGE целиком: parse_args отдаёт использование через тот
+       же err, и буфер, который его обрезает, gcc ловит как format-truncation
+       (цель cross), а пользователь — как оборванную строку помощи. */
+    char err[sizeof D2KASK_USAGE + 64];
 
     if (parse_args(argc, argv, &a, err, sizeof err) != 0) {
         fprintf(stderr, "d2kask: %s\n", err);
@@ -691,8 +815,14 @@ int main(int argc, char **argv) {
     print_header(&a);
     printf("\n");
     print_snapshot("триггера", have_trig, trig_timed_out, trig_how, trig_detail, trig_buf, trig_len);
+    if (a.save_trigger_path && have_trig) {
+        save_hex(a.save_trigger_path, "триггера", a.sni, trig_buf, trig_len);
+    }
     if (have_control_at_all) {
         print_snapshot("control", have_ctrl, ctrl_timed_out, ctrl_how, ctrl_detail, ctrl_buf, ctrl_len);
+        if (a.save_control_path && have_ctrl) {
+            save_hex(a.save_control_path, "control", a.control_sni, ctrl_buf, ctrl_len);
+        }
     } else {
         printf("снимок control: не запрошен (--control-sni/--control-hex не заданы) — вопросы "
               "\"счёт дубликатов\" и \"разбор протокола\" не будут заданы (см. секцию "
@@ -731,19 +861,21 @@ int main(int argc, char **argv) {
     d2k_hello trigger; trigger.bytes = trig_buf; trigger.len = trig_len;
     d2k_hello control; control.bytes = have_ctrl ? ctrl_buf : NULL; control.len = have_ctrl ? ctrl_len : 0;
 
-    d2k_props pr = d2k_props_ask(fd, a.ip, a.port, trigger, control, a.mark);
+    d2k_props_step steps[D2K_PROPS_QUESTIONS];
+    d2k_props pr = d2k_props_ask_traced(fd, a.ip, a.port, trigger, control, a.mark, steps);
 
     if (all_unknown(&pr)) {
-        printf("  - ни один зонд не прошёл: план последнего заданного вопроса остаётся стоять "
-              "на датапате под именем \"%s\" — DEL_NAME не вызывается\n", a.sni);
+        printf("  - ни один зонд не прошёл: план последнего заданного вопроса СНЯТ с датапата "
+              "(DEL_NAME по имени \"%s\") — иначе на боевом датапате остался бы стоять план, "
+              "про который это же измерение сказало \"не работает\"\n", a.sni);
     }
 
     printf("\nвопросы (порядок = порядок опроса d2k_props_ask):\n");
-    print_question(1, POS_OVERLAP, "перекрытие слева", "держит ли сегмент, начинающийся левее данных", &pr, have_ctrl);
-    print_question(2, POS_DUP, "счёт дубликатов", "считает ли разнесённые копии за одно", &pr, have_ctrl);
-    print_question(3, POS_REORDER, "порядок сегментов", "держит ли сегменты не по порядку прихода", &pr, have_ctrl);
-    print_question(4, POS_CHECKSUM, "контрольная сумма", "сверяет ли контрольную сумму TCP", &pr, have_ctrl);
-    print_question(5, POS_PARSE, "разбор протокола", "разбирает ли TLS, а не просто смотрит байты", &pr, have_ctrl);
+    print_question(1, POS_OVERLAP, "перекрытие слева", "держит ли сегмент, начинающийся левее данных", &pr, have_ctrl, &steps[0]);
+    print_question(2, POS_DUP, "счёт дубликатов", "считает ли разнесённые копии за одно", &pr, have_ctrl, &steps[1]);
+    print_question(3, POS_REORDER, "порядок сегментов", "держит ли сегменты не по порядку прихода", &pr, have_ctrl, &steps[2]);
+    print_question(4, POS_CHECKSUM, "контрольная сумма", "сверяет ли контрольную сумму TCP", &pr, have_ctrl, &steps[3]);
+    print_question(5, POS_PARSE, "разбор протокола", "разбирает ли TLS, а не просто смотрит байты", &pr, have_ctrl, &steps[4]);
 
     print_vector(&pr);
 
