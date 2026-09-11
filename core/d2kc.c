@@ -40,6 +40,10 @@
    только при падении. Минута — тот же порядок, что у Go-стороны. */
 #define SAVE_EVERY_MS 60000
 
+/* Как часто говорить, что видно. Чаще сохранения: это наблюдаемость, а не
+   запись на флеш, и стоит она одной строки. */
+#define REPORT_EVERY_MS 15000
+
 static volatile sig_atomic_t stop_asked;
 static void on_signal(int sig) { (void)sig; stop_asked = 1; }
 
@@ -77,6 +81,17 @@ static int save_atomic(const d2k_catalog *cat, const char *path,
         return -1;
     }
     return 0;
+}
+
+/* Печать планировщика. Со временем по стенным часам, а не монотонным: строку
+   читает человек, и ему нужно сопоставить её с тем, что он делал. */
+static void sched_say(void *ctx, const char *line) {
+    (void)ctx;
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    printf("%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
+    fflush(stdout);
 }
 
 static void usage(void) {
@@ -142,9 +157,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    d2k_sched_set_say(s, sched_say, NULL);
+
     printf("d2kc: запущен, сокет %s, каталог %s (%zu коробок), метка 0x%x\n",
            sock, catpath, cat.n_boxes, (unsigned)mark);
     fflush(stdout);
+
+    /* Счётчики событий. Заведены измеренной нуждой: первый живой прогон
+       молчал, и отличить «датапат не подозревает» от «связь есть, а событий не
+       идёт» было нечем — а это разные беды, одна про линию, другая про нас. */
+    unsigned long seen_events = 0, seen_hello = 0, seen_suspect = 0;
+    unsigned long seen_exchange = 0, seen_applied = 0, seen_refused = 0;
+    int64_t last_report = now_ms();
 
     int64_t last_tick = now_ms(), last_save = last_tick;
     size_t dirty = 0;   /* сколько привязок было при последнем сохранении */
@@ -174,6 +198,15 @@ int main(int argc, char **argv) {
             for (int i = 0; i < 256; i++) {
                 d2k_ev ev;
                 if (d2k_link_next(fd, &ev, 0, err, sizeof err) != 0) { break; }
+                seen_events++;
+                switch (ev.kind) {
+                case D2K_EV_HELLO:    seen_hello++; break;
+                case D2K_EV_SUSPECT:  seen_suspect++; break;
+                case D2K_EV_EXCHANGE: seen_exchange++; break;
+                case D2K_EV_APPLIED:  seen_applied++; break;
+                case D2K_EV_REFUSED:  seen_refused++; break;
+                default: break;
+                }
                 d2k_sched_event(s, &ev);
             }
         }
@@ -182,6 +215,17 @@ int main(int argc, char **argv) {
         if (t - last_tick >= TICK_MS || (pr > 0 && (pfd[1].revents & POLLIN))) {
             d2k_sched_tick(s, t);
             last_tick = t;
+        }
+
+        if (t - last_report >= REPORT_EVERY_MS) {
+            char line[300];
+            snprintf(line, sizeof line,
+                     "событий %lu (приветствий %lu, подозрений %lu, обменов %lu, "
+                     "применений %lu, отказов %lu), поисков идёт %zu",
+                     seen_events, seen_hello, seen_suspect, seen_exchange,
+                     seen_applied, seen_refused, d2k_sched_active(s));
+            sched_say(NULL, line);
+            last_report = t;
         }
 
         if (t - last_save >= SAVE_EVERY_MS) {

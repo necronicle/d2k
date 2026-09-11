@@ -241,6 +241,34 @@ int main(void) {
         d2k_catalog_free(&c2);
     }
 
+    /* --- кандидат, применяющийся без обмена, не залипает навсегда ------ */
+    {
+        d2k_catalog c5;
+        memset(&c5, 0, sizeof c5);
+        d2k_sched *s = d2k_sched_new(&c5, sv[0], 0x2d);
+        tcp_answer = D2K_V_PREFIX;
+        d2k_ev h = ev_hello(6, 40040, "instagram.com");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40040);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(d2k_sched_active(s) == 1, "поиск не дошёл до ожидания обмена");
+
+        /* Два применения без обмена — кандидат обязан смениться, а поиск
+           продолжиться (или честно кончиться), но не стоять до истечения
+           задачи (десять минут). */
+        d2k_ev ap = ev_hello(6, 40040, "");
+        ap.kind = D2K_EV_APPLIED;
+        ap.name[0] = '\0';
+        for (int i = 0; i < 2; i++) { d2k_sched_event(s, &ap); }
+        settle(s);
+        CHECK(total_bindings(&c5) == 0, "молчаливое применение записано как успех");
+        CHECK(d2k_sched_active(s) == 0,
+              "кандидат, применившийся дважды без обмена, залип — поиск не двинулся");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c5);
+    }
+
     /* --- обмен БЕЗ прикладных данных не подтверждает ничего (§8) ------- */
     {
         d2k_catalog c4;

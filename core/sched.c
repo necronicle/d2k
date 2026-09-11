@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,18 @@
    значение — назначать новое «на глаз» было бы ровно тем, что правило про
    числа запрещает. */
 #define SCHED_MAX_PROBES 8
+
+/* Сколько раз кандидат может примениться БЕЗ обмена, прежде чем считаться
+   плохим. Унаследовано с Go-стороны (controller.go, maxSilentTries) вместе с
+   её обоснованием: одного раза мало (применение говорит, что кандидат доехал
+   до соединения, а не что дело дошло до обмена), а без предела кандидат,
+   который исправно применяется и не даёт обмена, залипал бы до истечения
+   задачи — то есть на десять минут. Два, а не три: каждое применение без
+   обмена — это ожидание у человека, и порог считается в его секундах.
+
+   Живой прогон 11.09 показал ровно это залипание: по www.speedtest.net
+   кандидат применился шесть раз, обмена не было, и поиск стоял. */
+#define SCHED_MAX_SILENT 2
 
 /* Сколько имён помним за ключами потоков. Приветствие приходит на КАЖДОЕ
    соединение, подозрение — на малую их часть; таблица нужна только чтобы
@@ -113,6 +126,7 @@ typedef struct {
     char       plans[8][4096];
     size_t     n_plans;
     size_t     next_plan;
+    int        silent_applied;  /* применений текущего кандидата без обмена */
 
     /* Рабочий поток оракула. */
     pthread_t  th;
@@ -138,6 +152,9 @@ struct d2k_sched {
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
 
+    d2k_sched_say_fn say_fn;
+    void            *say_ctx;
+
     int          wake[2];     /* самопайп: рабочий поток будит цикл */
     pthread_mutex_t mu;       /* охраняет res/res_ready/th_live задач */
 };
@@ -145,6 +162,39 @@ struct d2k_sched {
 /* --------------------------------------------------------------------
  * Мелочи.
  * -------------------------------------------------------------------- */
+
+/* Говорит наружу, если есть кому. Сборка строки — здесь, чтобы вызывающий не
+   тащил printf-обвязку в каждый вызов. */
+static void say(d2k_sched *s, const char *fmt, ...) {
+    if (!s->say_fn) { return; }
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    s->say_fn(s->say_ctx, line);
+}
+
+void d2k_sched_set_say(d2k_sched *s, d2k_sched_say_fn fn, void *ctx) {
+    if (!s) { return; }
+    s->say_fn = fn;
+    s->say_ctx = ctx;
+}
+
+/* Вердикт словами. Своя таблица, а не в d2k_verdict.h: там перечисление —
+   контракт измерения, а имена нужны ровно одному читателю, человеку у лога. */
+static const char *verdict_name(d2k_verdict v) {
+    switch (v) {
+    case D2K_V_CLEAR:        return "проходит как есть";
+    case D2K_V_PREFIX:       return "помогает разрез";
+    case D2K_V_WHOLE:        return "нужен пакет целиком";
+    case D2K_V_OPAQUE:       return "решает содержимое";
+    case D2K_V_INCONCLUSIVE: return "вердикта нет";
+    case D2K_V_FLAKY:        return "измерению верить нельзя";
+    case D2K_V_UNREACHABLE:  return "до цели нет транспорта";
+    }
+    return "неизвестный вердикт";
+}
 
 static void ip_text(const uint8_t ip[4], char *out, size_t cap) {
     snprintf(out, cap, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -569,6 +619,9 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         memset(t, 0, sizeof *t);
         return 0;
     }
+    say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
+        t->name, t->transport == 17 ? "QUIC" : "TCP", t->ip, (unsigned)t->port,
+        t->trig_len, t->shape_armed ? ", снимок заказан" : "");
     return 1;
 }
 
@@ -586,7 +639,32 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         if (t->state != T_FREE && strcmp(t->name, name) == 0) {
             memcpy(t->trig, ev->shape, ev->shape_len);
             t->trig_len = ev->shape_len;
+            say(s, "по %s поймана форма приветствия: %zu байт", t->name, ev->shape_len);
         }
+    }
+}
+
+/* Кандидат доехал до какого-то соединения. Это НЕ успех: §8 требует
+   прикладного обмена. Считаем молчаливые применения, чтобы не залипнуть на
+   кандидате, который исправно применяется и ничего не даёт.
+
+   Только TCP: у QUIC-потока событие обмена прийти не может структурно —
+   datapath/session.c считает обмены и обходит по молчанию ТОЛЬКО таблицу
+   TCP-потоков, handle_udp возвращается раньше этого хвоста. Считать сюда
+   QUIC-применения значило бы отбрасывать рабочего кандидата по молчанию
+   потоков, для которых подтверждение вообще не реализовано, — ровно та
+   оговорка, которую Go-сторона написала у себя в EvApplied. */
+static void on_applied(d2k_sched *s, const d2k_ev *ev) {
+    if (ev->transport != 6) { return; }
+    const char *name = recall(s, ev);
+    if (!name) { return; }
+    task *t = task_of(s, name, ev->transport);
+    if (!t || t->state != T_WATCHING) { return; }
+    t->silent_applied++;
+    if (t->silent_applied >= SCHED_MAX_SILENT) {
+        say(s, "по %s кандидат %zu применился %d раза без обмена — беру следующего",
+            t->name, t->next_plan, t->silent_applied);
+        t->state = T_PLANNING; /* следующий круг тика поставит следующего */
     }
 }
 
@@ -609,6 +687,8 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tcp",
                          t->name, t->transport, now_ms);
+    say(s, "по %s (%s) ПОДТВЕРЖДЕНО прикладным обменом: %s, %u байт",
+        t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, (unsigned)ev->num);
     task_done(t);
 }
 
@@ -622,6 +702,9 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         return on_suspect(s, ev);
     case D2K_EV_SHAPE:
         on_shape(s, ev);
+        return 0;
+    case D2K_EV_APPLIED:
+        on_applied(s, ev);
         return 0;
     case D2K_EV_EXCHANGE:
         on_exchange(s, ev, 0);
@@ -664,6 +747,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (!ready) { continue; }
             join_worker(t);
             verdict_to_plans(t, r.verdict);
+            say(s, "по %s вердикт: %s (%s), кандидатов %zu",
+                t->name, verdict_name(r.verdict), r.reason, t->n_plans);
             if (t->n_plans == 0) {
                 task_fail(t, now_ms);
                 moved++;
@@ -675,10 +760,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_PLANNING) {
             if (install_next(s, t) != 0) {
+                say(s, "по %s кандидаты кончились (зондов %d) — цель отдыхает",
+                    t->name, t->probes);
                 task_fail(t, now_ms);
                 moved++;
                 continue;
             }
+            t->silent_applied = 0;
+            say(s, "по %s поставил кандидата %zu из %zu, жду обмена",
+                t->name, t->next_plan, t->n_plans);
             t->state = T_WATCHING;
             moved++;
         }
