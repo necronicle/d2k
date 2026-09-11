@@ -15,7 +15,11 @@ CC      ?= cc
 # здесь: единственный источник истины — datapath/include/d2k_ctl.h (кадры,
 # события, команды) и d2k_ctlsrv.h (D2K_KEY_WIRE_LEN — ширина ключа на
 # проводе; зашитая числом она уже ломалась в этом проекте, см. её комментарий).
-# Больше никто в core/ туда не смотрит.
+# Задача 5 (шаг 0) добавила второго читателя — compose.c: d2k_props_ask теперь
+# сам говорит с датапатом (d2k_link.h) и собирает канонический TLV своих
+# пяти зондов, для чего ему нужен ТОЛЬКО D2K_POISON_BADSUM из публичного
+# datapath/include/d2k_plan.h (коды записей TLV — приватное зеркало этого
+# контракта у compose.c, см. её шапку, а не отсюда).
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include
 LDFLAGS ?=
 # Стенд в тестах поднимает петлю-мишень в отдельном потоке; самому оракулу
@@ -43,11 +47,14 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # test_match тоже без стенда: сравнивает уже разобранные d2k_cat_fp (свои,
 # сконструированные inline, и настоящие — из того же testdata/catalog-real.json),
 # сети и файловой записи не касается вовсе.
-# test_compose (задача 3) тоже без стенда и вообще без сети: d2k_compose —
-# чистая сборка текста плана из вектора свойств, а d2k_props_ask в этой
-# реализации сети не касается вовсе (см. большой комментарий в шапке
-# compose.c про то, почему единственный честный ответ здесь — вектор из
-# одних D2K_P_UNKNOWN).
+# test_compose про d2k_compose (задача 3) без стенда и без сети: чистая
+# сборка текста плана из вектора свойств. Про d2k_props_ask (задача 5, шаг 0)
+# — уже С сетью и С TESTHDR-стендом (петля-мишень нужна как реальная точка
+# "одного обращения к цели", d2k_meas_once внутри d2k_props_ask), и ДОПОЛНИТЕЛЬНО
+# против настоящего ctlprobe (datapath/ctlprobe.c) тем же приёмом, что и
+# test_link — стенд и сеть здесь не заменяют друг друга: петля-мишень нужна,
+# чтобы connect+send в d2k_meas_once не упёрся в ECONNREFUSED/тайм-аут,
+# ctlprobe — чтобы дать событие обмена, по которому судит сам d2k_props_ask.
 # test_link тоже без TESTHDR-стенда: его "стенд" — настоящий ctlprobe
 # (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 TESTHDR = test_stand.h
@@ -125,20 +132,24 @@ catalog.o: catalog.c $(HDR)
 match.o: match.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Свойства коробки и вывод плана для TCP (задача 3): d2k_compose зовёт
-# d2k_hello_from_profile (hello.c, задача 1) для decoy-приветствия вопросов
-# 2/4/5 (см. build_decoy_hello в compose.c про то, почему именно LEGACY-
-# профиль, а не MODERN) — отсюда hello.o в связывании тестов ниже. От
-# meas.c/verdict.c не зависит по символам вовсе: единственный оракул задачи,
-# d2k_meas, недостаточен ни для одного из пяти вопросов, и d2k_props_ask в
-# этой реализации честно ничего не измеряет (см. шапку compose.c).
+# Свойства коробки и вывод плана для TCP (задача 3, дополнено задачей 5
+# шаг 0/0б): d2k_compose зовёт d2k_hello_from_profile (hello.c, задача 1) для
+# decoy-приветствия вопросов 2/4/5, выбирая MODERN/LEGACY по виду снятого
+# приветствия ЦЕЛИ (см. build_decoy_hello в compose.c) — отсюда hello.o в
+# связывании тестов ниже. d2k_props_ask (задача 5, шаг 0) — теперь настоящий
+# оракул: говорит с датапатом через link.o (d2k_link_set_name/_next,
+# d2k_ev_has_appdata) и делает одно обращение к цели через meas.o
+# (d2k_meas_once, без собственных разрезов — сегментацию делает уже
+# поставленный план) — отсюда meas.o и link.o в связывании тестов ниже. От
+# verdict.c не зависит по символам вовсе.
 compose.o: compose.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Связь с датапатом и порог успеха (задача 4): единственный модуль ядра, что
-# читает заголовок из datapath/include (см. -I в CFLAGS выше). Не вызывает ни
-# одной функции оттуда — только #define D2K_KEY_WIRE_LEN из d2k_ctlsrv.h,
-# поэтому лишней линковки с датапатом не образуется.
+# Связь с датапатом и порог успеха (задача 4). Читает заголовок из
+# datapath/include (см. -I в CFLAGS выше); задача 5 (шаг 0) добавила второго
+# такого читателя — compose.c (см. её комментарий выше). Сам link.c не
+# вызывает ни одной функции оттуда — только #define D2K_KEY_WIRE_LEN из
+# d2k_ctlsrv.h, поэтому лишней линковки с датапатом не образуется.
 link.o: link.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -183,8 +194,8 @@ test_catalog: test_catalog.c catalog.o $(HDR)
 test_match: test_match.c match.o catalog.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o $(TEST_LDFLAGS)
 
-test_compose: test_compose.c compose.o hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o $(TEST_LDFLAGS)
+test_compose: test_compose.c compose.o hello.o meas.o link.o $(HDR) $(TESTHDR)
+	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
 test_link: test_link.c link.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_link.c link.o $(TEST_LDFLAGS)
 
@@ -215,7 +226,11 @@ test-catalog: test_catalog
 test-match: test_match
 	./test_match
 
-test-compose: test_compose
+# ../datapath/ctlprobe как зависимость запуска (не только сборки test_compose):
+# d2k_props_ask (задача 5, шаг 0) теперь тоже проверяется против настоящего
+# ctlprobe, тем же приёмом, что test_link — см. её комментарий ниже и
+# TESTHDR-блок выше.
+test-compose: test_compose ../datapath/ctlprobe
 	./test_compose
 
 # ../datapath/ctlprobe как зависимость запуска (не только сборки test_link):
@@ -313,9 +328,9 @@ cross: hello_profiles.inc
 		test_match.c match.c catalog.c -lpthread || exit 1
 	@echo "== test_compose целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_compose-a64 \
-		test_compose.c compose.c hello.c -lpthread || exit 1
+		test_compose.c compose.c hello.c meas.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_compose-mipsel \
-		test_compose.c compose.c hello.c -lpthread || exit 1
+		test_compose.c compose.c hello.c meas.c link.c -lpthread || exit 1
 	@echo "== test_link целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_link-a64 \
 		test_link.c link.c -lpthread || exit 1
