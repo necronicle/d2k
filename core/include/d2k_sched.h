@@ -38,6 +38,14 @@
  * ОТРИЦАТЕЛЬНОЕ НЕ СОХРАНЯЕТСЯ (§10/§13). Неудачный поиск не оставляет в
  * каталоге ничего: ни цели, ни коробки, ни «пробовали и не вышло». Это
  * проверяется тестом отдельно, а не подразумевается.
+ *
+ * КАНДИДАТА ИСПЫТЫВАЕТ САМ ПЛАНИРОВЩИК. Поставленный план не ждёт, пока цель
+ * откроет человек: задача идёт к цели собственным зондом (d2k_verify.h),
+ * который ведёт СВОЁ рукопожатие TLS 1.3 и разбирает ответ приложения. Успех
+ * засчитывается только при совпадении двух вещей — прикладной ответ зонду И
+ * событие применения ЭТОГО плана по ключу ЕГО потока. Внешний тип записи 23 в
+ * чужом обмене успехом больше не считается вовсе: в TLS 1.3 им едет и второй
+ * полёт рукопожатия (RFC 8446 §5.2). Подробности — в шапке sched.c.
  */
 #ifndef D2K_SCHED_H
 #define D2K_SCHED_H
@@ -48,6 +56,7 @@
 #include "d2k_catalog.h"
 #include "d2k_link.h"
 #include "d2k_verdict.h"
+#include "d2k_verify.h"
 #include "d2k_volume.h"
 
 typedef struct d2k_sched d2k_sched;
@@ -70,6 +79,20 @@ typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char 
 typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
                                            const char *sni, int plain, uint32_t mark);
 extern d2k_sched_vol_fn  d2k_sched_vol_hook;
+
+/* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и
+ * три выше, и ещё по одной: этот зонд ведёт НАСТОЯЩЕЕ рукопожатие TLS 1.3 с
+ * настоящим сервером, и модульный тест обязан утверждать, что планировщик
+ * испытывает кандидата САМ, не выходя в сеть вовсе.
+ *
+ * transport (6 TCP, 17 UDP) передаётся зонду, потому что доказательство
+ * принадлежит транспорту: подтвердить план QUIC обращением по TCP значило бы
+ * записать успех ДРУГОГО транспорта. Умолчание (verify_default, sched.c) на
+ * не-TCP честно отвечает «не измерено»: своего зонда для QUIC сегодня нет. */
+typedef d2k_ver_result (*d2k_sched_ver_fn)(const char *ip, uint16_t port,
+                                           uint8_t transport, const char *sni,
+                                           int deadline_ms);
+extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;

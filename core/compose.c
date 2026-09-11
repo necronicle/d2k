@@ -31,10 +31,10 @@
  * см. её большой комментарий и находку 2 ревью 11.09), и читает исход
  * СТРОГО по событию обмена ЭТОГО ЖЕ ПОТОКА (D2K_EV_EXCHANGE с ключом,
  * сверенным против местных и целевых адреса:порта — находка 1 того же
- * ревью, — и порог d2k_ev_has_appdata) — НЕ по тому, что вернул локальный
+ * ревью, — и наблюдение d2k_ev_outer_appdata) — НЕ по тому, что вернул локальный
  * recv(): обратное направление почти всегда слепо для аппаратной разгрузки
  * роутера, а датапат (NFQUEUE) стоит ДО неё
- * (см. большой комментарий у seen_types/d2k_ev_has_appdata, d2k_link.h).
+ * (см. большой комментарий у seen_types/d2k_ev_outer_appdata, d2k_link.h).
  *
  * ПОЧЕМУ ПЛАНЫ СОБИРАЮТСЯ В TLV ЗДЕСЬ, А НЕ ЧЕРЕЗ *_plan_text НИЖЕ.
  * Функции ...plan_text в этом файле строят ЧЕЛОВЕЧЕСКУЮ форму плана
@@ -724,7 +724,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                     steps[i].first_type = exch.code;
                     steps[i].bytes = exch.num;
                 }
-                if (d2k_ev_has_appdata(&exch)) {
+                if (d2k_ev_outer_appdata(&exch)) {
                     passed = 1;
                     break;
                 }

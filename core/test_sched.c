@@ -5,12 +5,22 @@
  * переписан план, и он же — единственное место, где две половины движка
  * встречаются.
  *
- * СЕТИ ЗДЕСЬ НЕТ. Оба сетевых оракула подменены через d2k_sched_tcp_hook и
- * d2k_sched_quic_hook — тот же приём, что d2k_mark_hook (d2k_meas.h), и по той
- * же причине: тест обязан утверждать развилку одинаково и на машине
- * разработки, и на роутере, а не зависеть от того, что сегодня отвечает
- * настоящий instagram.com. Датапат подменён обычным socketpair: планировщик
- * пишет в него команды, тест их читает.
+ * СЕТИ ЗДЕСЬ НЕТ. Сетевые оракулы подменены через d2k_sched_tcp_hook,
+ * d2k_sched_quic_hook, d2k_sched_vol_hook и d2k_sched_ver_hook — тот же приём,
+ * что d2k_mark_hook (d2k_meas.h), и по той же причине: тест обязан утверждать
+ * развилку одинаково и на машине разработки, и на роутере, а не зависеть от
+ * того, что сегодня отвечает настоящий instagram.com. Датапат подменён обычным
+ * socketpair: планировщик пишет в него команды, тест их читает.
+ *
+ * ЧТО СЧИТАЕТСЯ ПОДТВЕРЖДЕНИЕМ. Две вещи вместе, и ни одна по отдельности:
+ * СОБСТВЕННЫЙ зонд планировщика дошёл до ответа приложения (D2K_VER_APPLICATION
+ * от подменённого d2k_sched_ver_hook) И датапат сказал, что ИМЕННО ЭТОТ план
+ * применился к ключу ИМЕННО ЕГО потока (D2K_EV_APPLIED с идентификатором
+ * плана). Событие обмена с внешним типом записи 23 подтверждением больше не
+ * является вовсе: в TLS 1.3 им едет и второй полёт рукопожатия (RFC 8446
+ * §5.2). Идентификатор плана тест не выдумывает, а ЧИТАЕТ С ПРОВОДА — из той
+ * самой команды, которую планировщик только что отправил (см. last_plan_id
+ * ниже): иначе он проверял бы своё представление о связи, а не связь.
  *
  * ПОДОЗРЕНИЕ НЕ НЕСЁТ ИМЕНИ. На проводе D2K_EV_SUSPECT — это ключ потока и код
  * причины, и только (core/link.c, разбор события; datapath/include/d2k_ctl.h).
@@ -91,6 +101,36 @@ static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
     return r;
 }
 
+/* Подменённый зонд подтверждения. Уровень задаёт тест; местный порт — тоже,
+   потому что планировщик сверяет событие применения со СВОИМ потоком, а
+   местный порт настоящего зонда назначает ядро. ver_fail_first позволяет
+   «провалить» первые обращения: так проверяется, что очередь кандидатов
+   движется сама, без пользователя. */
+static int ver_calls;
+static int ver_fail_first;
+static uint8_t ver_last_transport;
+static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
+static uint16_t ver_answer_port;
+
+static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
+                               const char *sni, int deadline_ms) {
+    (void)ip; (void)port; (void)sni; (void)deadline_ms;
+    ver_calls++;
+    ver_last_transport = transport;
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    /* Сокета нет вовсе: ver_close планировщика на отрицательном дескрипторе
+       ничего не закрывает, и чужой дескриптор тест не теряет. */
+    r.fd = -1;
+    r.level = (ver_calls <= ver_fail_first) ? D2K_VER_HANDSHAKE : ver_answer;
+    r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
+    /* Тот же местный конец, что в ключах событий этого теста (ev_hello). */
+    r.local_ip4[0] = 192; r.local_ip4[1] = 168; r.local_ip4[2] = 1; r.local_ip4[3] = 67;
+    r.local_port = ver_answer_port;
+    snprintf(r.reason, sizeof r.reason, "подменённый зонд");
+    return r;
+}
+
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark) {
     (void)ip; (void)port; (void)trigger; (void)control; (void)mark;
@@ -139,9 +179,10 @@ static d2k_ev ev_suspect(uint8_t transport, uint16_t cport) {
     return e;
 }
 
-/* Обмен с прикладными данными — §8, порог успеха: бит типа 23 в маске
-   встреченных типов (d2k_ev_has_appdata). Без него подтверждения нет и
-   привязка в каталог не идёт. */
+/* Обмен с ВНЕШНИМ типом записи 23 в маске встреченных типов
+   (d2k_ev_outer_appdata). Порогом успеха это БОЛЬШЕ НЕ является: в TLS 1.3 тем
+   же типом едет второй полёт рукопожатия (RFC 8446 §5.2). Наблюдение может
+   поднять уровень уже подтверждённой записи — и только. */
 static d2k_ev ev_exchange(uint8_t transport, uint16_t cport, int appdata) {
     d2k_ev e = ev_hello(transport, cport, "");
     e.kind = D2K_EV_EXCHANGE;
@@ -156,33 +197,114 @@ static d2k_ev ev_exchange(uint8_t transport, uint16_t cport, int appdata) {
    приветствие-приманка внутри плана весит полтора килобайта. Без чтения
    буфер socketpair переполняется, и d2k_link_set_name встаёт в write
    навсегда — первый прогон этого теста так и повис. На живом датапате
-   команды читает d2kd своим циклом; здесь читать обязан тест. */
+   команды читает d2kd своим циклом; здесь читать обязан тест.
+
+   Прочитанное НЕ выбрасывается: из него тест берёт идентификатор плана (см.
+   last_plan_id). */
 static int drain_fd = -1;
+static uint8_t sentbuf[1 << 18];
+static size_t sent_len;
+
 static void drain(void) {
     uint8_t buf[4096];
     /* Неблокирующее чтение через O_NONBLOCK на самом дескрипторе, а не через
        MSG_DONTWAIT: флага recv нет в чистом POSIX, и -std=c99 его не даёт. */
-    while (read(drain_fd, buf, sizeof buf) > 0) { }
+    for (;;) {
+        ssize_t n = read(drain_fd, buf, sizeof buf);
+        if (n <= 0) { break; }
+        size_t take = (size_t)n;
+        if (take > sizeof sentbuf) { take = sizeof sentbuf; }
+        if (sent_len + take > sizeof sentbuf) {
+            /* Нужен ПОСЛЕДНИЙ отправленный план, а не вся история: начинаем
+               буфер заново, а не отказываемся читать (иначе тест повиснет на
+               write планировщика — см. выше). */
+            sent_len = 0;
+        }
+        memcpy(sentbuf + sent_len, buf, take);
+        sent_len += take;
+    }
 }
 
-/* Крутит планировщик заданное число тиков. Сетевой оракул уезжает в рабочий
-   поток и возвращается позже; ждать его сном "на авось" здесь нельзя так же,
-   как в остальных тестах дерева, поэтому крутим тики — каждый забирает всё,
-   что уже готово. Потолок щедрый: на машине разработки подменённый оракул
-   возвращается мгновенно, а на медленной сборке — за несколько миллисекунд. */
-static void settle(d2k_sched *s) {
-    for (int i = 0; i < 400; i++) {
-        /* Ждём на будилке планировщика, а не крутим тики вплотную: рабочий
-           поток сетевого оракула ещё даже не начинался, когда четыреста
-           пустых тиков уже кончились — первая редакция этой функции так и
-           плавала, проходя или падая в зависимости от того, успел ли поток
-           встать. Миллисекунда на круг — это и ожидание, и уступка
-           планировщику ОС, и ровно тот же приём, каким d2kc ждёт событий. */
-        struct pollfd pfd;
-        pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
-        (void)poll(&pfd, 1, 1);
-        d2k_sched_tick(s, (int64_t)i * 5);
-        drain();
+static void forget_sent(void) { sent_len = 0; }
+
+/* Идентификатор ПОСЛЕДНЕГО отправленного плана — прямо с провода.
+ *
+ * Планировщик подставляет его в запись REC_ID кандидата перед отправкой
+ * (install_next, sched.c) байтами ASCII "plan-xxxxxxxx", добитыми нулями до
+ * шестнадцати. Тест ищет эти байты в отправленной команде, а не вычисляет их
+ * заново: вторая реализация правила разошлась бы с первой молча, и тест
+ * проверял бы себя. Возвращает 1, если нашёл. */
+static int last_plan_id(uint8_t out[16]) {
+    if (sent_len < 16) { return 0; }
+    for (size_t i = sent_len - 16 + 1; i-- > 0;) {
+        if (memcmp(sentbuf + i, "plan-", 5) == 0) {
+            memcpy(out, sentbuf + i, 16);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Событие применения ПО КЛЮЧУ ПОТОКА ЗОНДА и с идентификатором того плана,
+   который планировщик только что отправил. Вместе с уровнем «приложение» от
+   подменённого зонда это и есть полное доказательство. */
+static d2k_ev ev_applied(uint8_t transport, uint16_t cport) {
+    d2k_ev e = ev_hello(transport, cport, "");
+    e.kind = D2K_EV_APPLIED;
+    e.name[0] = '\0';
+    (void)last_plan_id(e.plan_id);
+    return e;
+}
+
+/* Модельные часы теста. ТОЛЬКО ВПЕРЁД и общие на весь файл: у планировщика
+   есть сроки, измеряемые секундами (потолок шага испытания — пять секунд), и
+   тик, поданный «назад», отменял бы их молча. Раньше каждый цикл ожидания
+   считал время от нуля своим i*5, и пересечь пятисекундный срок было нечем. */
+static int64_t g_now_ms;
+
+/* Один круг: ждём на будилке планировщика, двигаем часы, тикаем, читаем
+   команды. Ждём, а не крутим тики вплотную: рабочий поток сетевого оракула ещё
+   даже не начинался, когда четыреста пустых тиков уже кончились — первая
+   редакция этой функции так и плавала, проходя или падая в зависимости от
+   того, успел ли поток встать. Миллисекунда на круг — это и ожидание, и
+   уступка планировщику ОС, и ровно тот же приём, каким d2kc ждёт событий. */
+static void tick_once(d2k_sched *s) {
+    struct pollfd pfd;
+    pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
+    (void)poll(&pfd, 1, 1);
+    g_now_ms += 5;
+    d2k_sched_tick(s, g_now_ms);
+    drain();
+}
+
+static void spin(d2k_sched *s, int rounds) {
+    for (int i = 0; i < rounds; i++) { tick_once(s); }
+}
+
+/* Крутит планировщик четыреста кругов — две секунды модельного времени.
+   Потолок щедрый: на машине разработки подменённый оракул возвращается
+   мгновенно, а на медленной сборке — за несколько миллисекунд. */
+static void settle(d2k_sched *s) { spin(s, 400); }
+
+/* Перешагивает срок планировщика: сроки считаются секундами, а settle()
+   проходит меньше двух секунд модельного времени и потолок не пересекает
+   никогда. Живое время при этом не тратится — у планировщика часы приходят
+   аргументом, а не из ОС. */
+static void skip_ahead(d2k_sched *s, int64_t ms) {
+    g_now_ms += ms;
+    d2k_sched_tick(s, g_now_ms);
+    drain();
+}
+
+/* Доводит поиск до конца очереди кандидатов. Каждый неподтверждённый кандидат
+   уходит по потолку ожидания применения, а тот считается секундами модельного
+   времени — значит нужны прыжки часов, а не долгое кручение. Сорока кругов
+   между прыжками хватает с запасом: рабочий поток будит цикл сам, а tick_once
+   этого пробуждения и ждёт. */
+static void run_out(d2k_sched *s) {
+    for (int i = 0; i < 60 && d2k_sched_active(s); i++) {
+        skip_ahead(s, 6000);
+        spin(s, 40);
     }
 }
 
@@ -207,6 +329,10 @@ int main(void) {
     d2k_sched_vol_hook = stub_vol;
     d2k_sched_tcp_hook = stub_tcp;
     d2k_sched_quic_hook = stub_quic;
+    /* Зонд подтверждения тоже подменён: настоящий пошёл бы к 127.0.0.1 своим
+       рукопожатием TLS 1.3, а стенд этого теста TLS не умеет — тест мерил бы
+       стенд. */
+    d2k_sched_ver_hook = stub_ver;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -276,22 +402,35 @@ int main(void) {
         d2k_sched *s = d2k_sched_new(&c2, sv[0], 0x2d);
         tcp_answer = D2K_V_PREFIX;
         quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
 
+        /* Зонд «занимает» тот же местный порт, что стоит в ключе событий этой
+           цели: планировщик сверяет применение со СВОИМ потоком, и чужой порт
+           здесь означал бы чужой поток. */
+        ver_answer_port = 40010;
+        forget_sent();
         d2k_ev h1 = ev_hello(6, 40010, "instagram.com");
         d2k_sched_event(s, &h1);
         d2k_ev s1 = ev_suspect(6, 40010);
         d2k_sched_event(s, &s1);
         settle(s);
-        d2k_ev x1 = ev_exchange(6, 40010, 1);
-        d2k_sched_event(s, &x1);
+        d2k_ev a1 = ev_applied(6, 40010);
+        d2k_sched_event(s, &a1);
+        spin(s, 40);
 
+        ver_answer_port = 40011;
+        forget_sent();
         d2k_ev h2 = ev_hello(17, 40011, "instagram.com");
         d2k_sched_event(s, &h2);
         d2k_ev s2 = ev_suspect(17, 40011);
         d2k_sched_event(s, &s2);
         settle(s);
-        d2k_ev x2 = ev_exchange(17, 40011, 1);
-        d2k_sched_event(s, &x2);
+        CHECK(ver_last_transport == 17,
+              "зонду не сказали транспорт — умолчание не смогло бы отказать QUIC");
+        d2k_ev a2 = ev_applied(17, 40011);
+        d2k_sched_event(s, &a2);
+        spin(s, 40);
 
         const d2k_cat_binding *btcp = binding_of(&c2, "instagram.com", 6);
         const d2k_cat_binding *budp = binding_of(&c2, "instagram.com", 17);
@@ -354,10 +493,7 @@ int main(void) {
 
         /* Крутим до вопроса: он задаётся, когда вернулся вердикт. */
         for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) {
-            struct pollfd p2; p2.fd = d2k_sched_wake_fd(s); p2.events = POLLIN; p2.revents = 0;
-            (void)poll(&p2, 1, 1);
-            d2k_sched_tick(s, (int64_t)i * 5);
-            drain();
+            tick_once(s);
         }
         CHECK(said("спрашиваю коробку о свойствах"),
               "на вердикт «решает содержимое» вопросы о свойствах не начались");
@@ -375,7 +511,8 @@ int main(void) {
                 peer = accept(lfd, (struct sockaddr *)&pa, &pl);
                 if (peer >= 0) { a = pa; }
             }
-            d2k_sched_tick(s, (int64_t)i * 5);
+            g_now_ms += 5;
+            d2k_sched_tick(s, g_now_ms);
             drain();
         }
         CHECK(peer >= 0, "зонд не пришёл к цели после подтверждения плана-вопроса");
@@ -386,10 +523,7 @@ int main(void) {
            (в T_PROPS_WAIT ни одной задачи). Ждём, пока планировщик сам
            скажет, что ждёт. */
         for (int i = 0; i < 400 && !said("жду обмена"); i++) {
-            struct pollfd p3; p3.fd = d2k_sched_wake_fd(s); p3.events = POLLIN; p3.revents = 0;
-            (void)poll(&p3, 1, 1);
-            d2k_sched_tick(s, (int64_t)i * 5);
-            drain();
+            tick_once(s);
         }
         CHECK(said("жду обмена"), "планировщик не дошёл до ожидания обмена по вопросу");
 
@@ -421,10 +555,7 @@ int main(void) {
             /* Теперь честно: датапат говорит, что план применён к ПАКЕТАМ
                ЭТОГО потока, и следом приходит обмен. */
             for (int i = 0; i < 400 && !said("зонд вопроса 2 ушёл"); i++) {
-                struct pollfd p4; p4.fd = d2k_sched_wake_fd(s); p4.events = POLLIN; p4.revents = 0;
-                (void)poll(&p4, 1, 1);
-                d2k_sched_tick(s, (int64_t)i * 5);
-                drain();
+                tick_once(s);
             }
             /* Ждать соединения, а не висеть на accept: если зонд не пришёл
                (а именно так выглядит поломка, которую этот случай и ловит),
@@ -447,7 +578,7 @@ int main(void) {
             d2k_sched_event(s, &x);
             x.kind = D2K_EV_EXCHANGE;
             d2k_sched_event(s, &x);
-            settle(s);
+            spin(s, 40);
             if (peer2 >= 0) { close(peer2); }
 
             CHECK(said("вопрос 2 прошёл") || said("вопрос 3 прошёл"),
@@ -492,16 +623,21 @@ int main(void) {
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
 
         /* Первая цель: коробка ещё не известна — заводится новая, по
            отпечатку. */
+        ver_answer_port = 40050;
+        forget_sent();
         d2k_ev h = ev_hello(6, 40050, "первая.цель");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40050);
         d2k_sched_event(s, &su);
         settle(s);
-        d2k_ev x = ev_exchange(6, 40050, 1);
+        d2k_ev x = ev_applied(6, 40050);
         d2k_sched_event(s, &x);
+        spin(s, 40);
         CHECK(c6.n_boxes == 1, "первый успех не завёл коробку");
         CHECK(c6.n_boxes == 1 && c6.boxes[0].fp.n_sig == 1,
               "у заведённой коробки не записан отпечаток — узнать её потом будет нечем");
@@ -513,6 +649,8 @@ int main(void) {
            клон. */
         size_t boxes_before = c6.n_boxes;
         tcp_calls = vol_calls = 0;
+        ver_answer_port = 40051;
+        forget_sent();
         d2k_ev h2 = ev_hello(6, 40051, "вторая.цель");
         d2k_sched_event(s, &h2);
         d2k_ev su2 = ev_suspect(6, 40051);
@@ -520,8 +658,9 @@ int main(void) {
         settle(s);
         CHECK(tcp_calls == 0 && vol_calls == 0,
               "узнанная коробка запустила новый замер ДО проверки готового плана");
-        d2k_ev x2 = ev_exchange(6, 40051, 1);
+        d2k_ev x2 = ev_applied(6, 40051);
         d2k_sched_event(s, &x2);
+        spin(s, 40);
         CHECK(c6.n_boxes == boxes_before,
               "вторая цель с тем же отпечатком завела КЛОН коробки вместо узнавания");
         CHECK(binding_of(&c6, "вторая.цель", 6) != NULL, "вторая привязка не записана");
@@ -535,17 +674,15 @@ int main(void) {
         /* A miss on a new target falls back to research ONCE, without
            discarding the established bindings of the other targets. */
         tcp_calls = vol_calls = 0;
+        /* Готовый план узнанной коробки третьей цели НЕ помогает: зонд доходит
+           до рукопожатия и молчит. Промах виден планировщику сам, без единого
+           события от пользователя. */
+        ver_answer = D2K_VER_HANDSHAKE;
+        forget_sent();
         d2k_ev h3 = ev_hello(6, 40052, "третья.цель");
         d2k_sched_event(s, &h3);
         d2k_ev su3 = ev_suspect(6, 40052);
         d2k_sched_event(s, &su3);
-        settle(s);
-        CHECK(tcp_calls == 0 && vol_calls == 0, "повторное использование снова вызвало замер");
-        d2k_ev ap3 = h3;
-        ap3.kind = D2K_EV_APPLIED;
-        ap3.name[0] = '\0';
-        d2k_sched_event(s, &ap3);
-        d2k_sched_event(s, &ap3);
         settle(s);
         CHECK(tcp_calls == 1 && vol_calls == 1,
               "после промаха готового плана исследование не запущено ровно один раз");
@@ -617,79 +754,80 @@ int main(void) {
         }
     }
 
-    /* --- кандидат, применяющийся без обмена, не залипает навсегда ------ */
+    /* --- очередь кандидатов движется БЕЗ пользователя (задача 3) -------- */
     {
+        /* Раньше поставленный кандидат ждал чужого обмена: пока цель не
+           откроют ещё раз, очередь стояла, а у телевизора «ещё раз» — через
+           три минуты. Теперь кандидата испытывает сам планировщик, и промах
+           виден через секунды, без единого события от пользователя. */
         d2k_catalog c5;
         memset(&c5, 0, sizeof c5);
         d2k_sched *s = d2k_sched_new(&c5, sv[0], 0x2d);
         tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_HANDSHAKE;  /* рукопожатие есть, приложение молчит */
+        ver_fail_first = 0;
+        ver_calls = 0;
         d2k_ev h = ev_hello(6, 40040, "instagram.com");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40040);
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(d2k_sched_active(s) == 1, "поиск не дошёл до ожидания обмена");
-
-        /* Два применения без обмена — кандидат обязан смениться, а поиск
-           продолжиться (или честно кончиться), но не стоять до истечения
-           задачи (десять минут). */
-        d2k_ev ap = ev_hello(6, 40040, "");
-        ap.kind = D2K_EV_APPLIED;
-        ap.name[0] = '\0';
-        for (int i = 0; i < 2; i++) { d2k_sched_event(s, &ap); }
-        settle(s);
-        CHECK(total_bindings(&c5) == 0, "молчаливое применение записано как успех");
+        CHECK(ver_calls >= 1, "планировщик не испытал кандидата сам");
+        CHECK(total_bindings(&c5) == 0,
+              "рукопожатие без ответа приложения записано как успех");
         CHECK(d2k_sched_active(s) == 0,
-              "кандидат, применившийся дважды без обмена, залип — поиск не двинулся");
+              "очередь кандидатов не продвинулась сама — поиск ждёт пользователя");
         d2k_sched_free(s);
         d2k_catalog_free(&c5);
     }
 
-    /* --- потерянный обмен НЕ улика против плана ------------------------ */
+    /* --- потерянное применение НЕ улика против кандидата ---------------- */
     {
         /* Датапат держит ровно один исходящий кадр и теряет всё, что не
-           поместилось (d2k_ctl.h). Пропавший обмен снаружи неотличим от «план
-           не сработал» — и без этой проверки планировщик выбрасывал бы
-           РАБОЧИЙ план просто потому, что о его успехе не смогли сказать. */
+           поместилось (d2k_ctl.h). Пропавшее применение снаружи неотличимо от
+           «план к зонду не применялся» — и без этой проверки планировщик
+           выбрасывал бы РАБОЧИЙ кандидат просто потому, что о его применении
+           не смогли сказать. */
         d2k_catalog c9;
         memset(&c9, 0, sizeof c9);
         d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40070;
+        ver_calls = 0;
         d2k_ev h = ev_hello(6, 40070, "молчащая.цель");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40070);
         d2k_sched_event(s, &su);
         settle(s);
-        CHECK(d2k_sched_active(s) == 1, "поиск не дошёл до ожидания обмена");
+        CHECK(ver_calls == 1, "кандидат не испытан");
+        CHECK(said("жду применения плана"),
+              "зонд дошёл до приложения, а применения плана никто не ждёт");
 
-        d2k_ev ap = ev_hello(6, 40070, "");
-        ap.kind = D2K_EV_APPLIED;
-        ap.name[0] = '\0';
-
-        /* Между применениями связь сообщает о потерях — молчание перестаёт
-           быть уликой, и план обязан остаться. */
+        /* Связь сообщает о потерях, и события применения так и нет: считать
+           это уликой против кандидата нельзя — испытываем его ЕЩЁ РАЗ. */
         d2k_ev st;
         memset(&st, 0, sizeof st);
         st.kind = D2K_EV_STATS;
-        for (int i = 0; i < 6; i++) {
-            st.dropped = (uint32_t)(i + 1);
-            d2k_sched_event(s, &st);
-            d2k_sched_event(s, &ap);
-        }
+        st.dropped = 3;
+        d2k_sched_event(s, &st);
+        skip_ahead(s, 6000); /* перешагнуть потолок ожидания применения */
         settle(s);
         CHECK(said("молчание не в счёт"),
-              "потери событий не учтены — молчание засчитано как улика против плана");
-        CHECK(d2k_sched_active(s) == 1,
-              "план выброшен по молчанию, хотя связь в это время теряла события");
+              "потери событий не учтены — молчание засчитано как улика против кандидата");
+        CHECK(ver_calls == 2, "кандидат не испытан повторно, хотя связь теряла события");
+        CHECK(total_bindings(&c9) == 0, "потеря событий записана как успех");
 
-        /* А когда потерь нет — молчание снова улика, и поиск идёт дальше. */
-        d2k_sched_event(s, &ap);
-        d2k_sched_event(s, &ap);
-        settle(s);
+        /* А когда потерь больше нет — кандидат честно сменяется, и поиск
+           доходит до конца очереди сам. */
+        run_out(s);
+        CHECK(total_bindings(&c9) == 0,
+              "зонд прошёл, а применения не было — записано как успех");
         CHECK(d2k_sched_active(s) == 0,
-              "без потерь связи план так и не сменился — поиск встал");
+              "без потерь связи кандидат так и не сменился — поиск встал");
         d2k_sched_free(s);
         d2k_catalog_free(&c9);
     }
@@ -724,21 +862,34 @@ int main(void) {
         d2k_catalog_free(&cA);
     }
 
-    /* --- обмен БЕЗ прикладных данных не подтверждает ничего (§8) ------- */
+    /* --- внешний тип 23 сам по себе не подтверждает ничего (задача 4) --- */
     {
+        /* В TLS 1.3 внешним типом записи 23 наружу едет ВЕСЬ второй полёт
+           рукопожатия (RFC 8446 §5.2): с провода «приложение ответило» и
+           «коробка пропустила приветствие» неотличимы. Ровно на этом пороге
+           в каталоге накопились 4796 «успехов» по instagram при мёртвом
+           плане (§1 спецификации). Событие обмена по потоку задачи обязано
+           остаться НАБЛЮДЕНИЕМ и привязку не заводить. */
         d2k_catalog c4;
         memset(&c4, 0, sizeof c4);
         d2k_sched *s = d2k_sched_new(&c4, sv[0], 0x2d);
         tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_HANDSHAKE; /* зонд до приложения НЕ дошёл */
+        ver_fail_first = 0;
         d2k_ev h = ev_hello(6, 40030, "instagram.com");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40030);
         d2k_sched_event(s, &su);
         settle(s);
-        d2k_ev x = ev_exchange(6, 40030, 0); /* только рукопожатие */
+        d2k_ev x = ev_exchange(6, 40030, 1); /* внешний тип 23 по потоку цели */
         d2k_sched_event(s, &x);
+        spin(s, 40);
         CHECK(total_bindings(&c4) == 0,
-              "обмен без прикладных данных засчитан за успех — §8 требует прикладного обмена");
+              "внешний тип 23 записан как подтверждение — это только наблюдение (RFC 8446 §5.2)");
+        d2k_ev x0 = ev_exchange(6, 40030, 0); /* и рукопожатие тем более */
+        d2k_sched_event(s, &x0);
+        spin(s, 40);
+        CHECK(total_bindings(&c4) == 0, "обмен без внешнего типа 23 засчитан за успех");
         d2k_sched_free(s);
         d2k_catalog_free(&c4);
     }
@@ -798,23 +949,27 @@ int main(void) {
             if (ready) {
                 d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
                 tcp_calls = vol_calls = 0;
+                /* Первый кандидат (план модели с бо́льшим числом успехов) не
+                   помогает: зонд доходит только до рукопожатия. Второй —
+                   помогает. Обе развилки видит сам планировщик. */
+                ver_answer = D2K_VER_APPLICATION;
+                ver_fail_first = 1;
+                ver_calls = 0;
+                ver_answer_port = 40101;
+                forget_sent();
                 d2k_ev h = ev_hello(6, 40101, "неоднозначная.цель");
                 d2k_sched_event(s, &h);
                 d2k_ev su = ev_suspect(6, 40101);
                 d2k_sched_event(s, &su);
                 settle(s);
-                d2k_ev ap = h;
-                ap.kind = D2K_EV_APPLIED;
-                ap.name[0] = '\0';
-                d2k_sched_event(s, &ap);
-                d2k_sched_event(s, &ap);
-                settle(s);
                 CHECK(tcp_calls == 0 && vol_calls == 0,
                       "первая похожая модель не помогла — вторая пропущена ради исследования");
-                d2k_ev x = ev_exchange(6, 40101, 1);
-                d2k_sched_event(s, &x);
+                d2k_ev ap = ev_applied(6, 40101);
+                d2k_sched_event(s, &ap);
+                spin(s, 40);
                 CHECK(c.boxes[0].n_binds == 0 && c.boxes[1].n_binds == 1,
                       "результат второго плана записан не в его модель");
+                ver_fail_first = 0;
                 d2k_sched_free(s);
             }
             d2k_catalog_free(&c);
@@ -829,6 +984,7 @@ int main(void) {
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
         tcp_answer = D2K_V_INCONCLUSIVE;
+        ver_answer = D2K_VER_HANDSHAKE; /* кандидатов собрали, но не подтвердили */
         d2k_ev h = ev_hello(6, 40100, "без.контроля");
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(6, 40100);
@@ -839,6 +995,137 @@ int main(void) {
         d2k_sched_free(s);
         d2k_catalog_free(&c);
         tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* --- редкую цель планировщик испытывает САМ (задача 3) -------------- */
+    {
+        /* Главная проверка этой вертикали. Событий от пользователя после
+           подозрения НЕТ ВОВСЕ — только то, что говорит датапат о НАШЕМ
+           зонде. Спецификация (§4) прямо отказывается от того, чтобы цель
+           открывали несколько раз ради перебора: у телевизора одно обращение,
+           следующее через три минуты. */
+        d2k_catalog cB;
+        memset(&cB, 0, sizeof cB);
+        d2k_sched *s = d2k_sched_new(&cB, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40090;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40090, "редкая.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40090);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls >= 1, "планировщик не испытал кандидата сам");
+
+        /* Датапат говорит, что план применился к пакетам ЭТОГО потока. */
+        d2k_ev ap = ev_applied(6, 40090);
+        CHECK(ap.plan_id[0] != 0,
+              "кандидат ушёл на провод без идентификатора — сверять применение нечем");
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        CHECK(total_bindings(&cB) == 1,
+              "успех собственного испытания не записан — перебор снова ждёт пользователя");
+        CHECK(said("ПОДТВЕРЖДЕНО собственным зондом"),
+              "подтверждение не названо тем, чем оно является");
+        const d2k_cat_binding *bd = binding_of(&cB, "редкая.цель", 6);
+        CHECK(bd != NULL && bd->level == 3,
+              "уровень записи не третий («обмен прошёл») — именно это и доказано зондом");
+
+        /* Чужое применение того же плана к той же цели — НЕ наше испытание:
+           ключ потока другой. Проверяется отдельной целью, чтобы поймать
+           сверку по порту, а не «по чему-нибудь». */
+        ver_answer_port = 40091;
+        ver_calls = 0;
+        forget_sent();
+        d2k_ev h2 = ev_hello(6, 40091, "чужой.поток");
+        d2k_sched_event(s, &h2);
+        d2k_ev su2 = ev_suspect(6, 40091);
+        d2k_sched_event(s, &su2);
+        settle(s);
+        d2k_ev ap2 = ev_applied(6, 40091);
+        ap2.high_port = 40099; /* тот же план и та же цель, но ЧУЖОЙ поток */
+        d2k_sched_event(s, &ap2);
+        run_out(s);
+        CHECK(binding_of(&cB, "чужой.поток", 6) == NULL,
+              "применение по ЧУЖОМУ потоку засчитано за испытание нашего зонда");
+
+        /* Применение ЧУЖОГО плана по НАШЕМУ потоку — тоже не испытание: так
+           выглядит опоздавшее событие предыдущего кандидата (ради этого
+           различия идентификатор и завели, d2k_link.h). */
+        ver_answer_port = 40092;
+        ver_calls = 0;
+        forget_sent();
+        d2k_ev h3 = ev_hello(6, 40092, "старый.план");
+        d2k_sched_event(s, &h3);
+        d2k_ev su3 = ev_suspect(6, 40092);
+        d2k_sched_event(s, &su3);
+        settle(s);
+        d2k_ev ap3 = ev_applied(6, 40092);
+        memcpy(ap3.plan_id, "plan-deadbeef\0\0", 16); /* идентификатор другого плана */
+        d2k_sched_event(s, &ap3);
+        run_out(s);
+        CHECK(binding_of(&cB, "старый.план", 6) == NULL,
+              "применение ЧУЖОГО плана засчитано за испытание нашего кандидата");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cB);
+    }
+
+    /* --- живой трафик ПОСЛЕ подтверждения поднимает уровень записи ------ */
+    {
+        /* T_WATCHING теперь означает другое: не «ждём, пока пользователь
+           откроет цель», а «план подтверждён и стоит, смотрим на живой
+           трафик». Наблюдение внешнего типа 23 привязку не заводит (проверено
+           выше), но уже подтверждённой поднять уровень может — это и есть
+           пятый уровень, «подтверждён последующими соединениями». */
+        d2k_catalog cC;
+        memset(&cC, 0, sizeof cC);
+        d2k_sched *s = d2k_sched_new(&cC, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40110;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40110, "подтверждённая.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40110);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40110);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        const d2k_cat_binding *bd = binding_of(&cC, "подтверждённая.цель", 6);
+        CHECK(bd != NULL && bd->level == 3, "подтверждение зондом не записано третьим уровнем");
+
+        /* Обмен по потоку САМОГО зонда уровень не поднимает: это он и был
+           доказательством, и считать его ещё и «последующим соединением»
+           значит подтвердить себя собой. */
+        d2k_ev own = ev_exchange(6, 40110, 1);
+        d2k_sched_event(s, &own);
+        bd = binding_of(&cC, "подтверждённая.цель", 6);
+        CHECK(bd != NULL && bd->level == 3,
+              "обмен по потоку самого зонда поднял уровень — запись подтвердила себя собой");
+
+        /* А вот ПОСЛЕДУЮЩЕЕ живое соединение (другой местный порт) — поднимает.
+           Имя за его ключом планировщик знает из приветствия, как и всегда. */
+        d2k_ev h2 = ev_hello(6, 40111, "подтверждённая.цель");
+        d2k_sched_event(s, &h2);
+        d2k_ev live = ev_exchange(6, 40111, 1);
+        d2k_sched_event(s, &live);
+        bd = binding_of(&cC, "подтверждённая.цель", 6);
+        CHECK(bd != NULL && bd->level == 5,
+              "последующее живое соединение не подняло уровень записи до пятого");
+        CHECK(said("уровень записи поднят до 5"), "подъём уровня не назван в отчёте");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cC);
     }
 
     close(sv[0]);

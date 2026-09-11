@@ -183,7 +183,7 @@ match.o: match.c $(HDR)
 # приветствия ЦЕЛИ (см. build_decoy_hello в compose.c) — отсюда hello.o в
 # связывании тестов ниже. d2k_props_ask (задача 5, шаг 0) — теперь настоящий
 # оракул: говорит с датапатом через link.o (d2k_link_set_name/_next,
-# d2k_ev_has_appdata) и делает одно обращение к цели через meas.o
+# d2k_ev_outer_appdata) и делает одно обращение к цели через meas.o
 # (d2k_meas_once, без собственных разрезов — сегментацию делает уже
 # поставленный план) — отсюда meas.o и link.o в связывании тестов ниже. От
 # verdict.c не зависит по символам вовсе.
@@ -441,11 +441,11 @@ cross: hello_profiles.inc
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
-		-lpthread || exit 1
+		verify.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
-		-lpthread || exit 1
+		verify.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
@@ -507,13 +507,16 @@ test-plantlv: test_plantlv
 test_plantlv: test_plantlv.c plantlv.o compose.o hello.o meas.o link.o $(HDR) ../datapath/planlab
 	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
 
-test-sched: test_sched sched.o plantlv.o
+test-sched: test_sched sched.o plantlv.o verify.o
 	./test_sched
 
+# verify.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
+# умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
+# умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
 test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
-            hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o $(HDR)
+            hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o $(TEST_LDFLAGS)
+		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
