@@ -159,6 +159,11 @@ int main(int argc, char **argv) {
 
     d2k_sched_set_say(s, sched_say, NULL);
 
+    /* Знание из каталога — датапату СРАЗУ: он состояния между запусками не
+       хранит, и без этого прохода каждая уже изученная цель начинала бы поиск
+       заново. */
+    (void)d2k_sched_sync(s);
+
     printf("d2kc: запущен, сокет %s, каталог %s (%zu коробок), метка 0x%x\n",
            sock, catpath, cat.n_boxes, (unsigned)mark);
     fflush(stdout);

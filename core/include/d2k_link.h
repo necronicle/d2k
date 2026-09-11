@@ -184,6 +184,17 @@ int  d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap);
  * целей, которые никто не просил трогать. */
 int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
 
+/* Ставит план на АДРЕС цели: команда D2K_CMD_SET_ADDR (адрес IPv4 четырьмя
+ * байтами сетевого порядка, затем план TLV — d2k_ctl.h). Как и
+ * d2k_link_set_name, только отправляет команду и не ждёт ack.
+ *
+ * Нужна не для симметрии: каталог хранит привязки двух видов, "name" и "addr"
+ * (d2k_cat_binding.kind), и цель без имени — это НЕ вырожденный случай цели с
+ * именем, а отдельный вид знания. Ставить её планы по имени нечем, пропускать
+ * их — терять подтверждённое. */
+int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
+                       char *err, size_t errcap);
+
 /* Типы TLS-записей, встречающиеся в EXCHANGE (§8 спецификации,
  * docs/spec/2026-09-06-c-engine-design.md). Это НЕ протокол управляющего
  * сокета — датапат здесь только наблюдает чужой протокол (TLS, RFC 8446

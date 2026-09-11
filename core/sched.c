@@ -595,7 +595,14 @@ static size_t known_plans(d2k_sched *s, task *t) {
     int used[64];
     memset(used, 0, sizeof used);
     size_t cap = sizeof t->plans / sizeof t->plans[0];
-    const char *want = (t->transport == 17) ? "quic" : "tcp";
+    /* proto у плана каталога — протокол УРОВНЯ ПРИЛОЖЕНИЯ ("tls"/"quic"), а
+       не транспорт: живой каталог роутера Марка (11.09, 14 коробок, 353
+       привязки) не содержит ни одного плана с proto "tcp" — у всех "tls".
+       Сравнение с транспортом отбрасывало бы КАЖДЫЙ настоящий план узнанной
+       коробки, и узнавание работало бы только в тесте, где план заводил сам
+       планировщик. Имя поля общее с Go-стороной (Plan.Proto), и смысл берётся
+       оттуда же, а не выдумывается здесь. */
+    const char *want = (t->transport == 17) ? "quic" : "tls";
     while (took < cap) {
         int best = -1;
         for (size_t i = 0; i < b->n_plans && i < sizeof used / sizeof used[0]; i++) {
@@ -683,6 +690,76 @@ size_t d2k_sched_active(const d2k_sched *s) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task_state st = s->tasks[i].state;
         if (st == T_ASKING || st == T_PLANNING || st == T_WATCHING) { n++; }
+    }
+    return n;
+}
+
+/* Находит план коробки по идентификатору. NULL — нет такого или выключен. */
+static const d2k_cat_plan *plan_by_id(const d2k_cat_box *b, const char *id) {
+    for (size_t i = 0; i < b->n_plans; i++) {
+        if (strcmp(b->plans[i].id, id) == 0) {
+            return b->plans[i].enabled ? &b->plans[i] : NULL;
+        }
+    }
+    return NULL;
+}
+
+int d2k_sched_sync(d2k_sched *s) {
+    if (!s || !s->cat) { return -1; }
+    static char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    char err[200];
+    int n = 0, skipped = 0;
+
+    for (size_t i = 0; i < s->cat->n_boxes; i++) {
+        const d2k_cat_box *b = &s->cat->boxes[i];
+        for (size_t j = 0; j < b->n_binds; j++) {
+            const d2k_cat_binding *bd = &b->binds[j];
+            if (!bd->enabled) { continue; }
+            const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
+            if (!p || !p->text) {
+                skipped++;
+                continue;
+            }
+            if (d2k_plan_text_to_hex(p->text, hex, sizeof hex, err, sizeof err) != 0) {
+                /* Битую запись нашли бы при загрузке; сюда она дойти не должна.
+                   Если дошла — молчать нельзя (та же оговорка, что у Sync на
+                   Go-стороне). */
+                say(s, "каталог: план %s коробки %s не собирается: %s", p->id, b->id, err);
+                skipped++;
+                continue;
+            }
+            int rc;
+            if (strcmp(bd->kind, "addr") == 0) {
+                uint8_t ip4[4];
+                unsigned a, bb, c, d;
+                if (sscanf(bd->target, "%u.%u.%u.%u", &a, &bb, &c, &d) != 4 ||
+                    a > 255 || bb > 255 || c > 255 || d > 255) {
+                    say(s, "каталог: привязка по адресу \"%s\" не разбирается", bd->target);
+                    skipped++;
+                    continue;
+                }
+                ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)bb;
+                ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
+                rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+            } else {
+                /* transport привязки проверяется, но на провод не едет: у
+                   SET_NAME сегодня нет места под него (d2k_link.h). Ноль —
+                   старый файл, снятый до появления поля; принимаем как TCP,
+                   потому что до задачи 5 иных привязок не заводилось. */
+                uint8_t tr = bd->transport ? bd->transport : 6;
+                rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
+            }
+            if (rc != 0) {
+                say(s, "каталог: план для %s не отправился: %s", bd->target, err);
+                skipped++;
+                continue;
+            }
+            n++;
+        }
+    }
+    if (n > 0 || skipped > 0) {
+        say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
+            n, skipped ? " (пропущено негодных: см. выше)" : "");
     }
     return n;
 }
@@ -831,11 +908,15 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
         snprintf(box_id, sizeof box_id, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
     }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
-                         t->transport == 17 ? "quic" : "tcp",
+                         t->transport == 17 ? "quic" : "tls",
                          t->name, t->transport, now_ms, &t->fp);
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО прикладным обменом: %s, %u байт",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, (unsigned)ev->num);
     task_done(t);
+    /* Подтверждение — это новое знание, и датапат обязан узнать о нём сразу,
+       а не после следующего запуска (та же причина, по которой Sync на
+       Go-стороне зовётся «при запуске И после каждого подтверждения»). */
+    (void)d2k_sched_sync(s);
 }
 
 int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {

@@ -23,6 +23,7 @@
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -310,8 +311,66 @@ int main(void) {
         CHECK(binding_of(&c6, "вторая.цель", 6) != NULL, "вторая привязка не записана");
         CHECK(said("готовых планов узнанной коробки"),
               "коробка не узнана: её проверенные планы не попали в кандидаты второй цели");
+        CHECK(c6.n_boxes == 1 && c6.boxes[0].n_plans >= 1 &&
+              strcmp(c6.boxes[0].plans[0].proto, "tls") == 0,
+              "proto записанного плана не \"tls\" — в живом каталоге у всех планов именно он, "
+              "и сравнение с транспортом отбрасывало бы каждый настоящий план");
         d2k_sched_free(s);
         d2k_catalog_free(&c6);
+    }
+
+    /* --- каталог едет датапату при запуске, а не лежит мёртвым грузом --- */
+    {
+        /* Каталог с одной коробкой, одним планом и двумя привязками: по имени
+           и по адресу. d2k_sched_sync обязан поставить обе — датапат состояния
+           между запусками не хранит, и без этого прохода уже изученная цель
+           начинала бы поиск заново. */
+        d2k_catalog c7;
+        memset(&c7, 0, sizeof c7);
+        c7.boxes = calloc(1, sizeof *c7.boxes);
+        CHECK(c7.boxes != NULL, "каталог не завёлся");
+        if (c7.boxes) {
+            c7.n_boxes = 1;
+            snprintf(c7.boxes[0].id, sizeof c7.boxes[0].id, "box-эталон");
+            c7.boxes[0].plans = calloc(1, sizeof *c7.boxes[0].plans);
+            c7.boxes[0].n_plans = 1;
+            snprintf(c7.boxes[0].plans[0].id, sizeof c7.boxes[0].plans[0].id, "plan-эталон");
+            /* "tls", а не "tcp": proto плана — протокол уровня приложения,
+               как в живом каталоге (см. known_plans в sched.c). */
+            snprintf(c7.boxes[0].plans[0].proto, sizeof c7.boxes[0].plans[0].proto, "tls");
+            c7.boxes[0].plans[0].enabled = 1;
+            c7.boxes[0].plans[0].text = strdup(
+                "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
+                "split payload_start +1\norder reverse\n");
+            c7.boxes[0].binds = calloc(3, sizeof *c7.boxes[0].binds);
+            c7.boxes[0].n_binds = 3;
+            for (int i = 0; i < 3; i++) {
+                snprintf(c7.boxes[0].binds[i].plan_id, sizeof c7.boxes[0].binds[i].plan_id,
+                         "plan-эталон");
+                c7.boxes[0].binds[i].transport = 6;
+            }
+            snprintf(c7.boxes[0].binds[0].kind, sizeof c7.boxes[0].binds[0].kind, "name");
+            snprintf(c7.boxes[0].binds[0].target, sizeof c7.boxes[0].binds[0].target, "по.имени");
+            c7.boxes[0].binds[0].enabled = 1;
+            snprintf(c7.boxes[0].binds[1].kind, sizeof c7.boxes[0].binds[1].kind, "addr");
+            snprintf(c7.boxes[0].binds[1].target, sizeof c7.boxes[0].binds[1].target, "1.2.3.4");
+            c7.boxes[0].binds[1].enabled = 1;
+            /* Третья выключена — ставиться не должна. */
+            snprintf(c7.boxes[0].binds[2].kind, sizeof c7.boxes[0].binds[2].kind, "name");
+            snprintf(c7.boxes[0].binds[2].target, sizeof c7.boxes[0].binds[2].target, "выключена");
+            c7.boxes[0].binds[2].enabled = 0;
+
+            d2k_sched *s = d2k_sched_new(&c7, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            int n = d2k_sched_sync(s);
+            drain();
+            CHECK(n == 2, "поставлено не две подтверждённые привязки (имя и адрес)");
+            CHECK(said("поставлено планов по подтверждённым привязкам: 2"),
+                  "проход по каталогу не сказал, сколько поставил");
+            d2k_sched_free(s);
+            d2k_catalog_free(&c7);
+        }
     }
 
     /* --- кандидат, применяющийся без обмена, не залипает навсегда ------ */

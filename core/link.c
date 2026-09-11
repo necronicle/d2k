@@ -409,6 +409,55 @@ static int send_name_only(int fd, uint16_t cmd, const char *what,
     return 0;
 }
 
+int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
+                      char *err, size_t errcap) {
+    if (fd < 0) {
+        say(err, errcap, "сокет не открыт");
+        return -1;
+    }
+    if (!ip4) {
+        say(err, errcap, "адрес цели не задан");
+        return -1;
+    }
+    if (!plan_text) {
+        plan_text = "";
+    }
+    size_t hexlen = strlen(plan_text);
+    if (hexlen % 2 != 0) {
+        say(err, errcap, "план не hex: нечётное число символов (%zu)", hexlen);
+        return -1;
+    }
+
+    size_t o = HDR;
+    memcpy(g_scratch + o, ip4, 4);
+    o += 4;
+    long planlen = hex_decode(plan_text, g_scratch + o, sizeof g_scratch - o);
+    if (planlen < 0) {
+        say(err, errcap, "план не hex: недопустимый символ");
+        return -1;
+    }
+    o += (size_t)planlen;
+
+    size_t body_len = o - HDR;
+    if (body_len > (size_t)D2K_CTL_FRAME_MAX - 2) {
+        say(err, errcap, "команда длиннее предела кадра");
+        return -1;
+    }
+    uint32_t plen = (uint32_t)(2 + body_len);
+    g_scratch[0] = (uint8_t)(plen >> 24);
+    g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8);
+    g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_SET_ADDR >> 8);
+    g_scratch[5] = (uint8_t)D2K_CMD_SET_ADDR;
+
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "команда SET_ADDR не отправилась: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
     return send_name_only(fd, D2K_CMD_ARM_SHAPE, "ARM_SHAPE", name, err, errcap);
 }
