@@ -38,7 +38,10 @@ for ch in D2K_OUT D2K_IN D2K; do
 done
 say "правила сняты"
 
-rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kd"
+# Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
+# нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
+rm -f /opt/etc/ndm/netfilter.d/001-d2k.sh
+rm -f "$INIT" "$SBIN/d2k" "$SBIN/d2kc" "$SBIN/d2kd"
 rm -rf "$DIR/run" "$DIR/log"
 
 if [ "$KEEP" = "1" ]; then

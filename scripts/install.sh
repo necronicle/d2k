@@ -76,14 +76,22 @@ fetch() {
 
 say "загрузка"
 fetch "builds/d2k-linux-$ARCH"  "$TMP/d2k"
+fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
 fetch "files/S99d2k"            "$TMP/S99d2k"
+fetch "files/d2k-fw-heal.sh"    "$TMP/d2k-fw-heal.sh"
+fetch "files/001-d2k.sh"        "$TMP/001-d2k.sh"
 
-chmod +x "$TMP/d2k" "$TMP/d2kd" "$TMP/S99d2k"
+chmod +x "$TMP/d2k" "$TMP/d2kc" "$TMP/d2kd" "$TMP/S99d2k" \
+         "$TMP/d2k-fw-heal.sh" "$TMP/001-d2k.sh"
 
 # Проверка ДО замены: запускается ли то, что скачалось, и та ли это арка.
 "$TMP/d2k" version >/dev/null 2>&1 || die "скачанный d2k не запускается на этой системе"
 "$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
+# d2kc без обязательного --control печатает использование и выходит кодом 2 —
+# это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
+"$TMP/d2kc" >/dev/null 2>&1
+[ $? = 2 ] || die "скачанный d2kc не запускается на этой системе"
 say "проверено: $("$TMP/d2k" version | head -1)"
 
 # --- остановка прежней версии --------------------------------------------
@@ -104,8 +112,18 @@ install_atomic() {
     mv -f "$2.new" "$2" || die "не подменить $2"
 }
 install_atomic "$TMP/d2k"    "$SBIN/d2k"
+install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
 install_atomic "$TMP/S99d2k" "$INIT"
+install_atomic "$TMP/d2k-fw-heal.sh" "$DIR/d2k-fw-heal.sh"
+# Хук NDM — событийное восстановление правил. Каталог может отсутствовать на
+# прошивке без netfilter.d: тогда остаётся периодический сторож, и это
+# ухудшение страховки, а не отказ установки.
+if [ -d /opt/etc/ndm/netfilter.d ]; then
+    install_atomic "$TMP/001-d2k.sh" "/opt/etc/ndm/netfilter.d/001-d2k.sh"
+else
+    say "нет /opt/etc/ndm/netfilter.d — событийного восстановления правил не будет"
+fi
 
 # Конфигурация принадлежит человеку: существующую не трогаем.
 if [ ! -f "$DIR/config" ]; then
