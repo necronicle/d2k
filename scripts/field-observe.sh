@@ -51,7 +51,9 @@ PPE=${D2K_PPE:-1}
 # При обучении обратная сторона обязательна: контроллер учится на том, что
 # отвечает линия, а без неё учиться не на чем.
 REV=${D2K_REV:-${D2K_LEARN:-0}}
-# План в канонической форме (локальный путь). Собирается `d2k plan compile`.
+# План в канонической форме (локальный путь). Текст плана в байты провода
+# переводит core/plantlv.c; подкоманда `d2k plan compile` удалена вместе с
+# Go-стороной движка 11.09.2026.
 PLAN=${D2K_PLAN:-}
 # Метка на собственных пакетах. В режиме apply обязательна: без неё
 # собственные пакеты нечем исключить из своей же очереди (§5.5).
@@ -156,9 +158,12 @@ fi
 
 if [ "$LEARN" = 1 ]; then
     say "== доставка контроллера =="
-    GOOS=linux GOARCH=arm64 "${GO:-go}" build -trimpath -o "$REPO/builds/d2k-linux-arm64" ./cmd/d2k
-    CSIZE=$(wc -c < "$REPO/builds/d2k-linux-arm64" | tr -d ' ')
-    $SSH_IN "cat > /tmp/d2k.$TOKEN" < "$REPO/builds/d2k-linux-arm64"
+    # Контроллер — d2kc, на C. До 11.09.2026 здесь собирался Go-бинарник и
+    # запускался подкомандой `control`; и бинарник, и подкоманда удалены
+    # вместе с Go-стороной движка, так что эта ветка скрипта просто падала.
+    make -C "$REPO/core" d2kc-aarch64 >/dev/null
+    CSIZE=$(wc -c < "$REPO/builds/d2kc-aarch64" | tr -d ' ')
+    $SSH_IN "cat > /tmp/d2k.$TOKEN" < "$REPO/builds/d2kc-aarch64"
     RSIZE=$($SSH "wc -c < /tmp/d2k.$TOKEN" | tr -d ' \r')
     [ "$CSIZE" = "$RSIZE" ] || { say "контроллер доехал испорченным: $CSIZE против $RSIZE"; exit 1; }
     $SSH "chmod +x /tmp/d2k.$TOKEN"
@@ -241,13 +246,16 @@ echo \"  pid=\$(cat /tmp/d2kd.$TOKEN.pid 2>/dev/null)\"
 if [ "$LEARN" = 1 ]; then
     say "== запуск контроллера =="
     # Каталог кладём в /tmp: это опыт, а не эксплуатация, и на флеш роутера
-    # ради него писать нечего.
+    # ради него писать нечего. Конфигурационного файла d2kc не читает вовсе —
+    # всё, что ему нужно, приходит ключами; поэтому прежний блок с D2K_CONFIG
+    # здесь не нужен, а не «упущен».
     $SSH "
-    D2K_CONFIG=/tmp/d2k.$TOKEN.conf sh -c \"
-        printf 'SCHEMA=1\\nMODE=apply\\nPANEL_LISTEN=\\nSTATE_DIR=/tmp/d2k.$TOKEN.state\\nQUEUE_NUM=$QUEUE\\nCONTROL_SOCKET=/tmp/d2kd.$TOKEN.sock\\n' > /tmp/d2k.$TOKEN.conf
-    \"
-    start-stop-daemon -S -b -m -p /tmp/d2k.$TOKEN.pid -x /bin/sh -- -c \
-        'D2K_CONFIG=/tmp/d2k.$TOKEN.conf /tmp/d2k.$TOKEN control > /tmp/d2k.$TOKEN.out 2>&1'
+    mkdir -p /tmp/d2k.$TOKEN.state
+    start-stop-daemon -S -b -m -p /tmp/d2k.$TOKEN.pid -x /tmp/d2k.$TOKEN -- \
+        --control /tmp/d2kd.$TOKEN.sock \
+        --catalog /tmp/d2k.$TOKEN.state/catalog.json \
+        --live /tmp/d2k.$TOKEN.state/live.json \
+        --mark $MARK --log /tmp/d2k.$TOKEN.out
     sleep 2
     echo \"  контроллер: \$(head -3 /tmp/d2k.$TOKEN.out 2>/dev/null | tr '\n' ' ')\"
     " >&2
