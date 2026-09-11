@@ -250,6 +250,16 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             return -1;
         }
         out->code = rest[0];
+        /* Подробности необязательны по длине, но датапат их шлёт всегда
+           (ctlsrv.c, D2K_JRN_SUSPECT: код плюс пять байт). Проверяем длину, а
+           не предполагаем её: событие без подробностей — законный вход
+           (старый датапат), и терять из-за него весь разбор нельзя. */
+        if (rlen >= 6) {
+            out->ttl = rest[1];
+            out->ref_ttl = rest[2];
+            out->tos = rest[3];
+            out->ipid = (uint16_t)((uint16_t)rest[4] << 8 | rest[5]);
+        }
         break;
     case D2K_EV_EXCHANGE:
         if (rlen < 6) {

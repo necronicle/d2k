@@ -457,6 +457,45 @@ int main(void) {
         }
     }
     {
+        /* Подробности подозрения — те самые пять байт, из которых складывается
+           отпечаток коробки (datapath/ctlsrv.c, D2K_JRN_SUSPECT). До 11.09
+           разбор читал только код и молча терял их: каталог хранил бы факт
+           «был сброс», по которому одну коробку от другой не отличить. */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (подробности SUSPECT) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[6] = { 1, 127, 53, 0x20, 0x12, 0x34 };
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "SUSPECT с подробностями должен приниматься");
+            CHECK(ev.code == 1, "код причины подозрения потерян");
+            CHECK(ev.ttl == 127, "TTL подделки потерян — по нему узнаётся коробка");
+            CHECK(ev.ref_ttl == 53, "TTL сервера потерян — без него разность не посчитать");
+            CHECK(ev.tos == 0x20, "ToS подозрения потерян");
+            CHECK(ev.ipid == 0x1234, "идентификатор пакета потерян");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
+        /* Короткое подозрение (только код) — законный вход, а не отказ:
+           старый датапат подробностей не слал. Поля обязаны остаться нулями,
+           а не мусором. */
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (короткий SUSPECT) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[1] = { 3 };
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "SUSPECT без подробностей должен приниматься");
+            CHECK(ev.code == 3, "код причины короткого подозрения потерян");
+            CHECK(ev.ttl == 0 && ev.ref_ttl == 0 && ev.tos == 0 && ev.ipid == 0,
+                  "подробности, которых не было, пришли не нулями");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (EXCHANGE короче 6) не создался");
         if (sv[0] >= 0) {

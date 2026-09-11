@@ -128,6 +128,18 @@ typedef struct {
     size_t     next_plan;
     int        silent_applied;  /* применений текущего кандидата без обмена */
 
+    /* Отпечаток коробки, накопленный по приметам подозрений ЭТОЙ цели. По
+       нему каталог узнаёт уже изученную коробку (d2k_catalog_match) — без
+       этого каждая цель заводила бы новую «коробку», и каталог перестал бы
+       быть каталогом коробок. */
+    d2k_cat_fp fp;
+    /* id узнанной коробки, пусто — не узнана. */
+    char       box_id[40];
+    /* Сколько первых кандидатов пришло из готовых планов узнанной коробки, а
+       не из синтеза по вердикту: различать их нужно на записи успеха (план
+       узнанной коробки не заводит новую) и в логе. */
+    size_t     n_known;
+
     /* Рабочий поток оракула. */
     pthread_t  th;
     int        th_live;
@@ -194,6 +206,58 @@ static const char *verdict_name(d2k_verdict v) {
     case D2K_V_UNREACHABLE:  return "до цели нет транспорта";
     }
     return "неизвестный вердикт";
+}
+
+/* Примета из подозрения. Порт signalOf (controller.go) — перенос, не
+   пересказ, включая обе его оговорки:
+   - сброс и снятый-защитой сброс дают ОДИН вид "rst": различие между ними —
+     наша РЕАКЦИЯ, а отпечаток описывает поведение КОРОБКИ; разведи их, и одна
+     коробка попала бы в каталог дважды;
+   - TTL, ToS и идентификатор берутся ТОЛЬКО у сброса: у молчания и повтора
+     подделанного пакета нет вовсе, и подставлять туда нули значило бы
+     сравнивать приметы по полям, которых не измеряли. */
+static d2k_cat_signal signal_of(const d2k_ev *ev) {
+    d2k_cat_signal s;
+    memset(&s, 0, sizeof s);
+    s.seen = 1;
+    switch (ev->code) {
+    case 1: case 4: snprintf(s.kind, sizeof s.kind, "rst"); break;
+    case 2:         snprintf(s.kind, sizeof s.kind, "repeat"); break;
+    case 3:         snprintf(s.kind, sizeof s.kind, "silent"); break;
+    default:        snprintf(s.kind, sizeof s.kind, "код-%u", (unsigned)ev->code); break;
+    }
+    if (strcmp(s.kind, "rst") == 0) {
+        /* TTL самой подделки — примета коробки: она стоит на фиксированном
+           расстоянии от нас. Разность с TTL сервера сохраняется как
+           наблюдение, но приметой не является: серверы стоят на разном
+           расстоянии (замер: на четырёх целях одной линии разности были
+           3, 38, 40 и 74 при одном и том же TTL подделки 127). */
+        s.ttl = ev->ttl;
+        s.ttl_delta = (int)ev->ttl - (int)ev->ref_ttl;
+        s.tos = ev->tos;
+        s.ipid = ev->ipid;
+    }
+    return s;
+}
+
+/* Добавляет примету к отпечатку, схлопывая совпавшие. Допуск по TTL тот же,
+   что в каталоге (D2K_TTL_SLACK): иначе задача накопит приметы, которые
+   каталог потом сочтёт одной. Порт addSignal (controller.go). */
+static void fp_add(d2k_cat_fp *fp, const d2k_cat_signal *sig) {
+    for (size_t i = 0; i < fp->n_sig; i++) {
+        d2k_cat_signal *x = &fp->sig[i];
+        int d = (int)x->ttl - (int)sig->ttl;
+        if (d < 0) { d = -d; }
+        if (strcmp(x->kind, sig->kind) == 0 && d <= D2K_TTL_SLACK &&
+            x->ipid == sig->ipid && x->tos == sig->tos) {
+            x->seen += sig->seen;
+            return;
+        }
+    }
+    if (fp->n_sig >= sizeof fp->sig / sizeof fp->sig[0]) {
+        return; /* приметы кончились — восьми хватает с запасом (d2k_catalog.h) */
+    }
+    fp->sig[fp->n_sig++] = *sig;
 }
 
 static void ip_text(const uint8_t ip[4], char *out, size_t cap) {
@@ -397,10 +461,17 @@ static d2k_cat_box *box_ensure(d2k_catalog *c, const char *id) {
 
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
-                          const char *target, uint8_t transport, int64_t now_ms) {
+                          const char *target, uint8_t transport, int64_t now_ms,
+                          const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
     if (b->created == 0) { b->created = now_ms / 1000; }
+    if (b->fp.n_sig == 0 && fp && fp->n_sig > 0) {
+        /* Отпечаток записывается ОДИН раз, при заведении коробки: дальше он её
+           удостоверение, и переписывать его приметами следующей цели значило
+           бы менять то, по чему её узнают. */
+        b->fp = *fp;
+    }
     b->updated = now_ms / 1000;
 
     int have_plan = 0;
@@ -504,19 +575,65 @@ static int install_next(d2k_sched *s, task *t) {
     return -1;
 }
 
-static void verdict_to_plans(task *t, d2k_verdict v) {
-    t->n_plans = 0;
+/* Готовые планы УЗНАННОЙ коробки — первыми, синтез по вердикту — следом.
+ *
+ * Порядок не произволен: план, который уже работал на коробке с такой же
+ * приметой, проверен на ней же, а синтез — только выведен. Порт buildQueue
+ * (controller.go), включая порядок по числу подтверждённых успехов (§3.4).
+ * Возвращает, сколько кандидатов взято из каталога. */
+static size_t known_plans(d2k_sched *s, task *t) {
+    if (t->fp.n_sig == 0) { return 0; }
+    int bi = d2k_catalog_match(s->cat, &t->fp);
+    if (bi < 0) { return 0; }
+    const d2k_cat_box *b = &s->cat->boxes[bi];
+    snprintf(t->box_id, sizeof t->box_id, "%s", b->id);
+
+    /* Выбор лучшего по числу успехов прямо на выдаче: планов у коробки
+       десятки, а не тысячи, и отдельный массив индексов стоил бы дороже самой
+       работы. */
+    size_t took = 0;
+    int used[64];
+    memset(used, 0, sizeof used);
+    size_t cap = sizeof t->plans / sizeof t->plans[0];
+    const char *want = (t->transport == 17) ? "quic" : "tcp";
+    while (took < cap) {
+        int best = -1;
+        for (size_t i = 0; i < b->n_plans && i < sizeof used / sizeof used[0]; i++) {
+            if (used[i] || !b->plans[i].enabled || !b->plans[i].text) { continue; }
+            if (strcmp(b->plans[i].proto, want) != 0) { continue; }
+            if (best < 0 || b->plans[i].successes > b->plans[best].successes) { best = (int)i; }
+        }
+        if (best < 0) { break; }
+        used[best] = 1;
+        size_t n = strlen(b->plans[best].text);
+        if (n + 1 > sizeof t->plans[0]) { continue; } /* не влезает — но не обрезать молча */
+        memcpy(t->plans[took], b->plans[best].text, n + 1);
+        took++;
+    }
+    return took;
+}
+
+static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     t->next_plan = 0;
+    t->n_known = known_plans(s, t);
+    t->n_plans = t->n_known;
+
     if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE ||
         v == D2K_V_INCONCLUSIVE || v == D2K_V_FLAKY) {
-        /* Обходить нечего, либо мерить было нечем. Ни то, ни другое не
-           знание о плане — в каталог не идёт ничего (§10, §13). */
+        /* Обходить нечего, либо мерить было нечем. Ни то, ни другое не знание
+           о плане — в каталог не идёт ничего (§10, §13). Готовые планы
+           узнанной коробки при этом ОСТАЮТСЯ: они не вывод из этого вердикта,
+           а уже проверенное знание, и «мерить было нечем» его не отменяет. */
         return;
     }
     d2k_props pr;
     memset(&pr, 0, sizeof pr);
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
-    t->n_plans = d2k_compose(&pr, sh, SCHED_DECOY, t->plans, 8);
+    size_t cap = sizeof t->plans / sizeof t->plans[0];
+    if (t->n_plans < cap) {
+        t->n_plans += d2k_compose(&pr, sh, SCHED_DECOY,
+                                  t->plans + t->n_plans, cap - t->n_plans);
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -593,7 +710,12 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     task *t = task_of(s, name, ev->transport);
     if (t) {
-        return 0; /* по этой паре (имя, транспорт) поиск уже идёт */
+        /* Поиск уже идёт — но примета всё равно наша: отпечаток растёт по мере
+           того, как коробка себя проявляет, и первое подозрение редко
+           показывает её целиком. */
+        d2k_cat_signal sig = signal_of(ev);
+        fp_add(&t->fp, &sig);
+        return 0;
     }
     t = task_free_slot(s);
     if (!t) {
@@ -602,6 +724,11 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     memset(t, 0, sizeof *t);
     snprintf(t->name, sizeof t->name, "%s", name);
     t->transport = ev->transport;
+    t->fp.method = D2K_FP_METHOD;
+    {
+        d2k_cat_signal sig = signal_of(ev);
+        fp_add(&t->fp, &sig);
+    }
     server_of(ev, t->ip, sizeof t->ip, &t->port);
     t->started_ms = 0;
     if (fill_hellos(t) != 0) {
@@ -680,13 +807,32 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
     const char *text = t->plans[t->next_plan - 1];
     char plan_id[40], box_id[40];
     snprintf(plan_id, sizeof plan_id, "plan-%08x", (unsigned)(fnv1a(text) & 0xFFFFFFFFu));
-    /* Коробка пока опознаётся по примете подозрения; до тех пор, пока приметы
-       не собраны, поведение группируется по транспорту — это честнее, чем
-       завести одну коробку «всё подряд» и выдать её за узнанную. */
-    snprintf(box_id, sizeof box_id, "box-транспорт-%u", (unsigned)t->transport);
+    if (t->box_id[0]) {
+        /* Коробка узнана по отпечатку — успех идёт ей, а не новой записи:
+           иначе каталог наполнялся бы клонами одной и той же коробки. */
+        snprintf(box_id, sizeof box_id, "%s", t->box_id);
+    } else if (t->fp.n_sig == 0) {
+        /* Примет нет вовсе — узнавать нечем. Знание пишется под отдельную
+           запись, и это честнее, чем выдать её за узнанную коробку. */
+        snprintf(box_id, sizeof box_id, "box-без-приметы");
+    } else {
+        /* Новая коробка, и её имя выводится ИЗ ОТПЕЧАТКА, а не из счётчика и
+           не из транспорта: та же коробка, встреченная завтра на другой цели,
+           обязана получить то же имя. */
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < t->fp.n_sig; i++) {
+            char b[64];
+            snprintf(b, sizeof b, "%s/%u/%u/%u", t->fp.sig[i].kind,
+                     (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
+                     (unsigned)t->fp.sig[i].ipid);
+            h ^= fnv1a(b);
+            h *= 1099511628211ULL;
+        }
+        snprintf(box_id, sizeof box_id, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
+    }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tcp",
-                         t->name, t->transport, now_ms);
+                         t->name, t->transport, now_ms, &t->fp);
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО прикладным обменом: %s, %u байт",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, (unsigned)ev->num);
     task_done(t);
@@ -746,9 +892,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
-            verdict_to_plans(t, r.verdict);
-            say(s, "по %s вердикт: %s (%s), кандидатов %zu",
-                t->name, verdict_name(r.verdict), r.reason, t->n_plans);
+            verdict_to_plans(s, t, r.verdict);
+            if (t->n_known > 0) {
+                say(s, "по %s вердикт: %s (%s), кандидатов %zu — из них %zu готовых "
+                       "планов узнанной коробки %s",
+                    t->name, verdict_name(r.verdict), r.reason, t->n_plans,
+                    t->n_known, t->box_id);
+            } else {
+                say(s, "по %s вердикт: %s (%s), кандидатов %zu",
+                    t->name, verdict_name(r.verdict), r.reason, t->n_plans);
+            }
             if (t->n_plans == 0) {
                 task_fail(t, now_ms);
                 moved++;

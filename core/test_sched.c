@@ -25,10 +25,26 @@
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "d2k_sched.h"
+
+/* Что планировщик говорил о себе. Нужен не для красоты: узнавание коробки
+   снаружи иначе НЕ отличить от совпадения имени — имя коробки выводится из
+   отпечатка, поэтому вторая цель с тем же отпечатком попадёт в ту же запись
+   каталога и БЕЗ узнавания. Отличает их ровно одно: пришли ли готовые планы
+   узнанной коробки в кандидаты. Про это планировщик говорит, и только по
+   этому проверка честна (первая редакция этой проверки смотрела на число
+   коробок и проходила даже при выключенном d2k_catalog_match). */
+static char saidbuf[16384];
+static void collect_say(void *ctx, const char *line) {
+    (void)ctx;
+    size_t n = strlen(saidbuf);
+    snprintf(saidbuf + n, sizeof saidbuf - n, "%s\n", line);
+}
+static int said(const char *needle) { return strstr(saidbuf, needle) != NULL; }
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("ПРОВАЛ: %s\n", (msg)); fails++; } } while (0)
@@ -85,7 +101,11 @@ static d2k_ev ev_suspect(uint8_t transport, uint16_t cport) {
     d2k_ev e = ev_hello(transport, cport, "");
     e.kind = D2K_EV_SUSPECT;
     e.name[0] = '\0';
-    e.code = 1;
+    e.code = 1;      /* подделанный сброс */
+    e.ttl = 127;     /* примета коробки: она на фиксированном расстоянии */
+    e.ref_ttl = 53;  /* сервер — на своём, разность приметой не является */
+    e.tos = 0x88;
+    e.ipid = 54321;
     return e;
 }
 
@@ -122,6 +142,15 @@ static void drain(void) {
    возвращается мгновенно, а на медленной сборке — за несколько миллисекунд. */
 static void settle(d2k_sched *s) {
     for (int i = 0; i < 400; i++) {
+        /* Ждём на будилке планировщика, а не крутим тики вплотную: рабочий
+           поток сетевого оракула ещё даже не начинался, когда четыреста
+           пустых тиков уже кончились — первая редакция этой функции так и
+           плавала, проходя или падая в зависимости от того, успел ли поток
+           встать. Миллисекунда на круг — это и ожидание, и уступка
+           планировщику ОС, и ровно тот же приём, каким d2kc ждёт событий. */
+        struct pollfd pfd;
+        pfd.fd = d2k_sched_wake_fd(s); pfd.events = POLLIN; pfd.revents = 0;
+        (void)poll(&pfd, 1, 1);
         d2k_sched_tick(s, (int64_t)i * 5);
         drain();
     }
@@ -239,6 +268,50 @@ int main(void) {
         CHECK(budp != NULL, "привязка по QUIC не записана — план одного транспорта затёр другой");
         d2k_sched_free(s);
         d2k_catalog_free(&c2);
+    }
+
+    /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */
+    {
+        d2k_catalog c6;
+        memset(&c6, 0, sizeof c6);
+        d2k_sched *s = d2k_sched_new(&c6, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+
+        /* Первая цель: коробка ещё не известна — заводится новая, по
+           отпечатку. */
+        d2k_ev h = ev_hello(6, 40050, "первая.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40050);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev x = ev_exchange(6, 40050, 1);
+        d2k_sched_event(s, &x);
+        CHECK(c6.n_boxes == 1, "первый успех не завёл коробку");
+        CHECK(c6.n_boxes == 1 && c6.boxes[0].fp.n_sig == 1,
+              "у заведённой коробки не записан отпечаток — узнать её потом будет нечем");
+        CHECK(c6.n_boxes == 1 && strcmp(c6.boxes[0].id, "box-без-приметы") != 0,
+              "коробка заведена без имени по отпечатку");
+
+        /* Вторая цель с ТЕМ ЖЕ отпечатком: коробка обязана узнаться, её план —
+           уйти в кандидаты первым, а успех — лечь в ту же коробку, а не в
+           клон. */
+        size_t boxes_before = c6.n_boxes;
+        d2k_ev h2 = ev_hello(6, 40051, "вторая.цель");
+        d2k_sched_event(s, &h2);
+        d2k_ev su2 = ev_suspect(6, 40051);
+        d2k_sched_event(s, &su2);
+        settle(s);
+        d2k_ev x2 = ev_exchange(6, 40051, 1);
+        d2k_sched_event(s, &x2);
+        CHECK(c6.n_boxes == boxes_before,
+              "вторая цель с тем же отпечатком завела КЛОН коробки вместо узнавания");
+        CHECK(binding_of(&c6, "вторая.цель", 6) != NULL, "вторая привязка не записана");
+        CHECK(said("готовых планов узнанной коробки"),
+              "коробка не узнана: её проверенные планы не попали в кандидаты второй цели");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c6);
     }
 
     /* --- кандидат, применяющийся без обмена, не залипает навсегда ------ */
