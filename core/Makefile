@@ -20,9 +20,9 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
-          include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h
+          include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -36,13 +36,18 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # test_match тоже без стенда: сравнивает уже разобранные d2k_cat_fp (свои,
 # сконструированные inline, и настоящие — из того же testdata/catalog-real.json),
 # сети и файловой записи не касается вовсе.
+# test_compose (задача 3) тоже без стенда и вообще без сети: d2k_compose —
+# чистая сборка текста плана из вектора свойств, а d2k_props_ask в этой
+# реализации сети не касается вовсе (см. большой комментарий в шапке
+# compose.c про то, почему единственный честный ответ здесь — вектор из
+# одних D2K_P_UNKNOWN).
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -110,6 +115,16 @@ catalog.o: catalog.c $(HDR)
 match.o: match.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Свойства коробки и вывод плана для TCP (задача 3): d2k_compose зовёт
+# d2k_hello_from_profile (hello.c, задача 1) для decoy-приветствия вопросов
+# 2/4/5 (см. build_decoy_hello в compose.c про то, почему именно LEGACY-
+# профиль, а не MODERN) — отсюда hello.o в связывании тестов ниже. От
+# meas.c/verdict.c не зависит по символам вовсе: единственный оракул задачи,
+# d2k_meas, недостаточен ни для одного из пяти вопросов, и d2k_props_ask в
+# этой реализации честно ничего не измеряет (см. шапку compose.c).
+compose.o: compose.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -140,6 +155,9 @@ test_catalog: test_catalog.c catalog.o $(HDR)
 test_match: test_match.c match.o catalog.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o $(TEST_LDFLAGS)
 
+test_compose: test_compose.c compose.o hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o $(TEST_LDFLAGS)
+
 test-meas: test_meas
 	./test_meas
 
@@ -167,7 +185,10 @@ test-catalog: test_catalog
 test-match: test_match
 	./test_match
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match
+test-compose: test_compose
+	./test_compose
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -248,6 +269,11 @@ cross: hello_profiles.inc
 		test_match.c match.c catalog.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_match-mipsel \
 		test_match.c match.c catalog.c -lpthread || exit 1
+	@echo "== test_compose целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_compose-a64 \
+		test_compose.c compose.c hello.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_compose-mipsel \
+		test_compose.c compose.c hello.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
