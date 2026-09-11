@@ -472,6 +472,67 @@ static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
     return 0;
 }
 
+/* ЧТО спрашивает вопрос q — отдельно от того, КТО и КОГДА его двигает.
+ *
+ * Двигать вопросы умеют теперь двое: блокирующая d2k_props_ask (для d2kask,
+ * где блокировать некого) и планировщик d2kc, который не имеет права
+ * блокировать цикл и потому кормит те же шаги событиями сам (см. правку плана
+ * от 11.09 в docs/superpowers/plans/2026-09-07-engine-c-both-transports.md про
+ * единственное управляющее подключение). Смысл вопроса при этом обязан жить в
+ * ОДНОМ месте: две копии этой развилки разошлись бы молча, и вектор свойств
+ * стал бы зависеть от того, кто спрашивал.
+ *
+ * Возвращает 0 — план собран, -1 — этот вопрос сегодня не задать (не измерено
+ * само по себе, а не «нет»). */
+int d2k_props_question_plan(int q, d2k_hello control,
+                            uint8_t *buf, size_t cap, size_t *out_len) {
+    if (!buf || !out_len) { return -1; }
+    switch (q) {
+    case 0:
+        return overlap_plan_tlv(buf, cap, out_len);
+    case 1:
+        /* Счёт дубликатов нуждается в decoy-содержимом (control) — без него
+           вопрос не задать, и он просто пропускается, как пропускает
+           соответствующее плечо d2k_compose при пустом decoy. */
+        return (control.bytes && control.len > 0)
+                   ? badsum_fake_plan_tlv(control.bytes, control.len, 2, 20000,
+                                          buf, cap, out_len)
+                   : -1;
+    case 2:
+        return reorder_plan_tlv(buf, cap, out_len);
+    case 3:
+        return checksum_plan_tlv(buf, cap, out_len);
+    case 4: /* разбор протокола: та же нужда в control, что и у вопроса 1 */
+        return (control.bytes && control.len > 0)
+                   ? badsum_fake_plan_tlv(control.bytes, control.len, 1, 0,
+                                          buf, cap, out_len)
+                   : -1;
+    default:
+        return -1;
+    }
+}
+
+/* ЧТО означает проход вопроса q. Пишется ТОЛЬКО по проходу — промах не пишет
+ * ничего (§2.4, каждый Set в Go начинается с `if !passed { return }`). */
+void d2k_props_question_passed(int q, d2k_props *pr) {
+    if (!pr) { return; }
+    switch (q) {
+    case 0: pr->tolerates_left_overlap = D2K_P_NO; break;
+    case 1: pr->counts_duplicates = D2K_P_YES; break;
+    case 2: pr->tolerates_reorder = D2K_P_NO; break;
+    case 3: pr->validates_checksum = D2K_P_NO; break;
+    case 4:
+        /* Разбор протокола пишет ОБА поля из ОДНОГО факта (properties.go,
+           комментарий у Set вопроса «разбор протокола»): коробка разобрала
+           приманку как TLS И проглотила сегмент с битой суммой — иначе
+           испорченный сегмент не дошёл бы до разбора. */
+        pr->parses_l7 = D2K_P_YES;
+        pr->validates_checksum = D2K_P_NO;
+        break;
+    default: break;
+    }
+}
+
 /* --------------------------------------------------------------------
  * d2k_props_ask — см. большой комментарий в шапке файла.
  * -------------------------------------------------------------------- */
@@ -544,35 +605,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                                    POISON(12)+FAKE(14)+ORDER(5) = 63, запас
                                    до 2200 округлением вверх. */
         size_t plan_len = 0;
-        int built;
-
-        switch (i) {
-        case 0:
-            built = overlap_plan_tlv(planbuf, sizeof planbuf, &plan_len);
-            break;
-        case 1:
-            /* Счёт дубликатов нуждается в decoy-содержимом (control) — без
-               него (не измерено само по себе, не «нет») вопрос не задать,
-               и он просто пропускается, как пропускает соответствующее
-               плечо d2k_compose при пустом decoy. */
-            built = (control.bytes && control.len > 0)
-                        ? badsum_fake_plan_tlv(control.bytes, control.len, 2, 20000,
-                                              planbuf, sizeof planbuf, &plan_len)
-                        : -1;
-            break;
-        case 2:
-            built = reorder_plan_tlv(planbuf, sizeof planbuf, &plan_len);
-            break;
-        case 3:
-            built = checksum_plan_tlv(planbuf, sizeof planbuf, &plan_len);
-            break;
-        default: /* 4 — разбор протокола: та же нужда в control, что и в 1 */
-            built = (control.bytes && control.len > 0)
-                        ? badsum_fake_plan_tlv(control.bytes, control.len, 1, 0,
-                                              planbuf, sizeof planbuf, &plan_len)
-                        : -1;
-            break;
-        }
+        int built = d2k_props_question_plan(i, control, planbuf, sizeof planbuf, &plan_len);
         if (built != 0) {
             step_rc(steps, i, D2K_STEP_NOT_ASKED, NULL);
             continue; /* этот вопрос сегодня не собрать — не измерено, дальше */
@@ -690,20 +723,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         step_rc(steps, i, D2K_STEP_PASSED, NULL);
         passed_any = 1;
 
-        switch (i) {
-        case 0: pr.tolerates_left_overlap = D2K_P_NO; break;
-        case 1: pr.counts_duplicates = D2K_P_YES; break;
-        case 2: pr.tolerates_reorder = D2K_P_NO; break;
-        case 3: pr.validates_checksum = D2K_P_NO; break;
-        default:
-            /* Разбор протокола пишет ОБА поля из ОДНОГО факта (properties.go,
-               комментарий у Set вопроса «разбор протокола»): коробка
-               разобрала приманку как TLS И проглотила сегмент с битой
-               суммой — иначе испорченный сегмент не дошёл бы до разбора. */
-            pr.parses_l7 = D2K_P_YES;
-            pr.validates_checksum = D2K_P_NO;
-            break;
-        }
+        d2k_props_question_passed(i, &pr);
         /* Вопрос прошёл — это уже стратегия (двойное назначение плана,
            см. шапку файла), второй вопрос той же цели не задаётся: тот же
            принцип, что в controller.go verdictCandidates про то, почему до
@@ -775,7 +795,7 @@ static int append_hex(char *buf, size_t cap, size_t *pos,
  * Вопрос 1 — перекрытие слева (overlapPlan, properties.go:234-242).
  * decoy не нужен: приём про склейку потока, а не про имя.
  * -------------------------------------------------------------------- */
-static int overlap_plan_text(char *buf, size_t cap) {
+int overlap_plan_text(char *buf, size_t cap) {
     size_t pos = 0;
     if (emit_header(buf, cap, &pos) != 0) { return -1; }
     /* overlapByte = {0x41} — сама приставка перекрытия, длина = длине
@@ -801,7 +821,7 @@ static int overlap_plan_text(char *buf, size_t cap) {
  * одном куске, коробка получает осмысленное начало записи и спокойно ждёт
  * остаток. decoy не участвует: якорь sni_middle вычисляется датапатом из
  * sni_off/sni_len ТЕКУЩЕГО пакета, а не контроллером под конкретное имя. */
-static int reorder_plan_text(char *buf, size_t cap) {
+int reorder_plan_text(char *buf, size_t cap) {
     size_t pos = 0;
     if (emit_header(buf, cap, &pos) != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "split payload_start +1\n") != 0) { return -1; }
@@ -817,9 +837,9 @@ static int reorder_plan_text(char *buf, size_t cap) {
  * и про разбор, подмешивать вторую порчу значило бы спрашивать не то, что
  * названо).
  * -------------------------------------------------------------------- */
-static int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
-                                  unsigned repeats, uint32_t gap_us,
-                                  char *buf, size_t cap) {
+int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
+                          unsigned repeats, uint32_t gap_us,
+                          char *buf, size_t cap) {
     size_t pos = 0;
     if (emit_header(buf, cap, &pos) != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
@@ -840,7 +860,7 @@ static int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
  * коробка, что РАЗБИРАЕТ TLS, мусор проигнорирует и продолжит ждать
  * настоящее приветствие, и разница с вопросом «разбор протокола» именно в
  * этом, не косметическая. */
-static int checksum_plan_text(char *buf, size_t cap) {
+int checksum_plan_text(char *buf, size_t cap) {
     uint8_t filler[64];
     memset(filler, 0x41, sizeof filler);
     return badsum_fake_plan_text(filler, sizeof filler, 1, 0, buf, cap);

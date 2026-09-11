@@ -30,10 +30,10 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c sched.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
-          include/d2k_compose_internal.h include/d2k_link.h
+          include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_sched.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -63,11 +63,11 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o d2kask
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o sched.o d2kask d2kc
 
 
 meas.o: meas.c $(HDR)
@@ -127,6 +127,20 @@ hello.o: hello.c $(HDR) hello_profiles.inc
 # зависит и ни один не зависит от него — планировщик (задача 5) свяжет его
 # с остальными.
 catalog.o: catalog.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Планировщик (задача 5): развилка по транспорту. Зовёт дерево вердиктов
+# (verdict.o), вопросник QUIC (quicprobe.o, props.o), каталог с узнаванием
+# (catalog.o, match.o), сборку планов и смысл вопросов о свойствах (compose.o)
+# и связь с датапатом (link.o). Сетевые оракулы уезжают в рабочие потоки —
+# отсюда pthread и в боевой линковке, не только в тестовой.
+# Текст плана в байты провода (задача 5): d2k_compose выдаёт текст, датапат
+# принимает TLV. Без этого моста планировщик не мог поставить ни одного
+# собранного плана — d2k_link_set_name отвергала текст как «не hex».
+plantlv.o: plantlv.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sched.o: sched.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Узнавание коробки (задача 2): сравнение d2k_cat_fp с допуском поверх типов
@@ -391,11 +405,30 @@ cross: hello_profiles.inc
 		test_link.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_link-mipsel \
 		test_link.c link.c -lpthread || exit 1
+	@echo "== test_plantlv целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_plantlv-a64 \
+		test_plantlv.c plantlv.c compose.c hello.c meas.c link.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_plantlv-mipsel \
+		test_plantlv.c plantlv.c compose.c hello.c meas.c link.c -lpthread || exit 1
+	@echo "== test_sched целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
+		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		props.c hello.c catalog.c match.c compose.c link.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
+		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		props.c hello.c catalog.c match.c compose.c link.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kask-mipsel \
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
+	@echo "== d2kc целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kc-a64 \
+		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		props.c hello.c catalog.c match.c compose.c link.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kc-mipsel \
+		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		props.c hello.c catalog.c match.c compose.c link.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
@@ -412,11 +445,43 @@ BUILDDIR ?= ../builds
 # hello.c #include'ит hello_profiles.inc (см. hello.o выше) — кросс-сборка
 # компилирует hello.c напрямую, минуя hello.o, и без этой зависимости падала
 # на чистом дереве: "fatal error: 'hello_profiles.inc' file not found".
+# Тот же приём, что d2kask-aarch64: статический бинарник под роутер.
+d2kc-aarch64: hello_profiles.inc
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
+		-o $(BUILDDIR)/d2kc-aarch64 d2kc.c sched.c plantlv.c verdict.c meas.c \
+		crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
+		-lpthread
+	@ls -l $(BUILDDIR)/d2kc-aarch64
+
 d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
 		-o $(BUILDDIR)/d2kask-aarch64 d2kask.c compose.c hello.c meas.c link.c
 	@ls -l $(BUILDDIR)/d2kask-aarch64
 
+test-plantlv: test_plantlv
+	./test_plantlv
+
+# ../datapath/planlab — не украшение: тест прогоняет переведённый план через
+# НАСТОЯЩИЙ исполнитель датапата. Без этой зависимости цель проходила бы на
+# чистом дереве только потому, что planlab случайно собрал кто-то раньше.
+test_plantlv: test_plantlv.c plantlv.o compose.o hello.o meas.o link.o $(HDR) ../datapath/planlab
+	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
+
+test-sched: test_sched sched.o plantlv.o
+	./test_sched
+
+test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+            hello.o catalog.o match.o compose.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+		hello.o catalog.o match.o compose.o link.o $(TEST_LDFLAGS)
+
+# d2kc — процесс контроллера на C: цикл событий поверх планировщика.
+d2kc: d2kc.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+      hello.o catalog.o match.o compose.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+		hello.o catalog.o match.o compose.o link.o $(TEST_LDFLAGS)
+
 clean:
-	rm -f *.o $(TESTS) d2kask hello_profiles.inc
+	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc

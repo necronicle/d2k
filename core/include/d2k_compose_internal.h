@@ -29,7 +29,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "d2k_link.h" /* d2k_ev */
+#include "d2k_compose.h" /* d2k_hello, d2k_props */
+#include "d2k_link.h"    /* d2k_ev */
 
 int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len);
 int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len);
@@ -37,6 +38,19 @@ int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
                          uint8_t repeats, uint32_t gap_us,
                          uint8_t *buf, size_t cap, size_t *out_len);
 int checksum_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len);
+
+/* ТЕ ЖЕ четыре формы ТЕКСТОМ. Открыты той же причиной, что и их TLV-двойники
+ * (см. шапку файла), плюс одной новой: перевод текста в байты провода
+ * (core/plantlv.c) обязан давать РОВНО те байты, что собирает прямой
+ * TLV-сборщик рядом. Сверить это можно только имея обе формы одной и той же
+ * фигуры под рукой — иначе тест сверял бы перевод с собственным
+ * представлением о нём. */
+int overlap_plan_text(char *buf, size_t cap);
+int reorder_plan_text(char *buf, size_t cap);
+int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
+                          unsigned repeats, uint32_t gap_us,
+                          char *buf, size_t cap);
+int checksum_plan_text(char *buf, size_t cap);
 
 /* Ключ потока для фильтра wait_for_event — НЕУПОРЯДОЧЕННАЯ пара адрес:порт
  * плюс транспорт (не канонический d2k_key, datapath/include/d2k_track.h —
@@ -49,5 +63,14 @@ typedef struct {
 } d2k_flowkey;
 
 int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k);
+
+/* Смысл одного вопроса, отдельно от того, кто его двигает: что послать и что
+ * значит проход. Двигать вопросы умеют двое — блокирующая d2k_props_ask (для
+ * d2kask) и планировщик d2kc, которому блокировать цикл нельзя. Две копии этой
+ * развилки разошлись бы молча, и вектор свойств стал бы зависеть от того, кто
+ * спрашивал. Подробности — в doc-комментариях в compose.c. */
+int  d2k_props_question_plan(int q, d2k_hello control,
+                             uint8_t *buf, size_t cap, size_t *out_len);
+void d2k_props_question_passed(int q, d2k_props *pr);
 
 #endif /* D2K_COMPOSE_INTERNAL_H */
