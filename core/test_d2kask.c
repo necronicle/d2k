@@ -25,17 +25,25 @@
  * возвращённую структуру.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "d2k_hello.h"
 #include "d2k_link.h"
+/* Только ради D2K_KEY_WIRE_LEN — поддельный управляющий сокет (fakectl_run
+ * ниже, круг правок 2 задачи 5) строит кадры событий руками, тем же
+ * приёмом, что test_link.c/test_compose.c: ширина ключа нужна настоящая, а
+ * не переизобретённая здесь копией. */
+#include "d2k_ctlsrv.h"
 #include "test_stand.h"
 
 static int fails;
@@ -531,6 +539,200 @@ static void *runner_thread(void *arg) {
     return NULL;
 }
 
+/* ========================================================================
+ * ПОДДЕЛЬНЫЙ УПРАВЛЯЮЩИЙ СОКЕТ — только для C2/C3 (круг правок 2 задачи 5,
+ * находка 1: событие обмена не адресовано команде — datapath/session.c шлёт
+ * D2K_EV_EXCHANGE для ЛЮБОГО потока с приветствием и обратной нагрузкой,
+ * ctlsrv.c проталкивает его без фильтрации). Настоящий ctlprobe строит
+ * синтетические пакеты с ЖЁСТКО ЗАШИТЫМ адресом клиента (datapath/
+ * ctlprobe.c: build_pkt, LAN 192.168.1.67) — одним и тем же для любого
+ * теста, а d2kask (как и d2k_props_ask изнутри) соединяется с целью
+ * НАСТОЯЩИМ сокетом, местный порт которого назначает ядро при connect() и
+ * заранее не знает НИКТО, включая сам ctlprobe. До находки 1 это
+ * совпадение было незаметно — обмен принимался по виду события, без сверки
+ * ключа потока; честный фильтр (ev_matches_flow, compose.c) корректно
+ * отвергает событие с чужим ключом, и C2/C3 (сценариям нужен ПРОХОДЯЩИЙ
+ * ответ) больше неоткуда его взять от настоящего ctlprobe. C1 остаётся на
+ * настоящем ctlprobe НЕТРОНУТЫМ: там ни один вопрос не обязан пройти, и
+ * сверять ключ не с чем.
+ *
+ * Тот же приём, что fakeend_run/peerstand в test_compose.c (см. её шапку
+ * "ПОДДЕЛЬНЫЙ КОНЕЦ СВЯЗИ"), но конец связи здесь — не socketpair, а
+ * настоящий AF_UNIX-сокет по ПУТИ: d2kask — отдельный процесс (fork+execv,
+ * run_d2kask выше) и открывает связь сам (d2k_link_open("--control")), fd
+ * унаследовать неоткуда — только слушать по тому же пути, что ему передан.
+ * ==================================================================== */
+
+typedef struct { int listen_fd; uint16_t port; } peerstand;
+
+/* Настоящая петля-мишень на локалхосте: getpeername() с принявшей стороны
+ * отдаёт РЕАЛЬНЫЙ местный адрес props_ask_contact (compose.c) — тот же, что
+ * ляжет в ключ настоящего события на живом датапате. Сама props_ask_contact
+ * его наружу не отдаёт (не часть её контракта) — только тот, кто принял
+ * подключение, видит его вовремя. */
+static uint16_t peerstand_start(peerstand *s) {
+    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    a.sin_port = 0;
+    bind(s->listen_fd, (struct sockaddr *)&a, sizeof a);
+    socklen_t l = sizeof a;
+    getsockname(s->listen_fd, (struct sockaddr *)&a, &l);
+    listen(s->listen_fd, 4);
+    s->port = ntohs(a.sin_port);
+    return s->port;
+}
+
+static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_port) {
+    struct sockaddr_in pa;
+    socklen_t pl = sizeof pa;
+    int c = accept(s->listen_fd, (struct sockaddr *)&pa, &pl);
+    if (c < 0) { return -1; }
+    memcpy(peer_ip, &pa.sin_addr, 4);
+    *peer_port = ntohs(pa.sin_port);
+    uint8_t buf[4096];
+    (void)recv(c, buf, sizeof buf, 0); /* осушить присланное — содержимое здесь не проверяем */
+    close(c);
+    return 0;
+}
+
+/* bind+listen СИНХРОННО, ДО того как run_d2kask форкнёт ребёнка — иначе
+ * гонка между её connect() и нашим listen() решалась бы порядком
+ * планировщика ОС, а не гарантией. accept() делает уже отдельный поток
+ * (fakectl_accept_and_run ниже), пока этот же вызывающий тут же запускает
+ * d2kask. */
+static int fakectl_listen(const char *path) {
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path, sizeof a.sun_path - 1);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    if (listen(fd, 4) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Читает и отбрасывает РОВНО один кадр команды — та же раскладка, что и у
+ * события (d2k_ctl.h: "Кадр: [длина payload u32 BE][тип u16 BE][payload]",
+ * общая для обоих направлений), поэтому разбирать ВНУТРЕННЕЕ устройство
+ * SET_NAME здесь незачем. */
+static int drain_one_command(int fd) {
+    uint8_t hdr[6];
+    size_t got = 0;
+    while (got < sizeof hdr) {
+        ssize_t n = read(fd, hdr + got, sizeof hdr - got);
+        if (n <= 0) { return -1; }
+        got += (size_t)n;
+    }
+    uint32_t plen = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
+                    (uint32_t)hdr[2] << 8 | hdr[3];
+    if (plen < 2) { return -1; }
+    size_t remaining = (size_t)plen - 2;
+    uint8_t buf[4096];
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof buf ? remaining : sizeof buf;
+        ssize_t n = read(fd, buf, chunk);
+        if (n <= 0) { return -1; }
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Пишет один кадр события руками — та же раскладка, что send_synthetic в
+ * test_link.c: [длина payload BE32][тип BE16][ключ 13 байт][rest]. */
+static void send_event_frame(int fd, uint16_t kind,
+                             const uint8_t *low_ip, uint16_t low_port,
+                             const uint8_t *high_ip, uint16_t high_port,
+                             uint8_t transport,
+                             const uint8_t *rest, size_t rest_len) {
+    uint8_t frame[6 + D2K_KEY_WIRE_LEN + 32];
+    size_t body_len = D2K_KEY_WIRE_LEN + rest_len;
+    uint32_t plen = (uint32_t)(2 + body_len);
+    frame[0] = (uint8_t)(plen >> 24); frame[1] = (uint8_t)(plen >> 16);
+    frame[2] = (uint8_t)(plen >> 8);  frame[3] = (uint8_t)plen;
+    frame[4] = (uint8_t)(kind >> 8);  frame[5] = (uint8_t)kind;
+    uint8_t *k = frame + 6;
+    if (low_ip) { memcpy(k, low_ip, 4); } else { memset(k, 0, 4); }
+    if (high_ip) { memcpy(k + 4, high_ip, 4); } else { memset(k + 4, 0, 4); }
+    k[8] = (uint8_t)(low_port >> 8); k[9] = (uint8_t)low_port;
+    k[10] = (uint8_t)(high_port >> 8); k[11] = (uint8_t)high_port;
+    k[12] = transport;
+    if (rest_len) { memcpy(frame + 6 + D2K_KEY_WIRE_LEN, rest, rest_len); }
+    (void)write(fd, frame, 6 + body_len);
+}
+
+static void send_ack_ok(int fd, uint16_t cmd) {
+    uint8_t rest[4];
+    rest[0] = (uint8_t)(cmd >> 8); rest[1] = (uint8_t)cmd;
+    rest[2] = 1; /* признак успеха */
+    rest[3] = 0; /* D2K_ACK_OK */
+    send_event_frame(fd, D2K_EV_ACK, NULL, 0, NULL, 0, 0, rest, sizeof rest);
+}
+
+static const uint8_t FAKECTL_LOOPBACK4[4] = { 127, 0, 0, 1 };
+
+/* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
+ * (1<<(22-20))=0x04 (см. d2k_ev_has_appdata, d2k_link.h). */
+static void send_exchange(int fd, uint16_t target_port,
+                          const uint8_t *peer_ip, uint16_t peer_port,
+                          uint8_t seen_types) {
+    uint8_t rest[6];
+    rest[0] = 22; rest[1] = seen_types;
+    rest[2] = 0; rest[3] = 0; rest[4] = 0; rest[5] = 64;
+    send_event_frame(fd, D2K_EV_EXCHANGE, FAKECTL_LOOPBACK4, target_port,
+                     peer_ip, peer_port, 6, rest, sizeof rest);
+}
+
+/* Обслуживает N раундов SET_NAME->ack->(настоящее подключение цели)->обмен,
+ * каждый ПОД СВОЙ настоящий местный порт (peerstand_accept_one) — синхронно,
+ * без сна "на авось", тот же приём, что fakeend_run в test_compose.c.
+ * outcomes[i]: 0 — обмен без прикладных данных (промах), 1 — обмен с
+ * прикладными данными (проход). */
+typedef struct {
+    int ctl_fd;
+    peerstand *ps;
+    uint16_t target_port;
+    const int *outcomes;
+    size_t n;
+} fakectl_args;
+
+static void fakectl_run(fakectl_args *a) {
+    for (size_t i = 0; i < a->n; i++) {
+        if (drain_one_command(a->ctl_fd) != 0) { return; }
+        send_ack_ok(a->ctl_fd, D2K_CMD_SET_NAME);
+
+        uint8_t peer_ip[4]; uint16_t peer_port = 0;
+        if (peerstand_accept_one(a->ps, peer_ip, &peer_port) != 0) { return; }
+
+        uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
+        send_exchange(a->ctl_fd, a->target_port, peer_ip, peer_port, seen);
+    }
+}
+
+typedef struct {
+    int listen_fd;
+    peerstand *ps;
+    uint16_t target_port;
+    const int *outcomes;
+    size_t n;
+} fakectl_accept_args;
+
+static void *fakectl_accept_and_run(void *arg) {
+    fakectl_accept_args *a = (fakectl_accept_args *)arg;
+    int cfd = accept(a->listen_fd, NULL, NULL);
+    if (cfd < 0) { return NULL; }
+    fakectl_args fa;
+    fa.ctl_fd = cfd; fa.ps = a->ps; fa.target_port = a->target_port;
+    fa.outcomes = a->outcomes; fa.n = a->n;
+    fakectl_run(&fa);
+    close(cfd);
+    return NULL;
+}
+
 static void part_c(void) {
     char sock_path[64];
     snprintf(sock_path, sizeof sock_path, "/tmp/d2k-core-d2kask-%d.sock", (int)getpid());
@@ -613,30 +815,44 @@ static void part_c(void) {
 
     /* --- C2 (мирроит b1): первый вопрос проходит немедленно — печатается
      * ЗАДАН+ответ, остальные четыре — НЕ ЗАДАН с причиной "опрос
-     * остановился раньше". ------------------------------------------------ */
+     * остановился раньше". Через поддельный управляющий сокет — см. большой
+     * комментарий перед fakectl_run про находку 1 ревью 11.09, круг правок
+     * 2: настоящий ctlprobe не может дать событие, ключ которого совпадёт с
+     * настоящим местным портом d2kask. ------------------------------------ */
     {
         const char *hexpath = "/tmp/d2kask-test-c2.hex";
         const char *ctrlpath = "/tmp/d2kask-test-c2-control.hex";
         CHECK(write_hello_hex_file(hexpath, "c2.example") == 0, "C2: снимок не собрался");
         CHECK(write_hello_hex_file(ctrlpath, "c2-control.example") == 0, "C2: control-снимок не собрался");
 
-        char port_s[16]; snprintf(port_s, sizeof port_s, "%u", (unsigned)stand_port);
-        char *argv[] = { "d2kask", "--control", sock_path, "--ip", "127.0.0.1",
+        char sock_path2[64];
+        snprintf(sock_path2, sizeof sock_path2, "/tmp/d2k-core-d2kask-c2-%d.sock", (int)getpid());
+        int lfd = fakectl_listen(sock_path2);
+        CHECK(lfd >= 0, "C2: поддельный управляющий сокет не открылся");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 1 }; /* первый вопрос проходит сразу */
+        fakectl_accept_args aa = { lfd, &ps, target_port, outcomes, 1 };
+        pthread_t fth;
+        CHECK(pthread_create(&fth, NULL, fakectl_accept_and_run, &aa) == 0,
+              "C2: поддельный конец связи не запустился");
+
+        char port_s[16]; snprintf(port_s, sizeof port_s, "%u", (unsigned)target_port);
+        char *argv[] = { "d2kask", "--control", sock_path2, "--ip", "127.0.0.1",
                          "--port", port_s, "--sni", "c2.example",
                          "--hello-hex", (char *)hexpath,
                          "--control-hex", (char *)ctrlpath, NULL };
-
-        int replies[] = { 23 }; /* прикладные данные — проходит с первого раза */
-        driver_args da = { &p, "c2.example", replies, 1, 300 };
-        pthread_t dth;
-        CHECK(pthread_create(&dth, NULL, driver_run, &da) == 0, "C2: ведущий поток не запустился");
 
         run_result r;
         runner_args ra = { argv, &r };
         pthread_t rth;
         CHECK(pthread_create(&rth, NULL, runner_thread, &ra) == 0, "C2: d2kask не запустился");
         pthread_join(rth, NULL);
-        pthread_join(dth, NULL);
+        pthread_join(fth, NULL);
+        close(lfd);
+        close(ps.listen_fd);
+        unlink(sock_path2);
 
         CHECK(r.exit_code == 0, "C2: прогон обязан завершиться кодом 0");
         const char *p1 = strstr(r.out, "[1/5]");
@@ -668,36 +884,47 @@ static void part_c(void) {
 
         unlink(hexpath);
         unlink(ctrlpath);
-        drain_all_events(sock_path);
     }
 
     /* --- C3 (мирроит b4): четыре промаха, пятый (разбор протокола) проходит
      * последним — вопрос [4/5] обязан остаться "не измерено" (а не
      * приписать себе НЕТ, которое на самом деле пришло от [5/5]), а [5/5] —
-     * ЗАДАН/ДА с примечанием про побочный эффект. ------------------------- */
+     * ЗАДАН/ДА с примечанием про побочный эффект. Через поддельный
+     * управляющий сокет — та же причина, что у C2 выше. -------------------- */
     {
         const char *hexpath = "/tmp/d2kask-test-c3.hex";
         const char *ctrlpath = "/tmp/d2kask-test-c3-control.hex";
         CHECK(write_hello_hex_file(hexpath, "c3.example") == 0, "C3: снимок не собрался");
         CHECK(write_hello_hex_file(ctrlpath, "c3-control.example") == 0, "C3: control-снимок не собрался");
 
-        char port_s[16]; snprintf(port_s, sizeof port_s, "%u", (unsigned)stand_port);
-        char *argv[] = { "d2kask", "--control", sock_path, "--ip", "127.0.0.1",
+        char sock_path3[64];
+        snprintf(sock_path3, sizeof sock_path3, "/tmp/d2k-core-d2kask-c3-%d.sock", (int)getpid());
+        int lfd = fakectl_listen(sock_path3);
+        CHECK(lfd >= 0, "C3: поддельный управляющий сокет не открылся");
+        peerstand ps;
+        uint16_t target_port = peerstand_start(&ps);
+
+        int outcomes[] = { 0, 0, 0, 0, 1 };
+        fakectl_accept_args aa = { lfd, &ps, target_port, outcomes, 5 };
+        pthread_t fth;
+        CHECK(pthread_create(&fth, NULL, fakectl_accept_and_run, &aa) == 0,
+              "C3: поддельный конец связи не запустился");
+
+        char port_s[16]; snprintf(port_s, sizeof port_s, "%u", (unsigned)target_port);
+        char *argv[] = { "d2kask", "--control", sock_path3, "--ip", "127.0.0.1",
                          "--port", port_s, "--sni", "c3.example",
                          "--hello-hex", (char *)hexpath,
                          "--control-hex", (char *)ctrlpath, NULL };
-
-        int replies[] = { 22, 22, 22, 22, 23 };
-        driver_args da = { &p, "c3.example", replies, 5, 300 };
-        pthread_t dth;
-        CHECK(pthread_create(&dth, NULL, driver_run, &da) == 0, "C3: ведущий поток не запустился");
 
         run_result r;
         runner_args ra = { argv, &r };
         pthread_t rth;
         CHECK(pthread_create(&rth, NULL, runner_thread, &ra) == 0, "C3: d2kask не запустился");
         pthread_join(rth, NULL);
-        pthread_join(dth, NULL);
+        pthread_join(fth, NULL);
+        close(lfd);
+        close(ps.listen_fd);
+        unlink(sock_path3);
 
         CHECK(r.exit_code == 0, "C3: прогон обязан завершиться кодом 0");
         const char *p4 = strstr(r.out, "[4/5]");
@@ -718,7 +945,6 @@ static void part_c(void) {
 
         unlink(hexpath);
         unlink(ctrlpath);
-        drain_all_events(sock_path);
     }
 
  /* тест не держит fd связи сам — см. шапку; вызов no-op, оставлен для симметрии сборки заголовков */
