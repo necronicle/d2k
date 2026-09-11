@@ -10,7 +10,13 @@
 # узла незамеченной.
 
 CC      ?= cc
-CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude
+# -I../datapath/include — задача 4: link.c — первый модуль ядра, которому
+# нужен заголовок ИЗ ДАТАПАТА. Протокол управляющего сокета не переизобретён
+# здесь: единственный источник истины — datapath/include/d2k_ctl.h (кадры,
+# события, команды) и d2k_ctlsrv.h (D2K_KEY_WIRE_LEN — ширина ключа на
+# проводе; зашитая числом она уже ломалась в этом проекте, см. её комментарий).
+# Больше никто в core/ туда не смотрит.
+CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include
 LDFLAGS ?=
 # Стенд в тестах поднимает петлю-мишень в отдельном потоке; самому оракулу
 # потоки не нужны, поэтому pthread — только у тестовой линковки.
@@ -20,9 +26,10 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c
+SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
-          include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h
+          include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
+          include/d2k_link.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -41,13 +48,16 @@ HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/
 # реализации сети не касается вовсе (см. большой комментарий в шапке
 # compose.c про то, почему единственный честный ответ здесь — вектор из
 # одних D2K_P_UNKNOWN).
+# test_link тоже без TESTHDR-стенда: его "стенд" — настоящий ctlprobe
+# (datapath/ctlprobe.c), отдельным процессом, а не петля-мишень в потоке.
 TESTHDR = test_stand.h
 
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose
+TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link
 
-.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose
+.PHONY: all check san gcc-warn cross clean test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o
+
 
 meas.o: meas.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -125,6 +135,24 @@ match.o: match.c $(HDR)
 compose.o: compose.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Связь с датапатом и порог успеха (задача 4): единственный модуль ядра, что
+# читает заголовок из datapath/include (см. -I в CFLAGS выше). Не вызывает ни
+# одной функции оттуда — только #define D2K_KEY_WIRE_LEN из d2k_ctlsrv.h,
+# поэтому лишней линковки с датапатом не образуется.
+link.o: link.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# ctlprobe — настоящий C-сервер управляющего сокета (datapath/ctlprobe.c),
+# против которого проверяется link.c (см. шапку test_link.c): смысл
+# протокола проверяется чужим клиентом/сервером, а не сравнением исходников
+# на глаз. FORCE, а не файловый штамп: свежесть решает Makefile датапата, а
+# не мы — иначе `make -C core check`, вызванный САМ ПО СЕБЕ (например, гейт
+# в Docker на чужом дереве), рисковал бы найти бинарник чужой архитектуры
+# или не собранный вовсе и молча его использовать.
+../datapath/ctlprobe: FORCE
+	$(MAKE) -C ../datapath ctlprobe
+FORCE:
+
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
@@ -157,6 +185,8 @@ test_match: test_match.c match.o catalog.o $(HDR)
 
 test_compose: test_compose.c compose.o hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_compose.c compose.o hello.o $(TEST_LDFLAGS)
+test_link: test_link.c link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_link.c link.o $(TEST_LDFLAGS)
 
 test-meas: test_meas
 	./test_meas
@@ -188,13 +218,25 @@ test-match: test_match
 test-compose: test_compose
 	./test_compose
 
-check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose
+# ../datapath/ctlprobe как зависимость запуска (не только сборки test_link):
+# гарантирует свежий бинарник нужной архитектуры каждый раз, когда test_link
+# на самом деле ЗАПУСКАЕТСЯ, а не просто собирается (gcc-warn/cross его не
+# запускают — см. их комментарии, там этой зависимости нет и не нужно).
+test-link: test_link ../datapath/ctlprobe
+	./test_link
+
+check: all test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
+# -I../datapath/include — по той же причине, что и в CFLAGS выше: test_link.c
+# и link.c читают протокол оттуда.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
-           -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude
-san: hello_profiles.inc
+           -fno-omit-frame-pointer -Wall -Wextra -Werror -Iinclude -I../datapath/include
+# ../datapath/ctlprobe — test_link здесь не просто собирается, а сразу
+# ЗАПУСКАЕТСЯ (см. цикл ниже), значит нужен свежий бинарник заранее, как и у
+# test-link выше.
+san: hello_profiles.inc ../datapath/ctlprobe
 	@set -e; for t in $(TESTS); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
@@ -274,6 +316,11 @@ cross: hello_profiles.inc
 		test_compose.c compose.c hello.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_compose-mipsel \
 		test_compose.c compose.c hello.c -lpthread || exit 1
+	@echo "== test_link целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_link-a64 \
+		test_link.c link.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_link-mipsel \
+		test_link.c link.c -lpthread || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 clean:
