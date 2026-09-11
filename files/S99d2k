@@ -27,6 +27,10 @@ DIR=/opt/d2k
 # замеры, и оно их прошло. Бинарник /opt/sbin/d2k остаётся в системе только
 # ради панели — служба его больше не запускает.
 BIN=/opt/sbin/d2kc
+# Панель — тот самый Go-бинарник, но ТОЛЬКО панель: подкоманда serve после
+# 11.09.2026 поднимает веб-страницу и больше ничего, а узнанное читает из
+# файла, который пишет движок (state/live.json).
+PANELBIN=/opt/sbin/d2k
 DPBIN=/opt/sbin/d2kd
 CONF=$DIR/config
 RUN=$DIR/run
@@ -34,6 +38,7 @@ LOG=$DIR/log
 
 DP_PID=$RUN/d2kd.pid
 CT_PID=$RUN/d2k.pid
+PN_PID=$RUN/d2k-panel.pid
 SOCK=$RUN/d2kd.sock
 
 # Собственные цепочки, по одной на направление. Не одна на оба: правило,
@@ -188,20 +193,27 @@ start() {
 
     fw_up || { stop; die "не поставить правила"; }
 
-    # Журнал — перенаправлением, а не ключом: у d2kc ключа под журнал нет, он
-    # пишет в стандартный вывод. start-stop-daemon -b потоки потомка не
-    # перенаправляет, поэтому перенаправление ставится ЗДЕСЬ, на самой строке
-    # запуска, и достаётся потомку по наследству.
+    # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
+    # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
+    # роутере, файл оставался нулевым при исправно работающем движке.
     start-stop-daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
         --control "$SOCK" --catalog "$DIR/state/catalog.json" --mark "$MARK" \
-        >> "$LOG/d2k.log" 2>&1 || say "контроллер не запустился — датапат наблюдает без подбора"
+        --log "$LOG/d2kc.log" || say "контроллер не запустился — датапат наблюдает без подбора"
+
+    # Панель — отдельным процессом, и её отсутствие НЕ отменяет обход: она
+    # показывает происходящее, а не делает его. Поэтому неудача здесь — say,
+    # а не die.
+    if [ -x "$PANELBIN" ]; then
+        start-stop-daemon -S -b -m -p "$PN_PID" -x "$PANELBIN" -- serve \
+            -log "$LOG/panel.log" || say "панель не запустилась — обход это не затрагивает"
+    fi
 
     say "запущен: очередь $QUEUE_NUM, режим $MODE"
 }
 
 stop() {
     fw_down
-    for p in "$CT_PID" "$DP_PID"; do
+    for p in "$PN_PID" "$CT_PID" "$DP_PID"; do
         if running "$p"; then
             start-stop-daemon -K -q -p "$p" 2>/dev/null
             i=0
@@ -223,6 +235,8 @@ status() {
                       || echo "  датапат: не работает"
     running "$CT_PID" && echo "  контроллер: работает (pid $(cat $CT_PID))" \
                       || echo "  контроллер: не работает"
+    running "$PN_PID" && echo "  панель: работает (pid $(cat $PN_PID))" \
+                      || echo "  панель: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: НЕ стоят"
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
         /proc/net/netfilter/nfnetlink_queue 2>/dev/null)

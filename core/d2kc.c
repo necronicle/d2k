@@ -105,6 +105,7 @@ static void usage(void) {
         "  --control  управляющий сокет датапата (обязателен)\n"
         "  --catalog  где держать знание (умолчание /opt/d2k/catalog.json)\n"
         "  --live     куда писать вид для панели (умолчание — рядом с каталогом)\n"
+        "  --log      куда писать журнал (умолчание — стандартный вывод)\n"
         "  --mark     метка SO_MARK для зондов поиска (умолчание 0x2d)\n");
 }
 
@@ -112,6 +113,7 @@ int main(int argc, char **argv) {
     const char *sock = NULL;
     const char *catpath = "/opt/d2k/catalog.json";
     const char *livepath = NULL;
+    const char *logpath = NULL;
     uint32_t mark = 0x2d;
 
     for (int i = 1; i < argc; i++) {
@@ -119,6 +121,7 @@ int main(int argc, char **argv) {
         if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
+        else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
         else if (strcmp(f, "--mark") == 0 && i + 1 < argc) {
             mark = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else {
@@ -130,6 +133,20 @@ int main(int argc, char **argv) {
 
     /* Тот же приём, что в d2kd.c и ctlprobe.c: процесс не имеет права умирать
        оттого, что собеседник отвалился между записями. */
+    /* Журнал открываем САМИ, а не перенаправлением снаружи: start-stop-daemon
+       с -b потоки потомка не наследует — проверено на роутере, файл оставался
+       нулевой длины при исправно работающем движке. Ровно то же было у
+       Go-стороны, и там это тоже кончилось ключом. */
+    if (logpath) {
+        FILE *lf = freopen(logpath, "a", stdout);
+        if (!lf) {
+            fprintf(stderr, "d2kc: не открыть журнал %s: %s\n", logpath, strerror(errno));
+            return 1;
+        }
+        (void)dup2(fileno(stdout), fileno(stderr));
+        setvbuf(stdout, NULL, _IOLBF, 0);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
