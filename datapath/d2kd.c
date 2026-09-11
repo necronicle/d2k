@@ -535,6 +535,9 @@ int main(int argc, char **argv) {
     const uint64_t idle_ns = (uint64_t)idle_s * NS_PER_S;
     uint64_t next_stats = stats_s ? start + (uint64_t)stats_s * NS_PER_S : 0;
     uint64_t next_expire = start + NS_PER_S;
+    /* Счётчики связи уезжают контроллеру раз в секунду: реже — и он узнавал бы
+       о своей слепоте позже, чем успел бы выбросить рабочий план. */
+    uint64_t next_ctl_stats = start + NS_PER_S;
 
     while (!stop_flag) {
         uint64_t t = now_ns();
@@ -729,6 +732,30 @@ int main(int argc, char **argv) {
         }
         if (ctl) {
             d2k_ctlsrv_pump(ctl, sess, &events_seen);
+        }
+        if (ctl && t >= next_ctl_stats) {
+            /* Сколько СОБЫТИЙ мы потеряли. Датапат держит ровно один
+               исходящий кадр и теряет всё, что не поместилось (см. шапку
+               d2k_ctl.h) — это осознанный предел, а не дефект. Но контроллер
+               обязан знать, что был слеп: без этого числа пропавший обмен
+               выглядит у него ровно как «план не сработал», и он выбросил бы
+               рабочий план. Счётчик уже считался (d2k_ctl_dropped) и никуда
+               не уезжал. */
+            uint8_t body[D2K_KEY_WIRE_LEN + 8];
+            memset(body, 0, sizeof body);
+            uint64_t dr = d2k_ctl_dropped(ctl), sn = d2k_ctl_sent(ctl);
+            uint32_t dr32 = dr > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)dr;
+            uint32_t sn32 = sn > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)sn;
+            body[D2K_KEY_WIRE_LEN + 0] = (uint8_t)(dr32 >> 24);
+            body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)(dr32 >> 16);
+            body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(dr32 >> 8);
+            body[D2K_KEY_WIRE_LEN + 3] = (uint8_t)dr32;
+            body[D2K_KEY_WIRE_LEN + 4] = (uint8_t)(sn32 >> 24);
+            body[D2K_KEY_WIRE_LEN + 5] = (uint8_t)(sn32 >> 16);
+            body[D2K_KEY_WIRE_LEN + 6] = (uint8_t)(sn32 >> 8);
+            body[D2K_KEY_WIRE_LEN + 7] = (uint8_t)sn32;
+            d2k_ctl_event(ctl, D2K_EV_STATS, body, sizeof body);
+            next_ctl_stats = t + NS_PER_S;
         }
         if (next_stats && t >= next_stats) {
             print_stats(sess, sched, q, raw, t - start);

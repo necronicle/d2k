@@ -161,7 +161,8 @@ int main(int argc, char **argv) {
 
     /* Знание из каталога — датапату СРАЗУ: он состояния между запусками не
        хранит, и без этого прохода каждая уже изученная цель начинала бы поиск
-       заново. */
+       заново. Сам проход идёт порциями в цикле ниже — залпом он создавал бы
+       окно, в котором датапату некуда сказать про живой трафик. */
     (void)d2k_sched_sync(s);
 
     printf("d2kc: запущен, сокет %s, каталог %s (%zu коробок), метка 0x%x\n",
@@ -189,6 +190,11 @@ int main(int argc, char **argv) {
         int64_t t = now_ms();
         int wait = (int)(TICK_MS - (t - last_tick));
         if (wait < 0) { wait = 0; }
+        if (d2k_sched_sync_pending(s)) {
+            /* Пока проход по каталогу не закончен, круг цикла не ждёт: каждая
+               порция обязана идти сразу за чтением событий. */
+            wait = 0;
+        }
         int pr = poll(pfd, 2, wait);
         if (pr < 0 && errno != EINTR) {
             fprintf(stderr, "d2kc: poll: %s\n", strerror(errno));
@@ -216,8 +222,13 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Порция прохода по каталогу — ПОСЛЕ чтения событий и до следующего
+           круга poll: так между командами всегда есть чтение, и датапату
+           всегда есть куда сказать. */
+        int more = d2k_sched_sync_step(s);
+
         t = now_ms();
-        if (t - last_tick >= TICK_MS || (pr > 0 && (pfd[1].revents & POLLIN))) {
+        if (more || t - last_tick >= TICK_MS || (pr > 0 && (pfd[1].revents & POLLIN))) {
             d2k_sched_tick(s, t);
             last_tick = t;
         }

@@ -261,6 +261,16 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->ipid = (uint16_t)((uint16_t)rest[4] << 8 | rest[5]);
         }
         break;
+    case D2K_EV_STATS:
+        /* Счётчики необязательны по длине: старый датапат их не слал вовсе, и
+           терять из-за этого разбор события нельзя. */
+        if (rlen >= 8) {
+            out->dropped = (uint32_t)rest[0] << 24 | (uint32_t)rest[1] << 16 |
+                           (uint32_t)rest[2] << 8  | rest[3];
+            out->sent    = (uint32_t)rest[4] << 24 | (uint32_t)rest[5] << 16 |
+                           (uint32_t)rest[6] << 8  | rest[7];
+        }
+        break;
     case D2K_EV_EXCHANGE:
         if (rlen < 6) {
             say(err, errcap, "обмен короче типа записи и длины");

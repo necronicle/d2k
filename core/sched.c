@@ -99,8 +99,7 @@ d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
 typedef enum {
     T_FREE = 0,
     T_ASKING,        /* сетевой оракул работает в потоке */
-    T_PROPS_ACK,     /* план-вопрос отправлен, ждём подтверждения датапата */
-    T_PROPS_CONTACT, /* обращение к цели работает в потоке */
+    T_PROPS_CONTACT, /* план-вопрос отправлен, обращение к цели работает в потоке */
     T_PROPS_WAIT,    /* обращение состоялось, ждём обмена по своему потоку */
     T_PLANNING,      /* вектор собран, ставим планы */
     T_WATCHING,      /* план стоит, ждём обмена */
@@ -134,7 +133,8 @@ typedef struct {
     char       plans[8][4096];
     size_t     n_plans;
     size_t     next_plan;
-    int        silent_applied;  /* применений текущего кандидата без обмена */
+    int        silent_applied;  /* применений текущего плана без прикладного обмена */
+    uint32_t   silent_dropped0; /* сколько событий было потеряно, когда план встал */
 
     /* Отпечаток коробки, накопленный по приметам подозрений ЭТОЙ цели. По
        нему каталог узнаёт уже изученную коробку (d2k_catalog_match) — без
@@ -156,6 +156,7 @@ typedef struct {
     int        props_asked;     /* хоть один вопрос задан — нужно снять план */
     d2k_flowkey prop_flow;      /* чей обмен ждём */
     int        prop_fd;         /* сокет обращения, держится до конца ожидания */
+    int        prop_applied;    /* план вопроса применён к пакетам НАШЕГО зонда */
     int64_t    prop_until_ms;   /* потолок текущего шага */
 
     /* Рабочий поток оракула. */
@@ -179,28 +180,11 @@ typedef struct {
     int      used;
 } seen_name;
 
-/* Очередь ожидаемых подтверждений. Датапат отвечает на команды ПО ПОРЯДКУ и
-   по одному подключению (d2k_ctl.h), поэтому N-е подтверждение принадлежит
-   N-й отправленной команде — иначе привязать их не к чему: D2K_EV_ACK несёт
-   тип команды и код, но не имя цели.
-   Тот же приём, что pendingAcks на Go-стороне, но с одним отличием: ТАМ
-   проход по каталогу (Sync) шлёт команды, НЕ кладя их в очередь, и после
-   первого же подтверждения обмена очередь разъезжается — здесь в очередь
-   кладётся КАЖДАЯ отправленная команда, в том числе ничья. */
-#define SCHED_ACKS 1024
-typedef struct {
-    int owner;   /* индекс задачи, -1 — ничья команда (проход по каталогу, ловушка формы) */
-    uint16_t cmd;
-} pending_ack;
-
 struct d2k_sched {
     d2k_catalog *cat;
     int          link_fd;
     uint32_t     mark;
 
-    pending_ack  acks[SCHED_ACKS];
-    size_t       ack_head, ack_tail;
-    int          ack_lost;   /* очередь переполнялась — привязка подтверждений потеряна */
     /* Часы последнего тика. Подтверждения приходят СОБЫТИЕМ, а не по часам, и
        спрашивать время у ОС в каждом обработчике незачем: тик идёт трижды в
        секунду, а сроки здесь считаются секундами. */
@@ -209,6 +193,17 @@ struct d2k_sched {
     task         tasks[SCHED_MAX_TASKS];
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
+
+    /* Проход по каталогу, разложенный на порции (см. d2k_sched_sync_step):
+       где остановились и просили ли начать заново. */
+    size_t       sync_box, sync_bind;
+    int          sync_active, sync_pending, sync_sent, sync_skipped;
+
+    /* Сколько событий датапат потерял к последнему отчёту. Нужно затем, что
+       МОЛЧАНИЕ — не доказательство: пропавший обмен неотличим от «плана не
+       сработало», и если связь в этот момент теряла события, считать молчание
+       уликой нельзя (см. on_applied). */
+    uint32_t     dropped_seen;
 
     d2k_sched_say_fn say_fn;
     void            *say_ctx;
@@ -383,43 +378,6 @@ static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
         if (same_flow(&s->seen[i], ev)) { return s->seen[i].name; }
     }
     return NULL;
-}
-
-/* Кладёт команду в очередь ожидаемых подтверждений. Переполнение НЕ молчит:
-   дальше привязывать подтверждения не к чему, и делать вид, что привязка есть,
-   хуже, чем признать потерю. */
-static void ack_push(d2k_sched *s, int owner, uint16_t cmd) {
-    size_t next = (s->ack_tail + 1) % SCHED_ACKS;
-    if (next == s->ack_head) {
-        if (!s->ack_lost) {
-            say(s, "очередь подтверждений переполнилась (%d) — привязка подтверждений "
-                   "к задачам потеряна до её опустошения", SCHED_ACKS);
-        }
-        s->ack_lost = 1;
-        return;
-    }
-    s->acks[s->ack_tail].owner = owner;
-    s->acks[s->ack_tail].cmd = cmd;
-    s->ack_tail = next;
-}
-
-/* Достаёт следующее ожидаемое подтверждение. 0 — достали, -1 — очередь пуста
-   (подтверждение на команду, о которой мы не знаем: чужой контроллер или
-   потерянная привязка). */
-static int ack_pop(d2k_sched *s, pending_ack *out) {
-    if (s->ack_head == s->ack_tail) {
-        if (s->ack_lost) { s->ack_lost = 0; } /* очередь опустела — привязка снова честна */
-        return -1;
-    }
-    *out = s->acks[s->ack_head];
-    s->ack_head = (s->ack_head + 1) % SCHED_ACKS;
-    return 0;
-}
-
-/* Индекс задачи в массиве — он же её «владелец» в очереди подтверждений:
-   указатель туда класть нельзя, задача может освободиться раньше ответа. */
-static int task_index(const d2k_sched *s, const task *t) {
-    return (int)(t - s->tasks);
 }
 
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport) {
@@ -703,11 +661,31 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) != 0) {
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
-        ack_push(s, task_index(s, t), D2K_CMD_SET_NAME);
         t->props_asked = 1;
         t->probes++;
-        t->state = T_PROPS_ACK;
+        t->prop_applied = 0;
+        /* Подтверждения команды НЕ ждём, и это не спешка.
+         *
+         * Привязать подтверждение к своей команде можно было бы только по
+         * порядку: D2K_EV_ACK несёт тип команды и код, но не имя цели. А
+         * порядок здесь неприменим, потому что события у датапата ЛОССИ по
+         * контракту (d2k_ctl.h, дословно): «Событие — сообщение, а не
+         * обязательство. Не поместилось в сокет — потеряно и посчитано».
+         * Живой прогон это и показал: после прохода по каталогу (371 команда
+         * разом) очередь ожидаемых подтверждений разъехалась навсегда, и ВСЕ
+         * пять вопросов молча упирались в тайм-аут, ни разу не дойдя до цели.
+         *
+         * Вместо подтверждения берём то, что нельзя потерять незаметно:
+         * D2K_EV_APPLIED по КЛЮЧУ НАШЕГО ПОТОКА. Он говорит не «план принят на
+         * хранение», а «план применён к этим самым пакетам» — то есть ровно
+         * то, что вопросу и нужно знать. Не пришёл — ответ не засчитывается
+         * (не измерено, а не «нет»): иначе зонд мерил бы линию БЕЗ обхода,
+         * считая, что мерит с обходом (docs/field/2026-09-05-active-probe.md). */
+        t->state = T_PROPS_CONTACT;
         t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
+        if (start_worker(s, t, JOB_CONTACT) != 0) {
+            continue; /* поток не завёлся — вопрос не задан, берём следующий */
+        }
         return 0;
     }
     return -1;
@@ -721,9 +699,7 @@ static void prop_finish(d2k_sched *s, task *t) {
         /* Иначе на боевом датапате остался бы стоять план, про который это же
            измерение только что сказало «не работает» (см. d2k_props_ask). */
         char err[160];
-        if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) == 0) {
-            ack_push(s, -1, D2K_CMD_DEL_NAME);
-        }
+        (void)d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
     }
     t->prop_q = -1;
 }
@@ -762,7 +738,6 @@ static int install_next(d2k_sched *s, task *t) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) == 0) {
-            ack_push(s, task_index(s, t), D2K_CMD_SET_NAME);
             return 0;
         }
     }
@@ -913,66 +888,95 @@ static const d2k_cat_plan *plan_by_id(const d2k_cat_box *b, const char *id) {
     return NULL;
 }
 
+/* Сколько команд за одну порцию. Восемь, а не одна: круг цикла стоит
+   системного вызова, а датапат успевает отдать кадр за микросекунды — по
+   одной команде за круг проход по большому каталогу растянулся бы на секунды
+   без всякой пользы. И не сто: чем длиннее порция, тем длиннее окно, в котором
+   датапату некуда сказать про живой трафик. */
+#define SYNC_CHUNK 8
+
 int d2k_sched_sync(d2k_sched *s) {
     if (!s || !s->cat) { return -1; }
+    s->sync_box = 0;
+    s->sync_bind = 0;
+    s->sync_active = 1;
+    s->sync_pending = 0;
+    s->sync_sent = 0;
+    s->sync_skipped = 0;
+    return 0;
+}
+
+int d2k_sched_sync_pending(const d2k_sched *s) {
+    return (s && (s->sync_active || s->sync_pending)) ? 1 : 0;
+}
+
+int d2k_sched_sync_step(d2k_sched *s) {
+    if (!s || !s->cat || !s->sync_active) { return 0; }
     static char hex[2 * D2K_PLAN_TLV_MAX + 1];
     char err[200];
-    int n = 0, skipped = 0;
+    int sent_now = 0;
 
-    for (size_t i = 0; i < s->cat->n_boxes; i++) {
-        const d2k_cat_box *b = &s->cat->boxes[i];
-        for (size_t j = 0; j < b->n_binds; j++) {
-            const d2k_cat_binding *bd = &b->binds[j];
-            if (!bd->enabled) { continue; }
-            const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
-            if (!p || !p->text) {
-                skipped++;
-                continue;
-            }
-            if (d2k_plan_text_to_hex(p->text, hex, sizeof hex, err, sizeof err) != 0) {
-                /* Битую запись нашли бы при загрузке; сюда она дойти не должна.
-                   Если дошла — молчать нельзя (та же оговорка, что у Sync на
-                   Go-стороне). */
-                say(s, "каталог: план %s коробки %s не собирается: %s", p->id, b->id, err);
-                skipped++;
-                continue;
-            }
-            int rc;
-            if (strcmp(bd->kind, "addr") == 0) {
-                uint8_t ip4[4];
-                unsigned a, bb, c, d;
-                if (sscanf(bd->target, "%u.%u.%u.%u", &a, &bb, &c, &d) != 4 ||
-                    a > 255 || bb > 255 || c > 255 || d > 255) {
-                    say(s, "каталог: привязка по адресу \"%s\" не разбирается", bd->target);
-                    skipped++;
-                    continue;
-                }
-                ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)bb;
-                ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
-                rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
-                if (rc == 0) { ack_push(s, -1, D2K_CMD_SET_ADDR); }
-            } else {
-                /* transport привязки проверяется, но на провод не едет: у
-                   SET_NAME сегодня нет места под него (d2k_link.h). Ноль —
-                   старый файл, снятый до появления поля; принимаем как TCP,
-                   потому что до задачи 5 иных привязок не заводилось. */
-                uint8_t tr = bd->transport ? bd->transport : 6;
-                rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
-                if (rc == 0) { ack_push(s, -1, D2K_CMD_SET_NAME); }
-            }
-            if (rc != 0) {
-                say(s, "каталог: план для %s не отправился: %s", bd->target, err);
-                skipped++;
-                continue;
-            }
-            n++;
+    while (s->sync_box < s->cat->n_boxes && sent_now < SYNC_CHUNK) {
+        const d2k_cat_box *b = &s->cat->boxes[s->sync_box];
+        if (s->sync_bind >= b->n_binds) {
+            s->sync_box++;
+            s->sync_bind = 0;
+            continue;
         }
+        const d2k_cat_binding *bd = &b->binds[s->sync_bind++];
+        if (!bd->enabled) { continue; }
+        const d2k_cat_plan *p = plan_by_id(b, bd->plan_id);
+        if (!p || !p->text) {
+            s->sync_skipped++;
+            continue;
+        }
+        if (d2k_plan_text_to_hex(p->text, hex, sizeof hex, err, sizeof err) != 0) {
+            /* Битую запись нашли бы при загрузке; сюда она дойти не должна.
+               Если дошла — молчать нельзя (та же оговорка, что у Sync на
+               Go-стороне). */
+            say(s, "каталог: план %s коробки %s не собирается: %s", p->id, b->id, err);
+            s->sync_skipped++;
+            continue;
+        }
+        int rc;
+        if (strcmp(bd->kind, "addr") == 0) {
+            uint8_t ip4[4];
+            unsigned a, bb, c, d;
+            if (sscanf(bd->target, "%u.%u.%u.%u", &a, &bb, &c, &d) != 4 ||
+                a > 255 || bb > 255 || c > 255 || d > 255) {
+                say(s, "каталог: привязка по адресу \"%s\" не разбирается", bd->target);
+                s->sync_skipped++;
+                continue;
+            }
+            ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)bb;
+            ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
+            rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+        } else {
+            /* transport привязки проверяется, но на провод не едет: у SET_NAME
+               сегодня нет места под него (d2k_link.h). Ноль — старый файл,
+               снятый до появления поля; принимаем как TCP, потому что до
+               задачи 5 иных привязок не заводилось. */
+            uint8_t tr = bd->transport ? bd->transport : 6;
+            rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
+        }
+        if (rc != 0) {
+            say(s, "каталог: план для %s не отправился: %s", bd->target, err);
+            s->sync_skipped++;
+            continue;
+        }
+        s->sync_sent++;
+        sent_now++;
     }
-    if (n > 0 || skipped > 0) {
-        say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
-            n, skipped ? " (пропущено негодных: см. выше)" : "");
+
+    if (s->sync_box >= s->cat->n_boxes) {
+        s->sync_active = 0;
+        if (s->sync_sent > 0 || s->sync_skipped > 0) {
+            say(s, "каталог: поставлено планов по подтверждённым привязкам: %d%s",
+                s->sync_sent, s->sync_skipped ? " (пропущено негодных: см. выше)" : "");
+        }
+        return 0;
     }
-    return n;
+    return 1;
 }
 
 static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
@@ -1027,7 +1031,6 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         char err[128];
         if (d2k_link_arm_shape(s->link_fd, t->name, err, sizeof err) == 0) {
             t->shape_armed = 1;
-            ack_push(s, -1, D2K_CMD_ARM_SHAPE);
         }
     }
     t->state = T_ASKING;
@@ -1060,42 +1063,6 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     }
 }
 
-/* Подтверждение команды. Привязывается по порядку (см. ack_push): датапат
-   отвечает на команды по очереди и по одному подключению, а само событие
-   имени цели не несёт. */
-static void on_ack(d2k_sched *s, const d2k_ev *ev) {
-    pending_ack pa;
-    if (ack_pop(s, &pa) != 0) { return; }
-    if (pa.owner < 0 || pa.owner >= (int)SCHED_MAX_TASKS) { return; }
-    task *t = &s->tasks[pa.owner];
-    if (t->state != T_PROPS_ACK || pa.cmd != D2K_CMD_SET_NAME) { return; }
-
-    int ok = ((ev->num >> 8) & 0xFFu) == 1;
-    if (!ok) {
-        /* Датапат отверг план-вопрос. Это не наблюдение о коробке, а наш
-           негодный кандидат (или нехватка места — тоже не её вина): вопрос
-           считается НЕ заданным, вектор не трогаем, берём следующий. */
-        if (prop_send_next(s, t, s->now_ms) != 0) {
-            prop_finish(s, t);
-            verdict_to_plans(s, t, t->res.verdict);
-            t->state = T_PLANNING;
-        }
-        return;
-    }
-    /* План встал — теперь и только теперь идём к цели. Пускать зонд «через
-       паузу на всякий случай» — гонка, которую не видно, пока она не
-       проявится на медленной коробке (та же оговорка, что на Go-стороне). */
-    t->state = T_PROPS_CONTACT;
-    t->prop_until_ms = s->now_ms + SCHED_PROP_STEP_MS;
-    if (start_worker(s, t, JOB_CONTACT) != 0) {
-        if (prop_send_next(s, t, s->now_ms) != 0) {
-            prop_finish(s, t);
-            verdict_to_plans(s, t, t->res.verdict);
-            t->state = T_PLANNING;
-        }
-    }
-}
-
 /* Кандидат доехал до какого-то соединения. Это НЕ успех: §8 требует
    прикладного обмена. Считаем молчаливые применения, чтобы не залипнуть на
    кандидате, который исправно применяется и ничего не даёт.
@@ -1107,14 +1074,38 @@ static void on_ack(d2k_sched *s, const d2k_ev *ev) {
    потоков, для которых подтверждение вообще не реализовано, — ровно та
    оговорка, которую Go-сторона написала у себя в EvApplied. */
 static void on_applied(d2k_sched *s, const d2k_ev *ev) {
+    /* Сперва — не наш ли это зонд вопроса. «Применён» по КЛЮЧУ НАШЕГО потока
+       и есть то доказательство, которого вопрос ждёт вместо подтверждения
+       команды (см. prop_send_next): оно говорит, что план тронул ИМЕННО ЭТИ
+       пакеты. */
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state != T_PROPS_WAIT || t->prop_applied) { continue; }
+        if (!ev_matches_flow(ev, &t->prop_flow)) { continue; }
+        t->prop_applied = 1;
+        return;
+    }
     if (ev->transport != 6) { return; }
     const char *name = recall(s, ev);
     if (!name) { return; }
     task *t = task_of(s, name, ev->transport);
     if (!t || t->state != T_WATCHING) { return; }
     t->silent_applied++;
+    if (s->dropped_seen != t->silent_dropped0) {
+        /* Связь теряла события с тех пор, как план встал. Значит «обмена не
+           было» может означать «обмен был, но событие о нём не доехало» — а
+           это разные вещи, и вторая не улика против плана. Считаем заново от
+           текущего уровня потерь: пока связь теряет, молчание ничего не
+           доказывает. */
+        say(s, "по %s связь потеряла события (%u) — молчание не в счёт, жду дальше",
+            t->name, (unsigned)(s->dropped_seen - t->silent_dropped0));
+        t->silent_dropped0 = s->dropped_seen;
+        t->silent_applied = 0;
+        return;
+    }
     if (t->silent_applied >= SCHED_MAX_SILENT) {
-        say(s, "по %s кандидат %zu применился %d раза без обмена — беру следующего",
+        say(s, "по %s план %zu применился к пакетам %d раза, прикладного обмена не было "
+               "— перехожу к следующему выведенному плану",
             t->name, t->next_plan, t->silent_applied);
         t->state = T_PLANNING; /* следующий круг тика поставит следующего */
     }
@@ -1133,6 +1124,22 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
             /* Обмен пошёл, но прикладных данных ещё нет: §4.2 — это первый
                уровень, и датапат сообщит ВТОРОЙ, когда они появятся. Судить
                по первому значит навсегда остаться на первом (session.c). */
+            return;
+        }
+        if (!t->prop_applied) {
+            /* Обмен по нашему потоку есть, а доказательства, что план к нему
+               применился, нет. Засчитать это за ответ значило бы записать
+               свойство коробки по зонду, который, возможно, шёл голым — это
+               не ошибка измерения, а измерение не того. Вопрос остаётся НЕ
+               измеренным (§2.4), берём следующий. */
+            say(s, "по %s вопрос %d: обмен есть, но план к зонду не применялся — не засчитан",
+                t->name, t->prop_q + 1);
+            prop_close(t);
+            if (prop_send_next(s, t, now_ms) != 0) {
+                prop_finish(s, t);
+                verdict_to_plans(s, t, t->res.verdict);
+                t->state = T_PLANNING;
+            }
             return;
         }
         d2k_props_question_passed(t->prop_q, &t->props);
@@ -1192,8 +1199,11 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
     task_done(t);
     /* Подтверждение — это новое знание, и датапат обязан узнать о нём сразу,
        а не после следующего запуска (та же причина, по которой Sync на
-       Go-стороне зовётся «при запуске И после каждого подтверждения»). */
-    (void)d2k_sched_sync(s);
+       Go-стороне зовётся «при запуске И после каждого подтверждения»). Но
+       ЗАКАЗЫВАЕМ проход, а не делаем его здесь: мы внутри разбора события, и
+       залп команд отсюда создал бы то самое окно слепоты, ради устранения
+       которого проход и разложен на порции. */
+    s->sync_pending = 1;
 }
 
 int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
@@ -1204,11 +1214,11 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     case D2K_EV_SUSPECT:
         return on_suspect(s, ev);
+    case D2K_EV_STATS:
+        s->dropped_seen = ev->dropped;
+        return 0;
     case D2K_EV_SHAPE:
         on_shape(s, ev);
-        return 0;
-    case D2K_EV_ACK:
-        on_ack(s, ev);
         return 0;
     case D2K_EV_APPLIED:
         on_applied(s, ev);
@@ -1228,6 +1238,10 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     /* Осушить самопайп: он только будит, содержимое значения не имеет. */
     uint8_t drain[64];
     while (read(s->wake[0], drain, sizeof drain) > 0) { }
+
+    if (s->sync_pending && !s->sync_active) {
+        (void)d2k_sched_sync(s);
+    }
 
     int moved = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
@@ -1293,20 +1307,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             moved++;
         }
 
-        if (t->state == T_PROPS_ACK) {
-            if (now_ms >= t->prop_until_ms) {
-                /* Подтверждение не пришло в срок — вопрос не задан. Это не
-                   «нет», а «не измерено» (§2.4): вектор не трогаем. */
-                if (prop_send_next(s, t, now_ms) != 0) {
-                    prop_finish(s, t);
-                    verdict_to_plans(s, t, t->res.verdict);
-                    t->state = T_PLANNING;
-                }
-                moved++;
-            }
-            if (t->state == T_PROPS_ACK) { continue; }
-        }
-
         if (t->state == T_PROPS_CONTACT) {
             int ready;
             pthread_mutex_lock(&s->mu);
@@ -1362,14 +1362,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
 
         if (t->state == T_PLANNING) {
             if (install_next(s, t) != 0) {
-                say(s, "по %s кандидаты кончились (зондов %d) — цель отдыхает",
+                say(s, "по %s выведенные планы исчерпаны (зондов %d) — цель отдыхает. "
+                       "Это не «перебор кончился»: планы выводятся из замера, и если "
+                       "измерить было нечем, их и нет",
                     t->name, t->probes);
                 task_fail(t, now_ms);
                 moved++;
                 continue;
             }
             t->silent_applied = 0;
-            say(s, "по %s поставил кандидата %zu из %zu, жду обмена",
+            t->silent_dropped0 = s->dropped_seen;
+            say(s, "по %s поставил план %zu из %zu, жду прикладного обмена",
                 t->name, t->next_plan, t->n_plans);
             t->state = T_WATCHING;
             moved++;

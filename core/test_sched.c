@@ -344,21 +344,10 @@ int main(void) {
         CHECK(said("спрашиваю коробку о свойствах"),
               "на вердикт «решает содержимое» вопросы о свойствах не начались");
 
-        /* Подтверждаем ВСЁ, что планировщик успел отправить: сперва заказ
-           формы приветствия (ARM_SHAPE, уходит при заведении задачи), потом
-           план-вопрос. Подтверждения привязываются ПО ПОРЯДКУ (ack_push в
-           sched.c) — датапат отвечает на команды по очереди, и событие
-           подтверждения имени цели не несёт. Пришли бы они не по порядку —
-           зонд ушёл бы к цели, не дождавшись, встал ли план, и мерил бы линию
-           БЕЗ обхода, считая, что мерит с обходом. */
-        d2k_ev ack;
-        memset(&ack, 0, sizeof ack);
-        ack.kind = D2K_EV_ACK;
-        ack.code = 0x0087;          /* D2K_CMD_ARM_SHAPE */
-        ack.num = (1u << 8);        /* ok, причина значима только при ok==0 */
-        d2k_sched_event(s, &ack);
-        ack.code = 0x0081;          /* D2K_CMD_SET_NAME */
-        d2k_sched_event(s, &ack);
+        /* Подтверждения команды планировщик не ждёт и ждать не может: события
+           у датапата лосси по контракту, и привязать ack к своей команде по
+           порядку нельзя (см. prop_send_next в sched.c). Зонд уходит к цели
+           сразу. */
         int peer = -1;
         for (int i = 0; i < 200 && peer < 0; i++) {
             struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
@@ -392,26 +381,65 @@ int main(void) {
             uint16_t pport = ntohs(a.sin_port);
             d2k_ev x;
             memset(&x, 0, sizeof x);
-            x.kind = D2K_EV_EXCHANGE;
             x.transport = 6;
             x.low_ip[0] = 127; x.low_ip[3] = 1;
             x.low_port = g_server_port;
             x.high_ip[0] = 127; x.high_ip[3] = 1;
             x.high_port = pport;
+
+            /* СПЕРВА обмен БЕЗ доказательства применения: план мог не встать,
+               и тогда зонд шёл к цели голым. Засчитать такой обмен за ответ
+               значит записать свойство коробки по измерению не того. */
+            x.kind = D2K_EV_EXCHANGE;
             x.code = 22;
             x.num = 1380;
             x.seen_types = 0x0C; /* рукопожатие + прикладные данные */
             d2k_sched_event(s, &x);
-            settle(s);
+            CHECK(said("план к зонду не применялся — не засчитан"),
+                  "обмен без доказательства применения засчитан за ответ коробки");
+            CHECK(!said("перекрытие слева=нет"),
+                  "свойство записано по зонду, который мог идти без плана");
 
-            CHECK(said("вопрос 1 прошёл"),
+            /* Теперь честно: датапат говорит, что план применён к ПАКЕТАМ
+               ЭТОГО потока, и следом приходит обмен. */
+            for (int i = 0; i < 400 && !said("зонд вопроса 2 ушёл"); i++) {
+                struct pollfd p4; p4.fd = d2k_sched_wake_fd(s); p4.events = POLLIN; p4.revents = 0;
+                (void)poll(&p4, 1, 1);
+                d2k_sched_tick(s, (int64_t)i * 5);
+                drain();
+            }
+            /* Ждать соединения, а не висеть на accept: если зонд не пришёл
+               (а именно так выглядит поломка, которую этот случай и ловит),
+               блокирующий accept подвесил бы весь тест вместо честного
+               провала. */
+            int peer2 = -1;
+            {
+                struct pollfd pa3;
+                pa3.fd = lfd; pa3.events = POLLIN; pa3.revents = 0;
+                if (poll(&pa3, 1, 500) > 0) { peer2 = accept(lfd, NULL, NULL); }
+            }
+            if (peer2 >= 0) {
+                struct sockaddr_in pa2;
+                socklen_t pl2 = sizeof pa2;
+                if (getpeername(peer2, (struct sockaddr *)&pa2, &pl2) == 0) {
+                    x.high_port = ntohs(pa2.sin_port);
+                }
+            }
+            x.kind = D2K_EV_APPLIED;
+            d2k_sched_event(s, &x);
+            x.kind = D2K_EV_EXCHANGE;
+            d2k_sched_event(s, &x);
+            settle(s);
+            if (peer2 >= 0) { close(peer2); }
+
+            CHECK(said("вопрос 2 прошёл") || said("вопрос 3 прошёл"),
                   "проход вопроса не записан — свойство коробки потеряно");
             /* Проход обязан попасть В ВЕКТОР, а не просто в строку лога:
                проверка на «сказал, что прошёл» пропустила бы планировщик,
                который говорит и не записывает. */
-            CHECK(said("перекрытие слева=нет"),
+            CHECK(said("порядок сегментов=нет") || said("счёт дубликатов=да"),
                   "вопрос прошёл, а вектор остался пустым — свойство не записано");
-            CHECK(said("поставил кандидата 1 из"),
+            CHECK(said("поставил план 1 из"),
                   "после ответа коробки кандидаты не собрались");
 
             /* Ответ обязан МЕНЯТЬ план, иначе спрашивать незачем. Число
@@ -423,7 +451,7 @@ int main(void) {
             d2k_props none, answered;
             memset(&none, 0, sizeof none);
             memset(&answered, 0, sizeof answered);
-            d2k_props_question_passed(0, &answered);
+            d2k_props_question_passed(2, &answered);
             size_t n_empty = d2k_compose(&none, D2K_SHAPE_MODERN, "disk.rzd.ru", empty_plan, 8);
             size_t n_answ = d2k_compose(&answered, D2K_SHAPE_MODERN, "disk.rzd.ru", answered_plan, 8);
             CHECK(n_empty >= 1 && n_answ >= 1, "d2k_compose не собрал план ни там, ни там");
@@ -530,9 +558,15 @@ int main(void) {
             d2k_sched *s = d2k_sched_new(&c7, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
-            int n = d2k_sched_sync(s);
+            /* Проход идёт ПОРЦИЯМИ: залпом он создавал бы окно, в котором
+               датапату некуда сказать про живой трафик (см. d2k_sched_sync_step).
+               Крутим его так же, как это делает цикл d2kc — до конца. */
+            (void)d2k_sched_sync(s);
+            int rounds = 0;
+            while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
             drain();
-            CHECK(n == 2, "поставлено не две подтверждённые привязки (имя и адрес)");
+            CHECK(rounds < 1000, "проход по каталогу не закончился");
+            CHECK(!d2k_sched_sync_pending(s), "проход по каталогу остался незакрытым");
             CHECK(said("поставлено планов по подтверждённым привязкам: 2"),
                   "проход по каталогу не сказал, сколько поставил");
             d2k_sched_free(s);
@@ -566,6 +600,55 @@ int main(void) {
               "кандидат, применившийся дважды без обмена, залип — поиск не двинулся");
         d2k_sched_free(s);
         d2k_catalog_free(&c5);
+    }
+
+    /* --- потерянный обмен НЕ улика против плана ------------------------ */
+    {
+        /* Датапат держит ровно один исходящий кадр и теряет всё, что не
+           поместилось (d2k_ctl.h). Пропавший обмен снаружи неотличим от «план
+           не сработал» — и без этой проверки планировщик выбрасывал бы
+           РАБОЧИЙ план просто потому, что о его успехе не смогли сказать. */
+        d2k_catalog c9;
+        memset(&c9, 0, sizeof c9);
+        d2k_sched *s = d2k_sched_new(&c9, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        d2k_ev h = ev_hello(6, 40070, "молчащая.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40070);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(d2k_sched_active(s) == 1, "поиск не дошёл до ожидания обмена");
+
+        d2k_ev ap = ev_hello(6, 40070, "");
+        ap.kind = D2K_EV_APPLIED;
+        ap.name[0] = '\0';
+
+        /* Между применениями связь сообщает о потерях — молчание перестаёт
+           быть уликой, и план обязан остаться. */
+        d2k_ev st;
+        memset(&st, 0, sizeof st);
+        st.kind = D2K_EV_STATS;
+        for (int i = 0; i < 6; i++) {
+            st.dropped = (uint32_t)(i + 1);
+            d2k_sched_event(s, &st);
+            d2k_sched_event(s, &ap);
+        }
+        settle(s);
+        CHECK(said("молчание не в счёт"),
+              "потери событий не учтены — молчание засчитано как улика против плана");
+        CHECK(d2k_sched_active(s) == 1,
+              "план выброшен по молчанию, хотя связь в это время теряла события");
+
+        /* А когда потерь нет — молчание снова улика, и поиск идёт дальше. */
+        d2k_sched_event(s, &ap);
+        d2k_sched_event(s, &ap);
+        settle(s);
+        CHECK(d2k_sched_active(s) == 0,
+              "без потерь связи план так и не сменился — поиск встал");
+        d2k_sched_free(s);
+        d2k_catalog_free(&c9);
     }
 
     /* --- обмен БЕЗ прикладных данных не подтверждает ничего (§8) ------- */
