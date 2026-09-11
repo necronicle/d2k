@@ -400,8 +400,8 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
    Читать из сокета по-прежнему не нужно (судит датапат по проводу, см. шапку
    файла): держать открытым и читать — разные вещи, и здесь нужно первое.
    Закрывает вызывающий, ПОСЛЕ ожидания обмена. */
-static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
-                             uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
+int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
+                      uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
     if (out_fd) { *out_fd = -1; }
     if (!ip || !h.bytes || h.len == 0) { return -1; }
 
@@ -409,6 +409,14 @@ static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
     if (fd < 0) { return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    /* Библиотека не имеет права убивать вызывающего. Сброс от цели посреди
+       посылки — обычное дело для зонда (её ради этого и посылают), и без
+       этого весь процесс получал бы SIGPIPE. d2kc ставит SIG_IGN сам, но
+       полагаться на дисциплину каждого вызывающего нельзя: тест поймал это
+       первым же прогоном. На Linux того же добивается MSG_NOSIGNAL ниже. */
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
     struct timeval tv = { (time_t)(D2K_PROPS_ASK_WAIT_MS / 1000u),
                           (suseconds_t)(D2K_PROPS_ASK_WAIT_MS % 1000u) * 1000 };
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -452,7 +460,11 @@ static int props_ask_contact(const char *ip, uint16_t port, d2k_hello h,
 
     size_t sent = 0;
     while (sent < h.len) {
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, h.bytes + sent, h.len - sent, MSG_NOSIGNAL);
+#else
         ssize_t n = send(fd, h.bytes + sent, h.len - sent, 0);
+#endif
         if (n <= 0) { break; }
         sent += (size_t)n;
     }
@@ -650,7 +662,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         uint8_t local_ip4[4];
         uint16_t local_port = 0;
         int contact_fd = -1;
-        if (props_ask_contact(ip, port, trigger, local_ip4, &local_port, &contact_fd) != 0) {
+        if (d2k_props_contact(ip, port, trigger, local_ip4, &local_port, &contact_fd) != 0) {
             step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
         }

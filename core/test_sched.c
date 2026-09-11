@@ -27,9 +27,12 @@
 #include <string.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "d2k_compose_internal.h"
 #include "d2k_sched.h"
 
 /* Что планировщик говорил о себе. Нужен не для красоты: узнавание коробки
@@ -85,15 +88,24 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
 
 /* --- события ------------------------------------------------------------- */
 
+/* Адрес «сервера» в ключах событий. 127.0.0.1 и НЕ 443 — потому что
+   планировщик, задавая вопросы о свойствах, действительно идёт к этому адресу
+   настоящим сокетом (d2k_props_contact). Поставь сюда чужой адрес — и модульный
+   тест начал бы ходить в интернет, а его вердикт зависел бы от того, что
+   сегодня отвечает чужой сервер. Порт подставляет стенд, когда он нужен. */
+static uint16_t g_server_port = 1; /* 1 — заведомо никто не слушает */
+
 static d2k_ev ev_hello(uint8_t transport, uint16_t cport, const char *name) {
     d2k_ev e;
     memset(&e, 0, sizeof e);
     e.kind = D2K_EV_HELLO;
     e.transport = transport;
-    e.low_ip[0] = 192; e.low_ip[1] = 168; e.low_ip[2] = 1; e.low_ip[3] = 67;
-    e.low_port = cport;
-    e.high_ip[0] = 157; e.high_ip[1] = 240; e.high_ip[2] = 253; e.high_ip[3] = 174;
-    e.high_port = 443;
+    /* Сервер — тот конец, чей порт НЕ эфемерный (server_of в sched.c);
+       клиентские порты здесь всегда 4xxxx, серверный — маленький. */
+    e.low_ip[0] = 127; e.low_ip[1] = 0; e.low_ip[2] = 0; e.low_ip[3] = 1;
+    e.low_port = g_server_port;
+    e.high_ip[0] = 192; e.high_ip[1] = 168; e.high_ip[2] = 1; e.high_ip[3] = 67;
+    e.high_port = cport;
     snprintf(e.name, sizeof e.name, "%s", name);
     return e;
 }
@@ -205,7 +217,7 @@ int main(void) {
         settle(s);
         CHECK(tcp_calls == 1, "дерево вердиктов TCP не вызвано");
         CHECK(quic_calls == 0, "по TCP-подозрению позван вопросник QUIC");
-        CHECK(strcmp(tcp_last_ip, "157.240.253.174") == 0,
+        CHECK(strcmp(tcp_last_ip, "127.0.0.1") == 0,
               "дереву вердиктов достался не адрес сервера из ключа потока");
         d2k_sched_free(s);
     }
@@ -269,6 +281,161 @@ int main(void) {
         CHECK(budp != NULL, "привязка по QUIC не записана — план одного транспорта затёр другой");
         d2k_sched_free(s);
         d2k_catalog_free(&c2);
+    }
+
+    /* --- вопросы о свойствах: задаются, проходят, и ответ меняет план --- */
+    {
+        /* Что здесь проверяется. На вердикт «решает содержимое» разрез коробку
+           не берёт — и до появления вопросов планировщик получал от
+           d2k_compose РОВНО ОДИН запасной план (пустой вектор), ставил его и
+           на этом сдавался. Вопрос — это план-кандидат, который проходит
+           только если коробку можно отравить ИМЕННО ТАК; его проход пишет
+           свойство, и уже по вектору d2k_compose собирает прицельные плечи.
+           Проверяем всю цепочку: вопрос задан → подтверждён → зонд сходил к
+           цели → обмен с прикладными данными по ЕГО потоку → свойство
+           записано → кандидатов стало больше одного.
+
+           Цель — настоящий слушающий сокет на локалхосте: планировщик идёт к
+           ней НАСТОЯЩИМ соединением (d2k_props_contact), и местный порт
+           назначает ядро. Узнать его вовремя может только тот, кто принял
+           соединение, — отсюда стенд, а не догадка. */
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(lfd >= 0, "стенд-цель не открылась");
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(0x7f000001);
+        /* Порт НЕ эфемерный: сервером планировщик считает тот конец, чей порт
+           вне диапазона, из которого ядро раздаёт клиентские (server_of в
+           sched.c). Возьми bind(0) — стенд получил бы порт из того же
+           диапазона, что и клиент в ключе события, и планировщик пошёл бы
+           измерять клиента. Ищем свободный низкий, а не назначаем один: на
+           машине разработки он может быть занят. */
+        int bound = 0;
+        for (uint16_t port = 19400; port < 19500 && !bound; port++) {
+            a.sin_port = htons(port);
+            bound = (bind(lfd, (struct sockaddr *)&a, sizeof a) == 0);
+        }
+        CHECK(bound, "стенд-цель не привязалась ни к одному свободному низкому порту");
+        socklen_t al = sizeof a;
+        CHECK(getsockname(lfd, (struct sockaddr *)&a, &al) == 0, "порт стенда не узнать");
+        CHECK(listen(lfd, 4) == 0, "стенд-цель не слушает");
+        g_server_port = ntohs(a.sin_port);
+
+        d2k_catalog c8;
+        memset(&c8, 0, sizeof c8);
+        d2k_sched *s = d2k_sched_new(&c8, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_OPAQUE;
+
+        d2k_ev h = ev_hello(6, 40060, "непрозрачная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40060);
+        d2k_sched_event(s, &su);
+
+        /* Крутим до вопроса: он задаётся, когда вернулся вердикт. */
+        for (int i = 0; i < 200 && !said("спрашиваю коробку о свойствах"); i++) {
+            struct pollfd p2; p2.fd = d2k_sched_wake_fd(s); p2.events = POLLIN; p2.revents = 0;
+            (void)poll(&p2, 1, 1);
+            d2k_sched_tick(s, (int64_t)i * 5);
+            drain();
+        }
+        CHECK(said("спрашиваю коробку о свойствах"),
+              "на вердикт «решает содержимое» вопросы о свойствах не начались");
+
+        /* Подтверждаем ВСЁ, что планировщик успел отправить: сперва заказ
+           формы приветствия (ARM_SHAPE, уходит при заведении задачи), потом
+           план-вопрос. Подтверждения привязываются ПО ПОРЯДКУ (ack_push в
+           sched.c) — датапат отвечает на команды по очереди, и событие
+           подтверждения имени цели не несёт. Пришли бы они не по порядку —
+           зонд ушёл бы к цели, не дождавшись, встал ли план, и мерил бы линию
+           БЕЗ обхода, считая, что мерит с обходом. */
+        d2k_ev ack;
+        memset(&ack, 0, sizeof ack);
+        ack.kind = D2K_EV_ACK;
+        ack.code = 0x0087;          /* D2K_CMD_ARM_SHAPE */
+        ack.num = (1u << 8);        /* ok, причина значима только при ok==0 */
+        d2k_sched_event(s, &ack);
+        ack.code = 0x0081;          /* D2K_CMD_SET_NAME */
+        d2k_sched_event(s, &ack);
+        int peer = -1;
+        for (int i = 0; i < 200 && peer < 0; i++) {
+            struct pollfd p2; p2.fd = lfd; p2.events = POLLIN; p2.revents = 0;
+            if (poll(&p2, 1, 5) > 0) {
+                struct sockaddr_in pa;
+                socklen_t pl = sizeof pa;
+                peer = accept(lfd, (struct sockaddr *)&pa, &pl);
+                if (peer >= 0) { a = pa; }
+            }
+            d2k_sched_tick(s, (int64_t)i * 5);
+            drain();
+        }
+        CHECK(peer >= 0, "зонд не пришёл к цели после подтверждения плана-вопроса");
+
+        /* Принять соединение — ещё не значит, что планировщик уже ЖДЁТ обмена:
+           рабочий поток зонда возвращается позже, чем цель его приняла, и
+           событие обмена, посланное раньше, просто некому было бы отнести
+           (в T_PROPS_WAIT ни одной задачи). Ждём, пока планировщик сам
+           скажет, что ждёт. */
+        for (int i = 0; i < 400 && !said("жду обмена"); i++) {
+            struct pollfd p3; p3.fd = d2k_sched_wake_fd(s); p3.events = POLLIN; p3.revents = 0;
+            (void)poll(&p3, 1, 1);
+            d2k_sched_tick(s, (int64_t)i * 5);
+            drain();
+        }
+        CHECK(said("жду обмена"), "планировщик не дошёл до ожидания обмена по вопросу");
+
+        if (peer >= 0) {
+            /* Обмен по ЕГО потоку: ключ — настоящий местный порт зонда,
+               который знает только принявшая сторона. */
+            uint16_t pport = ntohs(a.sin_port);
+            d2k_ev x;
+            memset(&x, 0, sizeof x);
+            x.kind = D2K_EV_EXCHANGE;
+            x.transport = 6;
+            x.low_ip[0] = 127; x.low_ip[3] = 1;
+            x.low_port = g_server_port;
+            x.high_ip[0] = 127; x.high_ip[3] = 1;
+            x.high_port = pport;
+            x.code = 22;
+            x.num = 1380;
+            x.seen_types = 0x0C; /* рукопожатие + прикладные данные */
+            d2k_sched_event(s, &x);
+            settle(s);
+
+            CHECK(said("вопрос 1 прошёл"),
+                  "проход вопроса не записан — свойство коробки потеряно");
+            /* Проход обязан попасть В ВЕКТОР, а не просто в строку лога:
+               проверка на «сказал, что прошёл» пропустила бы планировщик,
+               который говорит и не записывает. */
+            CHECK(said("перекрытие слева=нет"),
+                  "вопрос прошёл, а вектор остался пустым — свойство не записано");
+            CHECK(said("поставил кандидата 1 из"),
+                  "после ответа коробки кандидаты не собрались");
+
+            /* Ответ обязан МЕНЯТЬ план, иначе спрашивать незачем. Число
+               кандидатов для этого не годится: на «не держит перекрытие
+               слева» d2k_compose даёт ровно одно прицельное плечо, и пустой
+               вектор тоже даёт один план — запасной. Различаются они
+               СОДЕРЖИМЫМ, и сверять надо его. */
+            char empty_plan[8][4096], answered_plan[8][4096];
+            d2k_props none, answered;
+            memset(&none, 0, sizeof none);
+            memset(&answered, 0, sizeof answered);
+            d2k_props_question_passed(0, &answered);
+            size_t n_empty = d2k_compose(&none, D2K_SHAPE_MODERN, "disk.rzd.ru", empty_plan, 8);
+            size_t n_answ = d2k_compose(&answered, D2K_SHAPE_MODERN, "disk.rzd.ru", answered_plan, 8);
+            CHECK(n_empty >= 1 && n_answ >= 1, "d2k_compose не собрал план ни там, ни там");
+            CHECK(n_empty >= 1 && n_answ >= 1 && strcmp(empty_plan[0], answered_plan[0]) != 0,
+                  "план по отвеченному вектору совпал с запасным — ответ коробки ничего не изменил");
+            close(peer);
+        }
+        d2k_sched_free(s);
+        d2k_catalog_free(&c8);
+        close(lfd);
+        g_server_port = 1;
+        tcp_answer = D2K_V_OPAQUE;
     }
 
     /* --- узнанная коробка отдаёт свои планы, и успех идёт ЕЙ ----------- */

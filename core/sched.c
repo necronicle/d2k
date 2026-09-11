@@ -21,6 +21,7 @@
  * (единственное подключение к датапату) и в комментарии у Run на Go-стороне.
  */
 #define _POSIX_C_SOURCE 200809L
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -97,11 +98,18 @@ d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
 
 typedef enum {
     T_FREE = 0,
-    T_ASKING,    /* сетевой оракул работает в потоке */
-    T_PLANNING,  /* вердикт есть, ставим планы */
-    T_WATCHING,  /* план стоит, ждём обмена */
-    T_RESTING    /* неудача, цель отдыхает */
+    T_ASKING,        /* сетевой оракул работает в потоке */
+    T_PROPS_ACK,     /* план-вопрос отправлен, ждём подтверждения датапата */
+    T_PROPS_CONTACT, /* обращение к цели работает в потоке */
+    T_PROPS_WAIT,    /* обращение состоялось, ждём обмена по своему потоку */
+    T_PLANNING,      /* вектор собран, ставим планы */
+    T_WATCHING,      /* план стоит, ждём обмена */
+    T_RESTING        /* неудача, цель отдыхает */
 } task_state;
+
+/* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
+   оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
+typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT } task_job;
 
 typedef struct {
     task_state state;
@@ -140,11 +148,27 @@ typedef struct {
        узнанной коробки не заводит новую) и в логе. */
     size_t     n_known;
 
+    /* Вопросы о свойствах коробки (§2.4, d2k_compose.h). Задаются ТОЛЬКО на
+       вердикт «решает содержимое»: разрез такую коробку не берёт, берёт её
+       отравление буфера пересборки, а чем именно — это и есть вопросы. */
+    int        prop_q;          /* какой вопрос задаём, -1 — не спрашиваем */
+    d2k_props  props;           /* накопленный вектор: не измерено / да / нет */
+    int        props_asked;     /* хоть один вопрос задан — нужно снять план */
+    d2k_flowkey prop_flow;      /* чей обмен ждём */
+    int        prop_fd;         /* сокет обращения, держится до конца ожидания */
+    int64_t    prop_until_ms;   /* потолок текущего шага */
+
     /* Рабочий поток оракула. */
     pthread_t  th;
     int        th_live;
+    task_job   job;
     d2k_vres   res;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
+    /* Итог JOB_CONTACT. */
+    uint8_t    c_ip[4];
+    uint16_t   c_port;
+    int        c_fd;
+    int        c_ok;
 } task;
 
 typedef struct {
@@ -155,10 +179,32 @@ typedef struct {
     int      used;
 } seen_name;
 
+/* Очередь ожидаемых подтверждений. Датапат отвечает на команды ПО ПОРЯДКУ и
+   по одному подключению (d2k_ctl.h), поэтому N-е подтверждение принадлежит
+   N-й отправленной команде — иначе привязать их не к чему: D2K_EV_ACK несёт
+   тип команды и код, но не имя цели.
+   Тот же приём, что pendingAcks на Go-стороне, но с одним отличием: ТАМ
+   проход по каталогу (Sync) шлёт команды, НЕ кладя их в очередь, и после
+   первого же подтверждения обмена очередь разъезжается — здесь в очередь
+   кладётся КАЖДАЯ отправленная команда, в том числе ничья. */
+#define SCHED_ACKS 1024
+typedef struct {
+    int owner;   /* индекс задачи, -1 — ничья команда (проход по каталогу, ловушка формы) */
+    uint16_t cmd;
+} pending_ack;
+
 struct d2k_sched {
     d2k_catalog *cat;
     int          link_fd;
     uint32_t     mark;
+
+    pending_ack  acks[SCHED_ACKS];
+    size_t       ack_head, ack_tail;
+    int          ack_lost;   /* очередь переполнялась — привязка подтверждений потеряна */
+    /* Часы последнего тика. Подтверждения приходят СОБЫТИЕМ, а не по часам, и
+       спрашивать время у ОС в каждом обработчике незачем: тик идёт трижды в
+       секунду, а сроки здесь считаются секундами. */
+    int64_t      now_ms;
 
     task         tasks[SCHED_MAX_TASKS];
     seen_name    seen[SCHED_SEEN];
@@ -339,6 +385,43 @@ static const char *recall(const d2k_sched *s, const d2k_ev *ev) {
     return NULL;
 }
 
+/* Кладёт команду в очередь ожидаемых подтверждений. Переполнение НЕ молчит:
+   дальше привязывать подтверждения не к чему, и делать вид, что привязка есть,
+   хуже, чем признать потерю. */
+static void ack_push(d2k_sched *s, int owner, uint16_t cmd) {
+    size_t next = (s->ack_tail + 1) % SCHED_ACKS;
+    if (next == s->ack_head) {
+        if (!s->ack_lost) {
+            say(s, "очередь подтверждений переполнилась (%d) — привязка подтверждений "
+                   "к задачам потеряна до её опустошения", SCHED_ACKS);
+        }
+        s->ack_lost = 1;
+        return;
+    }
+    s->acks[s->ack_tail].owner = owner;
+    s->acks[s->ack_tail].cmd = cmd;
+    s->ack_tail = next;
+}
+
+/* Достаёт следующее ожидаемое подтверждение. 0 — достали, -1 — очередь пуста
+   (подтверждение на команду, о которой мы не знаем: чужой контроллер или
+   потерянная привязка). */
+static int ack_pop(d2k_sched *s, pending_ack *out) {
+    if (s->ack_head == s->ack_tail) {
+        if (s->ack_lost) { s->ack_lost = 0; } /* очередь опустела — привязка снова честна */
+        return -1;
+    }
+    *out = s->acks[s->ack_head];
+    s->ack_head = (s->ack_head + 1) % SCHED_ACKS;
+    return 0;
+}
+
+/* Индекс задачи в массиве — он же её «владелец» в очереди подтверждений:
+   указатель туда класть нельзя, задача может освободиться раньше ответа. */
+static int task_index(const d2k_sched *s, const task *t) {
+    return (int)(t - s->tasks);
+}
+
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
@@ -398,6 +481,28 @@ static void *worker_run(void *vp) {
     d2k_hello trig; trig.bytes = t->trig; trig.len = t->trig_len;
     d2k_hello ctl;  ctl.bytes  = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
+    if (t->job == JOB_CONTACT) {
+        /* ОДНО обращение к цели — общее с d2kask (d2k_props_contact,
+           compose.c): непомеченное (иначе только что поставленный план-вопрос
+           прошёл бы мимо очереди нетронутым) и с ОТКРЫТЫМ сокетом наружу
+           (иначе FIN удалит ячейку потока раньше ответа сервера, и обмену не
+           с чем будет связаться). Закрывает сокет цикл, после ожидания. */
+        uint8_t ip4[4];
+        uint16_t lport = 0;
+        int fd = -1;
+        int rc = d2k_props_contact(t->ip, t->port, trig, ip4, &lport, &fd);
+        pthread_mutex_lock(&s->mu);
+        memcpy(t->c_ip, ip4, 4);
+        t->c_port = lport;
+        t->c_fd = fd;
+        t->c_ok = (rc == 0);
+        t->res_ready = 1;
+        pthread_mutex_unlock(&s->mu);
+        ssize_t ign = write(s->wake[1], "w", 1);
+        (void)ign;
+        return NULL;
+    }
+
     d2k_vres r;
     if (t->transport == 17) {
         r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->mark);
@@ -421,10 +526,11 @@ static void *worker_run(void *vp) {
     return NULL;
 }
 
-static int start_worker(d2k_sched *s, task *t) {
+static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
     if (!a) { return -1; }
     a->s = s; a->t = t;
+    t->job = job;
     t->res_ready = 0;
     if (pthread_create(&t->th, NULL, worker_run, a) != 0) {
         free(a);
@@ -537,8 +643,94 @@ static uint64_t fnv1a(const char *s) {
  * Ход задачи.
  * -------------------------------------------------------------------- */
 
+/* --------------------------------------------------------------------
+ * Вопросы о свойствах коробки — конечный автомат, который двигает ЦИКЛ.
+ *
+ * Почему не d2k_props_ask: та блокирующая и читает управляющий сокет сама
+ * (см. правку плана 11.09 и шапку d2k_sched.h). Смысл вопросов при этом
+ * общий на обе стороны — d2k_props_question_plan/d2k_props_question_passed,
+ * d2k_compose_internal.h: две копии этой развилки разошлись бы молча, и
+ * вектор свойств стал бы зависеть от того, кто спрашивал.
+ * -------------------------------------------------------------------- */
+
+/* Потолок ОДНОГО шага вопроса. Унаследован из D2K_PROPS_ASK_WAIT_MS (5000мс,
+   compose.c) вместе с его оговоркой: это страховка от молчания, а не
+   ожидаемая длительность, и для этого применения он НЕ измерен. */
+#define SCHED_PROP_STEP_MS 5000
+
+/* Обнулённая задача — это prop_fd == 0, а НЕ «нет сокета»: ноль это законный
+   дескриптор (стандартный ввод), и закрывать его по такому признаку значит
+   закрывать чужое. Первый прогон с вопросами так и падал: задача после
+   memset закрывала дескриптор 0, дальше номер переиспользовался, и однажды на
+   нём оказался читающий конец будилки планировщика — рабочий поток получал
+   SIGPIPE и убивал весь процесс. Отсюда две вещи: task_reset ниже ставит -1
+   явно, а эта функция не верит нулю. */
+static void prop_close(task *t) {
+    if (t->prop_fd > 0) {
+        close(t->prop_fd);
+    }
+    t->prop_fd = -1;
+}
+
+/* Единственное место, где задача обнуляется. Не memset на месте: у неё есть
+   поле, чей «пусто» не ноль (см. prop_close выше), и разложить это по всем
+   точкам сброса значило бы завести столько же мест, где про него забудут. */
+static void task_reset(task *t) {
+    memset(t, 0, sizeof *t);
+    t->prop_fd = -1;
+    t->prop_q = -1;
+}
+
+/* Отправляет план следующего задаваемого вопроса. 0 — отправлен (ждём ack),
+   -1 — вопросов больше нет. */
+static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
+    static uint8_t planbuf[2200];
+    static char hex[2 * sizeof planbuf + 1];
+    d2k_hello ctl; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
+
+    while (++t->prop_q < D2K_PROPS_QUESTIONS) {
+        size_t plan_len = 0;
+        if (d2k_props_question_plan(t->prop_q, ctl, planbuf, sizeof planbuf, &plan_len) != 0) {
+            continue; /* этот вопрос сегодня не собрать — не измерено, а не «нет» */
+        }
+        static const char digits[] = "0123456789abcdef";
+        for (size_t i = 0; i < plan_len; i++) {
+            hex[2 * i] = digits[planbuf[i] >> 4];
+            hex[2 * i + 1] = digits[planbuf[i] & 0x0F];
+        }
+        hex[2 * plan_len] = '\0';
+        char err[160];
+        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) != 0) {
+            continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
+        }
+        ack_push(s, task_index(s, t), D2K_CMD_SET_NAME);
+        t->props_asked = 1;
+        t->probes++;
+        t->state = T_PROPS_ACK;
+        t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
+        return 0;
+    }
+    return -1;
+}
+
+/* Вопросы кончились: снять план последнего (он не сработал) и идти собирать
+   кандидатов по накопленному вектору. */
+static void prop_finish(d2k_sched *s, task *t) {
+    prop_close(t);
+    if (t->props_asked) {
+        /* Иначе на боевом датапате остался бы стоять план, про который это же
+           измерение только что сказало «не работает» (см. d2k_props_ask). */
+        char err[160];
+        if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) == 0) {
+            ack_push(s, -1, D2K_CMD_DEL_NAME);
+        }
+    }
+    t->prop_q = -1;
+}
+
 static void task_fail(task *t, int64_t now_ms) {
     join_worker(t);
+    prop_close(t);
     t->state = T_RESTING;
     t->rest_until_ms = now_ms + SCHED_REST_MS;
     t->n_plans = 0;
@@ -547,7 +739,8 @@ static void task_fail(task *t, int64_t now_ms) {
 
 static void task_done(task *t) {
     join_worker(t);
-    memset(t, 0, sizeof *t);
+    prop_close(t);
+    task_reset(t);
     t->state = T_FREE;
 }
 
@@ -569,6 +762,7 @@ static int install_next(d2k_sched *s, task *t) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) == 0) {
+            ack_push(s, task_index(s, t), D2K_CMD_SET_NAME);
             return 0;
         }
     }
@@ -620,6 +814,20 @@ static size_t known_plans(d2k_sched *s, task *t) {
     return took;
 }
 
+/* Вектор свойств словами. Нужен наружу: иначе «кандидатов 3» ничего не
+   говорит о том, ЧЕМ коробка себя выдала, а это и есть результат опроса.
+   Тройственность сохраняется буквально — «не измерено» не превращается в
+   «нет» (§2.4). */
+static void props_text(const d2k_props *p, char *out, size_t cap) {
+    static const char *v[] = { "не измерено", "да", "нет" };
+    snprintf(out, cap,
+             "перекрытие слева=%s, счёт дубликатов=%s, порядок сегментов=%s, "
+             "контрольная сумма=%s, разбор протокола=%s",
+             v[p->tolerates_left_overlap % 3], v[p->counts_duplicates % 3],
+             v[p->tolerates_reorder % 3], v[p->validates_checksum % 3],
+             v[p->parses_l7 % 3]);
+}
+
 static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     t->next_plan = 0;
     t->n_known = known_plans(s, t);
@@ -633,12 +841,13 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
            а уже проверенное знание, и «мерить было нечем» его не отменяет. */
         return;
     }
-    d2k_props pr;
-    memset(&pr, 0, sizeof pr);
+    /* Вектор — накопленный вопросами, а не пустой: в этом весь смысл опроса.
+       Пустой вектор d2k_compose честно превращает в ОДИН запасной план, и до
+       появления вопросов планировщик только его и получал. */
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     if (t->n_plans < cap) {
-        t->n_plans += d2k_compose(&pr, sh, SCHED_DECOY,
+        t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY,
                                   t->plans + t->n_plans, cap - t->n_plans);
     }
 }
@@ -741,6 +950,7 @@ int d2k_sched_sync(d2k_sched *s) {
                 ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)bb;
                 ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
                 rc = d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err);
+                if (rc == 0) { ack_push(s, -1, D2K_CMD_SET_ADDR); }
             } else {
                 /* transport привязки проверяется, но на провод не едет: у
                    SET_NAME сегодня нет места под него (d2k_link.h). Ноль —
@@ -748,6 +958,7 @@ int d2k_sched_sync(d2k_sched *s) {
                    потому что до задачи 5 иных привязок не заводилось. */
                 uint8_t tr = bd->transport ? bd->transport : 6;
                 rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
+                if (rc == 0) { ack_push(s, -1, D2K_CMD_SET_NAME); }
             }
             if (rc != 0) {
                 say(s, "каталог: план для %s не отправился: %s", bd->target, err);
@@ -798,7 +1009,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     if (!t) {
         return 0; /* мест нет — подозрение придёт снова, датапат не молчит */
     }
-    memset(t, 0, sizeof *t);
+    task_reset(t);
     snprintf(t->name, sizeof t->name, "%s", name);
     t->transport = ev->transport;
     t->fp.method = D2K_FP_METHOD;
@@ -809,18 +1020,19 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     server_of(ev, t->ip, sizeof t->ip, &t->port);
     t->started_ms = 0;
     if (fill_hellos(t) != 0) {
-        memset(t, 0, sizeof *t);
+        task_reset(t);
         return 0;
     }
     if (!t->shape_armed) {
         char err[128];
         if (d2k_link_arm_shape(s->link_fd, t->name, err, sizeof err) == 0) {
             t->shape_armed = 1;
+            ack_push(s, -1, D2K_CMD_ARM_SHAPE);
         }
     }
     t->state = T_ASKING;
-    if (start_worker(s, t) != 0) {
-        memset(t, 0, sizeof *t);
+    if (start_worker(s, t, JOB_CLASSIFY) != 0) {
+        task_reset(t);
         return 0;
     }
     say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
@@ -844,6 +1056,42 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             memcpy(t->trig, ev->shape, ev->shape_len);
             t->trig_len = ev->shape_len;
             say(s, "по %s поймана форма приветствия: %zu байт", t->name, ev->shape_len);
+        }
+    }
+}
+
+/* Подтверждение команды. Привязывается по порядку (см. ack_push): датапат
+   отвечает на команды по очереди и по одному подключению, а само событие
+   имени цели не несёт. */
+static void on_ack(d2k_sched *s, const d2k_ev *ev) {
+    pending_ack pa;
+    if (ack_pop(s, &pa) != 0) { return; }
+    if (pa.owner < 0 || pa.owner >= (int)SCHED_MAX_TASKS) { return; }
+    task *t = &s->tasks[pa.owner];
+    if (t->state != T_PROPS_ACK || pa.cmd != D2K_CMD_SET_NAME) { return; }
+
+    int ok = ((ev->num >> 8) & 0xFFu) == 1;
+    if (!ok) {
+        /* Датапат отверг план-вопрос. Это не наблюдение о коробке, а наш
+           негодный кандидат (или нехватка места — тоже не её вина): вопрос
+           считается НЕ заданным, вектор не трогаем, берём следующий. */
+        if (prop_send_next(s, t, s->now_ms) != 0) {
+            prop_finish(s, t);
+            verdict_to_plans(s, t, t->res.verdict);
+            t->state = T_PLANNING;
+        }
+        return;
+    }
+    /* План встал — теперь и только теперь идём к цели. Пускать зонд «через
+       паузу на всякий случай» — гонка, которую не видно, пока она не
+       проявится на медленной коробке (та же оговорка, что на Go-стороне). */
+    t->state = T_PROPS_CONTACT;
+    t->prop_until_ms = s->now_ms + SCHED_PROP_STEP_MS;
+    if (start_worker(s, t, JOB_CONTACT) != 0) {
+        if (prop_send_next(s, t, s->now_ms) != 0) {
+            prop_finish(s, t);
+            verdict_to_plans(s, t, t->res.verdict);
+            t->state = T_PLANNING;
         }
     }
 }
@@ -873,6 +1121,35 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
 }
 
 static void on_exchange(d2k_sched *s, const d2k_ev *ev, int64_t now_ms) {
+    /* Сперва — не ответ ли это на заданный вопрос. Своё это обращение или
+       чужое, решает КЛЮЧ ПОТОКА: событие обмена не адресовано команде, и без
+       фильтра чужой обмен засчитался бы за наш зонд (ревью 11.09, находка 1
+       в compose.c — воспроизводилось 5/5 на стенде). */
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state != T_PROPS_WAIT) { continue; }
+        if (!ev_matches_flow(ev, &t->prop_flow)) { continue; }
+        if (!d2k_ev_has_appdata(ev)) {
+            /* Обмен пошёл, но прикладных данных ещё нет: §4.2 — это первый
+               уровень, и датапат сообщит ВТОРОЙ, когда они появятся. Судить
+               по первому значит навсегда остаться на первом (session.c). */
+            return;
+        }
+        d2k_props_question_passed(t->prop_q, &t->props);
+        {
+            char pv[400];
+            props_text(&t->props, pv, sizeof pv);
+            say(s, "по %s вопрос %d прошёл, вектор: %s", t->name, t->prop_q + 1, pv);
+        }
+        /* Вопрос прошёл — это уже стратегия (двойное назначение плана, см.
+           шапку compose.c), и второй вопрос той же цели не задаётся. */
+        prop_close(t);
+        t->prop_q = -1;
+        verdict_to_plans(s, t, t->res.verdict);
+        t->state = T_PLANNING;
+        return;
+    }
+
     if (!d2k_ev_has_appdata(ev)) {
         return; /* §8: порог — прикладной обмен, а не любые вернувшиеся байты */
     }
@@ -930,6 +1207,9 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     case D2K_EV_SHAPE:
         on_shape(s, ev);
         return 0;
+    case D2K_EV_ACK:
+        on_ack(s, ev);
+        return 0;
     case D2K_EV_APPLIED:
         on_applied(s, ev);
         return 0;
@@ -943,6 +1223,7 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
 
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     if (!s) { return 0; }
+    s->now_ms = now_ms;
 
     /* Осушить самопайп: он только будит, содержимое значения не имеет. */
     uint8_t drain[64];
@@ -973,6 +1254,26 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
+            if (r.verdict == D2K_V_OPAQUE && t->transport == 6) {
+                /* «Решает содержимое» — единственный вердикт, на который
+                   вопросы о свойствах вообще осмысленны: разрез такую коробку
+                   не берёт, берёт её отравление буфера пересборки, а чем
+                   именно — это и есть вопросы (d2k_compose.h). На остальных
+                   вердиктах спрашивать нечего: там ответ уже дан разрезом или
+                   его отсутствием. Только TCP: все пять вопросов —
+                   про TCP-сегменты, которых у QUIC нет. */
+                say(s, "по %s вердикт: %s (%s) — спрашиваю коробку о свойствах",
+                    t->name, verdict_name(r.verdict), r.reason);
+                memset(&t->props, 0, sizeof t->props);
+                t->prop_q = -1;
+                t->props_asked = 0;
+                t->res = r;
+                if (prop_send_next(s, t, now_ms) == 0) {
+                    moved++;
+                    continue;
+                }
+                prop_finish(s, t);
+            }
             verdict_to_plans(s, t, r.verdict);
             if (t->n_known > 0) {
                 say(s, "по %s вердикт: %s (%s), кандидатов %zu — из них %zu готовых "
@@ -990,6 +1291,73 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             }
             t->state = T_PLANNING;
             moved++;
+        }
+
+        if (t->state == T_PROPS_ACK) {
+            if (now_ms >= t->prop_until_ms) {
+                /* Подтверждение не пришло в срок — вопрос не задан. Это не
+                   «нет», а «не измерено» (§2.4): вектор не трогаем. */
+                if (prop_send_next(s, t, now_ms) != 0) {
+                    prop_finish(s, t);
+                    verdict_to_plans(s, t, t->res.verdict);
+                    t->state = T_PLANNING;
+                }
+                moved++;
+            }
+            if (t->state == T_PROPS_ACK) { continue; }
+        }
+
+        if (t->state == T_PROPS_CONTACT) {
+            int ready;
+            pthread_mutex_lock(&s->mu);
+            ready = t->res_ready;
+            pthread_mutex_unlock(&s->mu);
+            if (!ready) {
+                if (now_ms < t->prop_until_ms) { continue; }
+                /* Обращение не вернулось в срок — поток ещё в сети; бросать
+                   его нельзя, ждём столько же ещё раз, а не режем задачу. */
+                t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
+                continue;
+            }
+            join_worker(t);
+            if (!t->c_ok) {
+                /* Обращение не состоялось (транспорт) — вопрос не измерен. */
+                if (prop_send_next(s, t, now_ms) != 0) {
+                    prop_finish(s, t);
+                    verdict_to_plans(s, t, t->res.verdict);
+                    t->state = T_PLANNING;
+                }
+                moved++;
+                if (t->state != T_PLANNING) { continue; }
+            } else {
+                t->prop_fd = t->c_fd;
+                memcpy(t->prop_flow.a_ip, t->c_ip, 4);
+                t->prop_flow.a_port = t->c_port;
+                inet_pton(AF_INET, t->ip, t->prop_flow.b_ip);
+                t->prop_flow.b_port = t->port;
+                t->prop_flow.transport = 6;
+                t->state = T_PROPS_WAIT;
+                t->prop_until_ms = now_ms + SCHED_PROP_STEP_MS;
+                say(s, "по %s зонд вопроса %d ушёл с местного порта %u — жду обмена",
+                    t->name, t->prop_q + 1, (unsigned)t->c_port);
+                moved++;
+                continue;
+            }
+        }
+
+        if (t->state == T_PROPS_WAIT) {
+            if (now_ms < t->prop_until_ms) { continue; }
+            /* Обмена с прикладными данными не дождались — промах вопроса. Он
+               НЕ пишет ничего (§2.4, каждый Set в Go начинается с
+               `if !passed { return }`). */
+            prop_close(t);
+            if (prop_send_next(s, t, now_ms) != 0) {
+                prop_finish(s, t);
+                verdict_to_plans(s, t, t->res.verdict);
+                t->state = T_PLANNING;
+            }
+            moved++;
+            if (t->state != T_PLANNING) { continue; }
         }
 
         if (t->state == T_PLANNING) {
