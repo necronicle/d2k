@@ -349,6 +349,12 @@ void d2k_hkdf_extract(const uint8_t *salt, size_t slen,
 
 int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
                            uint8_t *out, size_t out_len) {
+    return d2k_hkdf_expand_label_ctx(secret, label, NULL, 0, out, out_len);
+}
+
+int d2k_hkdf_expand_label_ctx(const uint8_t secret[32], const char *label,
+                              const uint8_t *ctx, size_t ctx_len,
+                              uint8_t *out, size_t out_len) {
     /* HkdfLabel (RFC 8446 §7.1): length(2, big-endian) || len(full_label)(1)
      * || full_label || len(context)(1)=0. Контекст в этом модуле всегда пуст
      * (QUIC Initial его не использует, RFC 9001 §5.1). label — короткий
@@ -368,13 +374,24 @@ int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
     memcpy(full_label + HKDF_LABEL_PREFIX_LEN, label, label_len);
     size_t full_len = HKDF_LABEL_PREFIX_LEN + label_len;
 
-    uint8_t info[2 + 1 + (HKDF_LABEL_PREFIX_LEN + D2K_HKDF_LABEL_MAX) + 1];
+    /* Контекст — транскрипт рукопожатия TLS 1.3 (RFC 8446 §7.1,
+       Derive-Secret). У QUIC Initial он пуст, и до появления TLS-клиента
+       (core/tls13.c) этот параметр был не нужен вовсе — отсюда и вариант без
+       него, оставленный ради всех прежних вызовов. Длиннее хэша он не бывает:
+       Derive-Secret передаёт сюда ровно Transcript-Hash, 32 байта. */
+    if (ctx_len > 32) {
+        return -1;
+    }
+    uint8_t info[2 + 1 + (HKDF_LABEL_PREFIX_LEN + D2K_HKDF_LABEL_MAX) + 1 + 32];
     info[0] = (uint8_t)(out_len >> 8);
     info[1] = (uint8_t)(out_len);
     info[2] = (uint8_t)full_len;
     memcpy(info + 3, full_label, full_len);
-    info[3 + full_len] = 0;
-    size_t info_len = 3 + full_len + 1;
+    info[3 + full_len] = (uint8_t)ctx_len;
+    if (ctx_len) {
+        memcpy(info + 3 + full_len + 1, ctx, ctx_len);
+    }
+    size_t info_len = 3 + full_len + 1 + ctx_len;
 
     /* HKDF-Expand (RFC 5869 §2.3): T(0) пуст, T(i) = HMAC(secret, T(i-1) ||
      * info || i). Для ключей QUIC N всегда 1 (out_len <= 32), но цикл общий —
@@ -570,6 +587,41 @@ static int consttime_eq16(const uint8_t a[16], const uint8_t b[16]) {
         diff = (uint8_t)(diff | (uint8_t)(a[i] ^ b[i]));
     }
     return diff == 0;
+}
+
+/* Шифрование — та же машина в обратном порядке: сперва шифруем данные со
+ * счётчика 2, потом считаем GHASH ПО ШИФРОТЕКСТУ и накрываем его J0. Порядок
+ * важен: GHASH берётся именно от шифротекста (SP 800-38D §7.1), и посчитать
+ * его до шифрования было бы просто другой функцией. */
+int d2k_aes128_gcm_encrypt(const uint8_t key[16], const uint8_t iv[12],
+                           const uint8_t *aad, size_t aad_len,
+                           const uint8_t *in, size_t n,
+                           uint8_t *out, uint8_t tag[16]) {
+    if (!key || !iv || !tag || (n > 0 && (!in || !out))) {
+        return -1;
+    }
+    aes128_ks ks;
+    aes128_key_expand(key, &ks);
+
+    uint8_t zero_block[16], h[16];
+    memset(zero_block, 0, 16);
+    aes128_encrypt_block(&ks, zero_block, h);
+
+    uint8_t j0[16];
+    memcpy(j0, iv, 12);
+    j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+
+    uint8_t icb[16];
+    memcpy(icb, j0, 16);
+    inc32(icb);
+    if (n > 0) {
+        gctr(&ks, icb, in, n, out);
+    }
+
+    uint8_t sblk[16];
+    ghash(h, aad, aad_len, out, n, sblk);
+    gctr(&ks, j0, sblk, 16, tag);
+    return 0;
 }
 
 int d2k_aes128_gcm_decrypt(const uint8_t key[16], const uint8_t iv[12],

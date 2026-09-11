@@ -157,6 +157,16 @@ D2K_WARN_UNUSED
 int d2k_hkdf_expand_label(const uint8_t secret[32], const char *label,
                            uint8_t *out, size_t out_len);
 
+/* То же, но С КОНТЕКСТОМ — транскриптом рукопожатия TLS 1.3 (Derive-Secret,
+ * RFC 8446 §7.1). У QUIC Initial контекст пуст, поэтому до появления
+ * TLS-клиента (core/tls13.c) этого варианта не существовало, а не потому что
+ * его забыли. ctx_len > 32 — нарушение контракта (Derive-Secret передаёт ровно
+ * Transcript-Hash), отказ без записи в out. */
+D2K_WARN_UNUSED
+int d2k_hkdf_expand_label_ctx(const uint8_t secret[32], const char *label,
+                              const uint8_t *ctx, size_t ctx_len,
+                              uint8_t *out, size_t out_len);
+
 /* AES-128 в GCM (NIST SP 800-38D), IV ровно 96 бит — единственная длина,
  * которую использует QUIC (nonce = iv, поксоренный с номером пакета,
  * RFC 9001 §5.3), и стандарт для неё даёт упрощённый счётчик без отдельного
@@ -189,5 +199,23 @@ int d2k_aes128_gcm_decrypt(const uint8_t key[16], const uint8_t iv[12],
  * снятии; операция симметричная именно потому, что это XOR с одной и той же
  * маской, а не отдельное расшифрование. */
 void d2k_aes128_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
+
+/* Шифрование AES-128-GCM. Пара к d2k_aes128_gcm_decrypt, которая была здесь с
+ * самого начала (QUIC читает чужие пакеты, а не пишет свои). Понадобилось,
+ * когда ядру потребовалось ГОВОРИТЬ внутри TLS-сессии: проба на блокировку по
+ * объёму качает объём внутри настоящей сессии, иначе сервер оборвёт её сам и
+ * мерить станет нечего. out — шифртекст длиной n, tag — 16 байт. */
+int d2k_aes128_gcm_encrypt(const uint8_t key[16], const uint8_t iv[12],
+                           const uint8_t *aad, size_t aad_len,
+                           const uint8_t *in, size_t n,
+                           uint8_t *out, uint8_t tag[16]);
+
+/* Обмен ключами X25519 (RFC 7748). 0 — общий секрет в out; -1 — отказ
+ * (нулевой секрет = точка малого порядка, RFC 8446 §7.4.2 требует прервать
+ * рукопожатие, а не продолжать с предсказуемым секретом). */
+int d2k_x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
+
+/* Открытый ключ из закрытого: умножение прижатого скаляра на базовую точку. */
+int d2k_x25519_base(uint8_t out[32], const uint8_t scalar[32]);
 
 #endif

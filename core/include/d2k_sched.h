@@ -48,6 +48,7 @@
 #include "d2k_catalog.h"
 #include "d2k_link.h"
 #include "d2k_verdict.h"
+#include "d2k_volume.h"
 
 typedef struct d2k_sched d2k_sched;
 
@@ -63,6 +64,13 @@ typedef d2k_vres (*d2k_sched_tcp_fn)(const char *ip, uint16_t port,
 typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char *sni,
                                       d2k_hello trigger, d2k_hello control,
                                       uint32_t mark);
+/* Проба на блокировку по объёму. Отдельным крючком по той же причине, что и
+ * два оракула выше: тест обязан утверждать поведение планировщика, не выходя
+ * в сеть. */
+typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
+                                           const char *sni, int plain, uint32_t mark);
+extern d2k_sched_vol_fn  d2k_sched_vol_hook;
+
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
 extern d2k_sched_quic_fn d2k_sched_quic_hook;
 

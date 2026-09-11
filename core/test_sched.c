@@ -74,6 +74,23 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     return r;
 }
 
+/* Проба на объём подменена: иначе планировщик гонял бы настоящую лестницу
+   HTTP-запросов к стенду, который TLS не умеет, и тест мерил бы это. */
+static int vol_calls;
+static d2k_vol_verdict vol_answer = D2K_VOL_PASSED;
+
+static d2k_vol_result stub_vol(const char *ip, uint16_t port, const char *sni,
+                               int plain, uint32_t mark) {
+    (void)ip; (void)port; (void)sni; (void)plain; (void)mark;
+    vol_calls++;
+    d2k_vol_result r;
+    memset(&r, 0, sizeof r);
+    r.verdict = vol_answer;
+    r.at_kb = 20;
+    snprintf(r.reason, sizeof r.reason, "подменённая проба объёма");
+    return r;
+}
+
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark) {
     (void)ip; (void)port; (void)trigger; (void)control; (void)mark;
@@ -187,6 +204,7 @@ static const d2k_cat_binding *binding_of(const d2k_catalog *c, const char *targe
 }
 
 int main(void) {
+    d2k_sched_vol_hook = stub_vol;
     d2k_sched_tcp_hook = stub_tcp;
     d2k_sched_quic_hook = stub_quic;
 
@@ -649,6 +667,36 @@ int main(void) {
               "без потерь связи план так и не сменился — поиск встал");
         d2k_sched_free(s);
         d2k_catalog_free(&c9);
+    }
+
+    /* --- обрыв по объёму: дерево вердиктов не зовём, в каталог не пишем -- */
+    {
+        /* Пока ответ про объём неизвестен, вопрос «режут по имени или по
+           адресу» ЛЖЁТ: при блоке по объёму рукопожатие проходит с любым
+           именем, и дерево всегда отвечает «по адресу». Поэтому проба идёт
+           ПЕРВОЙ, а на её «обрыв» дерево не зовётся вовсе. */
+        d2k_catalog cA;
+        memset(&cA, 0, sizeof cA);
+        d2k_sched *s = d2k_sched_new(&cA, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        vol_calls = tcp_calls = 0;
+        vol_answer = D2K_VOL_CUT;
+
+        d2k_ev h = ev_hello(6, 40080, "режут.по.объёму");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40080);
+        d2k_sched_event(s, &su);
+        settle(s);
+
+        CHECK(vol_calls == 1, "проба на объём не вызвана");
+        CHECK(tcp_calls == 0,
+              "на обрыв по объёму позвано дерево вердиктов — его ответ там ложен");
+        CHECK(total_bindings(&cA) == 0, "обрыв по объёму записан в каталог");
+        CHECK(said("обрыв по объёму"), "обрыв по объёму не назван в отчёте");
+        vol_answer = D2K_VOL_PASSED;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cA);
     }
 
     /* --- обмен БЕЗ прикладных данных не подтверждает ничего (§8) ------- */

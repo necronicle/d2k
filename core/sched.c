@@ -37,6 +37,7 @@
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
+#include "d2k_volume.h"
 
 /* --------------------------------------------------------------------
  * Пределы. Перенесены с Go-стороны (internal/controller/controller.go, блок
@@ -89,6 +90,7 @@
 /* --------------------------------------------------------------------
  * Подменяемые оракулы (см. d2k_sched.h).
  * -------------------------------------------------------------------- */
+d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = d2k_classify;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
 
@@ -164,6 +166,7 @@ typedef struct {
     int        th_live;
     task_job   job;
     d2k_vres   res;
+    d2k_vol_result vol;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
     /* Итог JOB_CONTACT. */
     uint8_t    c_ip[4];
@@ -459,6 +462,31 @@ static void *worker_run(void *vp) {
         ssize_t ign = write(s->wake[1], "w", 1);
         (void)ign;
         return NULL;
+    }
+
+    /* Проба на объём идёт ПЕРВОЙ, и это не порядок ради порядка: пока её
+       ответ неизвестен, вопрос «режут по имени или по адресу» ЛЖЁТ — при
+       блоке по объёму рукопожатие проходит с любым именем, поток умирает и
+       там и там, и ответ всегда получается «по адресу» (шапка d2k_volume.h).
+       Только TCP: у QUIC нет установленного потока в этом смысле, и лестница
+       HTTP-запросов туда неприменима. */
+    if (t->transport == 6) {
+        t->vol = d2k_sched_vol_hook(t->ip, t->port, t->name, t->port == 80, s->mark);
+        if (t->vol.verdict == D2K_VOL_CUT) {
+            /* Разрезом этот класс не лечится вовсе: режется не рукопожатие.
+               Дальше мерить дерево вердиктов незачем — оно ответит про имя и
+               адрес то, что диктует оборванный поток, а не коробка. */
+            pthread_mutex_lock(&s->mu);
+            memset(&t->res, 0, sizeof t->res);
+            t->res.verdict = D2K_V_INCONCLUSIVE;
+            snprintf(t->res.reason, sizeof t->res.reason,
+                     "обрыв по объёму на %d КБ — разрезом не лечится", t->vol.at_kb);
+            t->res_ready = 1;
+            pthread_mutex_unlock(&s->mu);
+            ssize_t ign2 = write(s->wake[1], "w", 1);
+            (void)ign2;
+            return NULL;
+        }
     }
 
     d2k_vres r;
