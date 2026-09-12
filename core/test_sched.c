@@ -262,6 +262,21 @@ static d2k_ev ev_applied(uint8_t transport, uint16_t cport) {
     return e;
 }
 
+/* Отказ отправки ПО КЛЮЧУ ПОТОКА ЗОНДА. code — D2K_REFUSE_*: ненулевой
+   означает «посылка плана не покинула машину», то есть опыта не было. Это НЕ
+   ответ коробки, и свойство от него меняться не имеет права.
+   own_id == 0 подставляет ЧУЖОЙ идентификатор: такой отказ относится к
+   другому плану и не должен влиять на нашего кандидата (0009, U2). */
+static d2k_ev ev_refused(uint8_t transport, uint16_t cport, uint8_t code, int own_id) {
+    d2k_ev e = ev_hello(transport, cport, "");
+    e.kind = D2K_EV_REFUSED;
+    e.name[0] = '\0';
+    e.code = code;
+    (void)last_plan_id(e.plan_id);
+    if (!own_id) { e.plan_id[0] = (uint8_t)~e.plan_id[0]; }
+    return e;
+}
+
 /* Модельные часы теста. ТОЛЬКО ВПЕРЁД и общие на весь файл: у планировщика
    есть сроки, измеряемые секундами (потолок шага испытания — пять секунд), и
    тик, поданный «назад», отменял бы их молча. Раньше каждый цикл ожидания
@@ -900,6 +915,117 @@ int main(void) {
               "без потерь связи кандидат так и не сменился — поиск встал");
         d2k_sched_free(s);
         d2k_catalog_free(&c9);
+    }
+
+    /* --- отказ отправки: временный лечится повтором, постоянный — нет ---
+     *
+     * 0009, U2. Четыре утверждения в одном сценарии, потому что все четыре про
+     * одно: НАША неудача не имеет права стать свойством чужого устройства и не
+     * имеет права съесть поиск.
+     *
+     *   чужой отказ (не наш идентификатор плана) не трогает кандидата;
+     *   временный отказ даёт ПОВТОР того же кандидата, а не выброс;
+     *   повторов ограниченное число, а не «пока не кончится бюджет»;
+     *   постоянный отказ (посылка длиннее канала) не повторяется вовсе,
+     *     кандидат сменяется, и «рабочего обхода нет» никто не объявляет. */
+    {
+        d2k_catalog cu;
+        memset(&cu, 0, sizeof cu);
+        d2k_sched *s = d2k_sched_new(&cu, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40077;
+        ver_calls = 0;
+        d2k_ev h = ev_hello(6, 40077, "отказная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40077);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls == 1, "кандидат не испытан");
+
+        /* ЧУЖОЙ отказ: ключ наш, идентификатор плана — нет. */
+        d2k_ev alien = ev_refused(6, 40077, D2K_REFUSE_SEND, 0);
+        d2k_sched_event(s, &alien);
+        skip_ahead(s, 6000);
+        settle(s);
+        CHECK(!said("посылка плана не ушла на провод"),
+              "чужой отказ приписан нашему кандидату");
+
+        CHECK(total_bindings(&cu) == 0, "чужой отказ записан как успех");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cu);
+    }
+
+    {
+        /* СВОЙ временный отказ — повтор ТОГО ЖЕ кандидата. Отдельный
+           планировщик: проверка выше уже израсходовала своё окно ожидания,
+           и слать сюда второй отказ было бы некому. */
+        d2k_catalog ct;
+        memset(&ct, 0, sizeof ct);
+        d2k_sched *s = d2k_sched_new(&ct, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40079;
+        ver_calls = 0;
+        d2k_ev h = ev_hello(6, 40079, "временная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40079);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls == 1, "кандидат не испытан");
+
+        int before = ver_calls;
+        d2k_ev tmp = ev_refused(6, 40079, D2K_REFUSE_QUEUE, 1);
+        d2k_sched_event(s, &tmp);
+        skip_ahead(s, 6000);
+        settle(s);
+        CHECK(said("посылка плана не ушла на провод"),
+              "временный отказ отправки не назван — он неотличим от промаха коробки");
+        CHECK(ver_calls > before, "после временного отказа кандидат не переиспытан");
+        CHECK(total_bindings(&ct) == 0, "отказ отправки записан как успех");
+        d2k_sched_free(s);
+        d2k_catalog_free(&ct);
+    }
+
+    {
+        /* Постоянный отказ: повторять нечего, тот же план даст то же. */
+        d2k_catalog cp;
+        memset(&cp, 0, sizeof cp);
+        d2k_sched *s = d2k_sched_new(&cp, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40078;
+        ver_calls = 0;
+        d2k_ev h = ev_hello(6, 40078, "длинная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40078);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls == 1, "кандидат не испытан");
+
+        int before = ver_calls;
+        d2k_ev big = ev_refused(6, 40078, D2K_REFUSE_TOO_LONG, 1);
+        d2k_sched_event(s, &big);
+        skip_ahead(s, 6000);
+        settle(s);
+        CHECK(said("опыт невозможен"),
+              "постоянный отказ не назван причиной невозможности опыта");
+        CHECK(!said("испытываю кандидата ещё раз"),
+              "постоянный отказ лечится повтором — тот же план даст тот же результат");
+        CHECK(ver_calls == before || ver_calls == before + 1,
+              "постоянный отказ породил череду одинаковых повторов");
+        CHECK(total_bindings(&cp) == 0, "отказ по длине записан как успех");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cp);
     }
 
     /* --- дата подтверждения — стенная, а не монотонная ------------------ */
