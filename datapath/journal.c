@@ -54,6 +54,7 @@ const char *d2k_refuse_text(uint8_t code) {
     case D2K_REFUSE_SEND:     return "ядро отвергло посылку";
     case D2K_REFUSE_QUEUE:    return "очередь отложенной отправки не приняла посылку";
     case D2K_REFUSE_TOO_LONG: return "посылка длиннее того, что унесёт способ отправки";
+    case D2K_REFUSE_DAMAGED:  return "поток испорчен недоисполнением плана";
     default:                  return "отказ без кода";
     }
 }
@@ -139,7 +140,8 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                           uint8_t kind, uint8_t code, const uint8_t *plan_id) {
     d2k_jrn_entry *e = add_entry(j, at_ns, key, kind, code, 0, NULL, NULL, 0,
-                                 kind == D2K_JRN_PLAN_UNSENT ? d2k_refuse_text(code)
+                                 (kind == D2K_JRN_PLAN_UNSENT ||
+                                  kind == D2K_JRN_PLAN_DAMAGED) ? d2k_refuse_text(code)
                                                              : "план доисполнен");
     if (e && plan_id) {
         /* Как есть, байт в байт — та же причина, что у d2k_journal_add_applied

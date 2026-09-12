@@ -816,12 +816,28 @@ int main(void) {
         /* И отказ ОТПРАВКИ по нашему потоку. */
         d2k_session_unsent(sess, 1200, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG, r.execution_id);
 
+        /* ПОВРЕЖДЕНИЕ ПОТОКА — третий, отдельный факт. Раньше он доходил до
+           контроллера неотличимо от «плана для цели нет» (код 0), потому что
+           ехал обычным отказом ПРИМЕНИТЬ. Здесь проверяется вся цепочка
+           целиком: session → journal → ctlsrv → провод. */
+        uint8_t dmg_pkt[1024];
+        /* ТО ЖЕ ИМЯ, другой клиентский порт: план стоит по имени, значит
+           второе обращение к той же цели — второй поток с тем же планом. */
+        size_t dpl = build_pkt(dmg_pkt, 40202, hello, hl);
+        d2k_result rd;
+        d2k_session_packet(sess, dmg_pkt, dpl, 1300, obuf, sizeof obuf, &rd);
+        CHECK(rd.applied == 1, "второй поток той же цели не получил план");
+        /* Нагрузка уже на проводе — чистого выхода нет. */
+        CHECK(d2k_session_exec_failed(sess, 1400, &rd.key, rd.plan_id,
+                                      D2K_REFUSE_SEND, rd.execution_id, 1, 0) == 0,
+              "ушедшая нагрузка не объявила поток испорченным");
+
         uint64_t seen2 = 0;
         d2k_ctlsrv_pump(c, sess, &seen2);
         d2k_ctl_flush(c);
 
-        int seen_plain = 0, seen_unsent = 0;
-        for (int i = 0; i < 12; i++) {
+        int seen_plain = 0, seen_unsent = 0, seen_damaged = 0;
+        for (int i = 0; i < 20; i++) {
             uint16_t type = 0;
             uint8_t ev[256];
             ssize_t n = read_event(cli, &type, ev, sizeof ev);
@@ -840,10 +856,24 @@ int main(void) {
                 seen_plain = 1;
             } else if (ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_TOO_LONG) {
                 seen_unsent = 1;
+            } else if (ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_DAMAGED) {
+                seen_damaged = 1;
+                /* Идентичность обязана доехать: без неё повреждение нельзя
+                   приписать ни попытке, ни плану. */
+                CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 17),
+                      "повреждение приехало без идентификатора плана");
+                int nonzero = 0;
+                for (int b = 0; b < 16; b++) {
+                    if (ev[D2K_KEY_WIRE_LEN + 1 + b]) { nonzero = 1; }
+                }
+                CHECK(nonzero, "идентификатор плана у повреждения нулевой");
             }
         }
         CHECK(seen_plain, "обычный отказ применить план приехал не с нулевым кодом");
         CHECK(seen_unsent, "отказ отправки не приехал кодом D2K_REFUSE_TOO_LONG");
+        CHECK(seen_damaged,
+              "повреждение потока не доехало до контроллера отдельным кодом — "
+              "оно неотличимо от обычного «плана для цели нет»");
 
         close(cli);
         d2k_session_free(sess);

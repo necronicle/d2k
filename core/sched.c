@@ -124,6 +124,16 @@ static int refuse_is_permanent(uint8_t code) {
     return code == D2K_REFUSE_TOO_LONG;
 }
 
+/* Поток испорчен недоисполнением: часть плана ушла, остаток нет. Отличается
+ * от прочих локальных отказов тем, ЧТО случилось с клиентом, а не тем, что
+ * делать дальше: испытывать кандидата снова можно — зонд откроет НОВЫЙ поток,
+ * — но объяснение обязано называть повреждение, иначе в журнале поиска
+ * останется «посылка не ушла», и человек не узнает, что чей-то поток порвался
+ * (0009, U3-R2). */
+static int refuse_is_damage(uint8_t code) {
+    return code == D2K_REFUSE_DAMAGED;
+}
+
 /* Потолок ОДНОГО шага вопроса. Унаследован из D2K_PROPS_ASK_WAIT_MS (5000мс,
    compose.c) вместе с его оговоркой: это страховка от молчания, а не
    ожидаемая длительность, и для этого применения он НЕ измерен. */
@@ -269,6 +279,18 @@ typedef struct {
     /* Bounded early-event cache: IP addresses are part of the proof, not
        just the local port. Concurrent clients may use the same port. */
     d2k_flowkey ver_early[8];
+    /* РАННИЕ ОТКАЗЫ — тем же приёмом, что и ранние применения выше, и по той
+       же причине: местный порт зонда назначает ядро, и до возврата зонда его
+       не знает никто. Пока ключа нет, отказ нельзя приписать НАШЕМУ потоку.
+
+       Один пробный план действует и на соседние подключения той же цели,
+       поэтому отказ по цели и идентификатору плана совпадает с чужим
+       обращением так же легко, как со своим. Сверять только их значило бы
+       съесть чужую неудачу как свою и без нужды переиспытать кандидата
+       (доказано стендом ревью: свой порт 40091, чужой 49999). */
+    d2k_flowkey ver_unsent_early[8];
+    uint8_t    ver_unsent_code_early[8];
+    size_t     ver_unsent_seen;
     size_t     ver_seen;
     int        ver_ok;
     /* Последняя ПРИЧИНА, по которой посылка плана не ушла на провод
@@ -1129,6 +1151,33 @@ static size_t refill_from_fallback(task *t) {
  *   2 — постоянный отказ, опыт невозможен, нужен следующий кандидат.
  *
  * Свойство коробки не пишется ни в одном случае: воздействия не было (§2.4). */
+/* Разбирает НАКОПЛЕННЫЕ ранние отказы теперь, когда ключ зонда известен.
+ *
+ * До возврата зонда местный порт назначает ядро, и отказ, совпавший по цели и
+ * идентификатору плана, мог принадлежать как нашему обращению, так и
+ * соседнему: один пробный план действует на все подключения к этой цели.
+ * Съесть чужой отказ значит без нужды переиспытать кандидата, а при
+ * постоянном коде — объявить опыт невозможным там, где он состоялся.
+ *
+ * Чужие отказы не выбрасываются молча в счётчик: их наличие само по себе
+ * ничего про нашу попытку не говорит, и говорить не должно. */
+static void claim_early_refusal(task *t) {
+    d2k_ev probe;
+    memset(&probe, 0, sizeof probe);
+    memcpy(probe.low_ip, t->ver_flow.a_ip, 4);
+    memcpy(probe.high_ip, t->ver_flow.b_ip, 4);
+    probe.low_port = t->ver_flow.a_port;
+    probe.high_port = t->ver_flow.b_port;
+    probe.transport = t->ver_flow.transport;
+    for (size_t k = 0; k < t->ver_unsent_seen; k++) {
+        if (ev_matches_flow(&probe, &t->ver_unsent_early[k])) {
+            t->unsent_code = t->ver_unsent_code_early[k];
+            break;
+        }
+    }
+    t->ver_unsent_seen = 0;
+}
+
 static int local_refusal_verdict(d2k_sched *s, task *t) {
     if (t->unsent_code == 0) { return 0; }
     if (refuse_is_permanent(t->unsent_code)) {
@@ -1154,13 +1203,18 @@ static int local_refusal_verdict(d2k_sched *s, task *t) {
         return 2;
     }
     t->unsent_tries++;
-    say(s, "по %s посылка плана не ушла на провод (причина %u, попытка %u из %u) — "
+    say(s, "по %s %s (причина %u, попытка %u из %u) — "
            "опыта не было, испытываю кандидата ещё раз",
-        t->name, (unsigned)t->unsent_code,
+        t->name,
+        refuse_is_damage(t->unsent_code)
+            ? "поток испорчен недоисполнением плана"
+            : "посылка плана не ушла на провод",
+        (unsigned)t->unsent_code,
         (unsigned)t->unsent_tries, (unsigned)SCHED_UNSENT_RETRIES);
     t->unsent_code = 0;
     ver_close(t);
     t->ver_seen = 0;
+    t->ver_unsent_seen = 0;
     t->ver_ok = 0;
     t->probes++;
     s->probes_used++;
@@ -1175,6 +1229,9 @@ static int install_next(d2k_sched *s, task *t) {
        попытки у всех следующих. */
     t->unsent_tries = 0;
     t->unsent_code = 0;
+    /* Накопленные ранние отказы принадлежали ПРЕЖНЕМУ кандидату: у нового
+       свой идентификатор плана, и старые улики к нему не относятся. */
+    t->ver_unsent_seen = 0;
     for (;;) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
@@ -1955,8 +2012,25 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
             return;
         }
         if (t->state == T_VERIFY) {
+            /* Ключа зонда ещё нет — копим отказ целиком, как раннее
+               применение. Разберём, когда зонд вернётся и назовёт свой
+               местный порт. */
             if (!applied_of_candidate(t, ev)) { continue; }
-            t->unsent_code = (uint8_t)ev->code;
+            size_t cap = sizeof t->ver_unsent_early / sizeof t->ver_unsent_early[0];
+            for (size_t k = 0; k < t->ver_unsent_seen; k++) {
+                if (ev_matches_flow(ev, &t->ver_unsent_early[k])) { return; }
+            }
+            if (t->ver_unsent_seen == cap) {
+                return; /* переполнение теряет улику, но не выдумывает её */
+            }
+            d2k_flowkey *k = &t->ver_unsent_early[t->ver_unsent_seen];
+            memcpy(k->a_ip, ev->low_ip, 4);
+            memcpy(k->b_ip, ev->high_ip, 4);
+            k->a_port = ev->low_port;
+            k->b_port = ev->high_port;
+            k->transport = ev->transport;
+            t->ver_unsent_code_early[t->ver_unsent_seen] = (uint8_t)ev->code;
+            t->ver_unsent_seen++;
             return;
         }
         if (t->state == T_VERIFY_WAIT) {
@@ -2250,6 +2324,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; } /* зонд в сети; срок задачи считается выше */
             join_worker(t);
+            /* КЛЮЧ ЗОНДА ИЗВЕСТЕН ТОЛЬКО ТЕПЕРЬ: местный порт назначает ядро
+               при обращении. Собираем его сразу, до любых решений, потому что
+               по нему разбираются НАКОПЛЕННЫЕ ранние отказы: до возврата
+               зонда отличить отказ своего обращения от отказа соседнего
+               клиента той же цели было нечем. */
+            memcpy(t->ver_flow.a_ip, t->ver.local_ip4, 4);
+            t->ver_flow.a_port = t->ver.local_port;
+            inet_pton(AF_INET, t->ip, t->ver_flow.b_ip);
+            t->ver_flow.b_port = t->port;
+            t->ver_flow.transport = t->transport;
+            claim_early_refusal(t);
             if (t->ver.level != D2K_VER_APPLICATION) {
                 /* СПЕРВА — НАША ЛИ ЭТО НЕУДАЧА. Зонд мог не дойти до
                    приложения просто потому, что воздействия не было: посылка
@@ -2276,14 +2361,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->state = T_PLANNING;
                 }
             } else {
-                /* Ключ потока зонда известен только теперь: местный порт
-                   назначает ядро при обращении, и до возврата его не знает
-                   никто, кроме самого зонда. */
-                memcpy(t->ver_flow.a_ip, t->ver.local_ip4, 4);
-                t->ver_flow.a_port = t->ver.local_port;
-                inet_pton(AF_INET, t->ip, t->ver_flow.b_ip);
-                t->ver_flow.b_port = t->port;
-                t->ver_flow.transport = t->transport;
                 d2k_ev own;
                 memset(&own, 0, sizeof own);
                 memcpy(own.low_ip, t->ver_flow.a_ip, 4);

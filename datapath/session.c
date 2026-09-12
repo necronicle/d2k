@@ -360,6 +360,14 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        и будет чистой тратой на каждом пакете загрузки. */
     fl->fwd_pkts++; /* счётчик попыток разбора клиентской стороны потока */
 
+    /* ПОВРЕЖДЕНИЕ — ДО РАННЕГО ВЫХОДА по уже разобранному приветствию.
+       Поток портится ПОСЛЕ применения плана, то есть saw_hello к этому
+       моменту всегда взведён: проверка, стоящая после этого выхода,
+       недостижима по построению (0009, U3-R2). */
+    if (fl->damaged) {
+        out->skipped = "поток испорчен предыдущей отменой";
+        return;
+    }
     if (fl->saw_hello || fl->fwd_pkts > D2K_HELLO_WINDOW) {
         out->skipped = fl->saw_hello ? "поток уже показывал приветствие"
                                       : "за окном поиска";
@@ -446,11 +454,6 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        поток портится ровно тогда, когда план к нему уже применялся, и при
        обратном порядке ветка повреждения недостижима — флаг был бы
        write-only, а контроллер не получал бы о нём ни слова. */
-    if (fl->damaged) {
-        out->skipped = "поток испорчен предыдущей отменой";
-        refuse(s, now_ns, &key, out->skipped);
-        return;
-    }
     if (fl->plan_done) {
         out->skipped = "план уже применён к этому потоку";
         return;
@@ -979,11 +982,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        и событие на каждом из них забило бы единственное управляющее
        соединение (события лосси, d2k_ctl.h). */
     if (fl->damaged) {
+        /* Факт повреждения уже уехал контроллеру В МОМЕНТ установления
+           (d2k_session_exec_failed): замолчавший поток второго пакета мог бы
+           и не прислать. Здесь только отказываемся применять что-либо ещё —
+           повторное событие на каждом пакете забило бы единственное
+           управляющее соединение. */
         out->skipped = "поток испорчен предыдущей отменой";
-        if (!fl->damaged_told) {
-            fl->damaged_told = 1;
-            refuse(s, now_ns, &key, out->skipped);
-        }
         return 0;
     }
 
@@ -1372,6 +1376,15 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     }
     if (payload_on_wire || (orig_spent && fl->orig_taken)) {
         fl->damaged = 1;
+        /* СООБЩАЕМ В МОМЕНТ УСТАНОВЛЕНИЯ, а не при следующем пакете:
+           испорченный поток вполне может замолчать, и тогда факта не будет
+           вовсе. Один раз на попытку — события лосси по контракту. */
+        if (!fl->damaged_told) {
+            fl->damaged_told = 1;
+            d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DAMAGED,
+                                 D2K_REFUSE_DAMAGED,
+                                 plan_id ? plan_id : fl->execution_plan_id);
+        }
         return 0;
     }
     return 1;
