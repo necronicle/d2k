@@ -331,6 +331,12 @@ struct d2k_sched {
        какого времени идёт поиск» (внутри всё на монотонных). */
     int          confirms, probes_used;
     int64_t      wall_base_s;
+    /* Монотонные часы планировщика в СТЕННЫЕ секунды. Всё внутри считается
+       монотонными миллисекундами (сроки, потолки, отдых) — и это верно: стенные
+       часы на роутере прыгают при синхронизации времени, а сроки от этого
+       прыгать не должны. Но каталог читает ЧЕЛОВЕК и панель, и там нужна дата.
+       Без преобразования в файл уезжало «1970-01-01T04:14:39Z» — поймано на
+       живой приёмке 12.09.2026, у всех новых подтверждений. */
 
     d2k_sched_say_fn say_fn;
     void            *say_ctx;
@@ -718,21 +724,28 @@ static d2k_cat_box *box_ensure(d2k_catalog *c, const char *id) {
  *
  * shape/verified_by кладутся только измеренными: ноль поверх записанного не
  * пишется никогда — «не измерено» не отменяет измеренного (§2.4). */
+/* См. комментарий у wall_base_s. Отдельной функцией, а не выражением по месту:
+   мест семь, и разойдись хоть одно — в каталоге окажутся записи из двух разных
+   эпох, неотличимые на вид. */
+static int64_t wall_s(const d2k_sched *s, int64_t now_ms) {
+    return s->wall_base_s + now_ms / 1000;
+}
+
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
                           const char *target, uint8_t transport,
-                          uint8_t shape, uint8_t verified_by, int64_t now_ms,
+                          uint8_t shape, uint8_t verified_by, int64_t at_s,
                           const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
-    if (b->created == 0) { b->created = now_ms / 1000; }
+    if (b->created == 0) { b->created = at_s; }
     if (b->fp.n_sig == 0 && fp && fp->n_sig > 0) {
         /* Отпечаток записывается ОДИН раз, при заведении коробки: дальше он её
            удостоверение, и переписывать его приметами следующей цели значило
            бы менять то, по чему её узнают. */
         b->fp = *fp;
     }
-    b->updated = now_ms / 1000;
+    b->updated = at_s;
 
     int have_plan = 0;
     for (size_t i = 0; i < b->n_plans; i++) {
@@ -748,7 +761,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
         snprintf(p->proto, sizeof p->proto, "%s", proto);
         p->text = strdup(plan_text ? plan_text : "");
         if (!p->text) { return -1; }
-        p->added = now_ms / 1000;
+        p->added = at_s;
         p->successes = 1;
         p->enabled = 1;
         b->n_plans++;
@@ -759,7 +772,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
         if (bd->transport == transport && strcmp(bd->target, target) == 0 &&
             d2k_cat_shape_fits(bd->shape, shape)) {
             bd->successes++;
-            bd->confirmed = now_ms / 1000;
+            bd->confirmed = at_s;
             snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
             if (shape) { bd->shape = shape; }
             if (verified_by) { bd->verified_by = verified_by; }
@@ -775,7 +788,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     snprintf(bd->target, sizeof bd->target, "%s", target);
     snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
     bd->level = 3;
-    bd->confirmed = now_ms / 1000;
+    bd->confirmed = at_s;
     bd->successes = 1;
     bd->enabled = 1;
     bd->transport = transport;
@@ -801,7 +814,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
  * им запись значило бы сказать о ней больше, чем измерено (§2.4). */
 static int bind_raise_level(d2k_catalog *c, const char *box_id, const char *target,
                             uint8_t transport, uint8_t shape, uint8_t verified_by,
-                            int level, int64_t now_ms) {
+                            int level, int64_t at_s) {
     for (size_t i = 0; i < c->n_boxes; i++) {
         d2k_cat_box *b = &c->boxes[i];
         if (box_id && box_id[0] && strcmp(b->id, box_id) != 0) { continue; }
@@ -817,7 +830,7 @@ static int bind_raise_level(d2k_catalog *c, const char *box_id, const char *targ
             bd->level = level;
             if (shape) { bd->shape = shape; }
             if (verified_by) { bd->verified_by = verified_by; }
-            b->updated = now_ms / 1000;
+            b->updated = at_s;
             return 0;
         }
     }
@@ -1655,7 +1668,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->transport,
                          (uint8_t)SCHED_PROBE_SHAPE, D2K_VERBY_PROBE,
-                         now_ms, &t->fp);
+                         wall_s(s, now_ms), &t->fp);
     /* Коробку запоминаем: живое соединение потом поднимет уровень ИМЕННО этой
        записи, а не первой подходящей по имени цели. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
@@ -1848,7 +1861,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
                              ? (uint8_t)d2k_hello_shape(t->trig, t->trig_len)
                              : (uint8_t)D2K_SHAPE_UNKNOWN;
     if (bind_raise_level(s->cat, t->box_id, t->name, t->transport,
-                         live_shape, D2K_VERBY_CLIENT, 5, now_ms) == 0) {
+                         live_shape, D2K_VERBY_CLIENT, 5, wall_s(s, now_ms)) == 0) {
         say(s, "по %s (%s) последующее живое соединение дошло до обмена (%u байт) "
                "— уровень записи поднят до 5",
             t->name, t->transport == 17 ? "QUIC" : "TCP", (unsigned)ev->num);
