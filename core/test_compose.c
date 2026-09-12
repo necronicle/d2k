@@ -1342,8 +1342,13 @@ int main(void) {
         d2k_hello nodecoy = { NULL, 0 };
         CHECK(trig.bytes, "build_trigger(b3) не собрался");
 
-        int replies[] = { 22, 22, 22 }; /* перекрытие, порядок, сумма — все промах */
-        driver_args da = { &p, "b3.example", replies, 3, 300 };
+        /* Перекрытие, дубликаты, порядок, сумма — все промах. Дубликаты
+           теперь задаются и БЕЗ control: вопрос стал однофакторным, тело
+           фальшивки — набивка, и от приветствия ему нужна только ДЛИНА
+           (0008, расхождение 4). Без control остаётся незаданным один
+           вопрос — разбор протокола. */
+        int replies[] = { 22, 22, 22, 22 };
+        driver_args da = { &p, "b3.example", replies, 4, 300 };
         pthread_t th;
         CHECK(pthread_create(&th, NULL, driver_run, &da) == 0, "b3: ведущий поток не запустился");
 
@@ -1352,7 +1357,7 @@ int main(void) {
         pthread_join(th, NULL);
         unsigned long long after = query_ok_cmds(&p);
 
-        CHECK(after - before == 4, "b3: без control ожидались три SET_NAME (счёт дубликатов "
+        CHECK(after - before == 5, "b3: без control ожидались четыре SET_NAME (разбор протокола "
                                     "и разбор протокола — пропущены целиком) и один DEL_NAME "
                                     "по итогу полного промаха");
         CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN && pr.tolerates_reorder == D2K_P_UNKNOWN &&
@@ -1429,8 +1434,12 @@ int main(void) {
         CHECK(steps[0].plan_len > 0 && steps[0].ack_ok == 1,
               "b5: трасса первого вопроса без длины плана или без принятого подтверждения");
         CHECK(steps[0].local_port != 0, "b5: трасса первого вопроса без местного порта обращения");
-        CHECK(steps[1].rc == D2K_STEP_NOT_ASKED && steps[4].rc == D2K_STEP_NOT_ASKED,
-              "b5: вопросы без control должны быть отмечены как незаданные");
+        /* Без control незаданным остаётся ТОЛЬКО разбор протокола: счёт
+           дубликатов стал однофакторным и берёт от приветствия лишь длину. */
+        CHECK(steps[4].rc == D2K_STEP_NOT_ASKED,
+              "b5: вопрос без control должен быть отмечен как незаданный");
+        CHECK(steps[1].rc != D2K_STEP_NOT_ASKED,
+              "b5: счёт дубликатов пропущен, хотя control ему больше не нужен");
         /* Три законных исхода промаха, и все три — «не измерено»: плана не
            применили к нашему потоку, обмена не было вовсе, обмен был без
            ответа сервера. Который именно — зависит от стенда; важно, что ни

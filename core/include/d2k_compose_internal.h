@@ -75,7 +75,7 @@ int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k);
  * d2kask) и планировщик d2kc, которому блокировать цикл нельзя. Две копии этой
  * развилки разошлись бы молча, и вектор свойств стал бы зависеть от того, кто
  * спрашивал. Подробности — в doc-комментариях в compose.c. */
-int  d2k_props_question_plan(int q, d2k_hello control,
+int  d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
                              uint8_t *buf, size_t cap, size_t *out_len);
 void d2k_props_question_passed(int q, d2k_props *pr);
 

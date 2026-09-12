@@ -124,6 +124,16 @@ enum { D2K_ANCHOR_PAYLOAD_START = 0, D2K_ANCHOR_SNI_MIDDLE = 5 };
 enum { D2K_ORDER_FORWARD = 0, D2K_ORDER_REVERSE = 1 };
 enum { D2K_PLACE_BEFORE = 0 };
 
+/* Верхняя граница декой-приветствия. До задачи 5 здесь всегда стоял
+ * LEGACY (210 байт «в живую», core/profiles/legacy.hex, замер) — потолок был
+ * 600. Задача 5 (шаг 0б) снимает это ограничение: профиль теперь выбирается
+ * ПО ВИДУ СНЯТОГО ПРИВЕТСТВИЯ ЦЕЛИ (см. build_decoy_hello), и MODERN весит
+ * 1530 байт (замер: wc -c profiles/modern.hex после вырезания комментариев /
+ * 2). Запас — 1530 + 253 (максимальная длина имени по RFC 1035, на случай
+ * decoy длиннее метки __SNI__, которую он заменяет) = 1783, округлено вверх
+ * до 1800. */
+#define D2K_COMPOSE_HELLO_MAX 1800
+
 static void wr16be(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static uint16_t rd16be(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
 static void wr32be(uint8_t *p, uint32_t v) {
@@ -569,29 +579,68 @@ int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
  *
  * Возвращает 0 — план собран, -1 — этот вопрос сегодня не задать (не измерено
  * само по себе, а не «нет»). */
-int d2k_props_question_plan(int q, d2k_hello control,
+/* ТЕЛО ФАЛЬШИВКИ — ДВОЙНАЯ ДЛИНА ПРАВДЫ, набивка 0x0f, приветствие только
+ * там, где вопрос про разбор протокола.
+ *
+ * Длина не выбрана, а унаследована замером донора и прокомментирована в его
+ * же коде (probePoison, raw_linux.go:511-524): «ФАЛЬШИВКА ДЛИННЕЕ ПРАВДЫ, и
+ * это тоже из дампа: боевое плечо шлёт 677 байт на приветствие в 343, то есть
+ * накрывает его целиком И заходит за край. Коробка, дочитывающая запись до
+ * конца, на укороченной фальшивке осталась бы ждать продолжения и приняла бы
+ * настоящие байты как это продолжение — отравление тогда не срабатывает».
+ * Наши прежние 64 и «длина приветствия» давали фальшивку короче правды или
+ * равную ей, то есть приём заведомо не работал (0008, расхождение 2).
+ *
+ * decoy кладётся В ГОЛОВУ и только у вопроса про разбор протокола: у донора
+ * `copy(fake, p.decoyPayload)` срабатывает лишь когда у плеча decoy == "hello",
+ * а это один-единственный зонд `badsum+hello` (compose.go:62). Вопрос про
+ * дубликаты у него набивочный, и наш нёс приветствие зря: он мерил два фактора
+ * сразу, и любой его исход был неоднозначен (0008, расхождение 4).
+ *
+ * Возвращает длину или 0, если не собрать. */
+static size_t build_fake_body(uint8_t *dst, size_t cap, size_t truth_len,
+                              d2k_hello decoy) {
+    size_t want = truth_len * 2;
+    if (truth_len == 0 || want > cap) { return 0; }
+    memset(dst, D2K_OVERLAP_FILLER, want);
+    if (decoy.bytes && decoy.len > 0) {
+        size_t n = decoy.len < want ? decoy.len : want;
+        memcpy(dst, decoy.bytes, n);
+    }
+    return want;
+}
+
+int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
                             uint8_t *buf, size_t cap, size_t *out_len) {
     if (!buf || !out_len) { return -1; }
+    /* Тело фальшивки собирается на стеке: 2× приветствия браузера — три
+       килобайта, и держать их статически ради трёх вопросов незачем. */
+    static uint8_t fake[2 * D2K_COMPOSE_HELLO_MAX];
+    d2k_hello nodecoy; nodecoy.bytes = NULL; nodecoy.len = 0;
+    size_t flen = 0;
     switch (q) {
     case 0:
         return overlap_plan_tlv(buf, cap, out_len);
     case 1:
-        /* Счёт дубликатов нуждается в decoy-содержимом (control) — без него
-           вопрос не задать, и он просто пропускается, как пропускает
-           соответствующее плечо d2k_compose при пустом decoy. */
-        return (control.bytes && control.len > 0)
-                   ? badsum_fake_plan_tlv(control.bytes, control.len, 2, 20000,
-                                          buf, cap, out_len)
-                   : -1;
+        /* Счёт дубликатов: НАБИВКА, а не приветствие — вопрос однофакторный
+           (см. build_fake_body). Нужна только длина правды. */
+        flen = build_fake_body(fake, sizeof fake, truth_len, nodecoy);
+        return flen ? badsum_fake_plan_tlv(fake, flen, 2, 20000, buf, cap, out_len)
+                    : -1;
     case 2:
         return reorder_plan_tlv(buf, cap, out_len);
     case 3:
-        return checksum_plan_tlv(buf, cap, out_len);
-    case 4: /* разбор протокола: та же нужда в control, что и у вопроса 1 */
-        return (control.bytes && control.len > 0)
-                   ? badsum_fake_plan_tlv(control.bytes, control.len, 1, 0,
-                                          buf, cap, out_len)
-                   : -1;
+        flen = build_fake_body(fake, sizeof fake, truth_len, nodecoy);
+        return flen ? badsum_fake_plan_tlv(fake, flen, 1, 0, buf, cap, out_len)
+                    : -1;
+    case 4:
+        /* Разбор протокола: приветствие в голове фальшивки, хвост — набивка.
+           Без control вопрос не задать: он ровно про то, берёт ли коробка
+           осмысленное приветствие там, где набивку не взяла. */
+        if (!control.bytes || control.len == 0) { return -1; }
+        flen = build_fake_body(fake, sizeof fake, truth_len, control);
+        return flen ? badsum_fake_plan_tlv(fake, flen, 1, 0, buf, cap, out_len)
+                    : -1;
     default:
         return -1;
     }
@@ -684,13 +733,16 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
 
     int asked_any = 0, passed_any = 0;
     for (int i = 0; i < D2K_PROPS_QUESTIONS; i++) {
-        uint8_t planbuf[2200]; /* control до 2048 байт (потолок D2K_EV_SHAPE.shape,
-                                   d2k_link.h) плюс заголовок и записи —
-                                   ID(20)+PROTO(6)+PAYLOAD-заголовок(6)+
-                                   POISON(12)+FAKE(14)+ORDER(5) = 63, запас
-                                   до 2200 округлением вверх. */
+        /* Тело фальшивки — ДВОЙНАЯ длина правды (build_fake_body), а правда
+           бывает размером с приветствие браузера. Отсюда потолок: 2 ×
+           D2K_COMPOSE_HELLO_MAX плюс заголовок и записи
+           ID(20)+PROTO(6)+PAYLOAD-заголовок(6)+POISON(12)+FAKE(14)+ORDER(5)+
+           PACE(8) = 71, округлено вверх. Статический, а не на стеке: четыре
+           килобайта в кадре опросника — лишняя нагрузка на стек потока. */
+        static uint8_t planbuf[2 * D2K_COMPOSE_HELLO_MAX + 256];
         size_t plan_len = 0;
-        int built = d2k_props_question_plan(i, control, planbuf, sizeof planbuf, &plan_len);
+        int built = d2k_props_question_plan(i, control, trigger.len,
+                                            planbuf, sizeof planbuf, &plan_len);
         if (built != 0) {
             step_rc(steps, i, D2K_STEP_NOT_ASKED, NULL);
             continue; /* этот вопрос сегодня не собрать — не измерено, дальше */
@@ -1017,15 +1069,6 @@ int checksum_plan_text(char *buf, size_t cap) {
     return badsum_fake_plan_text(filler, sizeof filler, 1, 0, buf, cap);
 }
 
-/* Верхняя граница декой-приветствия. До задачи 5 здесь всегда стоял
- * LEGACY (210 байт «в живую», core/profiles/legacy.hex, замер) — потолок был
- * 600. Задача 5 (шаг 0б) снимает это ограничение: профиль теперь выбирается
- * ПО ВИДУ СНЯТОГО ПРИВЕТСТВИЯ ЦЕЛИ (см. build_decoy_hello), и MODERN весит
- * 1530 байт (замер: wc -c profiles/modern.hex после вырезания комментариев /
- * 2). Запас — 1530 + 253 (максимальная длина имени по RFC 1035, на случай
- * decoy длиннее метки __SNI__, которую он заменяет) = 1783, округлено вверх
- * до 1800. */
-#define D2K_COMPOSE_HELLO_MAX 1800
 
 /* Собирает приманку-приветствие для decoy ТЕМ ЖЕ путём, что и остальное
  * ядро — d2k_hello_from_profile (hello.c, задача 1), а не самодельными

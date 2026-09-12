@@ -956,13 +956,17 @@ static void task_reset(task *t) {
 /* Отправляет план следующего задаваемого вопроса. 0 — отправлен (ждём ack),
    -1 — вопросов больше нет. */
 static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
-    static uint8_t planbuf[2200];
+    /* Тело фальшивки — двойная длина правды (build_fake_body в compose.c), а
+       правда бывает размером с приветствие браузера. Потолок тот же, что у
+       опросника из командной строки. */
+    static uint8_t planbuf[2 * 1800 + 256];
     static char hex[2 * sizeof planbuf + 1];
     d2k_hello ctl; ctl.bytes = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
     while (++t->prop_q < D2K_PROPS_QUESTIONS) {
         size_t plan_len = 0;
-        if (d2k_props_question_plan(t->prop_q, ctl, planbuf, sizeof planbuf, &plan_len) != 0) {
+        if (d2k_props_question_plan(t->prop_q, ctl, t->trig_len,
+                                    planbuf, sizeof planbuf, &plan_len) != 0) {
             continue; /* этот вопрос сегодня не собрать — не измерено, а не «нет» */
         }
         /* Удостоверяем план вопроса — тем же способом, что и кандидата
