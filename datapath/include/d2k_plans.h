@@ -106,6 +106,13 @@ void         d2k_plantab_free(d2k_plantab *t);
 #define D2K_PLAN_SHAPE_ANY    0
 #define D2K_PLAN_SHAPE_MODERN 1
 #define D2K_PLAN_SHAPE_LEGACY 2
+/* Приветствие QUIC. Своё значение, а не ANY: план, подтверждённый собственным
+ * зондом на TLS поверх TCP, к Initial того же имени отношения не имеет —
+ * другой транспорт, другое приветствие, другая коробка на пути. До 12.09.2026
+ * путь QUIC звал поиск с ANY, и такой план ему выдавался (0009, U5). В
+ * нумерации продолжает d2k_shape контроллера, у которого QUIC-формы нет: там
+ * это значение не встречается и встречаться не может. */
+#define D2K_PLAN_SHAPE_QUIC   3
 
 int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
                          uint64_t now_ns, d2k_plan *p);

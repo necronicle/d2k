@@ -17,6 +17,10 @@
 #define TLS_HANDSHAKE 0x16
 #define HS_CLIENT_HELLO 0x01
 #define HS_SERVER_HELLO 0x02
+/* Минимальное тело ServerHello (RFC 8446 §4.1.3): legacy_version 2 +
+ * random 32 + длина legacy_session_id_echo 1 + cipher_suite 2 +
+ * legacy_compression_method 1. Пустой сессии соответствует ровно 38. */
+#define SERVER_HELLO_MIN_BODY 38
 #define EXT_SERVER_NAME 0x0000
 #define EXT_SUPPORTED_VERSIONS 0x002b
 #define TLS13_VERSION   0x0304
@@ -203,13 +207,30 @@ int d2k_tls_parse(const uint8_t *b, size_t len, d2k_tls_info *out) {
         return 0;
     }
     if (b[off] == HS_SERVER_HELLO) {
-        /* Ответ сервера. Дальше не разбираем: якоря считаются по НАШЕМУ
+        /* ОТВЕТ СЕРВЕРА. Дальше не разбираем: якоря считаются по НАШЕМУ
            приветствию, а обратному направлению от этого модуля нужен ровно
-           один факт — сервер поздоровался. Длину рукопожатия при этом всё же
-           сверяем с обещанием записи: запись, спорящая сама с собой, права
-           называться ServerHello не имеет. */
+           один факт — сервер поздоровался.
+ 
+           ЧТО ЭТО ЗА УРОВЕНЬ СВИДЕТЕЛЬСТВА, честно. Тело ServerHello здесь не
+           читается ни на байт: проверяются заголовок записи, тип сообщения и
+           согласованность ДВУХ ОБЪЯВЛЕННЫХ длин. Это признак сообщения, а не
+           разбор полного валидного ServerHello, и выдавать его за второе
+           нельзя.
+
+           Донорская приёмка (acceptServerHello, z2k-detect/internal/classify/
+           trigger.go:67-70) слабее: ей хватает шести байт и тела она тоже не
+           смотрит. Наши три условия сверх неё — пришедший заголовок
+           рукопожатия, обещанное под него место и отсутствие самопротиворечия
+           записи — сужают приём, а не расширяют.
+
+           Нижняя граница длины не выдумана: ServerHello по RFC 8446 §4.1.3
+           несёт legacy_version 2 + random 32 + legacy_session_id_echo (1 байт
+           длины) + cipher_suite 2 + legacy_compression_method 1, то есть не
+           меньше 38 байт тела. Рукопожатие нулевой или явно недостаточной
+           длины ServerHello'ом быть не может, и признавать его ответом
+           сервера — обманывать приёмку вопроса. */
         size_t sh_len = (size_t)b[off + 1] << 16 | (size_t)b[off + 2] << 8 | b[off + 3];
-        if (off + HS_HDR + sh_len <= claimed) {
+        if (sh_len >= SERVER_HELLO_MIN_BODY && off + HS_HDR + sh_len <= claimed) {
             out->is_server_hello = 1;
         }
         return 0;

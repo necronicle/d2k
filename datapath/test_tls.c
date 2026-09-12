@@ -279,12 +279,13 @@ int main(void) {
     {
         d2k_tls_info si;
 
-        /* Годный: запись рукопожатия, тело 40 байт, рукопожатие 0x02 длиной
-           36 — укладывается в обещание записи. */
-        uint8_t ok[45];
+        /* Годный: запись рукопожатия, тело 42 байта, рукопожатие 0x02 длиной
+           38 — минимально возможное тело ServerHello (RFC 8446 §4.1.3) и
+           укладывается в обещание записи. */
+        uint8_t ok[47];
         memset(ok, 0, sizeof ok);
-        ok[0] = 0x16; ok[1] = 0x03; ok[2] = 0x03; ok[3] = 0x00; ok[4] = 0x28;
-        ok[5] = 0x02; ok[6] = 0x00; ok[7] = 0x00; ok[8] = 0x24;
+        ok[0] = 0x16; ok[1] = 0x03; ok[2] = 0x03; ok[3] = 0x00; ok[4] = 0x2A;
+        ok[5] = 0x02; ok[6] = 0x00; ok[7] = 0x00; ok[8] = 0x26;
         CHECK(d2k_tls_parse(ok, sizeof ok, &si) == 0 && si.is_server_hello,
               "годный ServerHello не признан ответом сервера");
         CHECK(!si.is_client_hello, "ServerHello принят за ClientHello");
@@ -306,13 +307,29 @@ int main(void) {
            разойдутся в том, где кончается запись. */
         uint8_t bad[45];
         memcpy(bad, ok, sizeof bad);
-        bad[6] = 0x00; bad[7] = 0x01; bad[8] = 0x00;  /* 256 > 40 - 4 */
+        bad[6] = 0x00; bad[7] = 0x01; bad[8] = 0x00;  /* 256 > 42 - 4 */
         CHECK(d2k_tls_parse(bad, sizeof bad, &si) == 0 && !si.is_server_hello,
               "ServerHello длиннее своей записи признан годным");
 
         /* Обрывок: пришли только первые пять байт. */
         CHECK(d2k_tls_parse(ok, 5, &si) == 0 && !si.is_server_hello,
               "оборванная запись признана ответом сервера");
+
+        /* Рукопожатие НУЛЕВОЙ длины: тип тот, разметка непротиворечива, а
+           ServerHello'ом это быть не может — по RFC 8446 §4.1.3 его тело не
+           короче 38 байт. Раньше такой вход приёмку проходил. */
+        uint8_t empty[9] = { 0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00 };
+        CHECK(d2k_tls_parse(empty, sizeof empty, &si) == 0 && !si.is_server_hello,
+              "рукопожатие нулевой длины признано ответом сервера");
+
+        /* Тело есть, но короче минимального: 20 байт вместо 38. */
+        uint8_t shortbody[29];
+        memset(shortbody, 0, sizeof shortbody);
+        shortbody[0] = 0x16; shortbody[1] = 0x03; shortbody[2] = 0x03;
+        shortbody[3] = 0x00; shortbody[4] = 0x18;   /* запись 24 байта */
+        shortbody[5] = 0x02; shortbody[6] = 0x00; shortbody[7] = 0x00; shortbody[8] = 0x14;
+        CHECK(d2k_tls_parse(shortbody, sizeof shortbody, &si) == 0 && !si.is_server_hello,
+              "ServerHello короче минимально возможного признан годным");
     }
 
     if (fails) {

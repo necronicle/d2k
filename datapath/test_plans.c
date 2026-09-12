@@ -222,11 +222,19 @@ int main(void) {
         CHECK(d2k_plantab_find(t, nm, nl, 0, 4, D2K_PLAN_SHAPE_ANY) != NULL,
               "неразобранному приветствию план не отдан — выдумали форму вместо «не измерено»");
 
+        /* QUIC — ОТДЕЛЬНАЯ форма, и план, подтверждённый на TLS, ему не
+           достаётся: другой транспорт, другое приветствие, и переносить туда
+           подтверждение нечем (0009, U5). До правки путь QUIC звал поиск с
+           ANY и такой план получал. */
+        CHECK(d2k_plantab_find(t, nm, nl, 0, 8, D2K_PLAN_SHAPE_QUIC) == NULL,
+              "план, подтверждённый на TLS, выдан приветствию QUIC");
+
         /* Старая запись (форма не объявлена) остаётся совместимой с любой. */
         CHECK(d2k_plantab_set_name(t, nm, nl, 5, mkplan()) == 0,
               "план без объявленной формы не поставился");
         CHECK(d2k_plantab_find(t, nm, nl, 0, 6, D2K_PLAN_SHAPE_MODERN) != NULL &&
-              d2k_plantab_find(t, nm, nl, 0, 7, D2K_PLAN_SHAPE_LEGACY) != NULL,
+              d2k_plantab_find(t, nm, nl, 0, 7, D2K_PLAN_SHAPE_LEGACY) != NULL &&
+              d2k_plantab_find(t, nm, nl, 0, 8, D2K_PLAN_SHAPE_QUIC) != NULL,
               "старый каталог перестал применяться — «не записано» принято за «не подходит»");
         d2k_plantab_free(t);
     }
