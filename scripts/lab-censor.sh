@@ -61,6 +61,7 @@ dump() {
 }
 
 NAME=zablokirovano.example
+NAME2=vtoraya-zablokirovannaya.example
 PORT=4443
 QUEUE=2001
 MARK=0x2d
@@ -235,6 +236,11 @@ else
     # недоступности контролем по другому имени.
     iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
         -m string --string "$NAME" --algo bm -j DROP
+    # ВТОРАЯ ЦЕЛЬ, той же коробкой. Нужна для второго критерия MVP: ранее
+    # неизвестная цель обязана получить пробу готового плана ДО новых
+    # вопросов. Без второй цели это утверждение проверить нечем.
+    iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
+        -m string --string "$NAME2" --algo bm -j DROP
 fi
 
 echo "== цензор работает? =="
@@ -281,6 +287,33 @@ while [ $i -lt 60 ]; do
     i=$((i+1)); sleep 2
 done
 
+# ВТОРАЯ ЦЕЛЬ — уже после того, как коробка узнана по первой.
+if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
+    echo "== вторая цель: обращение к ещё неизвестному имени =="
+    for n in 1 2 3; do
+        timeout 8 openssl s_client -connect "127.0.0.1:$PORT" -servername "$NAME2" \
+            -tls1_3 </dev/null >/dev/null 2>&1 || true
+        sleep 2
+    done
+    i=0
+    while [ $i -lt 40 ]; do
+        grep -q "готовых планов" /tmp/d2kc.log 2>/dev/null && break
+        i=$((i+1)); sleep 2
+    done
+fi
+
+# КРИТЕРИЙ 4 — ДО остановки служб и сервера. Проверять «работает ли
+# контрольная цель» после того, как сервер убит, значит проверять не то:
+# первая редакция ровно так и проваливалась.
+#
+# Обход, который чинит одно и ломает другое, продуктом не является. Здесь это
+# не абстракция: датапат стоит в разрыве ВСЕГО трафика на этот порт, включая
+# тот, к которому плана нет.
+if ! control_passes; then
+    fail "контрольная цель перестала работать при живом обходе"
+fi
+echo "критерий 4 показан: контрольная цель работает при живом обходе"
+
 kill "$CPID" 2>/dev/null || true; wait "$CPID" 2>/dev/null || true
 kill "$DPID" 2>/dev/null || true; wait "$DPID" 2>/dev/null || true
 kill "$SRV" 2>/dev/null || true
@@ -298,6 +331,47 @@ if [ ! -s "$CAT" ]; then
     fail "каталог пуст: автономного обхода не найдено"
 fi
 grep -q '"bindings"' "$CAT" || fail "в каталоге нет привязок"
+
+# ВТОРОЙ КРИТЕРИЙ: готовый план узнанной коробки пробуется ДО новых вопросов.
+# Проверяем не «в каталоге стало две привязки» — это был бы результат любого
+# порядка, — а ИМЕННО ПОРЯДОК: сообщение о готовых планах обязано появиться
+# раньше первого вопроса по второй цели.
+if [ "${D2K_LAB_NOCENSOR:-0}" != "1" ]; then
+    if ! grep -q "готовых планов" /tmp/d2kc.log; then
+        echo "ВНИМАНИЕ: вторая цель не получила пробы готового плана — критерий 3 НЕ показан"
+    else
+        ready_at=$(grep -n "готовых планов" /tmp/d2kc.log | head -1 | cut -d: -f1)
+        ask_at=$(grep -n "$NAME2.*спрашиваю коробку" /tmp/d2kc.log | head -1 | cut -d: -f1)
+        if [ -n "$ask_at" ] && [ "$ready_at" -gt "$ask_at" ]; then
+            fail "вторая цель пошла в вопросы РАНЬШЕ пробы готового плана — порядок обучения нарушен"
+        fi
+        echo "критерий 3 показан: готовый план коробки пробуется до новых вопросов"
+    fi
+fi
+
+# КРИТЕРИЙ 5: перезапуск сохраняет знание и НЕ расширяет его область.
+# Считаем привязки до и после: их число обязано совпасть. Рост означал бы, что
+# перезапуск сам себе что-то дописал; падение — что знание потеряно.
+binds_before=$(grep -c '"target"' "$CAT")
+cp "$CAT" /tmp/lab-catalog-before.json
+/tmp/d2kd --mode apply --control "$SOCK" --queue "$QUEUE" --mark 45 \
+    --journal 100 --duration 20 > /tmp/d2kd2.log 2>&1 &
+DPID2=$!
+i=0; while [ ! -S "$SOCK" ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
+./core/d2kc --control "$SOCK" --catalog "$CAT" > /tmp/d2kc2.log 2>&1 &
+CPID2=$!
+sleep 8
+kill "$CPID2" 2>/dev/null || true; wait "$CPID2" 2>/dev/null || true
+kill "$DPID2" 2>/dev/null || true; wait "$DPID2" 2>/dev/null || true
+
+binds_after=$(grep -c '"target"' "$CAT")
+echo "привязок до перезапуска $binds_before, после $binds_after"
+[ "$binds_after" -ge "$binds_before" ] || fail "перезапуск ПОТЕРЯЛ подтверждённое знание"
+[ "$binds_after" -le "$binds_before" ] || fail "перезапуск САМ дописал привязки — знание расширено без замера"
+grep -q "поставлено планов по подтверждённым привязкам" /tmp/d2kc2.log || \
+    fail "после перезапуска планы каталога не поставлены датапату"
+echo "критерий 5 показан: перезапуск сохранил знание и не расширил его"
+
 echo "ВСЁ ЗЕЛЕНО: обход найден автономно, привязка записана в каталог"
 DRIVER
 
