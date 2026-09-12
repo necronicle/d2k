@@ -100,6 +100,11 @@ void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution);
  * Возвращает 1, если оригинал ещё наш и обязан уйти нетронутым; 0 — чистого
  * выхода нет и поток объявлен испорченным. Подробности и обоснование — у
  * определения (session.c). */
+/* Биты защиты, действующие на потоке (D2K_GUARD_* из d2k_plan.h), либо 0.
+ * Наружу нужен ровно для проверок: защита — часть плана, и снимается вместе
+ * с ним, когда поток объявлен испорченным. */
+uint8_t d2k_session_guards(const d2k_session *s, const d2k_key *k);
+
 int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                             const uint8_t *plan_id, uint8_t code,
                             uint64_t execution, int payload_on_wire, int orig_spent);

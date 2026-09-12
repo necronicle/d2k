@@ -912,6 +912,17 @@ static int is_hex_digit(char c) {
  * поэтому переписывание идёт прямо в буфере, а остальной текст не двигается и
  * не перестраивается. Второго сборщика текста плана здесь не заводится (§2.5):
  * правится ровно одно поле уже собранного. */
+/* Форма приветствия, которым пойдёт наш зонд. Снимок в датапате — нагрузка
+   одного пакета, и у браузерного приветствия форма по нему может не
+   разобраться вовсе. Ограничивать нечем — объявляем дедушкино право: иначе
+   план-кандидат не применится ни к чему, включая собственный зонд. План при
+   этом временный и снимается по итогам испытания. */
+static uint8_t probe_shape(const task *t) {
+    d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
+    return (sh == D2K_SHAPE_UNKNOWN) ? (uint8_t)D2K_LINK_SHAPE_GRANDFATHER
+                                     : (uint8_t)sh;
+}
+
 static int stamp_plan_id(char *text, const uint8_t id[D2K_PLAN_ID_LEN]) {
     static const char digits[] = "0123456789abcdef";
     char *p = text;
@@ -1016,7 +1027,7 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         char err[160];
         /* Форма приветствия вопроса — та же, что у снятого триггера. */
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
-                              (uint8_t)d2k_hello_shape(t->trig, t->trig_len),
+                              probe_shape(t),
                               err, sizeof err) != 0) {
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
@@ -1277,7 +1288,7 @@ static int install_next(d2k_sched *s, task *t) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
         if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
-                              (uint8_t)d2k_hello_shape(t->trig, t->trig_len),
+                              probe_shape(t),
                               err, sizeof err) == 0) {
             t->trial_installed = 1;
             return 0;
@@ -1695,8 +1706,14 @@ int d2k_sched_sync_step(d2k_sched *s) {
                подтверждён на той форме, и применять его к другой нельзя.
                Ноль в старой записи означает «не записано» и остаётся
                совместимым с любой формой (0009, U5). */
+            /* Формы в записи нет — это ВЕСЬ каталог, заведённый до появления
+               поля. Шлём явное дедушкино право, а не ноль: ноль означает
+               «сказать нечего», совместимости не даёт, и такой план молча
+               перестал бы применяться у человека (0009, U5-R3). */
+            uint8_t wire_shape = bd->shape ? (uint8_t)bd->shape
+                                           : (uint8_t)D2K_LINK_SHAPE_GRANDFATHER;
             rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex,
-                                   (uint8_t)bd->shape, err, sizeof err);
+                                   wire_shape, err, sizeof err);
         }
         if (rc != 0) {
             say(s, "каталог: план для %s не отправился: %s", bd->target, err);

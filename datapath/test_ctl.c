@@ -97,7 +97,7 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
 /* Тело команды SET_NAME: [длина имени u8][имя][план TLV]. */
 /* Тело SET_NAME: [длина имени][имя][ФОРМА][план]. Форма байтом перед планом
    — длина плана в теле не объявлена, и поле после него было бы съедено как
-   его часть (см. d2k_link.h). D2K_PLAN_SHAPE_ANY здесь потому, что эти
+   его часть (см. d2k_link.h). Дедушкино право здесь потому, что эти
    проверки про разбор команды, а не про ограничение по форме: оно проверяется
    отдельно, ниже. */
 static size_t set_name_body_shaped(uint8_t *body, const char *name,
@@ -113,7 +113,7 @@ static size_t set_name_body_shaped(uint8_t *body, const char *name,
 
 static size_t set_name_body(uint8_t *body, const char *name,
                             const uint8_t *plan, size_t planlen) {
-    return set_name_body_shaped(body, name, plan, planlen, D2K_PLAN_SHAPE_ANY);
+    return set_name_body_shaped(body, name, plan, planlen, D2K_PLAN_SHAPE_GRANDFATHER);
 }
 
 /* Минимальный годный план: только порядок. Общий для обоих блоков разбора
@@ -455,7 +455,7 @@ int main(void) {
         {
             uint8_t body[32], f[48];
             body[0] = 0;
-            body[1] = D2K_PLAN_SHAPE_ANY;
+            body[1] = D2K_PLAN_SHAPE_GRANDFATHER;
             memcpy(body + 2, tiny, sizeof tiny);
             size_t blen = 2 + sizeof tiny;
             frame(f, D2K_CMD_SET_NAME, body, blen);

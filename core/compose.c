@@ -779,7 +779,15 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         /* Форма ПРИВЕТСТВИЯ ВОПРОСА: зонд пойдёт к цели ровно этим триггером,
            и план-вопрос не должен примениться к чужому обращению другой
            формы, случившемуся в то же время (0009, U5). */
-        uint8_t qshape = (uint8_t)d2k_hello_shape(trigger.bytes, trigger.len);
+        /* Форма приветствия ВОПРОСА. Считается по ПОЛНЫМ байтам триггера,
+           которые мы сами сейчас и пошлём, поэтому обрыва здесь быть не
+           может. Если форма всё же не разобралась, ограничивать нечем:
+           объявляем дедушкино право — плану-вопросу иначе не примениться
+           вовсе, а живёт он до конца опроса и снимается сразу после. */
+        d2k_shape qsh = d2k_hello_shape(trigger.bytes, trigger.len);
+        uint8_t qshape = (qsh == D2K_SHAPE_UNKNOWN)
+                             ? (uint8_t)D2K_LINK_SHAPE_GRANDFATHER
+                             : (uint8_t)qsh;
         if (d2k_link_set_name(link_fd, name, 6, hexbuf, qshape, err, sizeof err) != 0) {
             step_rc(steps, i, D2K_STEP_SEND_FAIL, err);
             continue; /* план не отправился вовсе — не измерено */

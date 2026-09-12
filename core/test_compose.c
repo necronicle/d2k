@@ -1411,7 +1411,7 @@ int main(void) {
         }
         hex[2 * plen] = '\0';
 
-        CHECK(d2k_link_set_name(fd, name, 6, hex, D2K_PLAN_SHAPE_ANY, err, sizeof err) == 0,
+        CHECK(d2k_link_set_name(fd, name, 6, hex, D2K_LINK_SHAPE_GRANDFATHER, err, sizeof err) == 0,
               "b5: SET_NAME по имени из триггера не отправился");
         drain_all(fd);
         (void)probe_say(&p, "hello b5.example");

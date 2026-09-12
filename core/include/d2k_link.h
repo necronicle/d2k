@@ -214,6 +214,13 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * что осталось», и поле после него было бы съедено как его часть. Формат
  * тела сменился — d2kd и d2kc обязаны обновляться согласованно, как и с
  * кодом APPLIED (см. d2k_ctl.h). */
+/* Дедушкино право на проводе — то же число, что D2K_PLAN_SHAPE_GRANDFATHER в
+ * datapath/d2k_plans.h. Объявлено здесь своим именем, потому что контроллер
+ * не включает заголовки таблицы планов датапата: у обеих сторон одно значение
+ * и один смысл, а зависимости лишней не заводится. Расхождение поймает тест
+ * управляющего протокола. */
+#define D2K_LINK_SHAPE_GRANDFATHER 4
+
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
                        const char *plan_text, uint8_t shape,
                        char *err, size_t errcap);

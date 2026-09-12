@@ -1000,13 +1000,15 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         /* ФОРМА НАБЛЮДАЕМОГО ПРИВЕТСТВИЯ. План, подтверждённый на приветствии
            одной формы, не применяется к приветствию другой: успех
            собственного зонда на TLS 1.3 ничего не говорит про браузер с
-           TLS 1.2 (0009, U5). Обрывок, в котором расширения ещё не пришли,
-           даёт LEGACY по отсутствию признака — но это НЕ «не измерено»: у
-           такого приветствия supported_versions просто нет в пришедших
-           байтах, и объявлять его формой мы права не имеем. Поэтому
-           неразобранное приветствие идёт как ANY. */
+           TLS 1.2 (0009, U5).
+
+           ОБОРВАННЫЙ БЛОК РАСШИРЕНИЙ ФОРМЫ НЕ ДАЁТ. Первая редакция писала
+           здесь LEGACY по отсутствию признака — то есть выдумывала замер:
+           у браузера supported_versions приезжает вторым сегментом вслед за
+           server_name из первого, пересборки у нас нет, и такое приветствие
+           получало уверенную и неверную форму. Не разобрали — ANY. */
         uint8_t seen_shape = D2K_PLAN_SHAPE_ANY;
-        if (tls.is_client_hello && tls.have_sni) {
+        if (tls.is_client_hello && tls.have_sni && !tls.exts_truncated) {
             seen_shape = tls.is_tls13 ? D2K_PLAN_SHAPE_MODERN : D2K_PLAN_SHAPE_LEGACY;
         }
         use = d2k_plantab_find(s->plans,
@@ -1376,6 +1378,15 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     }
     if (payload_on_wire || (orig_spent && fl->orig_taken)) {
         fl->damaged = 1;
+        /* ЗАЩИТЫ СНИМАЮТСЯ ВМЕСТЕ С ПЛАНОМ.
+           Защита RST_ALIEN держит соединение живым, снимая подделанный сброс.
+           На ЦЕЛОМ потоке это помощь: настоящий сервер продолжает отвечать.
+           На испорченном — вред: поток уже не восстановится (байты либо ушли
+           дважды, либо потерялись), и удерживать его живым значит заставлять
+           человека ждать таймаута вместо быстрой переустановки соединения
+           клиентом. Защита была частью плана; плана на этом потоке больше
+           нет — нет и защиты. */
+        fl->guards = 0;
         /* СООБЩАЕМ В МОМЕНТ УСТАНОВЛЕНИЯ, а не при следующем пакете:
            испорченный поток вполне может замолчать, и тогда факта не будет
            вовсе. Один раз на попытку — события лосси по контракту. */
@@ -1388,6 +1399,12 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
         return 0;
     }
     return 1;
+}
+
+uint8_t d2k_session_guards(const d2k_session *s, const d2k_key *k) {
+    if (!s || !k) { return 0; }
+    d2k_flow *fl = d2k_track_find(table_of((d2k_session *)s, k), k);
+    return fl ? fl->guards : 0;
 }
 
 void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution) {

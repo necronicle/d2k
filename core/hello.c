@@ -107,6 +107,12 @@ typedef struct {
     int    have_exts;
     size_t exts_len_off; /* смещение 2-байтной длины блока расширений */
 
+    /* Блок расширений ОБОРВАН: объявленная длина не поместилась в пришедшие
+       байты. Тот же признак, что exts_truncated в datapath/d2k_tls.h, и та же
+       цена ошибки: supported_versions у браузера приезжает вторым сегментом
+       вслед за server_name из первого, и «признака не нашли» тогда значит
+       «ещё не всё пришло». */
+    int exts_truncated;
     int have_tls13; /* нашли supported_versions (0x002b), и среди
                         перечисленных в нём версий есть 0x0304 */
 
@@ -194,6 +200,7 @@ static void parse_hello(const uint8_t *b, size_t n, hello_layout *L) {
     size_t exts_end = off + exts_len;
     if (exts_end > hs_end) {
         exts_end = hs_end; /* влезает в запись, не в пришедшее */
+        L->exts_truncated = 1;
     }
 
     /* Отличие от find_sni в tls.c: цикл не возвращается на первом же
@@ -266,6 +273,19 @@ d2k_shape d2k_hello_shape(const uint8_t *b, size_t n) {
     hello_layout L;
     parse_hello(b, n, &L);
     if (!L.parsed) {
+        return D2K_SHAPE_UNKNOWN;
+    }
+    if (L.exts_truncated && !L.have_tls13) {
+        /* ФОРМУ НА ОБОРВАННОМ БЛОКЕ НЕ ОБЪЯВЛЯЕМ. Признака нет — но пришло
+           не всё, и supported_versions вполне может лежать в следующем
+           сегменте. Снимок в датапате это нагрузка ОДНОГО пакета, то есть
+           ровно первый сегмент, а пересборки потока у нас нет по проекту.
+           Уверенный LEGACY здесь был бы выдуманным замером: он уезжает в
+           каталог и в ограничение применения плана (§2.4, и прямая оговорка
+           «UNKNOWN ≠ LEGACY» в d2k_hello.h).
+
+           Найденный признак при обрыве, наоборот, достоверен: расширение
+           прочитано целиком, дальше искать нечего. */
         return D2K_SHAPE_UNKNOWN;
     }
     return L.have_tls13 ? D2K_SHAPE_MODERN : D2K_SHAPE_LEGACY;
