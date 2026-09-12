@@ -67,6 +67,25 @@ static int fails;
 /* Доводит рукопожатие и отвечает внутри сессии настоящим ответом HTTP. */
 #define ROLE_APP    2
 
+static const struct {
+    const char *text;
+    int status;
+    size_t split;
+} replies[] = {
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 200, 10},
+    {"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", 200, 0},
+    {"HTTP/1.1 103 Early Hints\r\n\r\n", 0, 0},
+    {"HTTP/1.1 200", 0, 0},
+    {"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n", 0, 0},
+    {"HTTP/1.1 2000 OK\r\n\r\n", 0, 0},
+    {"HTTP/1.1 200x OK\r\n\r\n", 0, 0},
+    {"HTTP/1.12 200 OK\r\n\r\n", 0, 0},
+    {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0},
+    {"HTTP/1.0 403 Forbidden\r\n\r\n", 403, 0},
+    {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0},
+};
+
 struct stand {
     int       fd;        /* слушающий сокет */
     uint16_t  port;
@@ -133,7 +152,7 @@ static int rec_read(int fd, struct dir *d, int enc, uint8_t *type,
     if (rd_exact(fd, hdr, 5) != 0) { return -1; }
     size_t rlen = get16(hdr + 3);
     if (rlen == 0 || rlen > REC_MAX) { return -1; }
-    static uint8_t raw[REC_MAX];
+    uint8_t raw[REC_MAX];
     if (rd_exact(fd, raw, rlen) != 0) { return -1; }
 
     if (hdr[0] == REC_CCS) {
@@ -164,7 +183,7 @@ static int rec_read(int fd, struct dir *d, int enc, uint8_t *type,
 static int rec_write(int fd, struct dir *d, uint8_t type,
                      const uint8_t *data, size_t n) {
     if (n + 1 + 16 > REC_MAX) { return -1; }
-    static uint8_t out[REC_MAX + 5];
+    uint8_t out[REC_MAX + 5];
     uint8_t inner[REC_MAX];
     memcpy(inner, data, n);
     inner[n] = type;
@@ -254,7 +273,7 @@ static int parse_client_hello(const uint8_t *ch, size_t len,
    его не проверяет и не будет (шапка d2k_tls13.h называет это прямо), а
    лишний сертификат означал бы держать в тесте ещё и X.509. */
 static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
-    static uint8_t tr[REC_MAX * 2];
+    uint8_t tr[REC_MAX * 2];
     size_t tr_len = 0;
 
     uint8_t ch[REC_MAX];
@@ -418,10 +437,12 @@ static void *stand_run(void *arg) {
         return NULL;
     }
 
-    if (s->role == ROLE_APP) {
-        static const char ok[] =
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-        (void)rec_write(c, &wr, REC_APPDATA, (const uint8_t *)ok, sizeof ok - 1);
+    if (s->role >= ROLE_APP) {
+        size_t i = (size_t)(s->role - ROLE_APP);
+        const uint8_t *p = (const uint8_t *)replies[i].text;
+        size_t n = strlen(replies[i].text), split = replies[i].split;
+        if (split) { (void)rec_write(c, &wr, REC_APPDATA, p, split); }
+        (void)rec_write(c, &wr, REC_APPDATA, p + split, n - split);
     }
     /* ROLE_SILENT: запрос прочитан, ответа нет. Сокет держим открытым до
        ухода зонда — молчание обязано наблюдаться как молчание, а не как
@@ -453,6 +474,14 @@ static uint16_t stand_start(struct stand *s, int role) {
 static void stand_stop(struct stand *s) {
     pthread_join(s->th, NULL);
     close(s->fd);
+}
+
+struct probe_job { uint16_t port; d2k_ver_result result; };
+static void *parallel_probe(void *arg) {
+    struct probe_job *j = arg;
+    j->result = d2k_verify_probe("127.0.0.1", j->port, "parallel.example", 3000);
+    d2k_verify_close(&j->result);
+    return NULL;
 }
 
 /* --- проверка «обращение непомеченное» ----------------------------------- */
@@ -563,6 +592,44 @@ int main(void) {
         CHECK(r.fd >= 0, "сокет закрыт до явного d2k_verify_close");
         d2k_verify_close(&r);
         stand_stop(&s);
+    }
+
+    /* Ни обрыв строки, ни промежуточный 1xx не заменяют окончательный ответ.
+       Валидный ответ, разделённый между TLS-записями, не теряется. */
+    for (size_t i = 1; i < sizeof replies / sizeof replies[0]; i++) {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_APP + (int)i);
+        CHECK(port != 0, "HTTP-стенд не поднялся");
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 600);
+        CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
+        CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
+              "фрагмент или промежуточный ответ засчитан как окончательный HTTP");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+    }
+    {
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", 1, "a\r\nInjected: yes", 100);
+        CHECK(r.level == D2K_VER_NOT_MEASURED && r.fd < 0,
+              "управляющие символы имени дошли до сети");
+    }
+    /* Общие static-буферы TLS портили транскрипт/записи соседнего зонда. */
+    for (int round = 0; round < 3; round++) {
+        struct stand stands[4];
+        struct probe_job jobs[4];
+        pthread_t threads[4];
+        int started[4];
+        for (int i = 0; i < 4; i++) {
+            jobs[i].port = stand_start(&stands[i], ROLE_APP);
+            CHECK(jobs[i].port != 0, "параллельный стенд не поднялся");
+            started[i] = pthread_create(&threads[i], NULL, parallel_probe, &jobs[i]) == 0;
+            CHECK(started[i], "поток зонда не создан");
+        }
+        for (int i = 0; i < 4; i++) {
+            if (!started[i]) { continue; }
+            pthread_join(threads[i], NULL);
+            CHECK(jobs[i].result.status == 200, "параллельные TLS-сессии мешают друг другу");
+            stand_stop(&stands[i]);
+        }
     }
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }

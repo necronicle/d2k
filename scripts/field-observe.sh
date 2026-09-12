@@ -82,6 +82,7 @@ LOCAL_LOG="$REPO/docs/field/raw/observe-$STAMP.log"
 # команда получает «Permission denied» на верном пароле.
 MUX="-o ControlMaster=auto -o ControlPath=$SCRATCH/m -o ControlPersist=180"
 BORROWED_SSH=0
+say() { printf '%s\n' "$*" >&2; }
 if [ -n "${D2K_SSH_CONTROL:-}" ]; then
     case "$D2K_SSH_CONTROL" in
         *[!a-zA-Z0-9_./-]*) say "недопустимый путь SSH control socket"; exit 2 ;;
@@ -102,8 +103,6 @@ else
     SSH_IN="ssh $MUX -p $SSH_PORT root@$ROUTER"
 fi
 
-say() { printf '%s\n' "$*" >&2; }
-
 # Снимает ВСЕ правила с нашим жетоном и гасит службу. Идемпотентно.
 teardown() {
     # Обе цепочки: правило обратного направления живёт в FORWARD, и уборка,
@@ -114,6 +113,8 @@ teardown() {
             sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
         done
         [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
+        [ -f /tmp/d2k.$TOKEN.pid ] && kill \$(cat /tmp/d2k.$TOKEN.pid) 2>/dev/null
+        [ -f /tmp/d2kd.$TOKEN.tcpdump.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid) 2>/dev/null
         echo \"остаток правил с жетоном: \$(iptables -t mangle -S 2>/dev/null | grep -c -- '--comment $TOKEN')\"
     " >&2 || true
 }
@@ -207,28 +208,26 @@ say "== правила, жетон $TOKEN =="
 $SSH "
 set -e
 if [ $PPE = 1 ]; then
-    iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
+    iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW -m connskip --connskip 1000000 -m comment --comment $TOKEN -j PPE
 fi
 iptables -t mangle -I POSTROUTING -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 if [ $REV = 1 ]; then
     iptables -t mangle -I FORWARD -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 if [ $LEARN = 1 ]; then
-    # Зонд идёт С САМОГО РОУТЕРА, а не через него: транзитные цепочки его не
-    # видят. Исходящее локальное — OUTPUT, входящее локальное — INPUT.
-    # Без этих двух правил план к зонду не применился бы, и зонд мерил бы
-    # линию без обхода, считая, что мерит с обходом.
+    # Исходящее локальное УЖЕ проходит POSTROUTING, как и транзит.
+    # Второе NFQUEUE в OUTPUT отдало бы пакет тому же движку дважды.
+    # Только ответы зонду нуждаются в дополнительном INPUT вместо FORWARD.
     #
     # Сужение здесь ОБЯЗАТЕЛЬНО, и его отсутствие стоило прогона: 06.09.2026
     # опыт по linkedin собрал подозрения по facebook, потому что эти два
     # правила забирали ВЕСЬ 443-й порт самого роутера — а на нём живут и
     # вебпанель, и прокси, и обновления. §2.6 требует узкого опыта не ради
     # вежливости: применение плана к чужому соединению это уже не эксперимент.
-    iptables -t mangle -I OUTPUT -p tcp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
     iptables -t mangle -I INPUT -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
 for ch in POSTROUTING FORWARD OUTPUT INPUT; do
-    n=\$(iptables -t mangle -S \$ch 2>/dev/null | grep -c -- '--comment $TOKEN')
+    n=\$(iptables -t mangle -S \$ch 2>/dev/null | grep -c -- '--comment $TOKEN' || true)
     [ \"\$n\" != 0 ] && printf '%s=%s ' \"\$ch\" \"\$n\"
 done; echo
 " | sed 's/^/  правил: /' >&2
@@ -242,6 +241,8 @@ $SSH "
     sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
   done
   [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
+  [ -f /tmp/d2k.$TOKEN.pid ] && kill \$(cat /tmp/d2k.$TOKEN.pid) 2>/dev/null
+  [ -f /tmp/d2kd.$TOKEN.tcpdump.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid) 2>/dev/null
   rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid
 ) >/dev/null 2>&1 &
 echo '  сторож взведён'
@@ -336,7 +337,10 @@ teardown
 $SSH "rm -f /tmp/d2kd.$TOKEN /tmp/d2kd.$TOKEN.pid /tmp/d2kd.$TOKEN.out /tmp/d2kd.$TOKEN.plan; ls /tmp/d2kd.* 2>/dev/null || echo '  на роутере чисто'" >&2
 trap - EXIT
 # shellcheck disable=SC2086  # MUX — набор ключей, разворачивается намеренно
-ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+if [ "$BORROWED_SSH" = 0 ]; then
+    # shellcheck disable=SC2086
+    ssh -O exit $MUX -p "$SSH_PORT" "root@$ROUTER" 2>/dev/null || true
+fi
 rm -rf "$SCRATCH"
 
 say "== вывод: $LOCAL_LOG =="

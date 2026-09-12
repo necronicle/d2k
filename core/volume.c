@@ -229,7 +229,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     res.rtt_ms = (int)(now_ms() - started);
 
     const char *host = (sni && sni[0]) ? sni : ip;
-    static char pad[D2K_VOL_CHUNK + 1];
+    char pad[D2K_VOL_CHUNK + 1];
     fill_pad(pad, D2K_VOL_CHUNK);
     pad[D2K_VOL_CHUNK] = '\0';
 
@@ -237,7 +237,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     int read_timeout = READ_MAX_MS;
 
     for (int i = 0; i < D2K_VOL_STEPS; i++) {
-        static char req[D2K_VOL_CHUNK + 512];
+        char req[D2K_VOL_CHUNK + 512];
         int n;
         if (i == 0) {
             n = snprintf(req, sizeof req,
@@ -248,7 +248,12 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
                          "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
                          "Connection: keep-alive\r\nX-Pad: %s\r\n\r\n", host, pad);
         }
-        if (n <= 0) { break; }
+        if (n <= 0 || (size_t)n >= sizeof req) {
+            snprintf(res.reason, sizeof res.reason, "запрос не поместился");
+            if (tls) { d2k_tls_free(tls); }
+            close(fd);
+            return res;
+        }
 
         int sent_kb = i * D2K_VOL_CHUNK / 1024;
         int64_t req_start = now_ms();

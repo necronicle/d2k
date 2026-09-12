@@ -26,8 +26,8 @@
  * И ПОЧЕМУ НЕ ВНЕШНИЙ ТИП ЗАПИСИ 23. В TLS 1.3 им едет весь второй полёт
  * рукопожатия (RFC 8446 §5.2), то есть с провода «приложение ответило»
  * неотличимо от «коробка пропустила приветствие». Это наблюдение (§4.2,
- * уровень 2), и оно осталось наблюдением: поднять уровень уже подтверждённой
- * записи может, завести её — нет (d2k_ev_outer_appdata, d2k_link.h).
+ * уровень 2): ни завести запись, ни повысить достоверность уже записанного
+ * успеха оно не может (d2k_ev_outer_appdata, d2k_link.h).
  *
  * ПАРА (ИМЯ, ТРАНСПОРТ), А НЕ ИМЯ. Go-сторона держит задачи по имени, и это её
  * известный дефект: комментарий в controller.go (обработка EvApplied) прямо
@@ -191,8 +191,8 @@ typedef enum {
     /* Подтверждено; смотрим на ЖИВОЙ трафик. Прежде это состояние означало
        «ждём, пока пользователь откроет цель» — того ожидания больше нет
        (см. шапку файла). Теперь оно означает другое: план подтверждён и
-       стоит, а обмен по ПОСЛЕДУЮЩЕМУ живому соединению может поднять
-       уровень записи в каталоге. Завести запись он не может. */
+       стоит. Последующий TLS-ответ остаётся наблюдением, а не новым
+       прикладным подтверждением. */
     T_WATCHING,
     T_RESTING        /* неудача, цель отдыхает */
 } task_state;
@@ -238,9 +238,8 @@ typedef struct {
        событие применения отличается от применения предыдущего кандидата,
        чьё событие опоздало (install_next ниже).
 
-       ver_seen/ver_port — ПЕРВОЕ применение нашего кандидата к нашей цели,
-       замеченное пока зонд ещё в сети: ключа его потока в тот момент нет,
-       есть только чужой порт из события, и сверка отложена до возврата.
+       ver_early/ver_seen — ограниченный набор полных ключей применений,
+       замеченных пока зонд ещё в сети. Сверка отложена до его возврата.
 
        ver_ok — применение сошлось с потоком зонда. Ноль здесь означает «не
        измерено», а не «плана не было» (§2.4): событие могло потеряться
@@ -248,8 +247,10 @@ typedef struct {
     d2k_ver_result ver;
     uint8_t    ver_plan_id[D2K_PLAN_ID_LEN];
     d2k_flowkey ver_flow;
-    uint16_t   ver_port;
-    int        ver_seen;
+    /* Bounded early-event cache: IP addresses are part of the proof, not
+       just the local port. Concurrent clients may use the same port. */
+    d2k_flowkey ver_early[8];
+    size_t     ver_seen;
     int        ver_ok;
     int64_t    ver_until_ms;
     uint32_t   ver_dropped0;    /* сколько событий было потеряно, когда план встал */
@@ -541,7 +542,7 @@ static task *task_free_slot(d2k_sched *s) {
 /* Задача, которая своё уже отдала: подтверждена и только смотрит на живой
    трафик (T_WATCHING). Её место уступается новому поиску, когда свободных не
    осталось: знание такой задачи ЛЕЖИТ В КАТАЛОГЕ, и потерять от её закрытия
-   можно только возможный подъём уровня записи — а отказ новому подозрению
+   можно только последующее наблюдение — а отказ новому подозрению
    стоит целого поиска. До 12.09 этого выбора не было: подтверждённая задача
    освобождала место сразу. */
 static task *task_watching_slot(d2k_sched *s) {
@@ -804,45 +805,6 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->verified_by = verified_by;
     b->n_binds++;
     return 0;
-}
-
-/* Поднимает уровень доказательства уже записанной привязки. 0 — поднят,
- * -1 — такой привязки нет (или уровень уже не ниже).
- *
- * Только вверх и только у существующей записи: наблюдение внешнего типа 23
- * записи не заводит (задача 4), а понижать уровень нечему — отрицательное не
- * хранится вовсе (§10, §13).
- *
- * Про числа. Подтверждение зондом — это «обмен прошёл», третий уровень
- * (level_name ниже, те же слова, что у status.LevelName на Go-стороне).
- * Живое ПОСЛЕДУЮЩЕЕ соединение — пятый, «подтверждён последующими
- * соединениями», буквально по имени. Четвёртый при этом пропускается, и это
- * не описка: он называется «прикладной обмен в проверенном объёме», а объёма
- * здесь никто не мерил (проба объёма живёт отдельно, d2k_volume.h). Назвать
- * им запись значило бы сказать о ней больше, чем измерено (§2.4). */
-static int bind_raise_level(d2k_catalog *c, const char *box_id, const char *target,
-                            uint8_t transport, uint8_t shape, uint8_t verified_by,
-                            int level, int64_t at_s) {
-    for (size_t i = 0; i < c->n_boxes; i++) {
-        d2k_cat_box *b = &c->boxes[i];
-        if (box_id && box_id[0] && strcmp(b->id, box_id) != 0) { continue; }
-        for (size_t j = 0; j < b->n_binds; j++) {
-            d2k_cat_binding *bd = &b->binds[j];
-            if (bd->transport != transport || strcmp(bd->target, target) != 0) { continue; }
-            /* Форма — часть ключа и здесь: запись, добытая одним
-               приветствием, не поднимается обменом ДРУГОГО. Ноль с любой
-               стороны означает «не измерено» и не спорит ни с чем
-               (d2k_cat_shape_fits). */
-            if (!d2k_cat_shape_fits(bd->shape, shape)) { continue; }
-            if (bd->level >= level) { return -1; }
-            bd->level = level;
-            if (shape) { bd->shape = shape; }
-            if (verified_by) { bd->verified_by = verified_by; }
-            b->updated = at_s;
-            return 0;
-        }
-    }
-    return -1;
 }
 
 /* Идентификатор коробки и плана — из содержимого, а не счётчиком: тот же
@@ -1677,8 +1639,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
                          t->name, t->transport,
                          (uint8_t)SCHED_PROBE_SHAPE, D2K_VERBY_PROBE,
                          wall_s(s, now_ms), &t->fp);
-    /* Коробку запоминаем: живое соединение потом поднимет уровень ИМЕННО этой
-       записи, а не первой подходящей по имени цели. */
+    /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
     s->confirms++;
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s, приложение ответило %d "
@@ -1705,26 +1666,25 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
  *
  * Нули в событии означают «плану нечем представиться» (d2k_link.h): либо
  * датапат старый, либо в тексте плана не нашлось строки id. Сверяем с тем,
- * что записали в план САМИ (install_next), поэтому оба случая сходятся
- * естественно: нулю равен нуль, и проверка остаётся ровно настолько строгой,
- * насколько отличимы сами идентификаторы. */
+ * что записали в план САМИ (install_next). Отсутствующий идентификатор
+ * доказательством применения кандидата быть не может. */
 static int plan_id_is_ours(const task *t, const d2k_ev *ev) {
+    uint8_t present = 0;
+    for (size_t i = 0; i < D2K_PLAN_ID_LEN; i++) { present |= ev->plan_id[i]; }
+    if (!present) { return 0; } /* an absent identity never proves application */
     return memcmp(ev->plan_id, t->ver_plan_id, D2K_PLAN_ID_LEN) == 0;
 }
 
-/* Применение НАШЕГО кандидата к НАШЕЙ цели? Клиентский порт второго конца
-   отдаётся наружу: с ним сверится местный порт зонда, когда тот вернётся. */
-static int applied_of_candidate(const task *t, const d2k_ev *ev, uint16_t *cport) {
+/* Применение НАШЕГО кандидата к НАШЕЙ цели? Полный ключ сверим после зонда. */
+static int applied_of_candidate(const task *t, const d2k_ev *ev) {
     if (ev->transport != t->transport || !plan_id_is_ours(t, ev)) { return 0; }
     char ip[16];
     ip_text(ev->low_ip, ip, sizeof ip);
     if (ev->low_port == t->port && strcmp(ip, t->ip) == 0) {
-        *cport = ev->high_port;
         return 1;
     }
     ip_text(ev->high_ip, ip, sizeof ip);
     if (ev->high_port == t->port && strcmp(ip, t->ip) == 0) {
-        *cport = ev->low_port;
         return 1;
     }
     return 0;
@@ -1754,22 +1714,23 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
             return;
         }
         if (t->state == T_VERIFY) {
-            /* Зонд ещё в сети, и его местный порт знает только он сам: ключа
-               потока у нас пока нет. Поэтому запоминаем ПЕРВОЕ применение
-               нашего кандидата к нашей цели, а сверка с портом зонда
-               произойдёт, когда он вернётся.
-
-               Первое, а не последнее: зонд идёт к цели сразу за установкой
-               плана и потому почти всегда оказывается первым НОВЫМ
-               соединением к ней (план применяется на приветствии, то есть к
-               соединениям, начавшимся после установки). Если первым окажется
-               чужое — браузер в ту же секунду переоткрыл цель, — порт не
-               сойдётся и испытание не засчитается: «не измерено», а не ложный
-               успех (§2.4). */
-            uint16_t cport = 0;
-            if (t->ver_seen || !applied_of_candidate(t, ev, &cport)) { continue; }
-            t->ver_seen = 1;
-            t->ver_port = cport;
+            /* Пока зонд работает, сохраняем полные ключи нескольких событий:
+               чужое соединение может прийти первым и иметь тот же порт на
+               другом клиенте. Переполнение теряет улику, но не создаёт успех. */
+            if (!applied_of_candidate(t, ev)) { continue; }
+            int duplicate = 0;
+            for (size_t k = 0; k < t->ver_seen; k++) {
+                if (ev_matches_flow(ev, &t->ver_early[k])) { duplicate = 1; break; }
+            }
+            if (duplicate || t->ver_seen == sizeof t->ver_early / sizeof t->ver_early[0]) {
+                continue; /* saturation may lose evidence, never invent it */
+            }
+            d2k_flowkey *k = &t->ver_early[t->ver_seen++];
+            memcpy(k->a_ip, ev->low_ip, 4);
+            memcpy(k->b_ip, ev->high_ip, 4);
+            k->a_port = ev->low_port;
+            k->b_port = ev->high_port;
+            k->transport = ev->transport;
             return;
         }
         if (t->state == T_VERIFY_WAIT) {
@@ -1861,21 +1822,11 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
            вдобавок «последующим соединением» значит подтвердить себя собой. */
         return;
     }
-    /* Форма ЖИВОГО клиента — только из снятого с провода приветствия. Не
-       снято (trig держит профиль холодного старта) — «не измерено», и ноль
-       честнее заготовки: заготовка всегда MODERN и сказала бы про клиента то,
-       чего никто не мерил. */
-    uint8_t live_shape = t->trig_snapped
-                             ? (uint8_t)d2k_hello_shape(t->trig, t->trig_len)
-                             : (uint8_t)D2K_SHAPE_UNKNOWN;
-    if (bind_raise_level(s->cat, t->box_id, t->name, t->transport,
-                         live_shape, D2K_VERBY_CLIENT, 5, wall_s(s, now_ms)) == 0) {
-        say(s, "по %s (%s) последующее живое соединение дошло до обмена (%u байт) "
-               "— уровень записи поднят до 5",
-            t->name, t->transport == 17 ? "QUIC" : "TCP", (unsigned)ev->num);
-    }
-    /* Смотреть дальше не на что: выше пятого уровня ничего нет, а место под
-       новый поиск нужнее. Подтверждённый план остаётся стоять. */
+    /* Даже известная форма приветствия не раскрывает зашифрованный ответ. */
+    say(s, "по %s замечен последующий TLS-ответ (%u байт); это не доказательство "
+           "работы приложения клиента — уровень и источник подтверждения не меняются",
+        t->name, (unsigned)ev->num);
+    /* Освобождаем задачу наблюдения. Подтверждённый план остаётся стоять. */
     task_done(t);
 }
 
@@ -2077,7 +2028,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 inet_pton(AF_INET, t->ip, t->ver_flow.b_ip);
                 t->ver_flow.b_port = t->port;
                 t->ver_flow.transport = t->transport;
-                if (t->ver_seen && t->ver_port == t->ver.local_port) { t->ver_ok = 1; }
+                d2k_ev own;
+                memset(&own, 0, sizeof own);
+                memcpy(own.low_ip, t->ver_flow.a_ip, 4);
+                memcpy(own.high_ip, t->ver_flow.b_ip, 4);
+                own.low_port = t->ver_flow.a_port;
+                own.high_port = t->ver_flow.b_port;
+                own.transport = t->ver_flow.transport;
+                for (size_t k = 0; k < t->ver_seen; k++) {
+                    if (ev_matches_flow(&own, &t->ver_early[k])) { t->ver_ok = 1; break; }
+                }
                 if (t->ver_ok) {
                     verify_confirm(s, t, now_ms);
                 } else {
@@ -2115,7 +2075,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     ver_close(t);
                     t->ver_seen = 0;
                     t->ver_ok = 0;
-                    t->ver_port = 0;
                     t->probes++;
                     s->probes_used++;
                     t->state = T_VERIFY;
@@ -2164,7 +2123,6 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                откроет человек (см. шапку файла). */
             t->ver_seen = 0;
             t->ver_ok = 0;
-            t->ver_port = 0;
             ver_close(t);
             memset(&t->ver, 0, sizeof t->ver);
             t->ver.fd = -1;

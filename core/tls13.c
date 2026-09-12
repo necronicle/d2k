@@ -57,6 +57,10 @@ struct d2k_tls {
     uint8_t  c_key[16], c_iv[12];
     uint8_t  s_key[16], s_iv[12];
     uint64_t c_seq, s_seq;
+    /* Каждый параллельный зонд владеет своим транскриптом. Не static и не
+       большой буфер на стеке рабочего потока роутера. */
+    uint8_t  transcript[REC_MAX * 4];
+    uint8_t  raw[REC_MAX], wire[REC_MAX + 5];
 
     /* Остаток прочитанного, ещё не отданный вызывающему. */
     uint8_t  plain[REC_MAX];
@@ -251,7 +255,7 @@ static int read_record(d2k_tls *t, int encrypted, uint8_t *type,
         say(err, errcap, "запись длиной %zu вне предела", rlen);
         return -1;
     }
-    static uint8_t raw[REC_MAX];
+    uint8_t *raw = t->raw;
     if (read_exact(t->fd, raw, rlen, deadline, err, errcap) != 0) { return -1; }
 
     if (hdr[0] == REC_CCS) {
@@ -294,7 +298,7 @@ static int read_record(d2k_tls *t, int encrypted, uint8_t *type,
 static int write_record(d2k_tls *t, uint8_t type, const uint8_t *data, size_t n,
                         char *err, size_t errcap) {
     if (n + 1 + 16 > REC_MAX) { say(err, errcap, "запись длиннее предела"); return -1; }
-    static uint8_t buf[REC_MAX + 5];
+    uint8_t *buf = t->wire;
     uint8_t inner[REC_MAX];
     memcpy(inner, data, n);
     inner[n] = type;                               /* настоящий тип внутри, §5.2 */
@@ -347,25 +351,24 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms,
     }
 
     /* Транскрипт: сообщения рукопожатия подряд, без заголовков записей. */
-    static uint8_t tr[REC_MAX * 4];
+    d2k_tls *t = calloc(1, sizeof *t);
+    if (!t) { say(err, errcap, "не хватило памяти"); return -1; }
+    t->fd = fd;
+    uint8_t *tr = t->transcript;
     size_t tr_len = 0;
 
     uint8_t ch[1024];
     size_t ch_len = build_client_hello(ch, sizeof ch, sni, pub, rnd);
-    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); return -1; }
+    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); free(t); return -1; }
 
     uint8_t rec[5 + 1024];
     rec[0] = REC_HANDSHAKE;
     put16(rec + 1, 0x0301);                        /* legacy_record_version */
     put16(rec + 3, (uint16_t)ch_len);
     memcpy(rec + 5, ch, ch_len);
-    if (write_all(fd, rec, 5 + ch_len, err, errcap) != 0) { return -1; }
+    if (write_all(fd, rec, 5 + ch_len, err, errcap) != 0) { free(t); return -1; }
     memcpy(tr, ch, ch_len);
     tr_len = ch_len;
-
-    d2k_tls *t = calloc(1, sizeof *t);
-    if (!t) { say(err, errcap, "не хватило памяти"); return -1; }
-    t->fd = fd;
 
     /* ServerHello — открытым текстом. */
     uint8_t sh[REC_MAX];
@@ -473,7 +476,7 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms,
             free(t);
             return -1;
         }
-        if (tr_len + mlen > sizeof tr) {
+        if (tr_len + mlen > sizeof t->transcript) {
             say(err, errcap, "транскрипт рукопожатия длиннее предела");
             free(t);
             return -1;
