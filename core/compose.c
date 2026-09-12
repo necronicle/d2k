@@ -125,6 +125,7 @@ enum { D2K_ORDER_FORWARD = 0, D2K_ORDER_REVERSE = 1 };
 enum { D2K_PLACE_BEFORE = 0 };
 
 static void wr16be(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static uint16_t rd16be(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
 static void wr32be(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
@@ -171,6 +172,48 @@ static int tlv_header(uint8_t *buf, size_t cap, size_t *pos, uint16_t n_records)
     if (tlv_rec(buf, cap, pos, D2K_REC_ID, id16, sizeof id16, NULL, 0) != 0) { return -1; }
     uint8_t pr[2]; pr[0] = 6; pr[1] = 1; /* transport=TCP, proto=TLS */
     return tlv_rec(buf, cap, pos, D2K_REC_PROTO, pr, sizeof pr, NULL, 0);
+}
+
+/* Удостоверяет собранный TLV: считает идентификатор по его же байтам и
+ * вписывает на место записи REC_ID.
+ *
+ * Зачем: без идентификатора событие «план применён» можно приписать только по
+ * ключу потока, а этого мало — на том же ключе мог примениться другой план
+ * (соседняя задача, прежняя попытка). Планировщик давно ставит идентификатор
+ * кандидатам (plan_ident/stamp_plan_id, sched.c); опросник свойств этого не
+ * делал, и его вопросы уходили на провод безымянными.
+ *
+ * Идентификатор ДЕТЕРМИНИРОВАН содержимым: тот же план даёт тот же
+ * идентификатор, и это правильно — два одинаковых плана и есть один план.
+ * Считается по байтам, в которых поле идентификатора ещё нулевое, иначе
+ * значение зависело бы от самого себя.
+ *
+ * Раскладка фиксирована сборщиком выше: 12 байт заголовка, затем REC_ID —
+ * тип(2) + длина(2) + 16 байт значения. Проверяем её, а не верим на слово:
+ * запись не на месте означает, что сборщик изменился, и молча писать в чужие
+ * байты нельзя. 0 — удостоверено, -1 — раскладка не та. */
+int plan_tlv_stamp_ident(uint8_t *tlv, size_t len, uint8_t out_id[D2K_PLAN_ID_LEN]) {
+    const size_t rec = 12;                 /* смещение записи REC_ID */
+    const size_t val = rec + 4;            /* смещение её значения */
+    if (!tlv || len < val + D2K_PLAN_ID_LEN) { return -1; }
+    if (rd16be(tlv + rec) != D2K_REC_ID || rd16be(tlv + rec + 2) != D2K_PLAN_ID_LEN) {
+        return -1;
+    }
+    /* FNV-1a, тот же, что у планировщика (fnv1a в sched.c): один способ
+       считать идентичность плана на всё дерево. */
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= tlv[i];
+        h *= 16777619u;
+    }
+    char text[32];
+    snprintf(text, sizeof text, "plan-%08x", (unsigned)h);
+    memset(out_id, 0, D2K_PLAN_ID_LEN);
+    size_t n = strlen(text);
+    if (n > D2K_PLAN_ID_LEN) { n = D2K_PLAN_ID_LEN; }
+    memcpy(out_id, text, n);
+    memcpy(tlv + val, out_id, D2K_PLAN_ID_LEN);
+    return 0;
 }
 
 /* Вопрос 1 — перекрытие слева (overlapPlan, properties.go:234-242): та же
@@ -320,12 +363,11 @@ int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k) {
  *
  * Возвращает 0 при находке (*out заполнен), -1 иначе (тайм-аут всего
  * бюджета, ошибка связи, обрыв). */
-/* То же, но ЛОВИТ ДВА ВИДА СРАЗУ. Нужно там, где ожидание может закончиться
-   не только тем, чего ждут: зонд ждёт обмена, но датапат вправе сообщить, что
-   посылка плана не покинула машину, — и тогда ждать обмена больше незачем, а
-   главное, нельзя называть его отсутствие промахом коробки. want_b == 0
-   означает «второго вида нет», и функция ведёт себя ровно как прежняя. */
-static int wait_for_event2(int fd, uint16_t want_a, uint16_t want_b,
+/* То же, но ЛОВИТ НЕСКОЛЬКО ВИДОВ СРАЗУ. Нужно там, где ожидание может
+   закончиться не только тем, чего ждут: вопрос ждёт трёх разных фактов —
+   применения плана к своему потоку, ответа сервера и отказа отправки, —
+   и приходят они в любом порядке. Нулевой want означает «этого вида нет». */
+static int wait_for_event3(int fd, uint16_t want_a, uint16_t want_b, uint16_t want_c,
                            int code_filter, const d2k_flowkey *flow,
                            uint32_t deadline_ms, d2k_ev *out,
                            char *err, size_t errcap) {
@@ -340,7 +382,8 @@ static int wait_for_event2(int fd, uint16_t want_a, uint16_t want_b,
         if (elapsed_ms >= (long)deadline_ms) { return -1; }
         int rc = d2k_link_next(fd, out, (int)((long)deadline_ms - elapsed_ms), err, errcap);
         if (rc != 0) { return -1; } /* тайм-аут этого чтения = тайм-аут всего бюджета, либо ошибка */
-        if (out->kind != want_a && !(want_b && out->kind == want_b)) { continue; }
+        if (out->kind != want_a && !(want_b && out->kind == want_b) &&
+            !(want_c && out->kind == want_c)) { continue; }
         /* Фильтр по коду — только для основного вида: у второго код и есть
            то, ради чего его ловят. */
         if (code_filter >= 0 && out->kind == want_a &&
@@ -354,7 +397,7 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
                           const d2k_flowkey *flow,
                           uint32_t deadline_ms, d2k_ev *out,
                           char *err, size_t errcap) {
-    return wait_for_event2(fd, want, 0, code_filter, flow, deadline_ms, out,
+    return wait_for_event3(fd, want, 0, 0, code_filter, flow, deadline_ms, out,
                            err, errcap);
 }
 
@@ -653,6 +696,15 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
             continue; /* этот вопрос сегодня не собрать — не измерено, дальше */
         }
         asked_any = 1;
+        /* Удостоверяем план: без идентификатора «применён» приписывается
+           только по ключу потока, а на том же ключе мог примениться другой
+           план. Раскладка не та — вопрос не задаём вовсе: испытание без
+           идентичности слабее ровно в том месте, ради которого затевалось. */
+        uint8_t qid[D2K_PLAN_ID_LEN];
+        if (plan_tlv_stamp_ident(planbuf, plan_len, qid) != 0) {
+            step_rc(steps, i, D2K_STEP_NOT_ASKED, NULL);
+            continue;
+        }
         if (steps) {
             steps[i].plan_len = plan_len;
         }
@@ -722,8 +774,24 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            Бюджет один на всё ожидание, а не на каждое событие: потолок
            D2K_PROPS_ASK_WAIT_MS — страховка от молчания, и продлевать её
            каждым пришедшим событием значило бы отменить её вовсе. */
+        /* ТРИ ФАКТА, И ВСЕ ТРИ ОБЯЗАТЕЛЬНЫ.
+         *
+         *   applied — датапат применил ИМЕННО ЭТОТ план к ЭТОМУ потоку;
+         *   hello   — сервер ответил ServerHello (приёмка вопроса);
+         *   не было отказа отправки.
+         *
+         * Раньше здесь хватало подтверждения команды и внешнего типа записи
+         * 23. Ни то, ни другое доказательством не было: ack говорит лишь, что
+         * датапат план ПРИНЯЛ, а тип 23 в TLS 1.3 несёт весь второй полёт
+         * рукопожатия (RFC 8446 §5.2) и появляется даже там, где сервер
+         * только поздоровался. Планировщик требовал применения уже давно —
+         * теперь у обоих опросников один контракт (0009, U1).
+         *
+         * Порядок фактов ЛЮБОЙ: применение объявляется после всех посылок
+         * плана, включая отложенные, и ответ сервера вполне может опередить
+         * его (0009, F3). Поэтому ждём оба, а не первый попавшийся. */
         d2k_ev exch;
-        int got = 0, passed = 0, unsent = 0;
+        int got = 0, passed = 0, unsent = 0, applied = 0, hello = 0;
         {
             struct timespec t0;
             clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -734,10 +802,21 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                              (now.tv_nsec - t0.tv_nsec) / 1000000L;
                 if (spent < 0) { spent = 0; }
                 if (spent >= (long)D2K_PROPS_ASK_WAIT_MS) { break; }
-                if (wait_for_event2(link_fd, D2K_EV_EXCHANGE, D2K_EV_REFUSED, -1, &fk,
+                if (wait_for_event3(link_fd, D2K_EV_EXCHANGE, D2K_EV_REFUSED,
+                                    D2K_EV_APPLIED, -1, &fk,
                                     (uint32_t)((long)D2K_PROPS_ASK_WAIT_MS - spent),
                                     &exch, err, sizeof err) != 0) {
                     break;
+                }
+                if (exch.kind == D2K_EV_APPLIED) {
+                    /* Свой ли это план. Нули в событии означают «плану нечем
+                       представиться» (d2k_link.h) и своим планом не считаются:
+                       мы свой удостоверили сами чуть выше. */
+                    if (memcmp(exch.plan_id, qid, D2K_PLAN_ID_LEN) == 0) {
+                        applied = 1;
+                        if (hello) { passed = 1; break; }
+                    }
+                    continue;
                 }
                 if (exch.kind == D2K_EV_REFUSED) {
                     /* НАША неудача, а не ответ коробки: посылка плана не
@@ -755,9 +834,9 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                     steps[i].first_type = exch.code;
                     steps[i].bytes = exch.num;
                 }
-                if (d2k_ev_outer_appdata(&exch)) {
-                    passed = 1;
-                    break;
+                if (exch.server_hello) {
+                    hello = 1;
+                    if (applied) { passed = 1; break; }
                 }
             }
         }
@@ -778,8 +857,15 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
             continue;
         }
         if (!passed) {
-            step_rc(steps, i, got ? D2K_STEP_NO_APPDATA : D2K_STEP_NO_EXCHANGE,
-                    got ? NULL : err);
+            /* Три разных «не прошло», и различать их обязательно: план не
+               доехал до потока — это про нас; обмена не было — это про
+               линию; обмен был без ответа сервера — это про коробку.
+               Свойство не пишет ни один из трёх (§2.4), но объяснение у них
+               разное, и слитое в одно оно уводит поиск. */
+            d2k_step_rc why = !applied ? D2K_STEP_NO_APPLIED
+                            : got      ? D2K_STEP_NO_SERVER_HELLO
+                                       : D2K_STEP_NO_EXCHANGE;
+            step_rc(steps, i, why, (why == D2K_STEP_NO_EXCHANGE) ? err : NULL);
             continue; /* промах — не пишет ничего (§2.4, каждый Set в Go
                           начинается с if !passed { return }) */
         }

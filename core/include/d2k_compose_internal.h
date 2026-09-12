@@ -32,6 +32,12 @@
 #include "d2k_compose.h" /* d2k_hello, d2k_props */
 #include "d2k_link.h"    /* d2k_ev */
 
+/* Удостоверяет собранный TLV: считает идентификатор по его байтам и вписывает
+ * его на место записи REC_ID. Без него вопрос уходит на провод безымянным, и
+ * событие «план применён» приписывается только по ключу потока. Подробности и
+ * раскладка — у определения (compose.c). */
+int plan_tlv_stamp_ident(uint8_t *tlv, size_t len, uint8_t out_id[D2K_PLAN_ID_LEN]);
+
 int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len);
 int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len);
 int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,

@@ -620,9 +620,14 @@ static int fakectl_listen(const char *path) {
  * события (d2k_ctl.h: "Кадр: [длина payload u32 BE][тип u16 BE][payload]",
  * общая для обоих направлений), поэтому разбирать ВНУТРЕННЕЕ устройство
  * SET_NAME здесь незачем. */
-static int drain_one_command(int fd) {
+/* Забирает команду и СОХРАНЯЕТ её тело: поддельному контроллеру нужен
+   идентификатор плана, чтобы ответить «применён» тем же ID, каким вопрос ушёл
+   на провод (0009, U1). Тело SET_NAME: [длина имени][имя][план ДВОИЧНЫЙ] —
+   d2k_link_set_name раскодирует hex перед отправкой. */
+static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have_id) {
     uint8_t hdr[6];
     size_t got = 0;
+    if (have_id) { *have_id = 0; }
     while (got < sizeof hdr) {
         ssize_t n = read(fd, hdr + got, sizeof hdr - got);
         if (n <= 0) { return -1; }
@@ -632,12 +637,29 @@ static int drain_one_command(int fd) {
                     (uint32_t)hdr[2] << 8 | hdr[3];
     if (plen < 2) { return -1; }
     size_t remaining = (size_t)plen - 2;
-    uint8_t buf[4096];
+    uint8_t body[4096];
+    size_t have = 0;
     while (remaining > 0) {
-        size_t chunk = remaining < sizeof buf ? remaining : sizeof buf;
-        ssize_t n = read(fd, buf, chunk);
+        size_t chunk = remaining < sizeof body - have ? remaining : sizeof body - have;
+        if (chunk == 0) {
+            uint8_t sink[1024];
+            chunk = remaining < sizeof sink ? remaining : sizeof sink;
+            ssize_t n = read(fd, sink, chunk);
+            if (n <= 0) { return -1; }
+            remaining -= (size_t)n;
+            continue;
+        }
+        ssize_t n = read(fd, body + have, chunk);
         if (n <= 0) { return -1; }
+        have += (size_t)n;
         remaining -= (size_t)n;
+    }
+    if (plan_id && have >= 1) {
+        size_t off = (size_t)1 + body[0] + 12 + 4;
+        if (off + D2K_PLAN_ID_LEN <= have) {
+            memcpy(plan_id, body + off, D2K_PLAN_ID_LEN);
+            if (have_id) { *have_id = 1; }
+        }
     }
     return 0;
 }
@@ -676,15 +698,24 @@ static void send_ack_ok(int fd, uint16_t cmd) {
 static const uint8_t FAKECTL_LOOPBACK4[4] = { 127, 0, 0, 1 };
 
 /* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
- * (1<<(22-20))=0x04 (см. d2k_ev_outer_appdata, d2k_link.h). */
+ * (1<<(22-20))=0x04. Седьмой байт — ПРИЁМКА вопроса: сервер прислал
+ * ServerHello (донор, acceptServerHello, trigger.go:67-70). */
 static void send_exchange(int fd, uint16_t target_port,
                           const uint8_t *peer_ip, uint16_t peer_port,
-                          uint8_t seen_types) {
-    uint8_t rest[6];
+                          uint8_t seen_types, uint8_t server_hello) {
+    uint8_t rest[7];
     rest[0] = 22; rest[1] = seen_types;
     rest[2] = 0; rest[3] = 0; rest[4] = 0; rest[5] = 64;
+    rest[6] = server_hello;
     send_event_frame(fd, D2K_EV_EXCHANGE, FAKECTL_LOOPBACK4, target_port,
                      peer_ip, peer_port, 6, rest, sizeof rest);
+}
+
+static void send_applied(int fd, uint16_t target_port,
+                         const uint8_t *peer_ip, uint16_t peer_port,
+                         const uint8_t plan_id[D2K_PLAN_ID_LEN]) {
+    send_event_frame(fd, D2K_EV_APPLIED, FAKECTL_LOOPBACK4, target_port,
+                     peer_ip, peer_port, 6, plan_id, D2K_PLAN_ID_LEN);
 }
 
 /* Обслуживает N раундов SET_NAME->ack->(настоящее подключение цели)->обмен,
@@ -702,14 +733,19 @@ typedef struct {
 
 static void fakectl_run(fakectl_args *a) {
     for (size_t i = 0; i < a->n; i++) {
-        if (drain_one_command(a->ctl_fd) != 0) { return; }
+        uint8_t qid[D2K_PLAN_ID_LEN]; int have_id = 0;
+        if (drain_one_command(a->ctl_fd, qid, &have_id) != 0) { return; }
         send_ack_ok(a->ctl_fd, D2K_CMD_SET_NAME);
 
         uint8_t peer_ip[4]; uint16_t peer_port = 0;
         if (peerstand_accept_one(a->ps, peer_ip, &peer_port) != 0) { return; }
 
+        if (have_id) {
+            send_applied(a->ctl_fd, a->target_port, peer_ip, peer_port, qid);
+        }
         uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
-        send_exchange(a->ctl_fd, a->target_port, peer_ip, peer_port, seen);
+        send_exchange(a->ctl_fd, a->target_port, peer_ip, peer_port, seen,
+                      (a->outcomes[i] == 1) ? 1 : 0);
     }
 }
 

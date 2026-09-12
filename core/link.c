@@ -280,6 +280,14 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         out->seen_types = rest[1]; /* маска встреченных типов — вход d2k_ev_outer_appdata */
         out->num = (uint32_t)rest[2] << 24 | (uint32_t)rest[3] << 16 |
                    (uint32_t)rest[4] << 8 | rest[5];
+        /* ПРИЁМКА ВОПРОСА. Байт необязателен по длине — тем же приёмом, что
+           идентификатор плана и счётчики выше: старый датапат его не слал, и
+           терять из-за этого разбор события нельзя. Нет байта — ноль, то есть
+           «сервер не отвечал ServerHello», и это честный ответ: приёмка
+           требует ДОКАЗАТЕЛЬСТВА, а не отсутствия опровержения. */
+        if (rlen >= 7) {
+            out->server_hello = rest[6];
+        }
         break;
     case D2K_EV_SHAPE:
         if (rlen > sizeof out->shape) {

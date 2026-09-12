@@ -444,7 +444,24 @@ static int peer_closed(int c) {
  * что и у события (d2k_ctl.h: "Кадр: [длина payload u32 BE][тип u16
  * BE][payload]", общая для обоих направлений), поэтому разбирать ВНУТРЕННЕЕ
  * устройство SET_NAME здесь незачем: границы кадра снаружи одни на всех. */
-static int drain_one_command(int fd) {
+/* Вытаскивает идентификатор плана из команды SET_NAME.
+   Тело команды: [длина имени 1 байт][имя][план ДВОИЧНЫЙ] — d2k_link_set_name
+   раскодирует hex перед отправкой (link.c: hex_decode в g_scratch). План
+   начинается заголовком 12 байт, следом запись REC_ID: тип(2)+длина(2)+
+   16 байт значения. 0 — нашли, -1 — тело короче ожидаемого. */
+static int plan_id_from_setname(const uint8_t *body, size_t len,
+                                uint8_t out[D2K_PLAN_ID_LEN]) {
+    if (len < 1) { return -1; }
+    size_t off = (size_t)1 + body[0] + 12 + 4;
+    if (off + D2K_PLAN_ID_LEN > len) { return -1; }
+    memcpy(out, body + off, D2K_PLAN_ID_LEN);
+    return 0;
+}
+
+/* Как drain_one_command, но СОХРАНЯЕТ тело: поддельному концу связи нужен
+   идентификатор плана, чтобы ответить «применён» тем же ID, каким вопрос
+   ушёл на провод. Без этого испытание проверяло бы только ключ потока. */
+static int drain_one_command_body(int fd, uint8_t *body, size_t cap, size_t *out_len) {
     uint8_t hdr[6];
     size_t got = 0;
     while (got < sizeof hdr) {
@@ -456,15 +473,23 @@ static int drain_one_command(int fd) {
                     (uint32_t)hdr[2] << 8 | hdr[3];
     if (plen < 2) { return -1; }
     size_t remaining = (size_t)plen - 2;
-    uint8_t buf[4096];
+    size_t have = 0;
+    uint8_t sink[4096];
     while (remaining > 0) {
-        size_t chunk = remaining < sizeof buf ? remaining : sizeof buf;
-        ssize_t n = read(fd, buf, chunk);
+        size_t room = (have < cap) ? cap - have : 0;
+        size_t chunk = remaining < sizeof sink ? remaining : sizeof sink;
+        if (room && chunk > room) { chunk = room; }
+        uint8_t *dst = room ? body + have : sink;
+        if (!room) { chunk = remaining < sizeof sink ? remaining : sizeof sink; }
+        ssize_t n = read(fd, dst, chunk);
         if (n <= 0) { return -1; }
+        if (room) { have += (size_t)n; }
         remaining -= (size_t)n;
     }
+    *out_len = have;
     return 0;
 }
+
 
 /* Пишет один кадр события руками — та же раскладка, что send_synthetic в
  * test_link.c: [длина payload BE32][тип BE16][ключ 13 байт][rest]. ip
@@ -505,12 +530,26 @@ static void send_ack_ok(int fd, uint16_t cmd) {
  * заполнены правдоподобно, не нулём, чтобы не полагаться на memset. */
 static void send_exchange(int fd, const uint8_t *ip_a, uint16_t port_a,
                           const uint8_t *ip_b, uint16_t port_b,
-                          uint8_t transport, uint8_t seen_types) {
-    uint8_t rest[6];
+                          uint8_t transport, uint8_t seen_types, uint8_t server_hello) {
+    /* Седьмой байт — ПРИЁМКА вопроса: сервер прислал ServerHello. Донор
+       принимает зонд ровно по этому (acceptServerHello, trigger.go:67-70:
+       0x16, 0x03, b[5]==0x02), а не по типу записи. */
+    uint8_t rest[7];
     rest[0] = 22;
     rest[1] = seen_types;
     rest[2] = 0; rest[3] = 0; rest[4] = 0; rest[5] = 64;
+    rest[6] = server_hello;
     send_event_frame(fd, D2K_EV_EXCHANGE, ip_a, port_a, ip_b, port_b, transport, rest, sizeof rest);
+}
+
+/* «План применён к этому потоку» с ИМЕННО ТЕМ идентификатором, каким вопрос
+   ушёл. Без этого события вопрос не проходит вовсе: ack говорит лишь, что
+   датапат план принял (0009, U1). */
+static void send_applied(int fd, const uint8_t *ip_a, uint16_t port_a,
+                         const uint8_t *ip_b, uint16_t port_b,
+                         uint8_t transport, const uint8_t plan_id[D2K_PLAN_ID_LEN]) {
+    send_event_frame(fd, D2K_EV_APPLIED, ip_a, port_a, ip_b, port_b, transport,
+                     plan_id, D2K_PLAN_ID_LEN);
 }
 
 static const uint8_t LOOPBACK4[4] = { 127, 0, 0, 1 };
@@ -523,14 +562,16 @@ static const uint8_t LOOPBACK4[4] = { 127, 0, 0, 1 };
  *
  * outcomes[i]: -1 — тайм-аут (обмена не шлём совсем, props_ask_contact всё
  * равно подключится к настоящей peerstand — сама цель "жива", просто ответа
- * от датапата не будет НИКОГДА, честная проверка тайм-аута); 0 — обмен без
- * прикладных данных (промах); 1 — обмен с прикладными данными (проход);
- * 2 — ДВА события подряд, как на живом датапате: сперва «обмен пошёл» (тип 22,
- * без прикладных данных), следом «появились прикладные данные» (§4.2, два
- * уровня доказательства — datapath/session.c, комментарий у D2K_JRN_EXCHANGE).
- * Опрос обязан дождаться ВТОРОГО: живой прогон 11.09 показал, что он этого не
- * делал и считал промахом обмен, в котором сервер ещё просто не успел
- * дослать свой второй полёт.
+ * от датапата не будет НИКОГДА, честная проверка тайм-аута); 0 — обмен БЕЗ
+ * ответа сервера (промах); 1 — обмен с ServerHello (проход);
+ * 2 — ДВА события подряд, как на живом датапате: сперва «обмен пошёл» без
+ * ответа сервера, следом ответ. Проход наступает на ВТОРОМ: приёмка вопроса
+ * — разбор ServerHello (донор, acceptServerHello, trigger.go:67-70), а не
+ * тип записи, и первое событие её не даёт.
+ *
+ * Перед обменом каждый раунд шлёт «план применён» с ИМЕННО ТЕМ
+ * идентификатором, каким вопрос ушёл: без него вопрос не проходит вовсе
+ * (0009, U1) — ack говорит лишь, что датапат план принял.
  * foreign_before_round: если раунд с этим индексом дошёл до обмена, ПЕРЕД
  * настоящим событием шлётся ОДНО чужое — с appdata, но с чужим ключом
  * (адрес 10.0.0.9:9999, к делу не относится) — находка 1: opros обязан его
@@ -554,7 +595,10 @@ typedef struct {
 static void *fakeend_run(void *arg) {
     fakeend_args *a = (fakeend_args *)arg;
     for (size_t i = 0; i < a->n; i++) {
-        if (drain_one_command(a->fd) != 0) { return NULL; }
+        uint8_t cmd[4096]; size_t cmdlen = 0;
+        uint8_t qid[D2K_PLAN_ID_LEN];
+        if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen) != 0) { return NULL; }
+        int have_id = (plan_id_from_setname(cmd, cmdlen, qid) == 0);
         send_ack_ok(a->fd, D2K_CMD_SET_NAME);
 
         uint8_t peer_ip[4]; uint16_t peer_port = 0;
@@ -570,22 +614,41 @@ static void *fakeend_run(void *arg) {
                подтвердить наш зонд НИ ПРИ КАКИХ обстоятельствах, включая
                "своего обмена не будет никогда" (outcomes[i]==-1, C1). */
             static const uint8_t foreign_ip[4] = { 10, 0, 0, 9 };
-            send_exchange(a->fd, foreign_ip, 9999, LOOPBACK4, a->target_port, 6, 0x08);
+            send_exchange(a->fd, foreign_ip, 9999, LOOPBACK4, a->target_port, 6, 0x08, 1);
         }
         if (a->outcomes[i] == -1) {
             close(peer_c);
             continue; /* настоящего обмена не шлём вовсе — честный тайм-аут у wait_for_event */
         }
+        /* 3 — ack есть, ИСПОЛНЕНИЯ нет: применённого события не шлём вовсе.
+           4 — «применён», но ЧУЖОЙ план: идентификатор перевёрнут.
+           5 — старый PREPARED (0x0003) вместо APPLIED: подготовка
+               доказательством не является (0009, F1). */
+        if (have_id && a->outcomes[i] != 3) {
+            uint8_t id[D2K_PLAN_ID_LEN];
+            memcpy(id, qid, sizeof id);
+            if (a->outcomes[i] == 4) { id[0] = (uint8_t)~id[0]; }
+            if (a->outcomes[i] == 5) {
+                send_event_frame(a->fd, D2K_EV_PREPARED, LOOPBACK4, a->target_port,
+                                 peer_ip, peer_port, 6, id, D2K_PLAN_ID_LEN);
+            } else {
+                send_applied(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, id);
+            }
+        }
         if (a->outcomes[i] == 2) {
-            /* Первый уровень: рукопожатие пошло, прикладных данных ещё нет. */
-            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x04);
-            /* Второй уровень приходит ПОЗЖЕ — иначе проверка выродилась бы в
-               «взял первое попавшееся и угадал». */
+            /* Обмен пошёл, ответа сервера ещё нет. */
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x04, 0);
+            /* Ответ приходит ПОЗЖЕ — иначе проверка выродилась бы в «взял
+               первое попавшееся и угадал». */
             nap_ms(150);
-            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x0C);
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, 0x0C, 1);
         } else {
-            uint8_t seen = (a->outcomes[i] == 1) ? 0x08 : 0x04;
-            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen);
+            /* Исходы 3..5 шлют ПОЛНОЦЕННЫЙ ответ сервера — и всё равно не
+               должны дать прохода: не хватает доказательства исполнения. */
+            int answered = (a->outcomes[i] >= 1);
+            uint8_t seen = answered ? 0x08 : 0x04;
+            send_exchange(a->fd, LOOPBACK4, a->target_port, peer_ip, peer_port, 6, seen,
+                          answered ? 1 : 0);
         }
         close(peer_c);
     }
@@ -1368,7 +1431,13 @@ int main(void) {
         CHECK(steps[0].local_port != 0, "b5: трасса первого вопроса без местного порта обращения");
         CHECK(steps[1].rc == D2K_STEP_NOT_ASKED && steps[4].rc == D2K_STEP_NOT_ASKED,
               "b5: вопросы без control должны быть отмечены как незаданные");
-        CHECK(steps[0].rc == D2K_STEP_NO_EXCHANGE || steps[0].rc == D2K_STEP_NO_APPDATA,
+        /* Три законных исхода промаха, и все три — «не измерено»: плана не
+           применили к нашему потоку, обмена не было вовсе, обмен был без
+           ответа сервера. Который именно — зависит от стенда; важно, что ни
+           один из них не записал свойство (проверено выше). */
+        CHECK(steps[0].rc == D2K_STEP_NO_EXCHANGE ||
+              steps[0].rc == D2K_STEP_NO_SERVER_HELLO ||
+              steps[0].rc == D2K_STEP_NO_APPLIED,
               "b5: промах первого вопроса не отмечен в трассе");
         drain_all(fd);
 
@@ -1449,10 +1518,77 @@ int main(void) {
 
         CHECK(!fa.closed_early, "b6: зонд закрыл соединение с целью ДО события обмена");
         CHECK(pr.tolerates_left_overlap == D2K_P_NO,
-              "b6: опрос осудил обмен по ПЕРВОМУ событию, не дождавшись прикладных данных");
+              "b6: опрос осудил обмен по ПЕРВОМУ событию, не дождавшись ответа сервера");
         CHECK(steps[0].rc == D2K_STEP_PASSED, "b6: трасса не отметила проход");
         CHECK((steps[0].seen_types & 0x08) != 0,
               "b6: трасса сохранила ПЕРВОЕ событие, а не то, по которому вынесен ответ");
+    }
+
+    /* --- b7: ОДИН КОНТРАКТ ДОКАЗАТЕЛЬСТВА (0009, U1) --------------------
+     *
+     * Три случая, в каждом сервер ОТВЕТИЛ полноценным ServerHello, и ни один
+     * не имеет права дать проход:
+     *
+     *   ack без исполнения — датапат план ПРИНЯЛ, но применения к нашему
+     *     потоку не подтвердил. Раньше этого хватало, и зонд мог мерить
+     *     линию БЕЗ обхода, считая, что мерит с обходом;
+     *   чужой идентификатор — на нашем потоке применился другой план
+     *     (соседняя задача, прежняя попытка);
+     *   старый PREPARED (0x0003) — подготовка, а не исполнение: событие
+     *     уезжало ДО sendto, и ошибка отправки его не отзывала.
+     *
+     * Свойство не должно измениться ни в одном из трёх, а трасса обязана
+     * назвать причину «план к потоку вопроса не применён» — это про НАС, а
+     * не про коробку (§2.4). */
+    {
+        static const struct { int outcome; const char *what; } cases[] = {
+            { 3, "ack без исполнения" },
+            { 4, "чужой идентификатор плана" },
+            { 5, "старый PREPARED вместо APPLIED" },
+        };
+        for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
+            uint8_t tb[2048], cb[2048];
+            d2k_hello trig = build_trigger(tb, sizeof tb, "b7.example");
+            d2k_hello ctl = build_trigger(cb, sizeof cb, "b7-control.example");
+            CHECK(trig.bytes && ctl.bytes, "build_trigger(b7) не собрался");
+
+            int sv[2];
+            CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "b7: socketpair не создался");
+            peerstand ps;
+            uint16_t target_port = peerstand_start(&ps);
+
+            int outcomes[] = { cases[ci].outcome, cases[ci].outcome,
+                               cases[ci].outcome, cases[ci].outcome,
+                               cases[ci].outcome };
+            fakeend_args fa; memset(&fa, 0, sizeof fa);
+            fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
+            fa.outcomes = outcomes;
+            fa.n = sizeof outcomes / sizeof outcomes[0];
+            fa.foreign_before_round = -1;
+            pthread_t th;
+            CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0,
+                  "b7: поддельный конец связи не запустился");
+
+            d2k_props_step steps[D2K_PROPS_QUESTIONS];
+            d2k_props pr = d2k_props_ask_traced(sv[0], "127.0.0.1", target_port,
+                                                trig, ctl, 0, steps);
+            pthread_join(th, NULL);
+            close(sv[0]); close(sv[1]); close(ps.listen_fd);
+
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "b7 (%s): ответ сервера засчитан без доказательства исполнения",
+                     cases[ci].what);
+            CHECK(pr.tolerates_left_overlap == D2K_P_UNKNOWN &&
+                  pr.tolerates_reorder == D2K_P_UNKNOWN &&
+                  pr.validates_checksum == D2K_P_UNKNOWN &&
+                  pr.parses_l7 == D2K_P_UNKNOWN &&
+                  pr.counts_duplicates == D2K_P_UNKNOWN, msg);
+            snprintf(msg, sizeof msg,
+                     "b7 (%s): трасса не назвала причину «план не применён»",
+                     cases[ci].what);
+            CHECK(steps[0].rc == D2K_STEP_NO_APPLIED, msg);
+        }
     }
 
     d2k_link_close(fd);

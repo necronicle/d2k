@@ -547,7 +547,8 @@ static const char *step_rc_str(d2k_step_rc rc) {
     case D2K_STEP_REFUSED:      return "датапат отверг план";
     case D2K_STEP_CONTACT_FAIL: return "обращение к цели не состоялось";
     case D2K_STEP_NO_EXCHANGE:  return "своего обмена не было в срок";
-    case D2K_STEP_NO_APPDATA:   return "обмен был, но без прикладных данных (§8)";
+    case D2K_STEP_NO_APPLIED:   return "план к потоку вопроса не применён";
+    case D2K_STEP_NO_SERVER_HELLO: return "обмен был, но сервер не ответил ServerHello";
     case D2K_STEP_UNSENT:       return "посылка плана не ушла на провод — опыта не было";
     case D2K_STEP_PASSED:       return "прошёл";
     }

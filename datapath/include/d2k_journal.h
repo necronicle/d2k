@@ -126,6 +126,8 @@ typedef struct {
     uint8_t  d_ref_ttl;  /* TTL того, что отвечало по этому соединению */
     uint8_t  d_tos;
     uint16_t d_ipid;
+    /* EXCHANGE: сервер прислал ServerHello (см. d2k_jrn_detail ниже). */
+    uint8_t  d_server_hello;
     /* Идентификатор применённого плана (REC_ID). Значим при
      * kind == D2K_JRN_PLAN_APPLIED и у записей о судьбе посылок
      * (D2K_JRN_PLAN_DONE/D2K_JRN_PLAN_UNSENT), у остального нули.
@@ -156,6 +158,9 @@ typedef struct {
     uint8_t  ref_ttl;
     uint8_t  tos;
     uint16_t ipid;
+    /* EXCHANGE: сервер прислал ServerHello. Это приёмка вопроса, а не
+       уровень доказательства: см. is_server_hello в d2k_tls.h. */
+    uint8_t  server_hello;
 } d2k_jrn_detail;
 
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,

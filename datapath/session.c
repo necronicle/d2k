@@ -705,6 +705,18 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             if (total > rpay_off) {
                 size_t rpay = total - rpay_off;
                 uint8_t t0 = pkt[rpay_off];
+                /* ОТВЕТ СЕРВЕРА — по разбору, а не по типу записи.
+                   Спрашиваем один раз: как только ServerHello увиден, повод
+                   разбирать обратное направление исчезает. Разбор здесь
+                   дешёвый (несколько границ) и идёт только до первого
+                   ответа. */
+                if (!fl->rev_server_hello) {
+                    d2k_tls_info ri;
+                    if (d2k_tls_parse(pkt + rpay_off, total - rpay_off, &ri) == 0 &&
+                        ri.is_server_hello) {
+                        fl->rev_server_hello = 1;
+                    }
+                }
                 if (fl->rev_first_type == 0) {
                     /* Тип первой TLS-записи запоминается как есть. Толковать
                        его здесь нельзя: 0x16 рукопожатие и 0x15 предупреждение
@@ -758,6 +770,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         d2k_jrn_detail det;
         memset(&det, 0, sizeof det);
         det.tos = fl->rev_types;   /* набор увиденных типов записей */
+        det.server_hello = fl->rev_server_hello;
         d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE,
                         fl->rev_first_type, fl->rev_payload_after_hello,
                         &det, NULL, 0, NULL);

@@ -16,6 +16,7 @@
 #define HS_HDR       4
 #define TLS_HANDSHAKE 0x16
 #define HS_CLIENT_HELLO 0x01
+#define HS_SERVER_HELLO 0x02
 #define EXT_SERVER_NAME 0x0000
 #define SNI_HOST_NAME   0x00
 
@@ -163,6 +164,18 @@ int d2k_tls_parse(const uint8_t *b, size_t len, d2k_tls_info *out) {
 
     size_t off = REC_HDR;
     if (off + HS_HDR > end) {
+        return 0;
+    }
+    if (b[off] == HS_SERVER_HELLO) {
+        /* Ответ сервера. Дальше не разбираем: якоря считаются по НАШЕМУ
+           приветствию, а обратному направлению от этого модуля нужен ровно
+           один факт — сервер поздоровался. Длину рукопожатия при этом всё же
+           сверяем с обещанием записи: запись, спорящая сама с собой, права
+           называться ServerHello не имеет. */
+        size_t sh_len = (size_t)b[off + 1] << 16 | (size_t)b[off + 2] << 8 | b[off + 3];
+        if (off + HS_HDR + sh_len <= claimed) {
+            out->is_server_hello = 1;
+        }
         return 0;
     }
     if (b[off] != HS_CLIENT_HELLO) {

@@ -372,6 +372,16 @@ int main(int argc, char **argv) {
                 rec[0] = (uint8_t)atoi(line + 6);
                 rec[1] = 0x03; rec[2] = 0x03;
                 rec[3] = 0x00; rec[4] = 0x28;
+                if (rec[0] == 0x16) {
+                    /* Запись рукопожатия обязана нести НАСТОЯЩИЙ ServerHello,
+                       иначе "reply 22" изображает ответ сервера, которого не
+                       было: приёмка вопроса разбирает содержимое, а не тип
+                       записи (d2k_tls.h). Тип сообщения 0x02 и длина 36 —
+                       ровно то, что укладывается в обещанные записью 40
+                       байт (4 байта заголовка рукопожатия + 36). */
+                    rec[5] = 0x02;
+                    rec[6] = 0x00; rec[7] = 0x00; rec[8] = 0x24;
+                }
                 size_t sz = build_pkt(pkt, 1, port, 0x18, 124, rec, sizeof rec);
                 d2k_session_packet(sess, pkt, sz, now++, buf, sizeof buf, &r);
                 printf("reply: обменов %llu\n",

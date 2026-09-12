@@ -92,6 +92,7 @@ static d2k_jrn_entry *add_entry(d2k_journal *j, uint64_t at_ns, const d2k_key *k
         e->d_ttl = det->ttl;
         e->d_ref_ttl = det->ref_ttl;
         e->d_tos = det->tos;
+        e->d_server_hello = det->server_hello;
         e->d_ipid = det->ipid;
     }
     e->note = note ? note : (kind == D2K_JRN_SUSPECT ? d2k_suspect_text(code) : NULL);
