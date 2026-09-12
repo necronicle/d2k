@@ -36,6 +36,22 @@ set -e
 cd /w
 
 fail() { echo "ПРОВАЛ: $*" >&2; dump; exit 1; }
+
+# Контрольное имя проверяется С ПОВТОРАМИ. Сервер обслуживает соединения по
+# очереди, и сразу после зарезанной попытки он вполне может быть ещё занят —
+# одна проба отличала бы «цензор режет лишнее» от «сервер не успел» только
+# случайно.
+control_passes() {
+    n=0
+    while [ $n -lt 5 ]; do
+        if timeout 5 openssl s_client -connect "127.0.0.1:$PORT" \
+               -servername control.example -tls1_3 </dev/null >/dev/null 2>&1; then
+            return 0
+        fi
+        n=$((n+1)); sleep 1
+    done
+    return 1
+}
 dump() {
     echo "--- ошибки отправки (все) ---"
     grep -iE "sendto|d2kd: " /tmp/d2kd.log 2>/dev/null | sort | uniq -c | head -20 || true
@@ -62,18 +78,58 @@ apt-get install -y -qq iptables socat >/dev/null 2>&1
 #
 # Свой сертификат: проверка подлинности здесь не предмет опыта (её и наш зонд
 # не делает, см. 0006). Предмет — доходит ли приветствие до сервера.
-openssl req -x509 -newkey rsa:2048 -keyout /tmp/k.pem -out /tmp/c.pem \
+# Ключ EC P-256, а не RSA. Наш зонд — минимальный клиент TLS 1.3 (X25519 +
+# TLS_AES_128_GCM_SHA256) с браузерным набором signature_algorithms; на
+# RSA-сертификате socat отвечал тревогой 40 (handshake_failure) КАЖДЫЙ раз,
+# когда приветствие до него доходило, и это маскировало успех обхода под
+# неудачу.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout /tmp/k.pem -out /tmp/c.pem \
     -days 1 -nodes -subj "/CN=$NAME" >/dev/null 2>&1
-cat /tmp/c.pem /tmp/k.pem > /tmp/both.pem
-socat "OPENSSL-LISTEN:$PORT,fork,reuseaddr,cert=/tmp/both.pem,verify=0" \
-    SYSTEM:'printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"' \
-    >/tmp/server.log 2>&1 &
+# СЕРВЕР — openssl s_server, а НЕ socat.
+#
+# Замерено прямо здесь: наш зонд доходит до приложения (уровень 3, статус 200)
+# против openssl s_server и получает тревогу 40 против socat OPENSSL-LISTEN на
+# том же сертификате и той же линии. То есть socat отвергает наше приветствие
+# по причине, не имеющей отношения к обходу, и весь опыт превращается в
+# «зонд не дошёл» на каждом плече, включая рабочие.
+#
+# s_server обслуживает соединения ПО ОЧЕРЕДИ, и это терпимо только потому, что
+# цензор ниже роняет соединение сбросом, а не молчанием: зависших рукопожатий
+# не остаётся.
+openssl s_server -quiet -accept "$PORT" -cert /tmp/c.pem -key /tmp/k.pem \
+    -tls1_3 -naccept 1000 -www >/tmp/server.log 2>&1 &
 SRV=$!
 i=0
 while ! (timeout 3 openssl s_client -connect "127.0.0.1:$PORT" </dev/null >/dev/null 2>&1) && [ $i -lt 50 ]; do
     i=$((i+1)); sleep 0.2
 done
 [ $i -lt 50 ] || fail "сервер цели не поднялся" 
+
+echo "== ЛАБОРАТОРИЯ ПРОВЕРЯЕТ СВОЙ ИНСТРУМЕНТ =="
+# Наш зонд — минимальный клиент TLS 1.3, и он вправе не сойтись с конкретным
+# сервером по причинам, не имеющим к обходу никакого отношения. Если это
+# случится, весь опыт будет показывать «зонд не дошёл до приложения» на КАЖДОМ
+# плече, включая рабочие, — то есть врать. Проверяем прямо, без цензора и без
+# датапата: доходит ли наш зонд до приложения на голой линии.
+cat > /tmp/probecheck.c <<'PC'
+#include <stdio.h>
+#include "d2k_verify.h"
+int main(void) {
+    d2k_ver_result r = d2k_verify_probe("127.0.0.1", 4443, "control.example", 4000);
+    printf("уровень %d, статус %d, причина: %s\n", (int)r.level, r.status, r.reason);
+    d2k_verify_close(&r);
+    return r.level == D2K_VER_APPLICATION ? 0 : 1;
+}
+PC
+cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
+   core/verify.c core/tls13.c core/x25519.c core/crypto.c core/hello.c core/meas.c 2>/dev/null || \
+cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
+   core/verify.c core/tls13.c core/x25519.c core/crypto.c core/hello.c core/meas.c core/link.c core/compose.c
+if ! /tmp/probecheck; then
+    fail "СОБСТВЕННЫЙ ЗОНД не доходит до приложения на ГОЛОЙ линии — опыт бессмыслен: он покажет неудачу на каждом плече, включая рабочие"
+fi
+echo "инструмент исправен: зонд доходит до приложения без цензора"
 
 echo "== сборка =="
 cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
@@ -106,6 +162,23 @@ iptables -t mangle -A D2KLAB -m mark --mark "$MARK" -j RETURN
 iptables -t mangle -A D2KLAB -p tcp --dport "$PORT" \
     -m connbytes --connbytes 0:20 --connbytes-dir original --connbytes-mode packets \
     -j NFQUEUE --queue-num "$QUEUE" --queue-bypass
+
+# ОБРАТНОЕ НАПРАВЛЕНИЕ — ОБЯЗАТЕЛЬНО, и это стоило отдельного разбора.
+#
+# Первая редакция ставила очередь только на исходящее, и датапат не видел
+# ответов сервера ВООБЩЕ: «обменов 0» получалось даже на контрольном прогоне
+# без цензора, где соединения проходили. А обмен — это половина
+# доказательства: без него ни один кандидат подтвердить невозможно, сколько бы
+# обход ни работал.
+#
+# Ровно так же устроен боевой набор правил (files/S99d2k): цепочка на
+# исходящее по --dports и цепочка на входящее по --sports.
+iptables -t mangle -N D2KLAB_IN 2>/dev/null || iptables -t mangle -F D2KLAB_IN
+iptables -t mangle -A INPUT -j D2KLAB_IN
+iptables -t mangle -A D2KLAB_IN -m mark --mark "$MARK" -j RETURN
+iptables -t mangle -A D2KLAB_IN -p tcp --sport "$PORT" \
+    -m connbytes --connbytes 0:20 --connbytes-dir reply --connbytes-mode packets \
+    -j NFQUEUE --queue-num "$QUEUE" --queue-bypass
 # ЦЕНЗОР — НА ПРИЁМНОЙ СТОРОНЕ, и это не мелочь.
 #
 # Замерено здесь же: DROP локально рождённого пакета в ИСХОДЯЩЕМ пути
@@ -118,19 +191,35 @@ iptables -t mangle -A D2KLAB -p tcp --dport "$PORT" \
 # Для петли путь такой: OUTPUT → POSTROUTING → (петля) → PREROUTING → INPUT.
 # Роняем в PREROUTING: отправка уже состоялась, до сервера не дошло — ровно
 # то, что делает цензор.
-iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
-    -m string --string "$NAME" --algo bm -j DROP
+if [ "${D2K_LAB_NOCENSOR:-0}" = "1" ]; then
+    echo "цензор ВЫКЛЮЧЕН (D2K_LAB_NOCENSOR=1): это контрольный прогон —"
+    echo "он отвечает на вопрос «доходят ли наши пакеты до сервера вообще»."
+else
+    # ЦЕНЗОР СБРАСЫВАЕТ СОЕДИНЕНИЕ, а не роняет пакет молча.
+    #
+    # Две причины, обе измеренные. Первая: подделанный RST — самая обычная
+    # форма блокировки на живых линиях, и d2k именно её и опознаёт приметой
+    # «rst». Вторая: молчаливый DROP оставляет однопоточный s_server висеть
+    # внутри SSL_accept, и следующие соединения не обслуживаются вовсе —
+    # отличить «цензор режет» от «сервер занят» становится нечем.
+    #
+    # REJECT доступен в filter, не в mangle; для петли пакет доходит до INPUT,
+    # и сброс уходит клиенту оттуда.
+    iptables -A INPUT -p tcp --dport "$PORT" \
+        -m string --string "$NAME" --algo bm -j REJECT --reject-with tcp-reset
+fi
 
 echo "== цензор работает? =="
-if timeout 5 openssl s_client -connect "127.0.0.1:$PORT" -servername "$NAME" \
+if [ "${D2K_LAB_NOCENSOR:-0}" = "1" ]; then
+    echo "пропущено: цензор выключен"
+elif timeout 5 openssl s_client -connect "127.0.0.1:$PORT" -servername "$NAME" \
        -tls1_3 </dev/null >/dev/null 2>&1; then
     fail "цензор не режет: соединение с заблокированным именем прошло"
-fi
-if ! timeout 5 openssl s_client -connect "127.0.0.1:$PORT" -servername control.example \
-       -tls1_3 </dev/null >/dev/null 2>&1; then
+elif ! control_passes; then
     fail "цензор режет ЛИШНЕЕ: контрольное имя тоже не проходит"
+else
+    echo "цензор на месте: заблокированное имя не проходит, контрольное проходит"
 fi
-echo "цензор на месте: заблокированное имя не проходит, контрольное проходит"
 
 CAT=/tmp/lab-catalog.json
 rm -f "$CAT"
@@ -176,4 +265,5 @@ echo "ВСЁ ЗЕЛЕНО (предварительно): поиск начал�
 DRIVER
 
 docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW \
+    -e "D2K_LAB_NOCENSOR=${D2K_LAB_NOCENSOR:-0}" \
     -v "$WORK:/w" -w /w gcc:14 sh /w/censor.sh
