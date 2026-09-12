@@ -1008,8 +1008,18 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            server_name из первого, пересборки у нас нет, и такое приветствие
            получало уверенную и неверную форму. Не разобрали — ANY. */
         uint8_t seen_shape = D2K_PLAN_SHAPE_ANY;
-        if (tls.is_client_hello && tls.have_sni && !tls.exts_truncated) {
-            seen_shape = tls.is_tls13 ? D2K_PLAN_SHAPE_MODERN : D2K_PLAN_SHAPE_LEGACY;
+        if (tls.is_client_hello && tls.have_sni) {
+            if (tls.is_tls13) {
+                /* Признак найден — достоверен независимо от обрыва:
+                   расширение прочитано целиком. */
+                seen_shape = D2K_PLAN_SHAPE_MODERN;
+            } else if (!tls.exts_truncated) {
+                /* Признака нет, и блок расширений пришёл ВЕСЬ — значит его
+                   действительно нет. */
+                seen_shape = D2K_PLAN_SHAPE_LEGACY;
+            }
+            /* Признака нет, блок оборван — «ещё не всё пришло». Формы не
+               объявляем: LEGACY здесь был бы выдуманным замером. */
         }
         use = d2k_plantab_find(s->plans,
                                tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
