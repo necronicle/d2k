@@ -28,9 +28,11 @@
 /* События: датапат → контроллер. */
 #define D2K_EV_HELLO     0x0001  /* ключ + имя цели */
 #define D2K_EV_SUSPECT   0x0002  /* ключ + код причины */
-#define D2K_EV_APPLIED   0x0003  /* ключ + id плана */
+#define D2K_EV_PREPARED  0x0003  /* legacy: prepared only, never execution proof */
+#define D2K_EV_APPLIED   0x0009  /* all sends + original verdict completed; key + plan ID */
 /* Отказ по плану: ключ + КОД ПРИЧИНЫ (D2K_REFUSE_* из d2k_journal.h) одним
- * байтом сразу за ключом.
+ * байтом сразу за ключом. При отказе отправки за кодом идут 16 байт ID плана;
+ * при обычном отказе подготовки ID может отсутствовать.
  *
  * Так было объявлено здесь с самого начала, а на проводе до 12.09.2026 ехал
  * один ключ. Цена расхождения названа в docs/decisions/0006: локальный отказ

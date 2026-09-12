@@ -694,15 +694,48 @@ int main(void) {
         /* Все посылки ушли — «план доисполнен». */
         CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
               "«доисполнен» записан до единой отправки");
-        d2k_session_sent(g, 1100, &r.key);
+        d2k_session_sent(g, 1100, &r.key, r.execution_id);
         CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
               "«доисполнен» записан на половине посылок");
-        d2k_session_sent(g, 1200, &r.key);
+        d2k_session_sent(g, 1200, &r.key, r.execution_id);
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
+              "отправки завершены, но судьба оригинала ещё не подтверждена");
+        d2k_session_sent(g, 1250, &r.key, r.execution_id);
         CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 1,
               "все посылки ушли, а «доисполнен» не записан");
         CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 0,
               "успешная отправка записана недоисполнением");
 
+        d2k_session_free(g);
+    }
+
+    /* One 5-tuple may be reused while old delayed packets still exist. */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &gp,
+                            err, sizeof err) == 0, "план для повторного ключа");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 46002, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        uint64_t old = r.execution_id;
+        d2k_key key = r.key;
+        n = build_pkt(pkt, 46002, 0x11, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 46002, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.applied && r.execution_id != old, "повторный поток наследовал номер исполнения");
+        CHECK(!d2k_session_send_pending(g, &key, old), "старый пакет разрешён к отправке");
+        d2k_session_sent(g, 1300, &key, old);
+        d2k_session_unsent(g, 1301, &key, NULL, D2K_REFUSE_SEND, old);
+        CHECK(d2k_session_send_pending(g, &r.key, r.execution_id), "старый отказ отменил новое исполнение");
+        for (size_t i = 0; i < r.n_out; i++) {
+            d2k_session_sent(g, 1400 + i, &r.key, r.execution_id);
+        }
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0, "чужая отправка зачтена новому потоку");
+        d2k_session_sent(g, 1500, &r.key, r.execution_id);
+        const d2k_jrn_entry *e = last_of_kind(g, D2K_JRN_PLAN_DONE);
+        CHECK(e && memcmp(e->plan_id, want_send_id, 16) == 0, "DONE потерял ID плана");
         d2k_session_free(g);
     }
 
@@ -721,7 +754,7 @@ int main(void) {
         d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
         CHECK(r.applied == 1, "план не применился во второй сессии");
 
-        d2k_session_unsent(g, 1100, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG);
+        d2k_session_unsent(g, 1100, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG, r.execution_id);
         CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 1,
               "отказ отправки не записан в журнал");
         {
@@ -736,8 +769,8 @@ int main(void) {
 
         /* Остаток плана уходит успешно — «доисполнен» всё равно не пишется:
            план исполнен НЕ полностью, и поздняя удача этого не меняет. */
-        d2k_session_sent(g, 1200, &r.key);
-        d2k_session_sent(g, 1300, &r.key);
+        d2k_session_sent(g, 1200, &r.key, r.execution_id);
+        d2k_session_sent(g, 1300, &r.key, r.execution_id);
         CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
               "поздняя удача остатка объявила недоисполненный план доисполненным");
 
@@ -753,4 +786,3 @@ int main(void) {
     printf("сессия: все проверки прошли\n");
     return 0;
 }
-

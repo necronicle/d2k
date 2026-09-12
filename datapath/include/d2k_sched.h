@@ -50,11 +50,14 @@ void       d2k_sched_free(d2k_sched *s);
  * результат пакетного пути давно забыт, а отказ отправки обязан быть приписан
  * своему плану: безымянный счётчик отказов — это ровно тот разрыв, из-за
  * которого «план применён» рос одновременно с «sendto: Message too large»
- * (docs/decisions/0006-proof-boundaries.md). Ключа достаточно и ничего
- * больше не нужно: план применяется к потоку ровно один раз
- * (d2k_flow.plan_done), так что ключ однозначно называет и план. */
+ * (docs/decisions/0006-proof-boundaries.md). На производственном пути нужны
+ * serial-варианты: ключ переиспользуется после удаления потока, поэтому
+ * вместе с ним передаётся execution_id. Обычные push/pop — для лаборатории. */
 int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
                    const d2k_key *key);
+/* Production path: preserve the incarnation, not just the reusable 5-tuple. */
+int d2k_sched_push_serial(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                          const d2k_key *key, uint64_t execution);
 
 /* Забирает один созревший пакет, копируя его в буфер вызывающего.
  * 1 — забрали, 0 — созревших нет либо буфер мал (тогда пакет остаётся).
@@ -62,6 +65,9 @@ int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t le
 int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
                       uint8_t *out, size_t outcap, size_t *len,
                       d2k_key *key);
+int d2k_sched_pop_due_serial(d2k_sched *s, uint64_t now_ns,
+                             uint8_t *out, size_t outcap, size_t *len,
+                             d2k_key *key, uint64_t *execution);
 
 /* Срок ближайшего пакета; 0 — очередь пуста. */
 uint64_t d2k_sched_next_ns(const d2k_sched *s);

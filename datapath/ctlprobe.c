@@ -306,6 +306,7 @@ int main(int argc, char **argv) {
             line[strcspn(line, "\r\n")] = '\0';
             uint8_t pkt[2048], buf[4096];
             d2k_result r;
+            memset(&r, 0, sizeof r);
 
             if (strncmp(line, "hello ", 6) == 0) {
                 uint8_t hello[1024];
@@ -393,6 +394,12 @@ int main(int argc, char **argv) {
                 break;
             } else if (line[0]) {
                 printf("не понял: %s\n", line);
+            }
+            /* Laboratory transport: simulate every send plus original verdict. */
+            if (r.applied) {
+                for (size_t i = 0; i <= r.n_out; i++) {
+                    d2k_session_sent(sess, now++, &r.key, r.execution_id);
+                }
             }
             d2k_ctlsrv_pump(ctl, sess, &seen);
             d2k_ctl_flush(ctl);

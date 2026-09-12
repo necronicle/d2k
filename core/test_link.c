@@ -524,15 +524,14 @@ int main(void) {
         }
     }
     {
-        /* Короткое событие (только ключ) — законный вход: старый датапат id
-           не слал. Поле обязано остаться нулевым, а не мусором. */
+        /* Новый wire-код исполнения не имеет старого формата без ID. */
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED без id) не создался");
         if (sv[0] >= 0) {
             send_synthetic(sv[1], D2K_EV_APPLIED, NULL, 0);
             d2k_ev ev; char e[200] = {0};
-            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
-                  "APPLIED без идентификатора должен приниматься");
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == -1,
+                  "APPLIED без идентификатора должен отвергаться");
             int zero = 1;
             for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != 0) { zero = 0; } }
             CHECK(zero, "идентификатора не было, а поле пришло не нулевым");
@@ -540,10 +539,7 @@ int main(void) {
         }
     }
     {
-        /* Обрезанный идентификатор (15 байт вместо 16) — не половина
-           идентификатора, а его отсутствие: половина ключа хуже, чем ничего,
-           её нельзя сверить с кандидатом, а нулём она честно означает «не
-           прислан». Граница отличает проверку «>= 16» от ослабленной. */
+        /* Обрезанный идентификатор — ошибочный кадр подтверждения. */
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (APPLIED с обрезанным id) не создался");
         if (sv[0] >= 0) {
@@ -551,11 +547,39 @@ int main(void) {
             memset(rest, 0xC7, sizeof rest);
             send_synthetic(sv[1], D2K_EV_APPLIED, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
-            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
-                  "APPLIED с обрезанным идентификатором должен приниматься");
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == -1,
+                  "APPLIED с обрезанным идентификатором должен отвергаться");
             int zero = 1;
             for (int i = 0; i < 16; i++) { if (ev.plan_id[i] != 0) { zero = 0; } }
             CHECK(zero, "обрезанный идентификатор принят за настоящий");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (старое исполнение) не создался");
+        if (sv[0] >= 0) {
+            uint8_t id[16]; memset(id, 0xC7, sizeof id);
+            send_synthetic(sv[1], D2K_EV_PREPARED, id, sizeof id);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "старое событие не должно ломать канал");
+            CHECK(ev.kind == D2K_EV_PREPARED && ev.kind != D2K_EV_APPLIED,
+                  "старая подготовка выдана за подтверждение исполнения");
+            close(sv[0]); close(sv[1]);
+        }
+    }
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (отказ с ID) не создался");
+        if (sv[0] >= 0) {
+            uint8_t rest[17]; memset(rest, 0xC7, sizeof rest); rest[0] = 3;
+            send_synthetic(sv[1], D2K_EV_REFUSED, rest, sizeof rest);
+            d2k_ev ev; char e[200] = {0};
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0,
+                  "отказ с ID не разобран");
+            CHECK(ev.code == 3 && memcmp(ev.plan_id, rest + 1, 16) == 0,
+                  "отказ потерял код или ID кандидата");
             close(sv[0]); close(sv[1]);
         }
     }

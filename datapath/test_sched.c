@@ -255,20 +255,23 @@ int main(void) {
         d2k_sched *s = d2k_sched_new(4, 64);
         d2k_key ka = any_key(6, 4001), kb = any_key(17, 4002);
         mark(pkt, 8, 77);
-        CHECK(d2k_sched_push(s, 200, pkt, 8, &ka) == 0, "посылка с меткой A не принята");
+        CHECK(d2k_sched_push_serial(s, 200, pkt, 8, &ka, 123) == 0, "посылка с меткой A не принята");
         mark(pkt, 8, 88);
-        CHECK(d2k_sched_push(s, 100, pkt, 8, &kb) == 0, "посылка с меткой B не принята");
+        CHECK(d2k_sched_push_serial(s, 100, pkt, 8, &kb, 456) == 0, "посылка с меткой B не принята");
 
         memset(&back, 0xFF, sizeof back);
-        CHECK(d2k_sched_pop_due(s, 1000, got, sizeof got, &len, &back) == 1,
+        uint64_t execution = 0;
+        CHECK(d2k_sched_pop_due_serial(s, 1000, got, sizeof got, &len, &back, &execution) == 1,
               "первая посылка не выдалась");
+        CHECK(execution == 456, "ранний пакет потерял поколение исполнения");
         CHECK(idof(got) == 88, "порядок по сроку нарушился");
         CHECK(memcmp(&back, &kb, sizeof back) == 0,
               "с ранней посылкой приехала чужая метка потока");
 
         memset(&back, 0xFF, sizeof back);
-        CHECK(d2k_sched_pop_due(s, 1000, got, sizeof got, &len, &back) == 1,
+        CHECK(d2k_sched_pop_due_serial(s, 1000, got, sizeof got, &len, &back, &execution) == 1,
               "вторая посылка не выдалась");
+        CHECK(execution == 123, "поздний пакет наследовал чужое поколение");
         CHECK(idof(got) == 77, "порядок по сроку нарушился на второй");
         CHECK(memcmp(&back, &ka, sizeof back) == 0,
               "со второй посылкой приехала чужая метка потока");

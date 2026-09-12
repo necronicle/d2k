@@ -692,8 +692,20 @@ int main(void) {
         d2k_session_packet(sess, pkt, pl, 1000, obuf, sizeof obuf, &r);
         CHECK(d2k_session_applied(sess) == 1,
               "план не применился — проверять в событии нечего");
-
         uint64_t seen = 0;
+        d2k_ctlsrv_pump(c, sess, &seen);
+        d2k_ctl_flush(c);
+        for (int i = 0; i < 4; i++) {
+            uint16_t type = 0;
+            uint8_t ev[256];
+            if (read_event(cli, &type, ev, sizeof ev) < 0) { break; }
+            CHECK(type != D2K_EV_APPLIED, "подготовка выдана за завершение отправки");
+        }
+        /* Explicitly complete the simulated sends and original verdict. */
+        for (size_t i = 0; i <= r.n_out; i++) {
+            d2k_session_sent(sess, 1001 + i, &r.key, r.execution_id);
+        }
+
         d2k_ctlsrv_pump(c, sess, &seen);
         d2k_ctl_flush(c);
 
@@ -789,7 +801,7 @@ int main(void) {
         d2k_session_packet(sess, opkt, opl, 1100, obuf, sizeof obuf, &r2);
 
         /* И отказ ОТПРАВКИ по нашему потоку. */
-        d2k_session_unsent(sess, 1200, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG);
+        d2k_session_unsent(sess, 1200, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG, r.execution_id);
 
         uint64_t seen2 = 0;
         d2k_ctlsrv_pump(c, sess, &seen2);
@@ -806,9 +818,9 @@ int main(void) {
             if (type != D2K_EV_REFUSED) {
                 continue;
             }
-            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1),
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1) || n == (ssize_t)(D2K_KEY_WIRE_LEN + 17),
                   "тело REFUSED не «ключ + код причины»");
-            if (n != (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
+            if (n < (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
                 continue;
             }
             if (ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_NONE) {

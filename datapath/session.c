@@ -57,6 +57,7 @@ struct d2k_session {
     d2k_plan    *plan;
     d2k_journal *jrn;
     uint64_t     applied;
+    uint64_t     next_execution;
     uint64_t     hellos;
     uint64_t     with_sni;
     uint64_t     suspects;
@@ -178,7 +179,7 @@ static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
    Одна функция на обе ветки (TCP и UDP/QUIC) нарочно: разойдись они, одна из
    двух однажды забыла бы взвести счёт, и «план доисполнен» по этому
    транспорту перестало бы появляться молча. */
-static void plan_handed_off(d2k_result *out, d2k_flow *fl, const d2k_key *k,
+static void plan_handed_off(d2k_session *s, d2k_result *out, d2k_flow *fl, const d2k_key *k,
                             const d2k_plan *use) {
     out->applied = 1;
     out->key = *k;
@@ -188,8 +189,12 @@ static void plan_handed_off(d2k_result *out, d2k_flow *fl, const d2k_key *k,
     }
     /* n_out не может превысить вместимость out[] (16): выше стоит явная
        проверка, отвергающая план целиком. */
-    fl->sends_left = (uint8_t)out->n_out;
+    /* One completion for each raw send AND one for the original's NF verdict. */
+    fl->sends_left = (uint8_t)(out->n_out + 1);
     fl->sends_failed = 0;
+    if (++s->next_execution == 0) { ++s->next_execution; }
+    out->execution_id = fl->execution_id = s->next_execution;
+    memcpy(fl->execution_plan_id, out->plan_id, D2K_PLAN_ID_LEN);
 }
 
 /* Таблица, в которой живёт поток этого ключа. Транспорт лежит в самом ключе,
@@ -561,7 +566,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
        отправляющий видит только байты, и отказ sendto оставался голым
        счётчиком (d2k_session.h, поля applied/key/plan_id). */
-    plan_handed_off(out, fl, &key, use);
+    plan_handed_off(s, out, fl, &key, use);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
@@ -1069,7 +1074,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
        отправляющий видит только байты, и отказ sendto оставался голым
        счётчиком (d2k_session.h, поля applied/key/plan_id). */
-    plan_handed_off(out, fl, &key, use);
+    plan_handed_off(s, out, fl, &key, use);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
@@ -1220,7 +1225,14 @@ size_t d2k_session_flows(const d2k_session *s) {
     return s ? d2k_track_count(s->flows) + d2k_track_count(s->uflows) : 0;
 }
 
-void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k) {
+int d2k_session_send_pending(d2k_session *s, const d2k_key *k, uint64_t execution) {
+    if (!s || !k || execution == 0) { return 0; }
+    d2k_flow *fl = d2k_track_find(table_of(s, k), k);
+    return fl && fl->execution_id == execution && fl->sends_left && !fl->sends_failed;
+}
+
+void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                       uint64_t execution) {
     if (!s || !k) {
         return;
     }
@@ -1228,27 +1240,26 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k) {
     /* Потока нет (забыт по RST/FIN/молчанию) либо машине по нему ничего не
        должны — объявлять нечего. Молчание здесь честнее выдумки: «доисполнен»
        по потоку, которого уже нет, мы доказать не можем. */
-    if (!fl || fl->sends_left == 0) {
+    if (!fl || execution == 0 || fl->execution_id != execution || fl->sends_left == 0) {
         return;
     }
     fl->sends_left--;
     if (fl->sends_left == 0 && !fl->sends_failed) {
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
-                             D2K_REFUSE_NONE, NULL);
+                             D2K_REFUSE_NONE, fl->execution_plan_id);
     }
 }
 
 void d2k_session_unsent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
-                        const uint8_t *plan_id, uint8_t code) {
+                        const uint8_t *plan_id, uint8_t code, uint64_t execution) {
     if (!s || !k) {
         return;
     }
-    /* Запись идёт ВСЕГДА, даже когда потока уже нет: отрицательный факт нам
-       известен и без него, а потерять его значит вернуться ровно к тому
-       разрыву, ради которого всё это заведено. */
-    d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code, plan_id);
+    /* Устаревший отказ не относится к новой попытке с тем же ключом. */
     d2k_flow *fl = d2k_track_find(table_of(s, k), k);
-    if (fl) {
+    if (fl && execution != 0 && fl->execution_id == execution) {
+        d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code,
+                             plan_id ? plan_id : fl->execution_plan_id);
         fl->sends_left = 0;
         fl->sends_failed = 1;
     }

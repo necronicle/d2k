@@ -298,14 +298,13 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         out->num = (uint32_t)rest[2] << 8 | rest[3]; /* (ok<<8)|reason, см. d2k_link.h */
         break;
     case D2K_EV_APPLIED:
-        /* Идентификатор необязателен по длине: старый датапат его не слал, и
-           терять из-за этого разбор события нельзя — та же оговорка, что у
-           подробностей SUSPECT и счётчиков STATS выше. Обрезанный (короче 16)
-           не берётся вовсе: половиной идентификатора кандидата не сверить, а
-           нулевое поле честно означает «не прислан» (см. d2k_link.h). */
-        if (rlen >= D2K_PLAN_ID_LEN) {
-            memcpy(out->plan_id, rest, D2K_PLAN_ID_LEN);
+        /* Новый код подтверждения исполнения требует полный ID. Старый
+           PREPARED (0x0003) — отдельное событие, не доказательство. */
+        if (rlen < D2K_PLAN_ID_LEN) {
+            say(err, errcap, "исполнение без полного идентификатора плана");
+            return -1;
         }
+        memcpy(out->plan_id, rest, D2K_PLAN_ID_LEN);
         break;
     case D2K_EV_REFUSED:
         /* КОД ПРИЧИНЫ, если он приехал. Байт необязателен по длине по той же
@@ -319,6 +318,9 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
            (docs/decisions/0006-proof-boundaries.md). */
         if (rlen >= 1) {
             out->code = rest[0];
+        }
+        if (rlen >= 1 + D2K_PLAN_ID_LEN) {
+            memcpy(out->plan_id, rest + 1, D2K_PLAN_ID_LEN);
         }
         break;
     default:

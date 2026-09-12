@@ -232,6 +232,9 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             body[n++] = (uint8_t)e->d_ipid;
             break;
         case D2K_JRN_PLAN_APPLIED:
+            /* Prepared, not yet sent. Never expose this as positive proof. */
+            continue;
+        case D2K_JRN_PLAN_DONE:
             type = D2K_EV_APPLIED;
             /* Идентификатор применённого плана — тем же приёмом, что и всё
                остальное здесь: побайтно в тело, без наложения структуры.
@@ -263,15 +266,9 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                ровно как «коробка не поддалась» (docs/decisions/0006). */
             type = D2K_EV_REFUSED;
             body[n++] = e->code;
+            memcpy(body + n, e->plan_id, D2K_PLAN_ID_LEN);
+            n += D2K_PLAN_ID_LEN;
             break;
-        case D2K_JRN_PLAN_DONE:
-            /* Наружу НЕ едет. Положительная сторона исполнения у контроллера
-               уже есть — APPLIED, и на нём настроены окна ожидания вопросов;
-               второе положительное событие с другим временем означало бы их
-               пересчёт, то есть отдельную работу с отдельным замером. Здесь
-               запись нужна диагностике датапата: по журналу видно, доехал ли
-               план до провода целиком. */
-            continue;
         case D2K_JRN_SHAPE: {
             /* Байты приветствия лежат не в журнале, а в ловушке сессии:
                запись журнала ограничена, а приветствие бывает в килобайт. */
@@ -300,4 +297,3 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         d2k_ctl_event(ctl, type, body, n);
     }
 }
-

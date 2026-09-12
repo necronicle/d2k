@@ -181,10 +181,12 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                  char *err, size_t errcap) {
     if (!r || !pkt || len < 20) {
         say(err, errcap, "нечего отправлять");
+        errno = EINVAL;
         return -1;
     }
     if ((pkt[0] >> 4) != 4) {
         say(err, errcap, "сырой сокет умеет только IPv4");
+        errno = EAFNOSUPPORT;
         return -1;
     }
 
@@ -200,6 +202,7 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
             if ((size_t)n != len) {
                 r->errors++;
                 say(err, errcap, "отправлено %zd из %zu байт", n, len);
+                errno = EIO;
                 return -1;
             }
             r->sent++;
@@ -208,8 +211,10 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         if (errno == EINTR) {
             continue;
         }
+        int failure = errno;
         r->errors++;
-        say(err, errcap, "sendto: %s", strerror(errno));
+        say(err, errcap, "sendto: %s", strerror(failure));
+        errno = failure;
         return -1;
     }
 }

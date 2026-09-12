@@ -207,7 +207,7 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
        применения по числу выпущенных пакетов, и план из одной защиты — без
        единой посылки — показывался как «применён 0», хотя журнал той же
        минутой писал «план применён». Один факт не может иметь двух счётчиков. */
-    printf("план применён %" PRIu64 ", выпущено %" PRIu64
+    printf("план подготовлен %" PRIu64 ", выпущено %" PRIu64
            ", отложено %" PRIu64 "\n",
            d2k_session_applied(s), st.emitted, st.deferred);
     /* Второе число — предел таблицы, а не что попало. В первом полевом
@@ -710,6 +710,7 @@ int main(int argc, char **argv) {
                         size_t plen = res.out[k].len;
                         if (at <= t) {
                             if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
+                                uint8_t failure = refuse_of_errno(errno);
                                 st.send_fail++;
                                 fprintf(stderr, "d2kd: %s\n", err);
                                 /* НАША неудача — не свойство коробки. Пока её
@@ -720,20 +721,20 @@ int main(int argc, char **argv) {
                                    плану. */
                                 if (res.applied) {
                                     d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                                       refuse_of_errno(errno));
+                                                       failure, res.execution_id);
                                 }
                                 break;
                             }
                             st.emitted++;
                             if (res.applied) {
-                                d2k_session_sent(sess, t, &res.key);
+                                d2k_session_sent(sess, t, &res.key, res.execution_id);
                             }
-                        } else if (d2k_sched_push(sched, at, p, plen,
-                                                  res.applied ? &res.key : NULL) != 0) {
+                        } else if (d2k_sched_push_serial(sched, at, p, plen,
+                                                  res.applied ? &res.key : NULL, res.execution_id) != 0) {
                             st.send_fail++;
                             if (res.applied) {
                                 d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                                   D2K_REFUSE_QUEUE);
+                                                   D2K_REFUSE_QUEUE, res.execution_id);
                             }
                             break;
                         } else {
@@ -743,6 +744,12 @@ int main(int argc, char **argv) {
 
                     if (d2k_nfq_verdict(q, np.id, verdict, err, sizeof err) != 0) {
                         st.verdict_fail++;
+                        if (res.applied && mode == MODE_APPLY) {
+                            d2k_session_unsent(sess, t, &res.key, res.plan_id,
+                                               D2K_REFUSE_SEND, res.execution_id);
+                        }
+                    } else if (res.applied && mode == MODE_APPLY) {
+                        d2k_session_sent(sess, t, &res.key, res.execution_id);
                     }
                     if (verdict == D2K_NF_DROP) {
                         st.dropped++;
@@ -758,21 +765,26 @@ int main(int argc, char **argv) {
         if (raw) {
             size_t slen = 0;
             d2k_key skey;
-            while (d2k_sched_pop_due(sched, t, sbuf, sizeof sbuf, &slen, &skey)) {
+            uint64_t execution;
+            while (d2k_sched_pop_due_serial(sched, t, sbuf, sizeof sbuf, &slen, &skey, &execution)) {
                 /* Нулевой ключ означает «клали без метки» (лаборатория):
                    приписывать такую посылку некому, и молчание тут честнее
                    выдумки. */
                 int named = (skey.proto != 0);
+                if (named && !d2k_session_send_pending(sess, &skey, execution)) {
+                    continue; /* failed/forgotten/reused flow: do not send stale bytes */
+                }
                 if (d2k_raw_send(raw, sbuf, slen, err, sizeof err) != 0) {
+                    uint8_t failure = refuse_of_errno(errno);
                     st.send_fail++;
                     fprintf(stderr, "d2kd: отложенная посылка: %s\n", err);
                     if (named) {
-                        d2k_session_unsent(sess, t, &skey, NULL, refuse_of_errno(errno));
+                        d2k_session_unsent(sess, t, &skey, NULL, failure, execution);
                     }
                 } else {
                     st.emitted++;
                     if (named) {
-                        d2k_session_sent(sess, t, &skey);
+                        d2k_session_sent(sess, t, &skey, execution);
                     }
                 }
             }

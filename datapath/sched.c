@@ -18,6 +18,7 @@ typedef struct {
        возвращается вместе с ней, чтобы отказ созревшей отправки было чем
        приписать плану (см. d2k_sched.h). */
     d2k_key  key;
+    uint64_t execution;
 } entry;
 
 struct d2k_sched {
@@ -118,6 +119,11 @@ static void sift_down(d2k_sched *s, size_t i) {
 
 int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
                    const d2k_key *key) {
+    return d2k_sched_push_serial(s, due_ns, data, len, key, 0);
+}
+
+int d2k_sched_push_serial(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                          const d2k_key *key, uint64_t execution) {
     if (!s || !data || len == 0) {
         return -2;
     }
@@ -136,6 +142,7 @@ int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t le
     s->heap[s->n].seq = s->next_seq++;
     s->heap[s->n].slot = slot;
     s->heap[s->n].len = len;
+    s->heap[s->n].execution = execution;
     if (key) {
         s->heap[s->n].key = *key;
     } else {
@@ -149,6 +156,12 @@ int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t le
 int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
                       uint8_t *out, size_t outcap, size_t *len,
                       d2k_key *key) {
+    return d2k_sched_pop_due_serial(s, now_ns, out, outcap, len, key, NULL);
+}
+
+int d2k_sched_pop_due_serial(d2k_sched *s, uint64_t now_ns,
+                             uint8_t *out, size_t outcap, size_t *len,
+                             d2k_key *key, uint64_t *execution) {
     if (!s || s->n == 0 || !out) {
         return 0;
     }
@@ -167,6 +180,7 @@ int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
     if (key) {
         *key = s->heap[0].key;
     }
+    if (execution) { *execution = s->heap[0].execution; }
     s->freelist[s->nfree++] = s->heap[0].slot;
 
     s->n--;
