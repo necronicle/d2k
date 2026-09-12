@@ -284,6 +284,14 @@ typedef struct {
        По нему сверяется «применён», как у кандидата по ver_plan_id: одного
        ключа потока мало, на нём мог примениться другой план. */
     uint8_t    prop_plan_id[D2K_PLAN_ID_LEN];
+    /* Номер следующего плеча ЗАПАСНОГО ПЕРЕБОРА (третий источник кандидатов,
+       после готовых планов и синтеза). */
+    size_t     fb_next;
+    /* Хэши уже испытанных текстов планов — чтобы перебор не предлагал то, что
+       синтез уже дал. Одинаковый текст это один и тот же план, сколько бы
+       источников его ни назвало. */
+    uint32_t   tried[SCHED_MAX_PLANS * 4];
+    size_t     n_tried;
     int64_t    ver_until_ms;
     uint32_t   ver_dropped0;    /* сколько событий было потеряно, когда план встал */
 
@@ -1060,12 +1068,58 @@ static void task_done(task *t) {
 }
 
 /* Ставит следующего кандидата. 0 — поставлен, -1 — кандидаты кончились. */
+/* ДОЛИВАЕТ ОЧЕРЕДЬ ИЗ ЗАПАСНОГО ПЕРЕБОРА — третий источник кандидатов после
+   готовых планов коробки и синтеза из вектора (0007 п.3, 0008 п.7).
+
+   Донор после синтеза идёт по списку poisons() до успеха или конца бюджета; у
+   нас этого пути не было вовсе — синтез не помог, задача уходила в отдых.
+
+   Повторы исключаются сравнением ТЕКСТА плана с уже испытанными: одинаковый
+   текст — это один и тот же план, сколько бы источников его ни предложило.
+   Бюджет остаётся общим: сюда попадают только те попытки, что уцелели после
+   готовых планов и синтеза.
+
+   Возвращает число долитых планов. */
+static size_t refill_from_fallback(task *t) {
+    size_t cap = sizeof t->plans / sizeof t->plans[0];
+    size_t added = 0;
+    d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
+    while (added < cap) {
+        char text[sizeof t->plans[0]];
+        if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, text, sizeof text) != 0) {
+            t->fb_next++;
+            if (t->fb_next > D2K_FALLBACK_MAX) { break; }
+            continue;   /* плечо не выразимо — пробел реализации, идём дальше */
+        }
+        t->fb_next++;
+        uint32_t h = fnv1a(text);
+        int seen = 0;
+        for (size_t i = 0; i < t->n_tried && !seen; i++) {
+            if (t->tried[i] == h) { seen = 1; }
+        }
+        if (seen) { continue; }
+        if (t->n_tried < sizeof t->tried / sizeof t->tried[0]) {
+            t->tried[t->n_tried++] = h;
+        }
+        snprintf(t->plans[added], sizeof t->plans[added], "%s", text);
+        t->plan_boxes[added][0] = '\0';   /* перебор не принадлежит модели коробки */
+        added++;
+    }
+    if (added) {
+        t->n_plans = added;
+        t->next_plan = 0;
+        t->n_known = 0;
+    }
+    return added;
+}
+
 static int install_next(d2k_sched *s, task *t) {
     /* Счёт повторов после временного отказа — про ОДНУ гипотезу. Новый
        кандидат начинает с нуля: иначе неудачная очередь у первого забирала бы
        попытки у всех следующих. */
     t->unsent_tries = 0;
     t->unsent_code = 0;
+    for (;;) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
         const char *text = t->plans[t->next_plan++];
@@ -1114,7 +1168,11 @@ static int install_next(d2k_sched *s, task *t) {
             return 0;
         }
     }
-    return -1;
+        /* Очередь исчерпана. Раньше здесь был отказ — задача уходила в
+           отдых. Теперь пробуем ТРЕТИЙ источник: запасной перебор донора.
+           Ничего не долилось — значит список кончился, и отказ честен. */
+        if (refill_from_fallback(t) == 0) { return -1; }
+    }
 }
 
 /* Готовые планы УЗНАННОЙ коробки — первыми, синтез по вердикту — следом.

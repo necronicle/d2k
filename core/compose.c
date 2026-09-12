@@ -1153,9 +1153,9 @@ static int everything_plan_text(d2k_shape shape, const char *decoy, char *buf, s
     if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
     if (append_hex(buf, cap, &pos, hello, hello_len) != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
-    /* payload 2 — overlapByte, та же приставка {0x41}, что и у
-       overlap_plan_text. */
-    if (append_fmt(buf, cap, &pos, "payload 2 41\n") != 0) { return -1; }
+    /* payload 2 — приставка перекрытия, та же, что и у overlap_plan_text. */
+    if (append_fmt(buf, cap, &pos, "payload 2 %02x\n",
+                    (unsigned)D2K_OVERLAP_FILLER) != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "poison 1 badsum\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "split payload_start +1\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "split sni_middle +0\n") != 0) { return -1; }
@@ -1165,6 +1165,208 @@ static int everything_plan_text(d2k_shape shape, const char *decoy, char *buf, s
     }
     if (append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "order reverse\n") != 0) { return -1; }
+    return 0;
+}
+
+/* --------------------------------------------------------------------
+ * ЗАПАСНОЙ ПЕРЕБОР — третий источник кандидатов (0007 п.3, 0008 п.7).
+ *
+ * Донор после синтеза из вектора идёт по списку poisons()
+ * (z2k-detect/internal/classify/classify.go:583-660) до успеха или конца
+ * бюджета. У нас этого пути не было вовсе: синтез не помог — отдых.
+ *
+ * ПОРЯДОК — ЭТО СТОИМОСТЬ, и он донорский дословно: неудачный зонд ждёт весь
+ * таймаут, удачный отвечает мгновенно и обрывает перебор. Поэтому первыми
+ * идут гипотезы, которые уже брали живые коробки.
+ *
+ * ЭТО НЕ СПИСОК ДОМЕНОВ. Перечень вариантов ВОЗДЕЙСТВИЯ прямо разрешён
+ * решением 0007 п.3 и ничего не знает ни об одном имени.
+ *
+ * ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ. Четыре донорских плеча не выразимы сегодняшним
+ * языком Plan, и они ПРОПУЩЕНЫ, а не подменены похожими:
+ *
+ *   md5      — нужна опция TCP MD5 в заголовке;
+ *   syndata  — нужна посылка с флагом SYN поверх готового соединения;
+ *   oob      — нужен срочный байт (URG) в середине имени;
+ *   ipfrag   — нужна IP-фрагментация.
+ *
+ * Пропуск примитива — пробел РЕАЛИЗАЦИИ, а не отрицательное свойство коробки
+ * (0007 п.3): промах непроверенного плеча ничего не говорит о DPI, и
+ * записывать его в вектор нельзя.
+ *
+ * Возвращает 0 — план собран в out, -1 — этого плеча нет (индекс за концом
+ * списка либо плечо не выразимо). Вызывающий идёт по индексам подряд и сам
+ * решает, когда остановиться: общий бюджет зондов принадлежит ему.
+ * -------------------------------------------------------------------- */
+
+/* Одно плечо перебора. Поля — ровно те, что читает отправитель донора
+   (probePoison, raw_linux.go): всё остальное было бы выдумкой. */
+typedef struct {
+    const char *name;
+    unsigned    seqovl;      /* длина перекрытия в байтах, 0 — нет */
+    int         seqovl_hello;/* перекрытие длиной в целое приветствие */
+    int         badsum;      /* фальшивка с битой суммой */
+    unsigned    repeats;     /* копий фальшивки */
+    unsigned    gap_ms;      /* пауза между копиями */
+    int         disorder;    /* сбитый порядок сегментов */
+    int         between;     /* фальшивка МЕЖДУ кусками, а не перед ними */
+    unsigned    ttl;         /* TTL фальшивки, 0 — не задан */
+    int         seq_out;     /* номер вне окна */
+    int         decoy_hello; /* телом фальшивки идёт приветствие, не набивка */
+} fb_arm;
+
+/* Голова списка — дословно donor poisons()[0..7], без неподдержанных. */
+static const fb_arm g_fb_head[] = {
+    { "seqovl-1",        1, 0, 0, 0,  0, 0, 0, 0, 0, 0 },
+    { "badsum-x2-g20",   0, 0, 1, 2, 20, 0, 0, 0, 0, 0 },
+    { "badsum-x2-g80",   0, 0, 1, 2, 80, 0, 0, 0, 0, 0 },
+    { "badsum-x7",       0, 0, 1, 7,  0, 0, 0, 0, 0, 0 },
+    { "disorder",        0, 0, 0, 0,  0, 1, 0, 0, 0, 0 },
+    { "badsum",          0, 0, 1, 1,  0, 0, 0, 0, 0, 0 },
+    { "seq-out-of-window", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
+    { "fakedsplit",      0, 0, 1, 1,  0, 0, 1, 0, 0, 0 },
+    { "fakedsplit-x7",   0, 0, 1, 7,  0, 0, 1, 0, 0, 0 },
+    { "seqovl-hello",    0, 1, 0, 0,  0, 0, 0, 0, 0, 0 },
+    { "seqovl-hello+disorder", 0, 1, 0, 0, 0, 1, 0, 0, 0, 0 },
+};
+
+/* Хвост — параметрические семейства донора в его же порядке. */
+static const unsigned g_fb_fake_reps[] = { 7, 4, 2 };
+static const unsigned g_fb_ovl_len[]   = { 2, 4, 8, 16, 64, 336, 681 };
+static const unsigned g_fb_dup_gap[]   = { 0, 20, 80, 300 };
+static const unsigned g_fb_dup_reps[]  = { 2, 3, 4, 7 };
+
+#define FB_N_HEAD (sizeof g_fb_head / sizeof g_fb_head[0])
+#define FB_N_FAKE (sizeof g_fb_fake_reps / sizeof g_fb_fake_reps[0])
+#define FB_N_OVL  (sizeof g_fb_ovl_len / sizeof g_fb_ovl_len[0])
+#define FB_N_DUP  ((sizeof g_fb_dup_gap / sizeof g_fb_dup_gap[0]) * \
+                   (sizeof g_fb_dup_reps / sizeof g_fb_dup_reps[0]))
+
+/* Плечо по номеру. 0 — заполнено, -1 — номер за концом списка. */
+static int fb_arm_at(size_t idx, fb_arm *a) {
+    memset(a, 0, sizeof *a);
+    if (idx < FB_N_HEAD) { *a = g_fb_head[idx]; return 0; }
+    idx -= FB_N_HEAD;
+    /* fake-xR + перекрытие длиной в приветствие — копия боевого плеча. */
+    if (idx < FB_N_FAKE) {
+        a->name = "fake+seqovl-hello";
+        a->badsum = 1; a->repeats = g_fb_fake_reps[idx];
+        a->seqovl_hello = 1; a->decoy_hello = 1;
+        return 0;
+    }
+    idx -= FB_N_FAKE;
+    if (idx < FB_N_FAKE) {
+        a->name = "fake+ttl62+seqovl-hello";
+        a->badsum = 1; a->repeats = g_fb_fake_reps[idx];
+        a->seqovl_hello = 1; a->decoy_hello = 1; a->ttl = 62;
+        return 0;
+    }
+    idx -= FB_N_FAKE;
+    /* Перекрытие разной длины: набивкой и приветствием. */
+    if (idx < FB_N_OVL * 2) {
+        a->name = "seqovl-N";
+        a->seqovl = g_fb_ovl_len[idx / 2];
+        a->decoy_hello = (int)(idx % 2);
+        return 0;
+    }
+    idx -= FB_N_OVL * 2;
+    /* Дубликаты: число копий × пауза, обе оси. */
+    if (idx < FB_N_DUP) {
+        a->name = "badsum-xN-gG";
+        a->badsum = 1;
+        a->repeats = g_fb_dup_reps[idx % (sizeof g_fb_dup_reps / sizeof g_fb_dup_reps[0])];
+        a->gap_ms = g_fb_dup_gap[idx / (sizeof g_fb_dup_reps / sizeof g_fb_dup_reps[0])];
+        return 0;
+    }
+    return -1;
+}
+
+int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
+                      char *buf, size_t cap) {
+    fb_arm a;
+    if (!buf || cap == 0 || fb_arm_at(idx, &a) != 0) { return -1; }
+
+    uint8_t hello[D2K_COMPOSE_HELLO_MAX];
+    size_t hello_len = 0;
+    int need_hello = a.seqovl_hello || a.decoy_hello;
+    if (need_hello &&
+        build_decoy_hello(shape, decoy, hello, sizeof hello, &hello_len) != 0) {
+        return -1;   /* приманку не собрать — плечо сегодня не задать */
+    }
+
+    size_t pos = 0;
+    if (emit_header(buf, cap, &pos) != 0) { return -1; }
+
+    /* payload 1 — тело фальшивки; payload 2 — приставка перекрытия. */
+    int have_fake = a.badsum || a.repeats > 0 || a.between;
+    if (have_fake) {
+        if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
+        if (a.decoy_hello) {
+            if (append_hex(buf, cap, &pos, hello, hello_len) != 0) { return -1; }
+        } else {
+            /* Набивка ВДВОЕ длиннее правды нам здесь недоступна: длина правды
+               зависит от пакета. Берём длину приманки — это то же, что делает
+               донор для плеч без decoy: у него фальшивка считается от длины
+               триггера, а триггер и приманка одного порядка. Расхождение
+               названо, а не замаскировано: см. 0008, расхождение 2. */
+            size_t fill = hello_len ? hello_len : 64;
+            for (size_t i = 0; i < fill; i++) {
+                if (append_fmt(buf, cap, &pos, "%02x", (unsigned)D2K_OVERLAP_FILLER) != 0) {
+                    return -1;
+                }
+            }
+        }
+        if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+    }
+    if (a.seqovl_hello) {
+        if (append_fmt(buf, cap, &pos, "payload 2 ") != 0) { return -1; }
+        if (append_hex(buf, cap, &pos, hello, hello_len) != 0) { return -1; }
+        if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+    } else if (a.seqovl > 0) {
+        if (append_fmt(buf, cap, &pos, "payload 2 ") != 0) { return -1; }
+        for (unsigned i = 0; i < a.seqovl; i++) {
+            if (append_fmt(buf, cap, &pos, "%02x", (unsigned)D2K_OVERLAP_FILLER) != 0) {
+                return -1;
+            }
+        }
+        if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+    }
+
+    if (have_fake || a.seq_out) {
+        if (append_fmt(buf, cap, &pos, "poison 1") != 0) { return -1; }
+        if (a.badsum && append_fmt(buf, cap, &pos, " badsum") != 0) { return -1; }
+        if (a.ttl && append_fmt(buf, cap, &pos, " ttl=%u", a.ttl) != 0) { return -1; }
+        /* Номер вне окна — донорский seqShift: -66000 (classify.go:597). */
+        if (a.seq_out && append_fmt(buf, cap, &pos, " seqshift=-66000") != 0) { return -1; }
+        if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+    }
+
+    if (a.disorder || a.between) {
+        if (append_fmt(buf, cap, &pos, "split payload_start +1\n") != 0) { return -1; }
+        if (append_fmt(buf, cap, &pos, "split sni_middle +0\n") != 0) { return -1; }
+    }
+    if (have_fake) {
+        if (append_fmt(buf, cap, &pos,
+                        "fake payload=1 poison=1 repeats=%u gap_us=%u place=%s\n",
+                        a.repeats ? a.repeats : 1u, a.gap_ms * 1000u,
+                        a.between ? "between" : "before") != 0) {
+            return -1;
+        }
+    }
+    if (a.seqovl_hello || a.seqovl > 0) {
+        if (append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n") != 0) { return -1; }
+    }
+    if (append_fmt(buf, cap, &pos, "order %s\n",
+                    a.disorder ? "reverse" : "forward") != 0) {
+        return -1;
+    }
+    /* Разнос во времени нужен там, где он есть у донора: между кусками при
+       сбитом порядке и между фальшивкой и правдой. */
+    if (a.disorder) {
+        if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_PIECE_US) != 0) { return -1; }
+    } else if (have_fake) {
+        if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) { return -1; }
+    }
     return 0;
 }
 

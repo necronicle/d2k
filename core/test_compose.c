@@ -682,7 +682,7 @@ int main(void) {
         CHECK(strstr(out[0], "poison 1 badsum") != NULL, "запасной план без порчи суммы");
         CHECK(strstr(out[0], "fake payload=1 poison=1 repeats=2 gap_us=20000") != NULL,
               "запасной план без пары дублей с разрывом 20000мкс");
-        CHECK(strstr(out[0], "payload 2 41") != NULL, "запасной план без приставки перекрытия");
+        CHECK(strstr(out[0], "payload 2 0f") != NULL, "запасной план без приставки перекрытия");
     }
 
     /* --- перекрытие выводится только из своего свойства -------------------- */
