@@ -51,6 +51,7 @@ static int fails;
 
 static d2k_quic_ask_fn real_ask_hook;
 static d2k_quic_ask_ttl_fn real_ask_ttl_hook;
+static d2k_quic_ask_copies_fn real_ask_copies_hook;
 static d2k_quic_ask_frag_fn real_ask_frag_hook;
 static d2k_quic_resolve_fn real_resolve_hook;
 
@@ -110,6 +111,31 @@ static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix
     if (sent_out) {
         *sent_out = repeats;
     }
+    return t;
+}
+
+/* -- мок d2k_quic_ask_copies_hook (несколько копий приманки) -- */
+static int g_cop_calls;
+static int g_cop_pass_at = -1;   /* число копий, при котором коробка поддаётся; -1 — никогда */
+static int g_cop_pass_blob;      /* какой блоб при этом нужен */
+static int g_cop_log[8];
+
+static d2k_tally mock_ask_copies(const char *addr, uint16_t port, const uint8_t *prefix,
+                                  size_t prefix_len, int copies, d2k_hello msg,
+                                  uint32_t wait_ms, uint32_t mark, int repeats, int *sent_out) {
+    (void)addr; (void)port; (void)msg; (void)wait_ms; (void)mark;
+    if (g_cop_calls < 8) { g_cop_log[g_cop_calls] = copies; }
+    g_cop_calls++;
+    d2k_tally t;
+    memset(&t, 0, sizeof t);
+    t.marked = 1;
+    int blob = blob_index_of(prefix, prefix_len);
+    if (copies == g_cop_pass_at && blob == g_cop_pass_blob) {
+        t.pass = repeats <= 1 ? 1 : repeats;
+    } else {
+        t.fail = repeats <= 1 ? 1 : repeats;
+    }
+    if (sent_out) { *sent_out = repeats <= 1 ? 1 : repeats; }
     return t;
 }
 
@@ -209,6 +235,10 @@ static void mocks_reset(void) {
     g_ask_mark_seen = 0;
     g_ask_pass_blob = -1;
     g_ask_confirm_ok = 1;
+    g_cop_calls = 0;
+    memset(g_cop_log, 0, sizeof g_cop_log);
+    g_cop_pass_at = -1;
+    g_cop_pass_blob = -1;
     g_ttl_calls = 0;
     memset(g_ttl_log, 0, sizeof g_ttl_log);
     g_ttl_pass_at = -1;
@@ -261,6 +291,45 @@ static void test_ladder_ttl_wins_when_no_blob_helps(void) {
     }
     CHECK(g_ttl_log[5] == 5, "подтверждение обязано идти на ТОМ ЖЕ TTL, что и разведка, не на любом другом");
     CHECK(g_frag_calls == 0, "фрагментация не нужна, если развёртка TTL уже нашла рабочее значение");
+}
+
+/* ЧИСЛО КОПИЙ — отдельная ось, и она идёт ДО развёртки TTL: две точки против
+   двухсот пятидесяти пяти. Донор ставит её так же (arms.go:117-150), и замер
+   12.09 показал, зачем: instagram берётся ТОЛЬКО одиннадцатью копиями quic5,
+   одиночные копии всех блобов дают 0/3. */
+static void test_ladder_copies_before_ttl(void) {
+    mocks_reset();
+    g_ask_pass_blob = -1;          /* одиночной копией не берётся ни один блоб */
+    g_ttl_pass_at = 5;             /* TTL помог бы, но до него дойти не должно */
+    g_cop_pass_at = D2K_QUIC_COPIES_A;
+    g_cop_pass_blob = 0;
+    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+
+    CHECK(a.kind == D2K_QA_COPIES,
+          "плечо с числом копий не названо своим видом — воздействие выдано за одиночную приманку");
+    CHECK(a.copies == D2K_QUIC_COPIES_A,
+          "число копий в результате не то, которым коробка поддалась");
+    CHECK(a.blob_id == 0, "номер блоба потерян");
+    CHECK(g_cop_log[0] == D2K_QUIC_COPIES_A,
+          "лестница копий обязана начинаться с меньшей точки");
+    CHECK(g_ttl_calls == 0,
+          "развёртка TTL пошла раньше лестницы копий — дорогая ось обогнала дешёвую");
+}
+
+/* Вторая точка лестницы достигается, если первой не хватило. */
+static void test_ladder_copies_second_point(void) {
+    mocks_reset();
+    g_ask_pass_blob = -1;
+    g_ttl_pass_at = -1;
+    g_cop_pass_at = D2K_QUIC_COPIES_B;
+    g_cop_pass_blob = 1;
+    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+
+    CHECK(a.kind == D2K_QA_COPIES, "вторая точка лестницы не сработала");
+    CHECK(a.copies == D2K_QUIC_COPIES_B, "число копий не совпало со второй точкой");
+    CHECK(a.blob_id == 1, "номер блоба второй точки потерян");
 }
 
 static void test_ladder_frag_is_last_resort(void) {
@@ -558,6 +627,7 @@ int main(void) {
        quicprobe.o целиком) — подмена обязана быть временной. */
     real_ask_hook = d2k_quic_ask_hook;
     real_ask_ttl_hook = d2k_quic_ask_ttl_hook;
+    real_ask_copies_hook = d2k_quic_ask_copies_hook;
     real_ask_frag_hook = d2k_quic_ask_frag_hook;
     real_resolve_hook = d2k_quic_resolve_hook;
 
@@ -565,10 +635,13 @@ int main(void) {
 
     d2k_quic_ask_hook = mock_ask;
     d2k_quic_ask_ttl_hook = mock_ask_ttl;
+    d2k_quic_ask_copies_hook = mock_ask_copies;
     d2k_quic_ask_frag_hook = mock_ask_frag;
 
     test_ladder_blob_wins();
     test_ladder_ttl_wins_when_no_blob_helps();
+    test_ladder_copies_before_ttl();
+    test_ladder_copies_second_point();
     test_ladder_frag_is_last_resort();
     test_nothing_works_is_honest_not_found();
     test_confirm_disagreement_is_flaky_not_escalation();

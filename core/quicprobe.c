@@ -710,6 +710,7 @@ static void nap_us(uint32_t us) {
    этом файле нужен только фрагментации (props.c), не приманке с TTL. */
 static int qp_send_one(const char *addr, uint16_t port,
                         const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
+                        int prefix_copies,
                         d2k_hello msg, uint32_t mark, int *marked) {
     *marked = (mark == 0);
     if (!addr || !msg.bytes || msg.len == 0) {
@@ -747,9 +748,18 @@ static int qp_send_one(const char *addr, uint16_t port,
             int want = prefix_ttl;
             (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &want, sizeof want);
         }
-        if (send(fd, prefix, prefix_len, 0) < 0) {
-            close(fd);
-            return -1;
+        /* КОПИЙ СТОЛЬКО, СКОЛЬКО ПРОСИЛИ, И КАЖДАЯ — СВОЯ ДАТАГРАММА.
+           Донор кладёт N отдельных датаграмм перед Initial
+           (z2k-detect/internal/quicprobe/arms.go:140-150), а не одну длинную
+           из N склеенных копий: коробка считает ДАТАГРАММЫ, и склейка
+           измеряла бы не то. Ноль и единица означают одну копию — прежнее
+           поведение. */
+        int copies = prefix_copies > 0 ? prefix_copies : 1;
+        for (int c = 0; c < copies; c++) {
+            if (send(fd, prefix, prefix_len, 0) < 0) {
+                close(fd);
+                return -1;
+            }
         }
         if (prefix_ttl > 0 && orig_ttl >= 0) {
             /* Восстановить ДО отправки trigger — иначе он тоже уйдёт с
@@ -823,6 +833,7 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    тащить лишний параметр через всё дерево). */
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
+                              int prefix_copies,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, qp_verify_fn verify) {
@@ -881,7 +892,8 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     int pending = 0;
 
     for (int i = 0; i < repeats; i++) {
-        fds[i] = qp_send_one(addr, port, prefix, prefix_len, prefix_ttl, msg, mark, &marked[i]);
+        fds[i] = qp_send_one(addr, port, prefix, prefix_len, prefix_ttl, prefix_copies,
+                              msg, mark, &marked[i]);
         if (!marked[i]) {
             t.marked = 0;
         }
@@ -999,8 +1011,8 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, 0, msg, wait_ms, mark, repeats, rtt_ms_out,
-                        refused_out, sent_out, qp_verify_aead);
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, msg, wait_ms, mark, repeats,
+                        rtt_ms_out, refused_out, sent_out, qp_verify_aead);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1024,7 +1036,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     d2k_hello msg;
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
-    return quic_ask_ex(addr, port, NULL, 0, 0, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
+    return quic_ask_ex(addr, port, NULL, 0, 0, 1, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
                         sent_out, qp_verify_vn);
 }
 
@@ -1036,10 +1048,28 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
 static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, msg, wait_ms, mark, repeats, NULL,
-                        NULL, sent_out, qp_verify_aead);
+    return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, msg, wait_ms, mark, repeats,
+                        NULL, NULL, sent_out, qp_verify_aead);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
+
+/* ЧИСЛО КОПИЙ ПРИМАНКИ — отдельная ось поиска, как у донора.
+   Донор пробует 6 и 11 копий (arms.go:140) ОТДЕЛЬНО от выбора блоба: одна
+   копия могла потеряться, а могла и не хватить коробке. Замер это и
+   показывает — instagram берётся только одиннадцатью копиями quic5, а
+   одиночные копии всех четырёх блобов дают 0/3
+   (docs/field/2026-09-12-donor-reference.md).
+   Отдельным хуком, а не расширением d2k_quic_ask_fn, по той же причине, что
+   и TTL: публичный контракт уже прошёл ревью, и тащить через всё дерево
+   параметр, нужный одному вызывающему, незачем. */
+static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
+                                  const uint8_t *prefix, size_t prefix_len,
+                                  int copies, d2k_hello msg, uint32_t wait_ms,
+                                  uint32_t mark, int repeats, int *sent_out) {
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, msg, wait_ms, mark, repeats,
+                        NULL, NULL, sent_out, qp_verify_aead);
+}
+d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
 
 /* Реальный оракул — умолчание d2k_quic_ask_hook (см. d2k_quicprobe.h про то,
    зачем этот хук вообще существует). Дерево ниже зовёт ИСКЛЮЧИТЕЛЬНО хук, не

@@ -489,7 +489,7 @@ static int qa_budget_left(const struct timespec *start) {
 
 static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_pool, size_t *next_fresh,
                                 uint16_t port, d2k_hello trigger, uint32_t mark, int *probes,
-                                d2k_quic_arm_kind kind, size_t blob_id, int ttl) {
+                                d2k_quic_arm_kind kind, size_t blob_id, int ttl, int copies) {
     d2k_quic_arm a;
     memset(&a, 0, sizeof a);
     if (*next_fresh >= n_pool) {
@@ -508,6 +508,12 @@ static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_po
     if (ttl > 0) {
         t = d2k_quic_ask_ttl_hook(fresh, port, bytes, blen, ttl, trigger, d2k_quic_wait_ms, mark,
                                    D2K_QUIC_REPEATS, &sent);
+    } else if (copies > 1) {
+        /* Подтверждать обязано ТО ЖЕ воздействие, которое нашлось. Подтвердив
+           одиночной копией плечо, найденное одиннадцатью, мы записали бы в
+           каталог не тот приём, каким цель берётся. */
+        t = d2k_quic_ask_copies_hook(fresh, port, bytes, blen, copies, trigger, d2k_quic_wait_ms,
+                                      mark, D2K_QUIC_REPEATS, &sent);
     } else {
         t = d2k_quic_ask_hook(fresh, port, bytes, blen, trigger, d2k_quic_wait_ms, mark, D2K_QUIC_REPEATS,
                                NULL, NULL, &sent);
@@ -521,6 +527,7 @@ static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_po
         a.kind = kind;
         a.blob_id = blob_id;
         a.ttl = ttl;
+        a.copies = copies;
         snprintf(a.reason, sizeof a.reason, "подтверждено на свежем адресе %s: %d/%d", fresh, t.pass,
                  D2K_QUIC_REPEATS);
     } else if (t.pass > 0) {
@@ -639,7 +646,40 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
     }
     if (chosen_blob >= 0) {
         return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes, D2K_QA_BLOB,
-                           (size_t)chosen_blob, 0);
+                           (size_t)chosen_blob, 0, 1);
+    }
+
+    /* ===== Ступень 1б: ЧИСЛО КОПИЙ ПРИМАНКИ — отдельная ось =====
+       Одиночная копия могла потеряться, а могла и не хватить коробке. Донор
+       разводит эти два случая отдельной осью и пробует две точки, 6 и 11
+       (arms.go:140); замер 12.09 показал, что instagram берётся ТОЛЬКО
+       одиннадцатью копиями, а одиночные копии всех блобов дают 0/3. Ось
+       идёт до TTL-развёртки: она дешевле — две точки против двухсот
+       пятидесяти пяти. */
+    {
+        static const int ladder[] = { D2K_QUIC_COPIES_A, D2K_QUIC_COPIES_B };
+        for (size_t li = 0; li < sizeof ladder / sizeof ladder[0]; li++) {
+            for (size_t i = 0; i < D2K_QUIC_ARM_N_BLOBS; i++) {
+                if (!qa_budget_left(&start)) {
+                    a.kind = D2K_QA_NOT_FOUND;
+                    snprintf(a.reason, sizeof a.reason,
+                             "бюджет исчерпан на числе копий приманки");
+                    a.probes = probes;
+                    return a;
+                }
+                size_t blen;
+                const uint8_t *bytes = d2k_quic_arm_blob(i, &blen);
+                int sent = 0;
+                d2k_tally t = d2k_quic_ask_copies_hook(pool[0], port, bytes, blen, ladder[li],
+                                                       trigger, d2k_quic_wait_ms, mark, 1, &sent);
+                probes += sent;
+                if (t.pass == 1) {
+                    d2k_quic_arm c = qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark,
+                                                &probes, D2K_QA_COPIES, i, 0, ladder[li]);
+                    return c;
+                }
+            }
+        }
     }
 
     /* ===== Ступень 2: приманка с укороченным TTL, взятым РАЗВЁРТКОЙ =====
@@ -671,7 +711,7 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
     }
     if (chosen_ttl >= 0) {
         return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes, D2K_QA_TTL,
-                           D2K_QUIC_ARM_BLOB_SHAPED, chosen_ttl);
+                           D2K_QUIC_ARM_BLOB_SHAPED, chosen_ttl, 1);
     }
 
     /* ===== Ступень 3 (самая дорогая): IP-фрагментация ===== */

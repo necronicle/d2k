@@ -408,6 +408,7 @@ size_t d2k_quic_build_pool(const char *ip, const char *sni, char pool[][D2K_QUIC
  * d2k_quic_classify выше). */
 typedef enum {
     D2K_QA_BLOB,      /* одиночной фальшивки достаточно (см. blob_id, ttl не значим) */
+    D2K_QA_COPIES,    /* потребовалось НЕСКОЛЬКО копий приманки (см. blob_id и copies) */
     D2K_QA_TTL,       /* фальшивке потребовался укороченный TTL, взятый развёрткой (см. ttl) */
     D2K_QA_FRAG,      /* потребовалась IP-фрагментация (см. reason) */
     D2K_QA_NOT_FOUND, /* честный отрицательный результат — см. reason (бюджет/пул/каталог) */
@@ -418,6 +419,7 @@ typedef struct {
     d2k_quic_arm_kind kind;
     size_t            blob_id; /* значим при kind==D2K_QA_BLOB || kind==D2K_QA_TTL */
     int               ttl;     /* значим только при kind==D2K_QA_TTL */
+    int               copies;  /* значим только при kind==D2K_QA_COPIES: сколько датаграмм приманки */
     int               probes;  /* сколько опытов всего стоил подбор (та же честность, что r.probes у d2k_vres) */
     char              reason[256];
 } d2k_quic_arm;
@@ -465,6 +467,31 @@ typedef d2k_tally (*d2k_quic_ask_ttl_fn)(const char *addr, uint16_t port, const 
                                           size_t prefix_len, int prefix_ttl, d2k_hello msg,
                                           uint32_t wait_ms, uint32_t mark, int repeats, int *sent_out);
 extern d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook;
+
+/* ЧИСЛО КОПИЙ ПРИМАНКИ — отдельная ось поиска.
+ *
+ * Донор пробует 6 и 11 копий (arms.go:140) ОТДЕЛЬНО от выбора блоба: одна
+ * копия могла потеряться, а могла и не хватить коробке. Замер 12.09.2026 это
+ * и показал — instagram берётся только одиннадцатью копиями quic5, а
+ * одиночные копии всех четырёх блобов дают 0/3
+ * (docs/field/2026-09-12-donor-reference.md).
+ *
+ * copies — сколько ОТДЕЛЬНЫХ датаграмм приманки уходит перед триггером.
+ * Именно датаграмм, а не байт: коробка считает датаграммы, и одна длинная из
+ * склеенных копий измеряла бы не то. 0 и 1 означают одну копию.
+ *
+ * Отдельным типажом, а не расширением d2k_quic_ask_fn, по той же причине, что
+ * и d2k_quic_ask_ttl_fn выше. */
+typedef d2k_tally (*d2k_quic_ask_copies_fn)(const char *addr, uint16_t port,
+                                            const uint8_t *prefix, size_t prefix_len,
+                                            int copies, d2k_hello msg, uint32_t wait_ms,
+                                            uint32_t mark, int repeats, int *sent_out);
+extern d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook;
+
+/* Лестница числа копий — ДВЕ ТОЧКИ, снятые донором: 6 и 11 (arms.go:140).
+ * Это точечные числа из замера, а не диапазон перебора. */
+#define D2K_QUIC_COPIES_A 6
+#define D2K_QUIC_COPIES_B 11
 
 /* Оракул для плеча "фрагментация": строит и посылает IP-фрагменты САМ (сырой
  * сокет, IP_HDRINCL) — единственный способ управлять границей фрагмента с
