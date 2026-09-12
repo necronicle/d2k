@@ -159,6 +159,11 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
                                  size_t len, uint32_t addr_be, uint64_t now_ns,
                                  uint8_t seen_shape);
 
+/* Сколько раз запись нашлась по цели, но НЕ ПОДОШЛА по форме приветствия.
+ * Отдельно от «плана нет»: тот счёт растёт и на каждом не-приветствии, и по
+ * нему нельзя отличить «цель незнакома» от «знаем, но форма другая». */
+size_t d2k_plantab_shape_misses(const d2k_plantab *t);
+
 size_t d2k_plantab_count(const d2k_plantab *t);
 size_t d2k_plantab_capacity(const d2k_plantab *t);
 

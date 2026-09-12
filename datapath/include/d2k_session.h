@@ -105,6 +105,14 @@ void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution);
  * с ним, когда поток объявлен испорченным. */
 uint8_t d2k_session_guards(const d2k_session *s, const d2k_key *k);
 
+/* Планы, ДОИСПОЛНЕННЫЕ целиком (все посылки ушли и вердикт принят ядром), и
+ * потоки, объявленные испорченными. Разрыв между «подготовлен» и
+ * «доисполнен» — первое, на что надо смотреть, когда подтверждений нет:
+ * контроллер видит применение ТОЛЬКО из доисполнения. */
+uint64_t d2k_session_done(const d2k_session *s);
+uint64_t d2k_session_damaged_count(const d2k_session *s);
+uint64_t d2k_session_sent_lost(const d2k_session *s);
+
 int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
                             const uint8_t *plan_id, uint8_t code,
                             uint64_t execution, int payload_on_wire, int orig_spent);

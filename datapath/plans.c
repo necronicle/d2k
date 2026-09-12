@@ -52,6 +52,8 @@ typedef struct {
  * не наложение структуры на чужую память (см. d2k_track.h про то, где такое
  * наложение запрещено и почему). */
 struct d2k_plantab {
+    /* Сколько раз запись НАШЛАСЬ, но не подошла по форме приветствия. */
+    size_t   shape_misses;
     entry *v;
     size_t cap;
     size_t used;
@@ -322,6 +324,10 @@ static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
     return entry_shape != 0 && entry_shape == seen_shape;
 }
 
+size_t d2k_plantab_shape_misses(const d2k_plantab *t) {
+    return t ? t->shape_misses : 0;
+}
+
 const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
                                  size_t len, uint32_t addr_be, uint64_t now_ns,
                                  uint8_t seen_shape) {
@@ -340,7 +346,13 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
                 return e->plan;
             }
             /* Форма не та — по адресу тоже не ищем: имя названо, и план
-               соседа по CDN подставлять вместо него нельзя. */
+               соседа по CDN подставлять вместо него нельзя.
+
+               Считаем отдельно: «плана для цели нет» срабатывает и на каждом
+               не-приветствии, и по нему отличить «имени не знаем» от «знаем,
+               но форма другая» невозможно. А различие это ровно то, из-за
+               которого обход может молча не применяться. */
+            t->shape_misses++;
             return NULL;
         }
     }
@@ -352,6 +364,7 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
         if (shape_fits(e->shape, seen_shape)) {
             return e->plan;
         }
+        t->shape_misses++;
     }
     return NULL;
 }

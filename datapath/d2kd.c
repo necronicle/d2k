@@ -139,6 +139,7 @@ static struct {
     uint64_t accepted, dropped;
     uint64_t emitted;          /* собственных пакетов выпущено */
     uint64_t deferred;         /* отложено до срока */
+    uint64_t stale_deferred;   /* созревшая посылка не ушла: поток забыт/отказал */
     uint64_t truncated;        /* ядро отдало кусок пакета */
     uint64_t no_payload;       /* атрибута с пакетом не было вовсе */
     uint64_t no_hdr;           /* некому отвечать вердиктом */
@@ -207,9 +208,11 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
        применения по числу выпущенных пакетов, и план из одной защиты — без
        единой посылки — показывался как «применён 0», хотя журнал той же
        минутой писал «план применён». Один факт не может иметь двух счётчиков. */
-    printf("план подготовлен %" PRIu64 ", выпущено %" PRIu64
-           ", отложено %" PRIu64 "\n",
-           d2k_session_applied(s), st.emitted, st.deferred);
+    printf("план подготовлен %" PRIu64 ", ДОИСПОЛНЕН %" PRIu64
+           ", выпущено %" PRIu64 ", отложено %" PRIu64
+           ", потоков испорчено %" PRIu64 ", отложенных протухло %" PRIu64 ", уведомлений потеряно %" PRIu64 "\n",
+           d2k_session_applied(s), d2k_session_done(s), st.emitted, st.deferred,
+           d2k_session_damaged_count(s), st.stale_deferred, d2k_session_sent_lost(s));
     /* Второе число — предел таблицы, а не что попало. В первом полевом
        прогоне здесь стояла длина очереди отправки, и строка читалась как
        «23 потока из 0».
@@ -254,6 +257,8 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
         printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));
     }
+    printf("отказов по форме приветствия %zu\n",
+           d2k_plantab_shape_misses(d2k_session_plans((d2k_session *)s)));
     printf("планов по целям %zu из %zu\n",
            d2k_session_plan_count(s), d2k_session_plan_capacity(s));
     for (size_t i = 0; i < n_reasons; i++) {
@@ -841,7 +846,11 @@ int main(int argc, char **argv) {
                    выдумки. */
                 int named = (skey.proto != 0);
                 if (named && !d2k_session_send_pending(sess, &skey, execution)) {
-                    continue; /* failed/forgotten/reused flow: do not send stale bytes */
+                    /* Поток забыт, отказал или переиспользован: старые байты
+                       не шлём. Считаем отдельно — разрыв между «подготовлен» и
+                       «доисполнен» объясняется чаще всего именно здесь. */
+                    st.stale_deferred++;
+                    continue;
                 }
                 if (d2k_raw_send(raw, sbuf, slen, err, sizeof err) != 0) {
                     uint8_t failure = refuse_of_errno(errno);

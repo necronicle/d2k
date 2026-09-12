@@ -57,6 +57,18 @@ struct d2k_session {
     d2k_plan    *plan;
     d2k_journal *jrn;
     uint64_t     applied;
+    /* Планы, ДОИСПОЛНЕННЫЕ целиком: все посылки ушли и вердикт оригинала
+       принят ядром. Отдельно от applied, потому что это разные факты, и
+       разрыв между ними — самое важное число диагностики: подготовили много,
+       доисполнили мало значит, что до контроллера подтверждений не доходит. */
+    uint64_t     done;
+    /* Потоки, объявленные испорченными. Не число отказов по ним — именно
+       потоки: отказов на одном потоке бывает много. */
+    uint64_t     damaged_flows;
+    /* Уведомления об отправке, которые НЕКОМУ приписать: поток забыт либо
+       поколение чужое. Если это число велико, «доисполнен» не наступит
+       никогда, и искать причину надо здесь, а не в поиске. */
+    uint64_t     sent_lost;
     uint64_t     next_execution;
     uint64_t     hellos;
     uint64_t     with_sni;
@@ -1343,10 +1355,12 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
        должны — объявлять нечего. Молчание здесь честнее выдумки: «доисполнен»
        по потоку, которого уже нет, мы доказать не можем. */
     if (!fl || execution == 0 || fl->execution_id != execution || fl->sends_left == 0) {
+        s->sent_lost++;
         return;
     }
     fl->sends_left--;
     if (fl->sends_left == 0 && !fl->sends_failed) {
+        s->done++;
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
                              D2K_REFUSE_NONE, fl->execution_plan_id);
     }
@@ -1387,6 +1401,7 @@ int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
         d2k_session_unsent(s, at_ns, k, plan_id, code, execution);
     }
     if (payload_on_wire || (orig_spent && fl->orig_taken)) {
+        if (!fl->damaged) { s->damaged_flows++; }
         fl->damaged = 1;
         /* ЗАЩИТЫ СНИМАЮТСЯ ВМЕСТЕ С ПЛАНОМ.
            Защита RST_ALIEN держит соединение живым, снимая подделанный сброс.
@@ -1444,6 +1459,18 @@ void d2k_session_unsent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
 
 uint64_t d2k_session_applied(const d2k_session *s) {
     return s ? s->applied : 0;
+}
+
+uint64_t d2k_session_done(const d2k_session *s) {
+    return s ? s->done : 0;
+}
+
+uint64_t d2k_session_damaged_count(const d2k_session *s) {
+    return s ? s->damaged_flows : 0;
+}
+
+uint64_t d2k_session_sent_lost(const d2k_session *s) {
+    return s ? s->sent_lost : 0;
 }
 
 uint64_t d2k_session_refusals(const d2k_session *s) {
