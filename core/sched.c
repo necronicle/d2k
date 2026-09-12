@@ -331,6 +331,14 @@ struct d2k_sched {
        какого времени идёт поиск» (внутри всё на монотонных). */
     int          confirms, probes_used;
     int64_t      wall_base_s;
+    /* Монотонные часы в тот же момент. Без них преобразование считает уптайм
+       ДВАЖДЫ: CLOCK_MONOTONIC на Linux отсчитывается от ЗАГРУЗКИ, а не от
+       старта процесса, и wall_base_s + now_ms давало дату на столько часов
+       вперёд, сколько роутер к тому моменту работал. Поймано живой приёмкой
+       12.09.2026: подтверждение записалось временем 05:16Z при настоящих
+       00:43Z — ровно на 4,5 часа уптайма вперёд. */
+    int64_t      mono_base_ms;
+    int          clock_seen;   /* видели ли хоть один тик: до него привязки нет */
     /* Монотонные часы планировщика в СТЕННЫЕ секунды. Всё внутри считается
        монотонными миллисекундами (сроки, потолки, отдых) — и это верно: стенные
        часы на роутере прыгают при синхронизации времени, а сроки от этого
@@ -728,7 +736,7 @@ static d2k_cat_box *box_ensure(d2k_catalog *c, const char *id) {
    мест семь, и разойдись хоть одно — в каталоге окажутся записи из двух разных
    эпох, неотличимые на вид. */
 static int64_t wall_s(const d2k_sched *s, int64_t now_ms) {
-    return s->wall_base_s + now_ms / 1000;
+    return s->wall_base_s + (now_ms - s->mono_base_ms) / 1000;
 }
 
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
@@ -1362,7 +1370,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         first = 0;
         fputs("\"target\": ", f); json_str(f, t->name);
         fputs(", \"phase\": ", f); json_str(f, task_phase(t));
-        fputs(", \"since\": ", f); json_time(f, s->wall_base_s + t->started_ms / 1000);
+        fputs(", \"since\": ", f); json_time(f, wall_s(s, t->started_ms));
         fprintf(f, ", \"attempts\": %zu, \"probes\": %d, ", t->next_plan, t->probes);
         fputs("\"candidate\": ", f);
         json_str(f, t->next_plan > 0 ? "план поставлен" : "");
@@ -1898,6 +1906,18 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
 
 int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     if (!s) { return 0; }
+    /* Привязка монотонных часов к стенным делается ПО ПЕРВОМУ ТИКУ, а не при
+       заведении планировщика, и не своим вызовом clock_gettime. Причина: часы
+       сюда приносит ВЫЗЫВАЮЩИЙ, и какие они — его дело. d2kc даёт
+       CLOCK_MONOTONIC (на Linux отсчитывается от ЗАГРУЗКИ), тест — модельные
+       от нуля. Сними отсчёт сам — и в тесте разность окажется отрицательной на
+       весь уптайм машины, а в проде уптайм посчитался бы дважды. Привязываемся
+       к тому, что реально приходит. */
+    if (!s->clock_seen) {
+        s->clock_seen = 1;
+        s->mono_base_ms = now_ms;
+        s->wall_base_s = (int64_t)time(NULL);
+    }
     s->now_ms = now_ms;
 
     /* Осушить самопайп: он только будит, содержимое значения не имеет. */
