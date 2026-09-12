@@ -38,6 +38,12 @@ typedef struct {
     /* Биты D2K_RAW_CANT_* выбранного способа отправки. Не сам сокет: смысл
      * команды не должен зависеть от того, как именно пакеты поедут. */
     uint32_t     send_limits;
+    /* Сколько байт унесёт ОДНА посылка выбранным способом отправки
+       (d2k_raw_maxlen). Ноль — предел не объявлен: по длине не проверяем.
+       Полем контекста по той же причине, что и send_limits: смысл команды не
+       должен зависеть от того, как именно пакеты поедут, но отказ обязан
+       случаться ДО активации плана, а не прилетать от ядра потом. */
+    uint32_t     send_maxlen;
     uint64_t     ok_cmds;
     uint64_t     bad_cmds;
     /* Давность «сейчас» для вытеснения в таблице планов (d2k_plantab_set_name/
@@ -54,7 +60,8 @@ typedef struct {
 /* Может ли способ отправки исполнить план ЧЕСТНО — не «примерно».
  * §2.5 запрещает молча приближать неподдерживаемую операцию другой.
  * 1 — да; 0 — нет, причина в why. */
-int d2k_plan_fits(const d2k_plan *p, uint32_t send_limits, char *why, size_t cap);
+int d2k_plan_fits(const d2k_plan *p, uint32_t send_limits, uint32_t send_maxlen,
+                  char *why, size_t cap);
 
 /* Обработчик для d2k_ctl_poll. ctx — d2k_ctlsrv *. */
 void d2k_ctlsrv_command(void *ctx, uint16_t type, const uint8_t *body, size_t len);

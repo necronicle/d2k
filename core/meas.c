@@ -57,6 +57,38 @@ static int d2k_mark_real(int fd, uint32_t mark) {
 
 d2k_mark_fn d2k_mark_hook = d2k_mark_real;
 
+/* Типы записей TLS (RFC 8446 §5.1) и тип сообщения рукопожатия (§4). Те же
+ * числа названы в d2k_link.h (D2K_TLS_ALERT, D2K_TLS_HANDSHAKE) — там их
+ * видит датапат на проводе, здесь мы читаем ответ сами. Общего заголовка на
+ * двоих не заводится нарочно: meas.o линкуется в тесты и утилиты, где link.o
+ * нет вовсе (см. core/Makefile), а ради двух констант тащить туда связь с
+ * датапатом незачем. Запись по версии не фильтруется: в поле версии
+ * ServerHello ставят и 0x0301, и 0x0303 независимо от того, о чём
+ * договорились (RFC 8446 §4.1.3), — проверяется старший байт 0x03, общий у
+ * всех живых версий. */
+#define TLS_REC_ALERT      0x15
+#define TLS_REC_HANDSHAKE  0x16
+#define TLS_HS_SERVER_HELLO 0x02
+
+int d2k_accept_serverhello(const uint8_t *buf, size_t len) {
+    /* 5 байт заголовка записи (тип, версия, длина) и первый байт тела —
+       тип сообщения рукопожатия. Шесть байт минимум, иначе смотреть не на
+       что; дочитывать ради полного разбора незачем — рукопожатие всё равно
+       не доводится до конца. */
+    return len >= 6 && buf[0] == TLS_REC_HANDSHAKE && buf[1] == 0x03 &&
+           buf[5] == TLS_HS_SERVER_HELLO;
+}
+
+int d2k_accept_tls_record(const uint8_t *buf, size_t len) {
+    return len >= 3 && (buf[0] == TLS_REC_HANDSHAKE || buf[0] == TLS_REC_ALERT) &&
+           buf[1] == 0x03;
+}
+
+int d2k_accept_any(const uint8_t *buf, size_t len) {
+    (void)buf;
+    return len > 0;
+}
+
 /* Точки разреза обязаны строго возрастать и лежать внутри длины приветствия
  * — контракт описан в d2k_meas.h. Нарушение отклоняется целиком, а не
  * ужимается до похожего валидного подмножества. */
@@ -78,7 +110,11 @@ static int cuts_valid(const size_t *cuts, size_t n_cuts, size_t len) {
 static int send_all(int fd, const uint8_t *buf, size_t len) {
     size_t sent = 0;
     while (sent < len) {
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
+#else
         ssize_t n = send(fd, buf + sent, len - sent, 0);
+#endif
         if (n <= 0) { return -1; }
         sent += (size_t)n;
     }
@@ -125,14 +161,14 @@ static int connect_bounded(int fd, const struct sockaddr *addr, socklen_t len,
 int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
                   const size_t *cuts, size_t n_cuts,
                   uint32_t gap_us, uint32_t wait_ms,
-                  uint32_t mark, int *marked_out) {
-    if (!ip || !h.bytes || h.len == 0) { return -1; }
-    if (n_cuts > 0 && !cuts_valid(cuts, n_cuts, h.len)) { return -1; }
+                  uint32_t mark, d2k_accept_fn accept, int *marked_out) {
+    if (!ip || !h.bytes || h.len == 0) { return D2K_MEAS_ERR; }
+    if (n_cuts > 0 && !cuts_valid(cuts, n_cuts, h.len)) { return D2K_MEAS_ERR; }
     if (marked_out) { *marked_out = (mark == 0); }
     if (wait_ms == 0 || wait_ms > WAIT_CEIL_MS) { wait_ms = WAIT_CEIL_MS; }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { return -1; }
+    if (fd < 0) { return D2K_MEAS_ERR; }
 
     if (mark != 0) {
         if (d2k_mark_hook(fd, mark) == 0) {
@@ -143,6 +179,14 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
     /* Без этого куски склеятся в один сегмент, и опыт про место разреза
        перестанет быть опытом про место разреза. */
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    /* Та же защита, что у зонда свойств (compose.c): библиотека не имеет
+       права убивать вызывающего. Сброс от цели посреди посылки для замера —
+       не исключение, а ожидаемый исход: ради него замер и делается. Прогон
+       test-meas ловил это SIGPIPE'ом (выход 141) до правки. На Linux того
+       же добивается MSG_NOSIGNAL в send_all. */
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
 
     struct timeval tv = { (time_t)(wait_ms / 1000u), (suseconds_t)(wait_ms % 1000u) * 1000 };
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -153,10 +197,10 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return -1; }
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) { close(fd); return D2K_MEAS_ERR; }
     if (connect_bounded(fd, (struct sockaddr *)&a, sizeof a, CONNECT_TIMEOUT_MS) != 0) {
         close(fd);
-        return -1;
+        return D2K_MEAS_ERR;
     }
 
     size_t prev = 0;
@@ -165,10 +209,21 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
         if (end > h.len) { end = h.len; }
         if (end <= prev) { continue; }
         if (send_all(fd, h.bytes + prev, end - prev) != 0) {
-            /* Сброс (или неустранимая короткая запись) — это «убито», а не
-               сбой опыта. */
+            /* НЕУДАВШАЯСЯ ОТПРАВКА — СБОЙ ОПЫТА, А НЕ РЕШЕНИЕ КОРОБКИ.
+               Раньше здесь стоял D2K_MEAS_SILENT, и это выдавало нашу
+               собственную неудачу за молчание мишени: воздействие на провод
+               целиком не попало, значит опыта не было и сказать про коробку
+               нечего (§2.4 — «не измерено» ≠ «нет»).
+
+               Граница проходит ровно здесь: сбой ОТПРАВКИ — опыт не
+               состоялся; сброс или тишина ПОСЛЕ того, как приветствие ушло
+               целиком, — законное наблюдение «убито» и остаётся
+               D2K_MEAS_SILENT ниже. У донора та же разводка: ошибка записи
+               возвращается вызывающему ошибкой и никогда не становится
+               отрицательным свойством коробки (probePoison →
+               classify.go:838-842). */
             close(fd);
-            return 0;
+            return D2K_MEAS_ERR;
         }
         prev = end;
         if (prev < h.len && gap_us > 0) { nap_us(gap_us); }
@@ -177,25 +232,35 @@ int d2k_meas_once(const char *ip, uint16_t port, d2k_hello h,
     uint8_t buf[512];
     ssize_t n = recv(fd, buf, sizeof buf, 0);
     close(fd);
-    return n > 0 ? 1 : 0;
+    if (n <= 0) { return D2K_MEAS_SILENT; }
+    /* Приёмки нет — годится любой непустой ответ (см. d2k_meas.h про NULL).
+       Есть — решает она, и её отказ НЕ выдаётся за молчание: ответ был. */
+    if (accept && !accept(buf, (size_t)n)) { return D2K_MEAS_UNPROVEN; }
+    return D2K_MEAS_PASS;
 }
 
 d2k_tally d2k_meas(const char *ip, uint16_t port, d2k_hello h,
                    const size_t *cuts, size_t n_cuts,
                    uint32_t gap_us, uint32_t wait_ms,
-                   uint32_t mark, int repeats) {
+                   uint32_t mark, d2k_accept_fn accept, int repeats) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
     if (repeats <= 0) { repeats = 3; }
     for (int i = 0; i < repeats; i++) {
         int marked = 0;
-        int r = d2k_meas_once(ip, port, h, cuts, n_cuts, gap_us, wait_ms, mark, &marked);
+        int r = d2k_meas_once(ip, port, h, cuts, n_cuts, gap_us, wait_ms, mark,
+                              accept, &marked);
         /* Метка серии — И по всем дозвонам: один непомеченный делает серию
            непомеченной. */
         if (!marked) { t.marked = 0; }
-        if (r < 0) { t.err++; t.fail++; continue; }
-        if (r == 1) { t.pass++; } else { t.fail++; }
+        if (r == D2K_MEAS_ERR) { t.err++; t.fail++; continue; }
+        if (r == D2K_MEAS_PASS) { t.pass++; continue; }
+        /* Не прошло. ЧЕМ именно не прошло — вопрос отдельный: непризнанный
+           ответ и тишина ложатся в один fail, но unproven помнит, что ответ
+           был (см. d2k_meas.h). */
+        if (r == D2K_MEAS_UNPROVEN) { t.unproven++; }
+        t.fail++;
     }
     return t;
 }

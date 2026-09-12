@@ -75,12 +75,16 @@ static int fails;
     } while (0)
 
 /* Подстрока, которая может встретиться ТОЛЬКО в checksum_plan_text: 64 байта
- * набивки 0x41 гарантируют длинный повтор "41", которого в decoy-приветствии
- * (LEGACY-профиль настоящего захвата) нет ни разу (проверено по исходнику
- * profiles/legacy.hex) — так отличаем "это план про сумму" от "это план про
- * разбор протокола/дубликаты", у которых тот же скелет (poison+fake), но
- * другая приманка. */
-static const char CHECKSUM_FILLER_MARK[] = "4141414141414141";
+ * набивки D2K_OVERLAP_FILLER гарантируют длинный повтор "0f", которого в
+ * decoy-приветствии нет ни разу — проверено по обоим исходникам,
+ * profiles/legacy.hex и profiles/modern.hex, ноль вхождений в каждом. Так
+ * отличаем "это план про сумму" от "это план про разбор протокола/дубликаты",
+ * у которых тот же скелет (poison+fake), но другая приманка.
+ *
+ * Значение сменилось с 0x41 на 0x0f 12.09.2026 вместе с самим наполнителем:
+ * 0x41 был унаследован от промежуточного Go-слоя, донор шлёт 0x0f
+ * (docs/decisions/0008-impact-parity.md, расхождения 1 и 3). */
+static const char CHECKSUM_FILLER_MARK[] = "0f0f0f0f0f0f0f0f";
 
 /* Число подряд идущих hex-цифр сразу после needle — используется, чтобы
  * измерить длину приманки в собранном плане без знания её байт: LEGACY и
@@ -625,7 +629,7 @@ int main(void) {
         size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], "seqovl") != NULL, "плечо перекрытия не собрано");
-        CHECK(strstr(out[0], "payload 1 41") != NULL, "приставка перекрытия не та");
+        CHECK(strstr(out[0], "payload 1 0f") != NULL, "приставка перекрытия не та");
 
         pr.tolerates_left_overlap = D2K_P_YES;
         n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
@@ -720,7 +724,7 @@ int main(void) {
         size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], CHECKSUM_FILLER_MARK) != NULL,
-              "план суммы не содержит набивку 0x41 — приманка не та");
+              "план суммы не содержит набивку 0x0f — приманка не та");
         CHECK(strstr(out[0], "repeats=1 gap_us=0") != NULL,
               "план суммы: не та форма fake");
         CHECK(strstr(out[0], "split") == NULL, "план суммы не должен резать поток");
@@ -852,7 +856,7 @@ int main(void) {
             CHECK(write_file_text(scnpath, "pkt 5000 none 0 00010203040506070809\n") == 0,
                   "сценарий перекрытия не записался");
             CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (перекрытие) не запустился");
-            CHECK(strstr(out, "emit payload 0 4999 ttl=0 poison=00 4100010203040506070809") != NULL,
+            CHECK(strstr(out, "emit payload 0 4999 ttl=0 poison=00 0f00010203040506070809") != NULL,
                   "перекрытие: смещение/приставка/нагрузка не те, что должен выпустить исполнитель");
             CHECK(strstr(out, "fate drop") != NULL, "перекрытие: план обязан снять оригинал (fate drop)");
             CHECK(count_substr(out, "emit ") == 1, "перекрытие: ожидалась ровно одна посылка");
@@ -924,7 +928,7 @@ int main(void) {
             CHECK(write_file_text(scnpath, "pkt 7000 none 0 aabbccdd\n") == 0,
                   "сценарий фальшивок не записался");
 
-            /* контрольная сумма: набивка 64×0x41, один повтор, без разреза
+            /* контрольная сумма: набивка 64×0x0f, один повтор, без разреза
                нагрузки — оригинал ПРОХОДИТ (fate pass), фальшивка идёт
                перед ним отдельной посылкой. */
             uint8_t plan[256]; size_t plen;
@@ -935,7 +939,7 @@ int main(void) {
             CHECK(count_substr(out, "emit ") == 1, "сумма: ожидалась ровно одна фальшивка");
             CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 ") != NULL,
                   "сумма: фальшивка не помечена битом порчи (poison=01) — мутация 6 обязана быть видна здесь");
-            CHECK(count_substr(out, "41") >= 64, "сумма: набивка не похожа на 64 байта 0x41");
+            CHECK(count_substr(out, "0f") >= 64, "сумма: набивка не похожа на 64 байта 0x0f");
             CHECK(strstr(out, "fate pass") != NULL,
                   "сумма: план не разрезает нагрузку — оригинал обязан пройти (fate pass)");
             unlink(tlvpath);

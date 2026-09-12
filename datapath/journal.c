@@ -48,6 +48,16 @@ const char *d2k_suspect_text(uint8_t code) {
     }
 }
 
+const char *d2k_refuse_text(uint8_t code) {
+    switch (code) {
+    case D2K_REFUSE_NONE:     return "причина не названа";
+    case D2K_REFUSE_SEND:     return "ядро отвергло посылку";
+    case D2K_REFUSE_QUEUE:    return "очередь отложенной отправки не приняла посылку";
+    case D2K_REFUSE_TOO_LONG: return "посылка длиннее того, что унесёт способ отправки";
+    default:                  return "отказ без кода";
+    }
+}
+
 /* Общая часть добавления. Возвращает занятую ячейку, чтобы вызывающий дописал
    в неё то, что есть только у его вида записи (сегодня — идентификатор плана).
    NULL, когда хранить негде: журнала нет вовсе или он выключен (cap == 0) —
@@ -121,6 +131,19 @@ void d2k_journal_add_applied(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
     if (e && plan_id) {
         /* Как есть, байт в байт: идентификатор двоичный, и чистка под печать,
            которой проходит имя выше, испортила бы его молча. */
+        memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
+    }
+}
+
+void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                          uint8_t kind, uint8_t code, const uint8_t *plan_id) {
+    d2k_jrn_entry *e = add_entry(j, at_ns, key, kind, code, 0, NULL, NULL, 0,
+                                 kind == D2K_JRN_PLAN_UNSENT ? d2k_refuse_text(code)
+                                                             : "план доисполнен");
+    if (e && plan_id) {
+        /* Как есть, байт в байт — та же причина, что у d2k_journal_add_applied
+           выше: идентификатор двоичный, и чистка под печать испортила бы его
+           молча. */
         memcpy(e->plan_id, plan_id, D2K_PLAN_ID_LEN);
     }
 }

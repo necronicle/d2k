@@ -14,6 +14,10 @@ typedef struct {
     uint64_t seq;      /* номер постановки — устойчивость при равных сроках */
     size_t   slot;
     size_t   len;
+    /* Чья это посылка. Очередь в ключ не заглядывает: он едет с посылкой и
+       возвращается вместе с ней, чтобы отказ созревшей отправки было чем
+       приписать плану (см. d2k_sched.h). */
+    d2k_key  key;
 } entry;
 
 struct d2k_sched {
@@ -112,7 +116,8 @@ static void sift_down(d2k_sched *s, size_t i) {
     }
 }
 
-int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len) {
+int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t len,
+                   const d2k_key *key) {
     if (!s || !data || len == 0) {
         return -2;
     }
@@ -131,13 +136,19 @@ int d2k_sched_push(d2k_sched *s, uint64_t due_ns, const uint8_t *data, size_t le
     s->heap[s->n].seq = s->next_seq++;
     s->heap[s->n].slot = slot;
     s->heap[s->n].len = len;
+    if (key) {
+        s->heap[s->n].key = *key;
+    } else {
+        memset(&s->heap[s->n].key, 0, sizeof s->heap[s->n].key);
+    }
     s->n++;
     sift_up(s, s->n - 1);
     return 0;
 }
 
 int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
-                      uint8_t *out, size_t outcap, size_t *len) {
+                      uint8_t *out, size_t outcap, size_t *len,
+                      d2k_key *key) {
     if (!s || s->n == 0 || !out) {
         return 0;
     }
@@ -152,6 +163,9 @@ int d2k_sched_pop_due(d2k_sched *s, uint64_t now_ns,
     memcpy(out, s->mem + s->heap[0].slot * s->slot_size, s->heap[0].len);
     if (len) {
         *len = s->heap[0].len;
+    }
+    if (key) {
+        *key = s->heap[0].key;
     }
     s->freelist[s->nfree++] = s->heap[0].slot;
 

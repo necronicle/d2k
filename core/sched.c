@@ -252,6 +252,11 @@ typedef struct {
     d2k_flowkey ver_early[8];
     size_t     ver_seen;
     int        ver_ok;
+    /* Последняя ПРИЧИНА, по которой посылка плана не ушла на провод
+       (D2K_REFUSE_*), либо 0. Не «флаг неудачи»: это код, и он попадает в
+       объяснение, чтобы отказ не читался как промах коробки. Сбрасывается при
+       заведении задачи (task_reset) и перед повторным испытанием. */
+    uint8_t    unsent_code;
     int64_t    ver_until_ms;
     uint32_t   ver_dropped0;    /* сколько событий было потеряно, когда план встал */
 
@@ -1742,6 +1747,45 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
     }
 }
 
+/* ОТКАЗ С ПРИЧИНОЙ — не ответ коробки, а наша неудача.
+ *
+ * Нулевой код означает «причина не кодирована»: такой отказ приходит на
+ * каждый транзитный поток, для цели которого плана нет, и к задачам поиска
+ * отношения не имеет. Ненулевой (D2K_REFUSE_*) означает, что план применён,
+ * но хотя бы одна его посылка не покинула машину, — воздействия на проводе не
+ * было вовсе.
+ *
+ * Что с этим делает планировщик: отмечает, что ИСПЫТАНИЕ НЕ СОСТОЯЛОСЬ, и
+ * оставляет разбор общему пути T_VERIFY_WAIT. Своё решение здесь принимать
+ * нельзя — событие приходит вне тика, а смена состояния задачи живёт в
+ * d2k_sched_tick; ровно поэтому и on_applied только помечает.
+ *
+ * Почему это не «кандидат не сработал»: выбросив его, поиск потерял бы
+ * рабочий план из-за собственной поломки (MTU, очередь отправки), и записал
+ * бы её свойством чужого устройства — тот самый разрыв из
+ * docs/decisions/0006-proof-boundaries.md. */
+static void on_refused(d2k_sched *s, const d2k_ev *ev) {
+    if (ev->code == 0) { return; }
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state == T_PROPS_WAIT) {
+            if (!ev_matches_flow(ev, &t->prop_flow)) { continue; }
+            t->unsent_code = (uint8_t)ev->code;
+            return;
+        }
+        if (t->state == T_VERIFY) {
+            if (!applied_of_candidate(t, ev)) { continue; }
+            t->unsent_code = (uint8_t)ev->code;
+            return;
+        }
+        if (t->state == T_VERIFY_WAIT) {
+            if (!ev_matches_flow(ev, &t->ver_flow)) { continue; }
+            t->unsent_code = (uint8_t)ev->code;
+            return;
+        }
+    }
+}
+
 /* Обмен по живому трафику. Порога успеха здесь БОЛЬШЕ НЕТ: внешний тип
    записи 23 — наблюдение (§4.2, уровень 2), потому что в TLS 1.3 им едет и
    второй полёт рукопожатия (RFC 8446 §5.2, см. d2k_ev_outer_appdata). Два
@@ -1846,6 +1890,9 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     case D2K_EV_APPLIED:
         on_applied(s, ev);
+        return 0;
+    case D2K_EV_REFUSED:
+        on_refused(s, ev);
         return 0;
     case D2K_EV_EXCHANGE:
         on_exchange(s, ev);
@@ -1992,7 +2039,20 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             if (now_ms < t->prop_until_ms) { continue; }
             /* Обмена с прикладными данными не дождались — промах вопроса. Он
                НЕ пишет ничего (§2.4, каждый Set в Go начинается с
-               `if !passed { return }`). */
+               `if !passed { return }`).
+
+               Отдельно называем случай, когда воздействия НЕ БЫЛО ВОВСЕ:
+               датапат сообщил, что посылка плана не покинула машину. Свойство
+               не пишется и здесь, но это другой факт, и в объяснении он
+               обязан звучать по-другому — иначе своя поломка читается как
+               «коробка не поддалась» и уводит поиск. Следующий вопрос
+               задаётся в обоих случаях: бюджет вопросов общий. */
+            if (t->unsent_code != 0) {
+                say(s, "по %s вопрос %d не состоялся: посылка плана не ушла на провод "
+                       "(причина %u) — это наша неудача, не свойство коробки",
+                    t->name, t->prop_q, (unsigned)t->unsent_code);
+                t->unsent_code = 0;
+            }
             prop_close(t);
             if (prop_send_next(s, t, now_ms) != 0) {
                 prop_finish(s, t);
@@ -2072,6 +2132,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "испытываю кандидата ещё раз",
                         t->name, (unsigned)(s->dropped_seen - t->ver_dropped0));
                     t->ver_dropped0 = s->dropped_seen;
+                    ver_close(t);
+                    t->ver_seen = 0;
+                    t->ver_ok = 0;
+                    t->probes++;
+                    s->probes_used++;
+                    t->state = T_VERIFY;
+                    if (start_worker(s, t, JOB_VERIFY) != 0) { t->state = T_PLANNING; }
+                } else if (t->unsent_code != 0 && t->probes < SCHED_MAX_PROBES) {
+                    /* Датапат сказал прямо: посылка плана не покинула машину.
+                       Испытания не было — выбрасывать кандидата не за что, это
+                       наша поломка, а не его промах. Испытываем ЕГО ЖЕ ещё
+                       раз, тем же приёмом и на тех же основаниях, что и при
+                       потере событий выше; повтор ограничен общим бюджетом
+                       зондов. */
+                    say(s, "по %s посылка плана не ушла на провод (причина %u) — "
+                           "опыта не было, испытываю кандидата ещё раз",
+                        t->name, (unsigned)t->unsent_code);
+                    t->unsent_code = 0;
                     ver_close(t);
                     t->ver_seen = 0;
                     t->ver_ok = 0;

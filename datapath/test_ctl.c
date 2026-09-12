@@ -725,6 +725,232 @@ int main(void) {
         d2k_session_free(sess);
     }
 
+    /* --- REFUSED несёт КОД ПРИЧИНЫ, а не только ключ -----------------------
+     *
+     * Разрыв «ложная отчётность об исполнении» (docs/decisions/0006): пока
+     * событие отказа несло один ключ, контроллер не мог отличить «коробка не
+     * поддалась» от «наша отправка не состоялась». Первое — свойство коробки,
+     * второе — наша поломка, и записывать второе как первое запрещено.
+     *
+     * Проверяется БАЙТАМИ на проводе, как и идентификатор выше: разбор в
+     * core/link.c — вторая сторона того же контракта.
+     *
+     * Обе стороны кода в одном блоке: обычный отказ ПРИМЕНИТЬ план («плана
+     * для этой цели нет») обязан ехать с нулём — он случается на каждом
+     * транзитном потоке и ничего не говорит о нашем зонде; отказ ОТПРАВКИ —
+     * со своим кодом. */
+    {
+        d2k_session *sess = d2k_session_new(2, 16);
+        CHECK(sess != NULL, "сессия для проверки кода отказа не создалась");
+
+        d2k_ctlsrv cx;
+        memset(&cx, 0, sizeof cx);
+        cx.sess = sess;
+        cx.ctl = c;
+        cx.send_limits = 0;
+
+        d2k_ctl_poll(c, on_cmd, NULL);
+        cli = dial();
+        CHECK(cli >= 0, "клиент для проверки кода отказа не подключился");
+        d2k_ctl_accept(c);
+        CHECK(d2k_ctl_peer_fd(c) >= 0, "подключение для проверки кода отказа не принято");
+
+        struct timeval tv2;
+        tv2.tv_sec = 2;
+        tv2.tv_usec = 0;
+        (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof tv2);
+
+        {
+            uint8_t body[128], f[160];
+            size_t blen = set_name_body(body, "unsent.example", plan_with_id, sizeof plan_with_id);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
+                  "команда с планом для проверки отказа не отправилась");
+            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+                  "команда с планом для проверки отказа не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack перед проверкой отказа не пришёл");
+            CHECK(ok == 1, "план для проверки отказа отвергнут");
+        }
+
+        uint8_t hello[512], pkt[1024], obuf[2048];
+        size_t hl = build_hello(hello, "unsent.example");
+        size_t pl = build_pkt(pkt, 40200, hello, hl);
+        d2k_result r;
+        d2k_session_packet(sess, pkt, pl, 1000, obuf, sizeof obuf, &r);
+        CHECK(r.applied == 1, "план не применился — недоисполнять нечего");
+
+        /* Чужой поток без плана: обычный отказ ПРИМЕНИТЬ. */
+        uint8_t other[512], opkt[1024];
+        size_t ohl = build_hello(other, "noplan.example");
+        size_t opl = build_pkt(opkt, 40201, other, ohl);
+        d2k_result r2;
+        d2k_session_packet(sess, opkt, opl, 1100, obuf, sizeof obuf, &r2);
+
+        /* И отказ ОТПРАВКИ по нашему потоку. */
+        d2k_session_unsent(sess, 1200, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG);
+
+        uint64_t seen2 = 0;
+        d2k_ctlsrv_pump(c, sess, &seen2);
+        d2k_ctl_flush(c);
+
+        int seen_plain = 0, seen_unsent = 0;
+        for (int i = 0; i < 12; i++) {
+            uint16_t type = 0;
+            uint8_t ev[256];
+            ssize_t n = read_event(cli, &type, ev, sizeof ev);
+            if (n < 0) {
+                break;
+            }
+            if (type != D2K_EV_REFUSED) {
+                continue;
+            }
+            CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 1),
+                  "тело REFUSED не «ключ + код причины»");
+            if (n != (ssize_t)(D2K_KEY_WIRE_LEN + 1)) {
+                continue;
+            }
+            if (ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_NONE) {
+                seen_plain = 1;
+            } else if (ev[D2K_KEY_WIRE_LEN] == D2K_REFUSE_TOO_LONG) {
+                seen_unsent = 1;
+            }
+        }
+        CHECK(seen_plain, "обычный отказ применить план приехал не с нулевым кодом");
+        CHECK(seen_unsent, "отказ отправки не приехал кодом D2K_REFUSE_TOO_LONG");
+
+        close(cli);
+        d2k_session_free(sess);
+    }
+
+    /* --- план отвергается по САМОЙ ДЛИННОЙ своей посылке --------------------
+     *
+     * На живой пробе 12.09.2026 отказ приходил от ядра — «sendto: Message too
+     * large», — когда команда была уже подтверждена, план уже стоял, а событие
+     * «план применён» уже ушло контроллеру. Отказ обязан случаться ДО всего
+     * этого, в d2k_plan_fits, по величине, которую план объявляет сам.
+     *
+     * Числа в этом блоке — не подобранные: 1500 это Ethernet MTU (RFC 894),
+     * а 1530 — вес приманки профиля MODERN, того самого, из-за которого отказ
+     * и случился (замер записан в core/compose.c у D2K_COMPOSE_HELLO_MAX).
+     * Посылка с такой приманкой весит 20 (IPv4) + 20 (TCP) + 1530 = 1570. */
+    {
+        static uint8_t longplan[2048];
+        static uint8_t shortplan[2048];
+        size_t lp = 0, sp = 0;
+
+        /* Заголовок: D2KP, схема 1, исполнитель 1, флаги 0, записей 2. */
+        for (size_t pass = 0; pass < 2; pass++) {
+            uint8_t *b = pass ? shortplan : longplan;
+            size_t plen = pass ? 8 : 1530;   /* 8 — заведомо влезает куда угодно */
+            size_t o = 0;
+            memcpy(b, "D2KP", 4); o = 4;
+            b[o++] = 0; b[o++] = 1;
+            b[o++] = 0; b[o++] = 1;
+            b[o++] = 0; b[o++] = 0;
+            b[o++] = 0; b[o++] = 2;
+            /* REC_PAYLOAD: id=1, затем сами байты. */
+            b[o++] = 0x00; b[o++] = 0x10;
+            b[o++] = (uint8_t)((2 + plen) >> 8); b[o++] = (uint8_t)(2 + plen);
+            b[o++] = 0x00; b[o++] = 0x01;
+            memset(b + o, 0xAA, plen); o += plen;
+            /* REC_FAKE: payload=1, poison=0, repeats=1, place=before, gap=0. */
+            b[o++] = 0x01; b[o++] = 0x01;
+            b[o++] = 0x00; b[o++] = 0x0A;
+            b[o++] = 0x00; b[o++] = 0x01;
+            b[o++] = 0x00; b[o++] = 0x00;
+            b[o++] = 0x01; b[o++] = 0x00;
+            b[o++] = 0; b[o++] = 0; b[o++] = 0; b[o++] = 0;
+            if (pass) { sp = o; } else { lp = o; }
+        }
+
+        d2k_plan *big = NULL, *small = NULL;
+        char why[200];
+        CHECK(d2k_plan_load(longplan, lp, &big, why, sizeof why) == 0,
+              "план с длинной приманкой не загрузился");
+        CHECK(d2k_plan_load(shortplan, sp, &small, why, sizeof why) == 0,
+              "план с короткой приманкой не загрузился");
+
+        if (big && small) {
+            /* Предел не объявлен (0) — не проверяем: стенд без сырого сокета
+               отправлять не будет вовсе, и резать там нечего. */
+            CHECK(d2k_plan_fits(big, D2K_RAW_CANT_IPID, 0, why, sizeof why) == 1,
+                  "без объявленного предела длины план зачем-то отвергнут");
+            CHECK(d2k_plan_fits(big, D2K_RAW_CANT_IPID, 1500, why, sizeof why) == 0,
+                  "план с посылкой 1570 байт принят при пределе 1500");
+            CHECK(d2k_plan_fits(small, D2K_RAW_CANT_IPID, 1500, why, sizeof why) == 1,
+                  "план, который заведомо влезает, отвергнут по длине");
+            /* Ровно на границе: 20+20+1460 = 1500 — это ВЛЕЗАЕТ. Проверка на
+               «строго больше», а не «больше либо равно»: перепутав их, мы
+               резали бы полный кадр, который прошёл бы. */
+            CHECK(d2k_plan_fits(big, D2K_RAW_CANT_IPID, 1570, why, sizeof why) == 1,
+                  "посылка ровно в предел объявлена невлезающей");
+        }
+        d2k_plan_free(big);
+        d2k_plan_free(small);
+    }
+
+    /* Тот же отказ, но через НАСТОЯЩУЮ команду: контроллер обязан получить
+       D2K_ACK_BAD_PLAN до того, как план встанет. */
+    {
+        d2k_session *sess = d2k_session_new(2, 16);
+        CHECK(sess != NULL, "сессия для проверки предела длины не создалась");
+
+        d2k_ctlsrv cx;
+        memset(&cx, 0, sizeof cx);
+        cx.sess = sess;
+        cx.ctl = c;
+        cx.send_limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
+        cx.send_maxlen = 1500;   /* Ethernet MTU, RFC 894 */
+
+        d2k_ctl_poll(c, on_cmd, NULL);
+        cli = dial();
+        CHECK(cli >= 0, "клиент для проверки предела длины не подключился");
+        d2k_ctl_accept(c);
+
+        struct timeval tv3;
+        tv3.tv_sec = 2;
+        tv3.tv_usec = 0;
+        (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv3, sizeof tv3);
+
+        static uint8_t longplan[2048];
+        size_t o = 0, plen = 1530;
+        memcpy(longplan, "D2KP", 4); o = 4;
+        longplan[o++] = 0; longplan[o++] = 1;
+        longplan[o++] = 0; longplan[o++] = 1;
+        longplan[o++] = 0; longplan[o++] = 0;
+        longplan[o++] = 0; longplan[o++] = 2;
+        longplan[o++] = 0x00; longplan[o++] = 0x10;
+        longplan[o++] = (uint8_t)((2 + plen) >> 8); longplan[o++] = (uint8_t)(2 + plen);
+        longplan[o++] = 0x00; longplan[o++] = 0x01;
+        memset(longplan + o, 0xAA, plen); o += plen;
+        longplan[o++] = 0x01; longplan[o++] = 0x01;
+        longplan[o++] = 0x00; longplan[o++] = 0x0A;
+        longplan[o++] = 0x00; longplan[o++] = 0x01;
+        longplan[o++] = 0x00; longplan[o++] = 0x00;
+        longplan[o++] = 0x01; longplan[o++] = 0x00;
+        longplan[o++] = 0; longplan[o++] = 0; longplan[o++] = 0; longplan[o++] = 0;
+
+        static uint8_t body[4096], f[4200];
+        size_t blen = set_name_body(body, "toolong.example", longplan, o);
+        frame(f, D2K_CMD_SET_NAME, body, blen);
+        CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
+              "команда с длинной посылкой не отправилась");
+        CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+              "команда с длинной посылкой не разобралась");
+        d2k_ctl_flush(c);
+        uint16_t cmd = 0; int ok = 1; uint8_t reason = 0;
+        CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на длинную посылку не пришёл");
+        CHECK(ok == 0, "план, чья посылка не унесётся, подтверждён как принятый");
+        CHECK(reason == D2K_ACK_BAD_PLAN, "отказ по длине назван не негодностью плана");
+        CHECK(d2k_session_plan_count(sess) == 0,
+              "отвергнутый по длине план всё-таки встал в таблицу");
+
+        close(cli);
+        d2k_session_free(sess);
+    }
+
     d2k_ctl_close(c);
 
     /* Файл сокета обязан исчезнуть: иначе следующий запуск наткнётся на него. */

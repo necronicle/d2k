@@ -158,6 +158,7 @@ static void usage(void) {
         "  --plan FILE        план в канонической форме TLV\n"
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
+        "  --iface NAME       чей MTU берётся пределом длины посылки\n"
         "  --flows N          предел числа потоков — отдельно на TCP и на\n"
         "                     UDP/QUIC, не общий бюджет датапата (2048)\n"
         "  --queue-len N      глубина очереди ядра в пакетах (1024)\n"
@@ -325,11 +326,26 @@ static void print_journal(const d2k_session *s, uint64_t start) {
     fflush(stdout);
 }
 
+/* Причина отказа отправки кодом журнала. Различаем ровно то, что различимо:
+   «длиннее того, что унесёт способ отправки» отделено от прочих отказов ядра,
+   потому что это ЕДИНСТВЕННАЯ причина, которую можно было предвидеть заранее
+   (d2k_plan_fits) — её появление здесь означает, что предел разошёлся с
+   настоящим, например MTU сменился под нами после старта (см. d2k_raw_open).
+   Остальное сваливается в D2K_REFUSE_SEND намеренно: выдумывать по errno
+   градации, которых журнал не различает, значило бы обещать точность,
+   которой нет. */
+static uint8_t refuse_of_errno(int e) {
+    return (e == EMSGSIZE) ? D2K_REFUSE_TOO_LONG : D2K_REFUSE_SEND;
+}
+
 int main(int argc, char **argv) {
     uint32_t queue = 0;
     int have_queue = 0;
     const char *plan_path = NULL;
     const char *log_path = NULL;
+    /* Интерфейс, чей MTU станет пределом длины посылки. NULL — взять
+       наименьший среди поднятых (см. d2k_raw_open, d2k_raw.h). */
+    const char *ifname = NULL;
     const char *ctl_path = NULL;
     int mode = MODE_OBSERVE;
     uint32_t mark = 0;
@@ -347,6 +363,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--log") == 0)         { NEEDV(); log_path = v; }
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
+        else if (strcmp(a, "--iface") == 0)       { NEEDV(); ifname = v; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
         else if (strcmp(a, "--queue-len") == 0)   { NEEDV(); if (arg_u32(v, &qlen)) goto badval; }
         else if (strcmp(a, "--copy-range") == 0)  { NEEDV(); if (arg_u32(v, &copy_range)) goto badval; }
@@ -440,14 +457,15 @@ int main(int argc, char **argv) {
     /* --- сырой сокет и сверка пределов ------------------------------------ */
     d2k_raw *raw = NULL;
     if (mode == MODE_APPLY) {
-        raw = d2k_raw_open(mark, err, sizeof err);
+        raw = d2k_raw_open(mark, ifname, err, sizeof err);
         if (!raw) {
             fprintf(stderr, "сырой сокет: %s\n", err);
             d2k_plan_free(plan);
             return 1;
         }
         char why[200];
-        if (plan && !d2k_plan_fits(plan, d2k_raw_limits(raw), why, sizeof why)) {
+        if (plan && !d2k_plan_fits(plan, d2k_raw_limits(raw),
+                                   (uint32_t)d2k_raw_maxlen(raw), why, sizeof why)) {
             fprintf(stderr, "план не активируется: %s.\n"
                             "Исполненное разошлось бы с измеренным (§2.5).\n", why);
             d2k_raw_close(raw);
@@ -486,7 +504,12 @@ int main(int argc, char **argv) {
     }
 
     d2k_session *sess = d2k_session_new(flows, journal);
-    d2k_sched   *sched = d2k_sched_new(slots, copy_range);
+    /* Вместимость ячейки — «сколько байт унесёт способ отправки», а не
+       «сколько байт пакета мы берём у ядра» (--copy-range): посылка плана
+       бывает длиннее пришедшего, перекрытие несёт приставку сверх нагрузки.
+       Пока это было одним числом, очередь отвергала посылку по чужому
+       пределу (см. d2k_sched_new, d2k_sched.h). */
+    d2k_sched   *sched = d2k_sched_new(slots, raw ? d2k_raw_maxlen(raw) : copy_range);
     if (!sess || !sched) {
         fprintf(stderr, "не хватило памяти на состояние\n");
         d2k_ctl_close(ctl);
@@ -525,6 +548,9 @@ int main(int argc, char **argv) {
     cx.sess = sess;
     cx.ctl = ctl;
     cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
+    /* Ноль без сырого сокета — «предел не объявлен»: в режиме наблюдения на
+       провод ничего не пойдёт, и резать по длине нечего. */
+    cx.send_maxlen = raw ? (uint32_t)d2k_raw_maxlen(raw) : 0;
     uint64_t events_seen = 0;
 
     static uint8_t rbuf[RECV_BUF];
@@ -686,11 +712,29 @@ int main(int argc, char **argv) {
                             if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
                                 st.send_fail++;
                                 fprintf(stderr, "d2kd: %s\n", err);
+                                /* НАША неудача — не свойство коробки. Пока её
+                                   знал только этот счётчик, контроллер видел
+                                   «план применён» и делал из неё вывод о
+                                   коробке (0006). Теперь отказ уезжает
+                                   отдельным фактом, привязанным к потоку и
+                                   плану. */
+                                if (res.applied) {
+                                    d2k_session_unsent(sess, t, &res.key, res.plan_id,
+                                                       refuse_of_errno(errno));
+                                }
                                 break;
                             }
                             st.emitted++;
-                        } else if (d2k_sched_push(sched, at, p, plen) != 0) {
+                            if (res.applied) {
+                                d2k_session_sent(sess, t, &res.key);
+                            }
+                        } else if (d2k_sched_push(sched, at, p, plen,
+                                                  res.applied ? &res.key : NULL) != 0) {
                             st.send_fail++;
+                            if (res.applied) {
+                                d2k_session_unsent(sess, t, &res.key, res.plan_id,
+                                                   D2K_REFUSE_QUEUE);
+                            }
                             break;
                         } else {
                             st.deferred++;
@@ -713,11 +757,23 @@ int main(int argc, char **argv) {
         t = now_ns();
         if (raw) {
             size_t slen = 0;
-            while (d2k_sched_pop_due(sched, t, sbuf, sizeof sbuf, &slen)) {
+            d2k_key skey;
+            while (d2k_sched_pop_due(sched, t, sbuf, sizeof sbuf, &slen, &skey)) {
+                /* Нулевой ключ означает «клали без метки» (лаборатория):
+                   приписывать такую посылку некому, и молчание тут честнее
+                   выдумки. */
+                int named = (skey.proto != 0);
                 if (d2k_raw_send(raw, sbuf, slen, err, sizeof err) != 0) {
                     st.send_fail++;
+                    fprintf(stderr, "d2kd: отложенная посылка: %s\n", err);
+                    if (named) {
+                        d2k_session_unsent(sess, t, &skey, NULL, refuse_of_errno(errno));
+                    }
                 } else {
                     st.emitted++;
+                    if (named) {
+                        d2k_session_sent(sess, t, &skey);
+                    }
                 }
             }
         }

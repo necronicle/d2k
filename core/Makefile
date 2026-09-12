@@ -221,8 +221,14 @@ FORCE:
 test_meas: test_meas.c meas.o $(HDR) $(TESTHDR)
 	$(CC) $(CFLAGS) -o $@ test_meas.c meas.o $(TEST_LDFLAGS)
 
-test_verdict: test_verdict.c meas.o verdict.o $(HDR) $(TESTHDR)
-	$(CC) $(CFLAGS) -o $@ test_verdict.c meas.o verdict.o $(TEST_LDFLAGS)
+# hello.o — дерево вердиктов спрашивает ВИД снятого приветствия
+# (d2k_hello_shape): clear на форме TLS 1.2 обязан нести оговорку «обратное
+# направление не проверено» (§6 спеки, шапка reverse_note в verdict.c), а на
+# форме 1.3 такой оговорки нет и быть не должно. Тот же вопрос и тем же
+# разбором уже задаёт compose.o (выбор формы приманки) — второго разбора
+# приветствия ради одной оговорки не заводится.
+test_verdict: test_verdict.c meas.o verdict.o hello.o $(HDR) $(TESTHDR)
+	$(CC) $(CFLAGS) -o $@ test_verdict.c meas.o verdict.o hello.o $(TEST_LDFLAGS)
 
 test_crypto: test_crypto.c crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_crypto.c crypto.o $(TEST_LDFLAGS)
@@ -384,9 +390,9 @@ cross: hello_profiles.inc
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_meas-mipsel test_meas.c meas.c -lpthread || exit 1
 	@echo "== test_verdict целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verdict-a64 \
-		test_verdict.c meas.c verdict.c -lpthread || exit 1
+		test_verdict.c meas.c verdict.c hello.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verdict-mipsel \
-		test_verdict.c meas.c verdict.c -lpthread || exit 1
+		test_verdict.c meas.c verdict.c hello.c -lpthread || exit 1
 	@echo "== test_crypto целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_crypto-a64 \
 		test_crypto.c crypto.c -lpthread || exit 1

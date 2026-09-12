@@ -51,7 +51,8 @@ int main(void) {
     {
         struct stand s;
         uint16_t p = stand_start(&s, 0);
-        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0, 3);
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_serverhello, 3);
         CHECK(t.pass == 3, "на чистой мишени прошли не все три повтора");
         CHECK(t.fail == 0, "на чистой мишени есть промахи");
     }
@@ -60,7 +61,8 @@ int main(void) {
     {
         struct stand s;
         uint16_t p = stand_start(&s, 1);
-        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0, 3);
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_serverhello, 3);
         CHECK(t.pass == 0, "на блокирующей мишени что-то прошло");
     }
 
@@ -71,7 +73,8 @@ int main(void) {
         size_t cuts[1] = { 1 };
         /* Пауза обязательна: на петле два send подряд попадают в один recv, и
            опыт про разрез перестаёт быть опытом про разрез. */
-        d2k_tally t = d2k_meas("127.0.0.1", p, h, cuts, 1, 5000, 700, 0, 3);
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, cuts, 1, 5000, 700, 0,
+                               d2k_accept_serverhello, 3);
         CHECK(t.pass == 3, "разрез не прошёл на префиксном матчере");
     }
 
@@ -79,7 +82,8 @@ int main(void) {
     {
         struct stand s;
         uint16_t p = stand_start(&s, 0);
-        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0, 1);
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_serverhello, 1);
         CHECK(t.marked == 1, "без запроса метки серия объявлена непомеченной");
     }
 
@@ -97,17 +101,81 @@ int main(void) {
         d2k_mark_fn real_mark = d2k_mark_hook; /* вернуть после подмены */
 
         d2k_mark_hook = mark_always_ok;
-        d2k_tally t_ok = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0x2d, 3);
+        d2k_tally t_ok = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0x2d,
+                                  d2k_accept_serverhello, 3);
         CHECK(t_ok.marked == 1,
               "успешная метка на всех трёх дозвонах не признана серией помеченной");
 
         mark_fail_calls = 0;
         d2k_mark_hook = mark_fail_on_second;
-        d2k_tally t_bad = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0x2d, 3);
+        d2k_tally t_bad = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0x2d,
+                                   d2k_accept_serverhello, 3);
         CHECK(t_bad.marked == 0,
               "один непомеченный дозвон из трёх не погасил метку всей серии");
 
         d2k_mark_hook = real_mark;
+    }
+
+    /* --- АЛЕРТ — ОТВЕТ, НО НЕ ДОКАЗАТЕЛЬСТВО ПРОХОДА -----------------------
+     * Стенд (режим 7) отвечает фатальным алертом. Байты вернулись, и по
+     * счёту «вернулось хоть что-то» это неотличимо от ServerHello — отсюда и
+     * брались ложные CLEAR. Алерт инжектируют сами коробки, поэтому
+     * доказательством прохода служит только ServerHello (acceptServerHello,
+     * internal/classify/trigger.go донора). */
+    {
+        struct stand s;
+        memset(&s, 0, sizeof s);
+        uint16_t p = stand_start(&s, 7);
+
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_serverhello, 3);
+        CHECK(t.pass == 0, "алерт засчитан за проход");
+        CHECK(t.unproven == 3, "алерт не отмечен как непризнанный ответ");
+        CHECK(t.err == 0, "ответ алертом принят за несостоявшийся опыт");
+        CHECK(t.fail == 3, "непризнанный ответ не попал в fail (err и unproven — его подмножества)");
+
+        /* Приёмка КОНТРОЛЯ шире и намеренно: сервер, отвечающий отказом на
+           незнакомое имя, — это всё равно сервер, до которого дошли. */
+        d2k_tally c = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_tls_record, 3);
+        CHECK(c.pass == 3, "контроль не засчитал алерт — а это ответ сервера, и линия им доказана");
+        CHECK(c.unproven == 0, "признанный контролем ответ отмечен непризнанным");
+    }
+
+    /* --- БЛОК-СТРАНИЦА — ОТВЕТ, И ДАЖЕ НЕ ЗАПИСЬ TLS -----------------------
+     * Второй способ ответить «не то» (режим 8): обычный HTTP-текст. Его не
+     * признаёт даже приёмка контроля, которой достаточно любой записи TLS, —
+     * и это разные степени «не то», а не одно и то же. */
+    {
+        struct stand s;
+        memset(&s, 0, sizeof s);
+        uint16_t p = stand_start(&s, 8);
+
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_tls_record, 3);
+        CHECK(t.pass == 0, "блок-страница засчитана за запись TLS");
+        CHECK(t.unproven == 3, "блок-страница не отмечена как непризнанный ответ");
+
+        /* Чужой протокол: там разбирать нечего, и ответ есть ответ
+           (RawTrigger донора — «важно лишь, ответил сервер или промолчал»). */
+        d2k_tally a = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_any, 3);
+        CHECK(a.pass == 3, "приёмка «любой непустой ответ» не засчитала ответ");
+    }
+
+    /* --- «НЕ ПРИШЛО» И «НЕ ПРИЗНАНО» — РАЗНЫЕ СОСТОЯНИЯ --------------------
+     * Стенд (режим 1) на эти байты молчит: ответа нет вовсе. Счёт обязан
+     * отличать это от непризнанного ответа выше — иначе дерево вердиктов
+     * объявит молчание линии там, где линия ответила (§2.4). */
+    {
+        struct stand s;
+        memset(&s, 0, sizeof s);
+        uint16_t p = stand_start(&s, 1);
+        d2k_tally t = d2k_meas("127.0.0.1", p, h, NULL, 0, 0, 700, 0,
+                               d2k_accept_serverhello, 3);
+        CHECK(t.fail == 3, "молчание не засчитано в промахи");
+        CHECK(t.unproven == 0, "молчание записано как непризнанный ответ");
+        CHECK(t.err == 0, "молчание записано как несостоявшийся опыт");
     }
 
     /* --- невалидные точки разреза: отказ, а не тихая подмена ---------------
@@ -122,16 +190,46 @@ int main(void) {
         int marked;
 
         size_t unordered[3] = { 12, 4, 8 };
-        int r1 = d2k_meas_once("127.0.0.1", p, h, unordered, 3, 0, 700, 0, &marked);
+        int r1 = d2k_meas_once("127.0.0.1", p, h, unordered, 3, 0, 700, 0,
+                               d2k_accept_serverhello, &marked);
         CHECK(r1 == -1, "немонотонные точки разреза приняты вместо отказа");
 
         size_t out_of_range[2] = { 1000, 8 };
-        int r2 = d2k_meas_once("127.0.0.1", p, h, out_of_range, 2, 0, 700, 0, &marked);
+        int r2 = d2k_meas_once("127.0.0.1", p, h, out_of_range, 2, 0, 700, 0,
+                               d2k_accept_serverhello, &marked);
         CHECK(r2 == -1, "точка разреза за пределами длины принята вместо отказа");
 
         size_t valid[1] = { 1 };
-        int r3 = d2k_meas_once("127.0.0.1", p, h, valid, 1, 0, 700, 0, &marked);
+        int r3 = d2k_meas_once("127.0.0.1", p, h, valid, 1, 0, 700, 0,
+                               d2k_accept_serverhello, &marked);
         CHECK(r3 == 1, "валидный разрез отклонён заодно с невалидными");
+    }
+
+    /* --- НЕУДАВШАЯСЯ ОТПРАВКА — СБОЙ ОПЫТА, А НЕ РЕШЕНИЕ КОРОБКИ ----------
+     * Стенд (режим 10) принимает и сразу закрывает, не читая: первый кусок
+     * уезжает в закрытый сокет, в ответ приходит RST, и вторая посылка
+     * разреза уже не уходит. Приветствие не попало на провод целиком —
+     * значит, опыта не было, и «мишень промолчала» тут неправда: мы ей
+     * ничего толком и не сказали. У донора ошибка записи возвращается
+     * вызывающему ошибкой и никогда не становится отрицательным свойством
+     * коробки (once/measure, internal/classify/classify.go).
+     *
+     * Попутно этот же тест держит второе: запись в сокет, получивший RST,
+     * валит процесс сигналом SIGPIPE, если его не подавить. d2kc ставит
+     * SIG_IGN сам, но тесты — отдельные процессы (ровно та же оговорка, что
+     * у props_ask_contact в compose.c), и до подавления этот блок убивал
+     * прогон целиком. */
+    {
+        struct stand s;
+        memset(&s, 0, sizeof s);
+        uint16_t p = stand_start(&s, 10);
+        size_t cuts[1] = { 1 };
+        int marked;
+        int r = d2k_meas_once("127.0.0.1", p, h, cuts, 1, 5000, 700, 0,
+                              d2k_accept_serverhello, &marked);
+        CHECK(r == D2K_MEAS_ERR,
+              "неудавшаяся отправка выдана за молчание мишени — своя неудача "
+              "записана коробке в свойства");
     }
 
     /* --- connect ограничен по времени, а не висит на умолчании ядра --------
@@ -158,7 +256,8 @@ int main(void) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         int marked;
-        int r = d2k_meas_once("127.0.0.1", closed_port, h, NULL, 0, 0, 700, 0, &marked);
+        int r = d2k_meas_once("127.0.0.1", closed_port, h, NULL, 0, 0, 700, 0,
+                              d2k_accept_serverhello, &marked);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double secs = (double)(t1.tv_sec - t0.tv_sec) +
                       (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
@@ -201,7 +300,8 @@ int main(void) {
            незачем. Обязаны вернуть значение обратно — оно глобальное. */
         d2k_send_timeout_s = 1;
         int marked;
-        int r = d2k_meas_once("127.0.0.1", p, bh, NULL, 0, 0, 3000, 0, &marked);
+        int r = d2k_meas_once("127.0.0.1", p, bh, NULL, 0, 0, 3000, 0,
+                              d2k_accept_serverhello, &marked);
         d2k_send_timeout_s = 8;
         CHECK(r == 1, "короткая запись потеряла часть большого приветствия");
     }

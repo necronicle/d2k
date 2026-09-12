@@ -125,6 +125,58 @@ static void emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
     }
 }
 
+/* Заголовки на проводе — те же числа, что у сборщиков (wire.c, wire_udp.c).
+   Повторены здесь, а не вынесены в общий заголовок, по тому же правилу, по
+   которому wire_udp.c держит собственные копии wr16/sum16: модули пакетного
+   пути самодостаточны. Расхождение поймает test_ctl: он сверяет 20+20+длина
+   приманки с тем, что реально собирает wire.c. */
+#define EMIT_IP_HDR   20
+#define EMIT_TCP_HDR  20
+#define EMIT_UDP_HDR   8
+/* Метка времени TCP: NOP, NOP, тип 8, длина 10 — см. TS_OPT_LEN в wire.c. */
+#define EMIT_TS_OPT   12
+
+static size_t emit_overhead(const d2k_plan *p, const struct d2k_poison *po) {
+    /* Транспорт не объявлен — считаем по TCP: его заголовок шире, и ошибка в
+       эту сторону отвергает лишнее, а не пропускает непроходимое. */
+    size_t hdr = EMIT_IP_HDR + ((p->transport == 17) ? EMIT_UDP_HDR : EMIT_TCP_HDR);
+    if (po && (po->flags & D2K_POISON_TCPTS_BACK) && p->transport != 17) {
+        hdr += EMIT_TS_OPT;
+    }
+    return hdr;
+}
+
+size_t d2k_plan_max_emit(const d2k_plan *p) {
+    if (!p) {
+        return 0;
+    }
+    size_t max = 0;
+    for (size_t i = 0; i < p->n_fakes; i++) {
+        const struct d2k_payload *pl = d2k_find_payload(p, p->fakes[i].payload_id);
+        if (!pl) {
+            continue;   /* висячая ссылка отвергается разбором, сюда не доходит */
+        }
+        const struct d2k_poison *po = p->fakes[i].poison_id
+            ? d2k_find_poison(p, p->fakes[i].poison_id) : NULL;
+        size_t n = emit_overhead(p, po) + pl->len;
+        if (n > max) { max = n; }
+    }
+    for (size_t i = 0; i < p->n_seqovls; i++) {
+        const struct d2k_payload *pl = d2k_find_payload(p, p->seqovls[i].payload_id);
+        if (!pl) {
+            continue;
+        }
+        const struct d2k_poison *po = p->seqovls[i].poison_id
+            ? d2k_find_poison(p, p->seqovls[i].poison_id) : NULL;
+        /* Только приставка: кусок нагрузки, к которому она приклеивается,
+           приходит из пакета — см. d2k_plan_max_emit в d2k_plan.h про то,
+           почему он здесь не считается. */
+        size_t n = emit_overhead(p, po) + pl->len;
+        if (n > max) { max = n; }
+    }
+    return max;
+}
+
 int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                    const d2k_pkt *in, d2k_actions *out) {
     (void)f;

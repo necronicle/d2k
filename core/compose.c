@@ -192,7 +192,7 @@ int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
     if (tlv_header(buf, cap, &pos, 5) != 0) { return -1; }
     uint8_t pid[2]; wr16be(pid, 1);
-    uint8_t ovl = 0x41;
+    uint8_t ovl = D2K_OVERLAP_FILLER;
     if (tlv_rec(buf, cap, &pos, D2K_REC_PAYLOAD, pid, sizeof pid, &ovl, 1) != 0) { return -1; }
     uint8_t so[4]; wr16be(so, 1); wr16be(so + 2, 0); /* payload_id=1, poison_id=0 */
     if (tlv_rec(buf, cap, &pos, D2K_REC_SEQOVL, so, sizeof so, NULL, 0) != 0) { return -1; }
@@ -250,7 +250,7 @@ int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
  * настоящее приветствие). */
 int checksum_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     uint8_t filler[64];
-    memset(filler, 0x41, sizeof filler);
+    memset(filler, D2K_OVERLAP_FILLER, sizeof filler);
     return badsum_fake_plan_tlv(filler, sizeof filler, 1, 0, buf, cap, out_len);
 }
 
@@ -315,10 +315,15 @@ int ev_matches_flow(const d2k_ev *ev, const d2k_flowkey *k) {
  *
  * Возвращает 0 при находке (*out заполнен), -1 иначе (тайм-аут всего
  * бюджета, ошибка связи, обрыв). */
-static int wait_for_event(int fd, uint16_t want, int code_filter,
-                          const d2k_flowkey *flow,
-                          uint32_t deadline_ms, d2k_ev *out,
-                          char *err, size_t errcap) {
+/* То же, но ЛОВИТ ДВА ВИДА СРАЗУ. Нужно там, где ожидание может закончиться
+   не только тем, чего ждут: зонд ждёт обмена, но датапат вправе сообщить, что
+   посылка плана не покинула машину, — и тогда ждать обмена больше незачем, а
+   главное, нельзя называть его отсутствие промахом коробки. want_b == 0
+   означает «второго вида нет», и функция ведёт себя ровно как прежняя. */
+static int wait_for_event2(int fd, uint16_t want_a, uint16_t want_b,
+                           int code_filter, const d2k_flowkey *flow,
+                           uint32_t deadline_ms, d2k_ev *out,
+                           char *err, size_t errcap) {
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
@@ -330,11 +335,22 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
         if (elapsed_ms >= (long)deadline_ms) { return -1; }
         int rc = d2k_link_next(fd, out, (int)((long)deadline_ms - elapsed_ms), err, errcap);
         if (rc != 0) { return -1; } /* тайм-аут этого чтения = тайм-аут всего бюджета, либо ошибка */
-        if (out->kind != want) { continue; }
-        if (code_filter >= 0 && out->code != (uint16_t)code_filter) { continue; }
+        if (out->kind != want_a && !(want_b && out->kind == want_b)) { continue; }
+        /* Фильтр по коду — только для основного вида: у второго код и есть
+           то, ради чего его ловят. */
+        if (code_filter >= 0 && out->kind == want_a &&
+            out->code != (uint16_t)code_filter) { continue; }
         if (flow && !ev_matches_flow(out, flow)) { continue; }
         return 0;
     }
+}
+
+static int wait_for_event(int fd, uint16_t want, int code_filter,
+                          const d2k_flowkey *flow,
+                          uint32_t deadline_ms, d2k_ev *out,
+                          char *err, size_t errcap) {
+    return wait_for_event2(fd, want, 0, code_filter, flow, deadline_ms, out,
+                           err, errcap);
 }
 
 /* Потолок ожидания ОДНОГО шага (ack SET_NAME, connect цели, событие обмена)
@@ -702,7 +718,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            D2K_PROPS_ASK_WAIT_MS — страховка от молчания, и продлевать её
            каждым пришедшим событием значило бы отменить её вовсе. */
         d2k_ev exch;
-        int got = 0, passed = 0;
+        int got = 0, passed = 0, unsent = 0;
         {
             struct timespec t0;
             clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -713,10 +729,20 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                              (now.tv_nsec - t0.tv_nsec) / 1000000L;
                 if (spent < 0) { spent = 0; }
                 if (spent >= (long)D2K_PROPS_ASK_WAIT_MS) { break; }
-                if (wait_for_event(link_fd, D2K_EV_EXCHANGE, -1, &fk,
-                                   (uint32_t)((long)D2K_PROPS_ASK_WAIT_MS - spent),
-                                   &exch, err, sizeof err) != 0) {
+                if (wait_for_event2(link_fd, D2K_EV_EXCHANGE, D2K_EV_REFUSED, -1, &fk,
+                                    (uint32_t)((long)D2K_PROPS_ASK_WAIT_MS - spent),
+                                    &exch, err, sizeof err) != 0) {
                     break;
+                }
+                if (exch.kind == D2K_EV_REFUSED) {
+                    /* НАША неудача, а не ответ коробки: посылка плана не
+                       покинула машину (код в ev.code, D2K_REFUSE_*). Ждать
+                       обмена дальше бессмысленно — воздействия на проводе не
+                       было. Нулевой код сюда не относится: это обычный отказ
+                       применить план к чужому потоку, и он к нашему ключу не
+                       придёт. */
+                    if (exch.code != 0) { unsent = 1; break; }
+                    continue;
                 }
                 got = 1;
                 if (steps) {
@@ -734,6 +760,17 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
            ожидание обмена (см. doc-комментарий props_ask_contact). */
         if (contact_fd >= 0) {
             close(contact_fd);
+        }
+        if (unsent) {
+            /* Опыта не было: воздействие не доехало до провода по НАШЕЙ
+               причине. Отличается от промаха тем, что промах хотя бы
+               состоялся; здесь коробке не показали ничего, и записывать ей
+               нечего (§2.4). Свойство не пишется в обоих случаях, но трасса
+               обязана различать их: иначе собственная поломка читается как
+               «приём не сработал» и уводит поиск.  */
+            step_rc(steps, i, D2K_STEP_UNSENT, NULL);
+            if (steps) { steps[i].ack_code = (uint8_t)exch.code; }
+            continue;
         }
         if (!passed) {
             step_rc(steps, i, got ? D2K_STEP_NO_APPDATA : D2K_STEP_NO_EXCHANGE,
@@ -823,7 +860,7 @@ int overlap_plan_text(char *buf, size_t cap) {
        приманки (plan.Seqovl не хранит число: см. комментарий у Seqovl,
        plan.go). PoisonID=0 у Seqovl не задан Go-стороной — печатается как
        poison=0 безусловно (см. Text(), text.go:93). */
-    if (append_fmt(buf, cap, &pos, "payload 1 41\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "payload 1 0f\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "seqovl payload=1 poison=0\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
     return 0;
@@ -883,7 +920,7 @@ int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
  * этом, не косметическая. */
 int checksum_plan_text(char *buf, size_t cap) {
     uint8_t filler[64];
-    memset(filler, 0x41, sizeof filler);
+    memset(filler, D2K_OVERLAP_FILLER, sizeof filler);
     return badsum_fake_plan_text(filler, sizeof filler, 1, 0, buf, cap);
 }
 

@@ -171,6 +171,33 @@ static void refuse(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_PLAN_REFUSED, 0, 0, NULL, NULL, 0, why);
 }
 
+/* План построен и передан на отправку. Ключ потока и идентификатор плана
+   уезжают вызывающему, а на потоке взводится счёт непокинувших машину
+   посылок: по нему отправляющий и скажет потом, доисполнен план или нет.
+
+   Одна функция на обе ветки (TCP и UDP/QUIC) нарочно: разойдись они, одна из
+   двух однажды забыла бы взвести счёт, и «план доисполнен» по этому
+   транспорту перестало бы появляться молча. */
+static void plan_handed_off(d2k_result *out, d2k_flow *fl, const d2k_key *k,
+                            const d2k_plan *use) {
+    out->applied = 1;
+    out->key = *k;
+    const uint8_t *id = d2k_plan_id(use);
+    if (id) {
+        memcpy(out->plan_id, id, D2K_PLAN_ID_LEN);
+    }
+    /* n_out не может превысить вместимость out[] (16): выше стоит явная
+       проверка, отвергающая план целиком. */
+    fl->sends_left = (uint8_t)out->n_out;
+    fl->sends_failed = 0;
+}
+
+/* Таблица, в которой живёт поток этого ключа. Транспорт лежит в самом ключе,
+   и выбирать таблицу по чему-то ещё было бы вторым источником истины. */
+static d2k_table *table_of(d2k_session *s, const d2k_key *k) {
+    return (k->proto == 17) ? s->uflows : s->flows;
+}
+
 /* Подозрение. Отмечается ОДИН раз на поток: три улики об одном соединении
    выглядели бы как три соединения, а это разные факты.
    Слово «подозрение» выбрано вместо «блокировки» намеренно: §2.4 запрещает
@@ -531,6 +558,10 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
+    /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
+       отправляющий видит только байты, и отказ sendto оставался голым
+       счётчиком (d2k_session.h, поля applied/key/plan_id). */
+    plan_handed_off(out, fl, &key, use);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
@@ -1035,6 +1066,10 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     fl->plan_done = 1;
     fl->guards = d2k_plan_guards(use);
     s->applied++;
+    /* Ключ потока и идентификатор плана — ВЫЗЫВАЮЩЕМУ, до отправки. Без них
+       отправляющий видит только байты, и отказ sendto оставался голым
+       счётчиком (d2k_session.h, поля applied/key/plan_id). */
+    plan_handed_off(out, fl, &key, use);
     /* Не просто «план применился», а КАКОЙ: без идентификатора контроллер не
        отличит применение своего кандидата от применения предыдущего, чьё
        событие пришло позже (d2k_ctl.h объявляет APPLIED «ключ + id плана»). */
@@ -1183,6 +1218,40 @@ size_t d2k_session_expire(d2k_session *s, uint64_t now_ns, uint64_t idle_ns) {
 
 size_t d2k_session_flows(const d2k_session *s) {
     return s ? d2k_track_count(s->flows) + d2k_track_count(s->uflows) : 0;
+}
+
+void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k) {
+    if (!s || !k) {
+        return;
+    }
+    d2k_flow *fl = d2k_track_find(table_of(s, k), k);
+    /* Потока нет (забыт по RST/FIN/молчанию) либо машине по нему ничего не
+       должны — объявлять нечего. Молчание здесь честнее выдумки: «доисполнен»
+       по потоку, которого уже нет, мы доказать не можем. */
+    if (!fl || fl->sends_left == 0) {
+        return;
+    }
+    fl->sends_left--;
+    if (fl->sends_left == 0 && !fl->sends_failed) {
+        d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
+                             D2K_REFUSE_NONE, NULL);
+    }
+}
+
+void d2k_session_unsent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                        const uint8_t *plan_id, uint8_t code) {
+    if (!s || !k) {
+        return;
+    }
+    /* Запись идёт ВСЕГДА, даже когда потока уже нет: отрицательный факт нам
+       известен и без него, а потерять его значит вернуться ровно к тому
+       разрыву, ради которого всё это заведено. */
+    d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_UNSENT, code, plan_id);
+    d2k_flow *fl = d2k_track_find(table_of(s, k), k);
+    if (fl) {
+        fl->sends_left = 0;
+        fl->sends_failed = 1;
+    }
 }
 
 uint64_t d2k_session_applied(const d2k_session *s) {

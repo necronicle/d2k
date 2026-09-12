@@ -16,8 +16,68 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "d2k_hello.h"
 #include "d2k_meas.h"
 #include "d2k_verdict.h"
+
+/* Тип записи TLS «рукопожатие» (RFC 8446 §5.1). То же число названо в meas.c
+ * (TLS_REC_HANDSHAKE) и в d2k_link.h (D2K_TLS_HANDSHAKE) — здесь оно нужно
+ * ровно для одного вопроса: шлём мы TLS или чужой протокол. */
+#define TLS_REC_HANDSHAKE 0x16
+
+/* Похоже ли то, что мы шлём, на запись TLS. От ответа зависит ПРИЁМКА: у
+ * приветствия TLS доказательством прохода может быть только ServerHello, а у
+ * сырых байт чужого протокола — любой непустой ответ, потому что разбирать
+ * чужой протокол ради вердикта незачем (TLSTrigger против RawTrigger у
+ * донора, internal/classify/trigger.go). */
+static int looks_like_tls(d2k_hello h) {
+    return h.bytes != NULL && h.len > 0 && h.bytes[0] == TLS_REC_HANDSHAKE;
+}
+
+/* Оговорка к CLEAR: обратное направление не проверено.
+ *
+ * В TLS 1.2 сертификат сервера едет ОТКРЫТЫМ ТЕКСТОМ и содержит имя, и
+ * коробка может пропустить запрос, а убить ОТВЕТ (§6 спеки и шапка
+ * internal/classify/response.go донора). Дерево вердиктов меряет ровно одно
+ * направление — клиент → сервер: наш ClientHello доходит, ServerHello
+ * возвращается, и «проходит как есть» тут правда про запрос и, возможно,
+ * неправда про жизнь. Зонда обратного направления (рукопожатие 1.2 до конца,
+ * ProbeResponse у донора) в d2k сегодня нет вовсе, поэтому CLEAR обязан
+ * сказать, чего он не мерил.
+ *
+ * MODERN оговорки не несёт, и это не поблажка: в TLS 1.3 всё после
+ * ServerHello зашифровано, резать по имени в сертификате нечего, класса
+ * блокировки не существует. UNKNOWN несёт оговорку тоже — вид приветствия не
+ * разобран, и исключить 1.2 нечем (см. про UNKNOWN в d2k_hello.h: уверенный
+ * неправильный ответ хуже честного «не знаю»). */
+static const char *reverse_note(d2k_hello trigger) {
+    switch (d2k_hello_shape(trigger.bytes, trigger.len)) {
+    case D2K_SHAPE_MODERN:
+        return "";
+    case D2K_SHAPE_LEGACY:
+        return "; форма TLS 1.2 — обратное направление не проверено";
+    default:
+        return "; вид приветствия не разобран — обратное направление не проверено";
+    }
+}
+
+/* Оговорка к выводам о РАЗРЕЗЕ: на какой паузе между кусками он замерен.
+ *
+ * Пауза — параметр опыта, а не подробность реализации: боевое умолчание 60 мс
+ * (§7 спеки, у донора WriteGap в withDefaults) существует затем, чтобы куски
+ * гарантированно разъехались по разным сегментам. Нулевая пауза этого не
+ * гарантирует — замерено прямо в этом дереве: «на петле два send подряд
+ * попадают в один recv» (test_meas.c), и тогда опыт про место разреза
+ * перестаёт быть опытом про место разреза. Вывод, снятый на одной паузе,
+ * обязан называть её: на другой он может не повториться, а других дерево не
+ * задаёт. */
+static void pause_note(char *out, size_t cap, uint32_t gap_us) {
+    if (gap_us == 0) {
+        snprintf(out, cap, "замерено без пауз между кусками");
+    } else {
+        snprintf(out, cap, "замерено с паузой %u мкс между кусками", (unsigned)gap_us);
+    }
+}
 
 /* Сколько ДОПОЛНИТЕЛЬНЫХ повторов задать базовому вопросу перед тем, как
  * вынести CLEAR — независимо от repeats. Ложный clear — худшая из ошибок
@@ -46,6 +106,20 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
        что попало, если вызывающий передал <= 0. */
     if (repeats <= 0) { repeats = 3; }
 
+    /* ПРИЁМКА — по одной на роль, и роли разные. Триггеру доказательством
+       прохода служит только ServerHello; контролю достаточно любой записи
+       TLS, включая алерт, потому что он отвечает на другой вопрос — жива ли
+       линия, а не прошло ли имя (см. d2k_meas.h). */
+    d2k_accept_fn acc_trig = looks_like_tls(trigger) ? d2k_accept_serverhello
+                                                     : d2k_accept_any;
+    d2k_accept_fn acc_ctl  = looks_like_tls(control) ? d2k_accept_tls_record
+                                                     : d2k_accept_any;
+    /* 96 байт: самая длинная оговорка — «замерено с паузой 4294967295 мкс
+       между кусками», 76 байт с запасом на кириллицу в UTF-8 (два байта на
+       букву). В 64 она молча теряла хвост. */
+    char gap_note[96];
+    pause_note(gap_note, sizeof gap_note, gap_us);
+
     /* Разрез на 1 определён только когда в приветствии есть что резать
        ПОСЛЕ первого байта — вопрос 2 дерева не имеет смысла на триггере
        короче двух байт. Это не «повторы разошлись» (обычный смысл FLAKY,
@@ -61,7 +135,8 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
     }
 
     /* 1. БАЗА. Триггер целиком, ни одного разреза. */
-    d2k_tally base = d2k_meas(ip, port, trigger, NULL, 0, gap_us, wait_ms, mark, repeats);
+    d2k_tally base = d2k_meas(ip, port, trigger, NULL, 0, gap_us, wait_ms, mark,
+                              acc_trig, repeats);
     r.probes += repeats;
     if (!base.marked) { all_marked = 0; }
 
@@ -81,7 +156,7 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
            выглядит как clear ровно так же, как «3 из 3, а следующие два
            дозвона уже молчат» — дереву нечем их различить. */
         d2k_tally confirm = d2k_meas(ip, port, trigger, NULL, 0, gap_us, wait_ms,
-                                      mark, D2K_CLEAR_CONFIRM_REPEATS);
+                                      mark, acc_trig, D2K_CLEAR_CONFIRM_REPEATS);
         r.probes += D2K_CLEAR_CONFIRM_REPEATS;
         if (!confirm.marked) { all_marked = 0; }
 
@@ -103,8 +178,8 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                 r.verdict = D2K_V_CLEAR;
                 snprintf(r.reason, sizeof r.reason,
                          "триггер проходит как есть, метка подтверждена "
-                         "(%d/%d подряд) — обходить нечего",
-                         total_pass, total_repeats);
+                         "(%d/%d подряд) — обходить нечего%s",
+                         total_pass, total_repeats, reverse_note(trigger));
             } else {
                 /* Самоподтверждение: зонд шёл СКВОЗЬ наш обход, а не мимо
                    него (см. шапку d2k_verdict.h) — «обходить нечего» отсюда
@@ -124,7 +199,8 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
         /* 2. ПОМОГАЕТ ЛИ РЕЗАТЬ ВООБЩЕ. Разрез после первого байта — самый
            агрессивный: в первом сегменте остаётся один байт. */
         size_t cut1 = 1;
-        d2k_tally one = d2k_meas(ip, port, trigger, &cut1, 1, gap_us, wait_ms, mark, repeats);
+        d2k_tally one = d2k_meas(ip, port, trigger, &cut1, 1, gap_us, wait_ms, mark,
+                                 acc_trig, repeats);
         r.probes += repeats;
         if (!one.marked) { all_marked = 0; }
 
@@ -153,15 +229,16 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
             r.verdict = D2K_V_PREFIX;
             r.split_pos = 1;
             snprintf(r.reason, sizeof r.reason,
-                     "разрез на 1 проходит единогласно (%d/%d) — матчер "
+                     "разрез на 1 проходит единогласно (%d/%d), %s — матчер "
                      "решает по первому байту, пересборка его не спасает",
-                     one.pass, repeats);
+                     one.pass, repeats, gap_note);
         } else {
             /* one.pass == 0 — разрез не помог. Прежде чем говорить
                «пересборка», исключаем, что дело вообще не в содержимом:
                контроль ДРУГИМ именем на ту же цель (§2.3 — d2k не
                утверждает блокировку по адресу). */
-            d2k_tally ctl = d2k_meas(ip, port, control, NULL, 0, gap_us, wait_ms, mark, repeats);
+            d2k_tally ctl = d2k_meas(ip, port, control, NULL, 0, gap_us, wait_ms, mark,
+                                     acc_ctl, repeats);
             r.probes += repeats;
             if (!ctl.marked) { all_marked = 0; }
 
@@ -179,11 +256,40 @@ d2k_vres d2k_classify(const char *ip, uint16_t port,
                          "контроль другим именем не воспроизводится: %d из %d",
                          ctl.pass, repeats);
             } else if (ctl.pass == repeats) {
-                r.verdict = D2K_V_OPAQUE;
+                if (base.unproven > 0 || one.unproven > 0) {
+                    /* Триггер НЕ молчал: на него отвечали — просто не
+                       доказательством прохода. «Решает содержимое, поток
+                       пересобирается» отсюда не следует: до кого дошли наши
+                       байты и кто именно ответил, этот ответ не говорит.
+                       Алерт инжектируют и коробки, и серверы (сервер
+                       отвечает им на незнакомое имя), а различить инжект и
+                       отказ сервера дереву нечем — значит, вердикта нет,
+                       а не «пересборка». */
+                    r.verdict = D2K_V_INCONCLUSIVE;
+                    snprintf(r.reason, sizeof r.reason,
+                             "на триггер ответили не доказательством прохода "
+                             "(%d опытов из %d): алерт инжектируют и коробки, "
+                             "и серверы — вердикта нет",
+                             base.unproven + one.unproven, repeats * 2);
+                } else {
+                    r.verdict = D2K_V_OPAQUE;
+                    snprintf(r.reason, sizeof r.reason,
+                             "разрез не помог (%s), но контроль другим именем "
+                             "прошёл (%d/%d) — решает содержимое, поток "
+                             "пересобирается",
+                             gap_note, ctl.pass, repeats);
+                }
+            } else if (ctl.unproven > 0) {
+                /* Контроль ответил, и ответ не признан: у контроля приёмка
+                   самая широкая — любая запись TLS, включая алерт, — а
+                   пришло не это. Молчанием такое звать нельзя: «молчит вся
+                   линия» и «линия ответила не тем» — разные состояния, и
+                   вывод из них разный (§2.4). */
+                r.verdict = D2K_V_INCONCLUSIVE;
                 snprintf(r.reason, sizeof r.reason,
-                         "разрез не помог, но контроль другим именем прошёл "
-                         "(%d/%d) — решает содержимое, поток пересобирается",
-                         ctl.pass, repeats);
+                         "контроль другим именем ответил не записью TLS "
+                         "(%d из %d) — это не проход и не молчание; "
+                         "вердикта нет", ctl.unproven, repeats);
             } else {
                 r.verdict = D2K_V_INCONCLUSIVE;
                 snprintf(r.reason, sizeof r.reason,

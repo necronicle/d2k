@@ -35,6 +35,36 @@ static size_t count_plan_refused(const d2k_session *s) {
     return c;
 }
 
+/* Сколько записей заданного вида в журнале. Отдельно от count_plan_refused:
+   «план не доисполнен» и «план не применялся» — разные виды записи, и считать
+   их одной функцией значило бы снова смешать два разных факта. */
+static size_t count_kind(const d2k_session *s, uint8_t kind) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j);
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == kind) {
+            c++;
+        }
+    }
+    return c;
+}
+
+/* Последняя запись заданного вида. NULL — такой не было. */
+static const d2k_jrn_entry *last_of_kind(const d2k_session *s, uint8_t kind) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j);
+    const d2k_jrn_entry *found = NULL;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == kind) {
+            found = e;
+        }
+    }
+    return found;
+}
+
 /* Тот же план плюс защита от чужого сброса. minexec=2: защита появилась во
    второй версии исполнителя, и план обязан это объявлять. */
 static const uint8_t plan_guard[] = {
@@ -57,6 +87,28 @@ static const uint8_t plan_bytes[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
+/* Тот же план, что plan_bytes, плюс запись REC_ID (тип 0x0001, длина 16) —
+ * записей в заголовке поэтому пять. Идентификатор НЕпечатный (0xС0..0xCF)
+ * нарочно: он двоичный, и путь от разбора плана до ТОЧКИ ОТПРАВКИ не имеет
+ * права его чистить под печать — дорога через поле имени журнала заменила бы
+ * каждый такой байт точкой (journal.c), и проверка печатным идентификатором
+ * прошла бы мимо этого. */
+static const uint8_t want_send_id[16] = {
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7,
+    0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF
+};
+static const uint8_t plan_with_send_id[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 5,
+    0x00, 0x01, 0x00, 0x10,
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7,
+    0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x01, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
 /* План с ОДНОЙ фальшивкой и repeats=20 (ревью задачи 4, круг 2): repeats —
  * байт TLV без потолка (d2k_plan.h/plan_parse.c), а d2k_result.out[] вмещает
  * 16 посылок (d2k_session.h) — 20 > 16. Нужен для проверки, что план,
@@ -70,6 +122,18 @@ static const uint8_t plan_too_many_repeats[] = {
     0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0xAA,
     0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
+/* Порты в ключе потока лежат в СЕТЕВОМ порядке (d2k_key_make, d2k_track.h):
+   сравнивать их с числом напрямую значит сравнить по-разному на разных арках.
+   Своя функция, а не htons: <arpa/inet.h> тянуть в переносимый тест незачем. */
+static uint16_t htons16(uint16_t v) {
+    uint8_t b[2];
+    b[0] = (uint8_t)(v >> 8);
+    b[1] = (uint8_t)v;
+    uint16_t o;
+    memcpy(&o, b, 2);
+    return o;
+}
 
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static void wr32(uint8_t *p, uint32_t v) {
@@ -590,6 +654,92 @@ int main(void) {
         d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
         CHECK(count_plan_refused(g) == after_hello,
               "пакет после рукопожатия на том же потоке размножил отказ плана");
+
+        d2k_session_free(g);
+    }
+
+    /* --- результат исполнения доезжает до контроллера ---------------------
+     *
+     * Разрыв, ради которого заведён этот блок (docs/decisions/0006, «Что
+     * по-прежнему НЕ доказано»): APPLIED писался при ПОСТРОЕНИИ результата, до
+     * отправки, и ошибка отправки его не отзывала. На живой пробе 12.09.2026
+     * «sendto: Message too large» шло ОДНОВРЕМЕННО с ростом «план применён».
+     * Отрицательный исход становился неотличим от неотправленного зонда.
+     *
+     * Проверяется тройка: (1) ключ потока и идентификатор плана доезжают до
+     * точки отправки в самом результате; (2) когда все посылки ушли, журнал
+     * получает «план доисполнен»; (3) когда хоть одна не ушла — «план не
+     * доисполнен» с кодом причины, и поздняя удача остатка НЕ превращает это
+     * обратно в «доисполнен». */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &gp,
+                            err, sizeof err) == 0,
+              "план с идентификатором не загрузился");
+        d2k_session_set_plan(g, gp);
+
+        n = build_pkt(pkt, 46000, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2, "план с идентификатором не дал двух посылок");
+        CHECK(r.applied == 1, "результат не объявил план применённым");
+        /* Ключ канонический: низкий конец пары — не обязательно клиент.
+           Сверяем то, что не зависит от порядка: транспорт и оба порта. */
+        CHECK(r.key.proto == 6, "в результате нет транспорта ключа потока");
+        CHECK((r.key.low_port == htons16(46000) || r.key.high_port == htons16(46000)),
+              "ключ потока в результате не про этот поток");
+        CHECK(memcmp(r.plan_id, want_send_id, 16) == 0,
+              "идентификатор плана не доехал до точки отправки");
+
+        /* Все посылки ушли — «план доисполнен». */
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
+              "«доисполнен» записан до единой отправки");
+        d2k_session_sent(g, 1100, &r.key);
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
+              "«доисполнен» записан на половине посылок");
+        d2k_session_sent(g, 1200, &r.key);
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 1,
+              "все посылки ушли, а «доисполнен» не записан");
+        CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 0,
+              "успешная отправка записана недоисполнением");
+
+        d2k_session_free(g);
+    }
+
+    /* Отказ отправки: «план не доисполнен» с кодом, и поздняя удача остатка
+       не отменяет отказ. Отдельная сессия — иначе счётчики предыдущей
+       смешались бы с этими. */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_with_send_id, sizeof plan_with_send_id, &gp,
+                            err, sizeof err) == 0,
+              "план с идентификатором не загрузился (вторая сессия)");
+        d2k_session_set_plan(g, gp);
+
+        n = build_pkt(pkt, 46001, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied == 1, "план не применился во второй сессии");
+
+        d2k_session_unsent(g, 1100, &r.key, r.plan_id, D2K_REFUSE_TOO_LONG);
+        CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 1,
+              "отказ отправки не записан в журнал");
+        {
+            const d2k_jrn_entry *e = last_of_kind(g, D2K_JRN_PLAN_UNSENT);
+            CHECK(e != NULL && e->code == D2K_REFUSE_TOO_LONG,
+                  "у недоисполнения нет кода причины");
+            CHECK(e != NULL && memcmp(e->plan_id, want_send_id, 16) == 0,
+                  "недоисполнение не названо идентификатором плана");
+            CHECK(e != NULL && e->key.proto == 6,
+                  "недоисполнение не названо ключом потока");
+        }
+
+        /* Остаток плана уходит успешно — «доисполнен» всё равно не пишется:
+           план исполнен НЕ полностью, и поздняя удача этого не меняет. */
+        d2k_session_sent(g, 1200, &r.key);
+        d2k_session_sent(g, 1300, &r.key);
+        CHECK(count_kind(g, D2K_JRN_PLAN_DONE) == 0,
+              "поздняя удача остатка объявила недоисполненный план доисполненным");
 
         d2k_session_free(g);
     }

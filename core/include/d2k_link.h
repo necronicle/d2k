@@ -90,7 +90,11 @@ typedef struct {
     uint8_t  low_ip[4], high_ip[4];
     uint16_t low_port, high_port;
     uint8_t  transport;     /* 6 TCP, 17 UDP — см. большой комментарий выше */
-    uint16_t code;          /* SUSPECT: причина; EXCHANGE: тип TLS-записи; ACK: тип команды */
+    uint16_t code;          /* SUSPECT: причина; EXCHANGE: тип TLS-записи; ACK: тип команды;
+                               REFUSED: D2K_REFUSE_* — НЕНУЛЕВОЙ означает нашу
+                               собственную неудачу (посылка не покинула машину),
+                               а не решение коробки; ноль — «причина не
+                               кодирована», обычный отказ применить план */
     uint32_t num;           /* EXCHANGE: сколько байт; ACK: (ok<<8)|reason */
     uint8_t  seen_types;    /* EXCHANGE: маска встреченных типов, бит (тип-20) */
     /* APPLIED: идентификатор ПРИМЕНЁННОГО плана, 16 байт (REC_ID, тот же, что
