@@ -91,6 +91,9 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
         case REC_ORDER:
             if (ln != 1) { fail(err, errlen, "порядок не 1 байт"); return -1; }
             break;
+        case REC_PACE:
+            if (ln != 4) { fail(err, errlen, "разнос во времени не 4 байта"); return -1; }
+            break;
         case REC_GUARD:
             if (ln != 1) { fail(err, errlen, "защита не 1 байт"); return -1; }
             if (b[off] == 0 || (b[off] & ~(unsigned)D2K_GUARD_RST_ALIEN) != 0) {
@@ -315,6 +318,13 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         }
         case REC_ORDER:
             p->order = v[0];
+            break;
+        case REC_PACE:
+            /* Последняя запись побеждает — та же дисциплина, что у порядка и
+               защиты выше: план с двумя разносами противоречив, но отвергать
+               его нечем осмысленным, а молча складывать значения было бы
+               выдумкой. */
+            p->pace_us = rd32(v);
             break;
         case REC_GUARD:
             p->guards = v[0];

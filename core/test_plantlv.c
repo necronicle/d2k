@@ -87,7 +87,7 @@ int main(void) {
         same("порядок сегментов", text, tlv, tlv_len);
     }
 
-    /* --- контрольная сумма (набивка 64×0x41) ----------------------------- */
+    /* --- контрольная сумма (набивка 64×0x0f) ----------------------------- */
     {
         char text[4096];
         uint8_t tlv[4096];
@@ -109,6 +109,42 @@ int main(void) {
         CHECK(badsum_fake_plan_tlv(payload, sizeof payload, 2, 20000, tlv, sizeof tlv, &tlv_len) == 0,
               "badsum_fake_plan_tlv не собрался");
         same("счёт дубликатов", text, tlv, tlv_len);
+    }
+
+    /* --- pace: ноль и мусор отвергаются ---------------------------------
+     *
+     * «pace 0» запрещён нарочно: он и отсутствие строки означали бы одно и то
+     * же, а директива, ничего не меняющая, — способ написать план, который
+     * читается не так, как исполняется. Здесь же ловится и второе: значение у
+     * pace идёт БЕЗ ключа, и разбор не должен принимать "pace pace=12000". */
+    {
+        uint8_t out[1024];
+        size_t n = 0;
+        char err[200];
+        static const char *head =
+            "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "split payload_start +1\norder forward\n";
+        char text[1024];
+
+        snprintf(text, sizeof text, "%space 0\n", head);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "pace 0 принят — а он неотличим от отсутствия строки");
+
+        snprintf(text, sizeof text, "%space pace=12000\n", head);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "pace принял значение с ключом — у него значение голое");
+
+        snprintf(text, sizeof text, "%space 12ms\n", head);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "pace принял не-число");
+
+        snprintf(text, sizeof text, "%space 12000 15000\n", head);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "pace принял два значения");
+
+        snprintf(text, sizeof text, "%space 12000\n", head);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) == 0,
+              "правильный pace отвергнут заодно с неправильными");
     }
 
     /* --- неизвестная директива = ОТКАЗ, а не пропуск (§2.5) -------------- */

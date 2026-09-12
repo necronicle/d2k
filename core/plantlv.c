@@ -44,7 +44,8 @@ enum {
     REC_FAKE    = 0x0101,
     REC_SEQOVL  = 0x0102,
     REC_ORDER   = 0x0103,
-    REC_GUARD   = 0x0104
+    REC_GUARD   = 0x0104,
+    REC_PACE    = 0x0105
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -88,6 +89,7 @@ typedef struct {
     pl_seqovl  seqovls[MAX_SEQOVLS];   size_t n_seqovls;
     uint8_t    order;
     uint8_t    guards;
+    uint32_t   pace_us;   /* 0 — записи нет */
 } pl_plan;
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
@@ -168,6 +170,18 @@ static int kv_u32(const char *field, const char *key, unsigned long *out) {
     if (!*v) { return -1; }
     char *end = NULL;
     unsigned long val = strtoul(v, &end, 10);
+    if (!end || *end != '\0') { return -1; }
+    *out = val;
+    return 0;
+}
+
+/* Разбирает голое десятичное число. Отдельно от kv_u32: у pace значение
+   идёт без ключа, и притворяться, что "ключ=значение" тут есть, значило бы
+   принимать "pace pace=12000". */
+static int str_u32(const char *sv, unsigned long *out) {
+    if (!sv || !*sv) { return -1; }
+    char *end = NULL;
+    unsigned long val = strtoul(sv, &end, 10);
     if (!end || *end != '\0') { return -1; }
     *out = val;
     return 0;
@@ -309,6 +323,20 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (strcmp(f[1], "forward") == 0) { p->order = 0; }
             else if (strcmp(f[1], "reverse") == 0) { p->order = 1; }
             else { say(err, errcap, "строка %zu: неизвестный порядок \"%s\"", lineno, f[1]); goto bad; }
+        } else if (strcmp(f[0], "pace") == 0) {
+            /* Разнос посылок нагрузки во времени, микросекунды. Ноль
+               запрещён: «pace 0» и отсутствие строки означали бы одно и то
+               же, а директива, ничего не меняющая, — это способ написать
+               план, который читается не так, как исполняется. */
+            if (nf != 2) { say(err, errcap, "строка %zu: pace ждёт одно число", lineno); goto bad; }
+            {
+                unsigned long u = 0;
+                if (str_u32(f[1], &u) != 0 || u == 0) {
+                    say(err, errcap, "строка %zu: pace ждёт положительное число микросекунд", lineno);
+                    goto bad;
+                }
+                p->pace_us = (uint32_t)u;
+            }
         } else if (strcmp(f[0], "guard") == 0) {
             if (nf != 2) { say(err, errcap, "строка %zu: guard ждёт одно слово", lineno); goto bad; }
             if (strcmp(f[1], "rst_alien") == 0) { p->guards |= 1u << 0; }
@@ -363,7 +391,8 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
        только при ненулевых защитах — GUARD. */
     wbuf w = { out, cap, 0, 0 };
     size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
-                       p.n_fakes + p.n_seqovls + 1 + (p.guards ? 1u : 0u);
+                       p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
+                       (p.guards ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -426,6 +455,14 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     put_u8(&w, (uint8_t)(REC_ORDER >> 8)); put_u8(&w, (uint8_t)REC_ORDER);
     put_u16(&w, 1);
     put_u8(&w, p.order);
+    /* PACE — ПОСЛЕ ORDER и ДО GUARD. Место в ряду не косметика: датапат
+       читает записи подряд, и порядок обязан быть один и тот же у сборщика и
+       у разбора (см. шапку файла). */
+    if (p.pace_us) {
+        uint8_t v[4] = { (uint8_t)(p.pace_us >> 24), (uint8_t)(p.pace_us >> 16),
+                         (uint8_t)(p.pace_us >> 8),  (uint8_t)p.pace_us };
+        put_rec(&w, REC_PACE, v, sizeof v);
+    }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);
     }

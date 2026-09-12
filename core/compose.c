@@ -116,7 +116,8 @@ enum {
     D2K_REC_SPLIT   = 0x0100,
     D2K_REC_FAKE    = 0x0101,
     D2K_REC_SEQOVL  = 0x0102,
-    D2K_REC_ORDER   = 0x0103
+    D2K_REC_ORDER   = 0x0103,
+    D2K_REC_PACE    = 0x0105
 };
 enum { D2K_REC_ID = 0x0001, D2K_REC_PROTO = 0x0002 };
 enum { D2K_ANCHOR_PAYLOAD_START = 0, D2K_ANCHOR_SNI_MIDDLE = 5 };
@@ -206,16 +207,18 @@ int overlap_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
  * два разреза, что и reorder_plan_text — {payload_start+1, sni_middle},
  * порядок reverse. decoy/якорь sni_middle не нужны здесь: якорь вычисляет
  * датапат из sni_off/sni_len ТЕКУЩЕГО пакета (anchor_offset, plan_apply.c).
- * Записей: ID, PROTO, SPLIT, SPLIT, ORDER = 5. */
+ * Записей: ID, PROTO, SPLIT, SPLIT, ORDER, PACE = 6. */
 int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
-    if (tlv_header(buf, cap, &pos, 5) != 0) { return -1; }
+    if (tlv_header(buf, cap, &pos, 6) != 0) { return -1; }
     uint8_t s1[4]; wr16be(s1, D2K_ANCHOR_PAYLOAD_START); wr16be(s1 + 2, 1);
     if (tlv_rec(buf, cap, &pos, D2K_REC_SPLIT, s1, sizeof s1, NULL, 0) != 0) { return -1; }
     uint8_t s2[4]; wr16be(s2, D2K_ANCHOR_SNI_MIDDLE); wr16be(s2 + 2, 0);
     if (tlv_rec(buf, cap, &pos, D2K_REC_SPLIT, s2, sizeof s2, NULL, 0) != 0) { return -1; }
     uint8_t ord = D2K_ORDER_REVERSE;
     if (tlv_rec(buf, cap, &pos, D2K_REC_ORDER, &ord, 1, NULL, 0) != 0) { return -1; }
+    uint8_t pc[4]; wr32be(pc, D2K_PACE_PIECE_US);
+    if (tlv_rec(buf, cap, &pos, D2K_REC_PACE, pc, sizeof pc, NULL, 0) != 0) { return -1; }
     *out_len = pos;
     return 0;
 }
@@ -223,12 +226,12 @@ int reorder_plan_tlv(uint8_t *buf, size_t cap, size_t *out_len) {
 /* Общая форма вопросов 2, 4, 5 (badsumFakePlan, properties.go:321-333):
  * приманка с испорченной суммой ПЕРЕД настоящей нагрузкой, без TTL — тот же
  * смысл, что у badsum_fake_plan_text. Записей: ID, PROTO, PAYLOAD, POISON,
- * FAKE, ORDER = 6. */
+ * FAKE, ORDER, PACE = 7. */
 int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
                          uint8_t repeats, uint32_t gap_us,
                          uint8_t *buf, size_t cap, size_t *out_len) {
     size_t pos = 0;
-    if (tlv_header(buf, cap, &pos, 6) != 0) { return -1; }
+    if (tlv_header(buf, cap, &pos, 7) != 0) { return -1; }
     uint8_t pid[2]; wr16be(pid, 1);
     if (tlv_rec(buf, cap, &pos, D2K_REC_PAYLOAD, pid, sizeof pid, payload, paylen) != 0) { return -1; }
     uint8_t po[8];
@@ -240,6 +243,8 @@ int badsum_fake_plan_tlv(const uint8_t *payload, size_t paylen,
     if (tlv_rec(buf, cap, &pos, D2K_REC_FAKE, fk, sizeof fk, NULL, 0) != 0) { return -1; }
     uint8_t ord = D2K_ORDER_FORWARD;
     if (tlv_rec(buf, cap, &pos, D2K_REC_ORDER, &ord, 1, NULL, 0) != 0) { return -1; }
+    uint8_t pc[4]; wr32be(pc, D2K_PACE_SETTLE_US);
+    if (tlv_rec(buf, cap, &pos, D2K_REC_PACE, pc, sizeof pc, NULL, 0) != 0) { return -1; }
     *out_len = pos;
     return 0;
 }
@@ -885,6 +890,7 @@ int reorder_plan_text(char *buf, size_t cap) {
     if (append_fmt(buf, cap, &pos, "split payload_start +1\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "split sni_middle +0\n") != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "order reverse\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_PIECE_US) != 0) { return -1; }
     return 0;
 }
 
@@ -910,6 +916,7 @@ int badsum_fake_plan_text(const uint8_t *payload, size_t paylen,
         return -1;
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) { return -1; }
     return 0;
 }
 

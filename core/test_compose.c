@@ -907,9 +907,16 @@ int main(void) {
                проверяется через ОТНОСИТЕЛЬНЫЕ позиции подстрок, а не только
                их наличие: три strstr по отдельности не отличили бы "хвост,
                середина, голова" от любой другой перестановки тех же трёх строк. */
+            /* Задержки: первый ушедший кусок — сразу, остальные через
+               D2K_PACE_PIECE_US. Пауза здесь не украшение: приём про
+               переупорядочивание без разноса во времени переупорядочивания не
+               создаёт (донор: time.Sleep(12ms) после каждого куска,
+               raw_linux.go:686-694). Проверяется ИМЕННО позиционно — задержка
+               обязана остаться свойством места в очереди, а не уехать вместе
+               с куском при перевороте порядка. */
             const char *tail = strstr(out, "emit payload 0 5013 ttl=0 poison=00 0d0e0f10111213");
-            const char *mid  = strstr(out, "emit payload 0 5001 ttl=0 poison=00 0102030405060708090a0b0c");
-            const char *head = strstr(out, "emit payload 0 5000 ttl=0 poison=00 00\n");
+            const char *mid  = strstr(out, "emit payload 12000 5001 ttl=0 poison=00 0102030405060708090a0b0c");
+            const char *head = strstr(out, "emit payload 12000 5000 ttl=0 poison=00 00\n");
             CHECK(tail && mid && head, "порядок: не нашлись все три ожидаемых куска");
             if (tail && mid && head) {
                 CHECK(tail < mid && mid < head,
@@ -936,12 +943,21 @@ int main(void) {
             snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-checksum.tlv", (int)getpid());
             CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план суммы не записался");
             CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (сумма) не запустился");
-            CHECK(count_substr(out, "emit ") == 1, "сумма: ожидалась ровно одна фальшивка");
+            CHECK(count_substr(out, "emit ") == 2, "сумма: ожидались фальшивка и правда");
             CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 ") != NULL,
                   "сумма: фальшивка не помечена битом порчи (poison=01) — мутация 6 обязана быть видна здесь");
             CHECK(count_substr(out, "0f") >= 64, "сумма: набивка не похожа на 64 байта 0x0f");
-            CHECK(strstr(out, "fate pass") != NULL,
-                  "сумма: план не разрезает нагрузку — оригинал обязан пройти (fate pass)");
+            /*
+               ВЫДЕРЖКА. С 12.09.2026 план сам выпускает правду после паузы
+               D2K_PACE_SETTLE_US (донор: time.Sleep(15ms) в конце шага 1
+               probePoison, raw_linux.go:537), поэтому посылок на одну больше,
+               а оригинал СНИМАЕТСЯ (fate drop): выдержать паузу перед правдой
+               можно только тогда, когда правду выпускаем мы сами, — оригинал,
+               отпущенный ядром, уходит когда ему угодно. */
+            CHECK(strstr(out, "emit payload 15000 7000 ttl=0 poison=00 aabbccdd") != NULL,
+                  "сумма: правда ушла без выдержки после фальшивки");
+            CHECK(strstr(out, "fate drop") != NULL,
+                  "сумма: правду выпускает план — оригинал обязан быть снят (fate drop)");
             unlink(tlvpath);
 
             /* счёт дубликатов: та же control-приманка, ДВЕ копии, разрыв
@@ -953,12 +969,19 @@ int main(void) {
             snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-dup.tlv", (int)getpid());
             CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план дубликатов не записался");
             CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (дубликаты) не запустился");
-            CHECK(count_substr(out, "emit ") == 2, "дубликаты: ожидались ровно две фальшивки");
+            CHECK(count_substr(out, "emit ") == 3, "дубликаты: ожидались две фальшивки и правда");
             CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
                   "дубликаты: первая копия не та (задержка/содержимое/порча)");
             CHECK(strstr(out, "emit fake 20000 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
                   "дубликаты: вторая копия без разрыва 20000мкс — repeats/gap_us перепутаны");
-            CHECK(strstr(out, "fate pass") != NULL, "дубликаты: оригинал обязан пройти (fate pass)");
+            /* Разрыв между копиями (gap_us) и выдержка перед правдой (pace) —
+               РАЗНЫЕ величины и разные механизмы: первая делает из копий
+               серию, вторая отделяет серию от правды. Здесь видно обе сразу,
+               и перепутать их местами нечем. */
+            CHECK(strstr(out, "emit payload 15000 7000 ttl=0 poison=00 aabbccdd") != NULL,
+                  "дубликаты: правда ушла без выдержки после серии");
+            CHECK(strstr(out, "fate drop") != NULL,
+                  "дубликаты: правду выпускает план — оригинал обязан быть снят (fate drop)");
             unlink(tlvpath);
 
             /* разбор протокола: та же control-приманка, ОДНА копия, без
@@ -969,10 +992,13 @@ int main(void) {
             snprintf(tlvpath, sizeof tlvpath, "/tmp/d2k-core-planlab-%d-parse.tlv", (int)getpid());
             CHECK(write_file_bytes(tlvpath, plan, plen) == 0, "план разбора протокола не записался");
             CHECK(run_planlab(tlvpath, scnpath, out, sizeof out) == 0, "planlab (разбор протокола) не запустился");
-            CHECK(count_substr(out, "emit ") == 1, "разбор протокола: ожидалась ровно одна фальшивка");
+            CHECK(count_substr(out, "emit ") == 2, "разбор протокола: ожидались фальшивка и правда");
             CHECK(strstr(out, "emit fake 0 7000 ttl=0 poison=01 aabbccddeeff1122") != NULL,
                   "разбор протокола: приманка не та (обязана быть control, не набивка суммы)");
-            CHECK(strstr(out, "fate pass") != NULL, "разбор протокола: оригинал обязан пройти (fate pass)");
+            CHECK(strstr(out, "emit payload 15000 7000 ttl=0 poison=00 aabbccdd") != NULL,
+                  "разбор протокола: правда ушла без выдержки после фальшивки");
+            CHECK(strstr(out, "fate drop") != NULL,
+                  "разбор протокола: правду выпускает план — оригинал обязан быть снят (fate drop)");
             unlink(tlvpath);
             unlink(scnpath);
         }
