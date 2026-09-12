@@ -67,7 +67,20 @@ MARK=0x2d
 
 echo "== подготовка =="
 apt-get update -qq >/dev/null 2>&1
-apt-get install -y -qq iptables socat >/dev/null 2>&1
+apt-get install -y -qq iptables libssl-dev ethtool >/dev/null 2>&1
+
+# ОФЛОАД НА ПЕТЛЕ СКЛЕИВАЕТ НАШИ СЕГМЕНТЫ ОБРАТНО.
+#
+# Приём «разнести имя между сегментами» работает ровно потому, что коробка
+# видит пакеты по отдельности. На loopback включены GRO и TSO: ядро собирает
+# наши три посылки в один большой пакет ДО того, как его увидит netfilter, и
+# цензор снова находит имя целиком. То есть без этой строки лаборатория
+# проверяет не обход, а офлоад.
+#
+# На роутере у этого та же природа и то же лечение: fastnat/PPE уводят поток
+# мимо conntrack и склеивают сегменты, и полевая процедура снимает их отдельным
+# шагом (docs/field/2026-09-12-mvp-acceptance-procedure.md).
+ethtool -K lo gro off tso off gso off >/dev/null 2>&1 || true
 
 # Цель: настоящий сервер TLS 1.3, ФОРКАЮЩИЙ.
 #
@@ -97,8 +110,11 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 # s_server обслуживает соединения ПО ОЧЕРЕДИ, и это терпимо только потому, что
 # цензор ниже роняет соединение сбросом, а не молчанием: зависших рукопожатий
 # не остаётся.
-openssl s_server -quiet -accept "$PORT" -cert /tmp/c.pem -key /tmp/k.pem \
-    -tls1_3 -naccept 1000 -www >/tmp/server.log 2>&1 &
+# ФОРКАЮЩИЙ сервер, свой. Почему не готовые — в шапке spike/labtls.c:
+# s_server обслуживает по очереди и виснет на зарезанном рукопожатии,
+# socat отвергает приветствие нашего зонда тревогой 40.
+cc -std=c99 -O2 -Wall -Wextra -o /tmp/labtls spike/labtls.c -lssl -lcrypto
+/tmp/labtls "$PORT" /tmp/c.pem /tmp/k.pem >/tmp/server.log 2>&1 &
 SRV=$!
 i=0
 while ! (timeout 3 openssl s_client -connect "127.0.0.1:$PORT" </dev/null >/dev/null 2>&1) && [ $i -lt 50 ]; do
@@ -205,8 +221,20 @@ else
     #
     # REJECT доступен в filter, не в mangle; для петли пакет доходит до INPUT,
     # и сброс уходит клиенту оттуда.
-    iptables -A INPUT -p tcp --dport "$PORT" \
-        -m string --string "$NAME" --algo bm -j REJECT --reject-with tcp-reset
+    # ЦЕНЗОР В mangle PREROUTING С DROP, и оба выбора измерены.
+    #
+    # Хук: в исходящем пути DROP локально рождённого пакета возвращает
+    # отправителю EPERM, и датапат честно считает это СВОЕЙ ошибкой отправки —
+    # лаборатория мерила бы собственную реакцию, а не обход. В filter INPUT
+    # правило со строкой не срабатывает вовсе (счётчик правила остаётся нулём;
+    # проверено отдельно). Работает PREROUTING: отправка уже состоялась, до
+    # сервера не дошло — ровно то, что делает цензор.
+    #
+    # Действие: DROP, а не REJECT. Молчаливая потеря — та форма, в которой
+    # блокировку видит клиент, и та, на которой d2k учится отличать её от
+    # недоступности контролем по другому имени.
+    iptables -t mangle -A PREROUTING -p tcp --dport "$PORT" \
+        -m string --string "$NAME" --algo bm -j DROP
 fi
 
 echo "== цензор работает? =="
