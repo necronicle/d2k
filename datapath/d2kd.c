@@ -760,6 +760,23 @@ int main(int argc, char **argv) {
                                 if (res.applied) {
                                     d2k_session_unsent(sess, t, &res.key, res.plan_id,
                                                        failure, res.execution_id);
+                                    /* УШЛА ЛИ УЖЕ НАГРУЗКА. Пока на провод
+                                       уходили одни фальшивки, клиентский поток
+                                       цел: коробка увидела лишнее, но байты
+                                       человека не разорваны, и оригинал ниже
+                                       пройдёт. Как только ушёл хоть один кусок
+                                       нагрузки, чистого выхода нет — поток
+                                       испорчен, и утверждать, что трафик
+                                       остался нетронутым, мы больше не вправе
+                                       (§4.1). */
+                                    if (res.first_payload != 0xFF &&
+                                        res.first_payload < k) {
+                                        d2k_session_damaged(sess, &res.key,
+                                                            res.execution_id);
+                                        fprintf(stderr,
+                                            "d2kd: поток испорчен: ушло %zu посылок из %zu, "
+                                            "нагрузка уже на проводе\n", k, res.n_out);
+                                    }
                                 }
                                 break;
                             }

@@ -551,6 +551,9 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
             d2k_actions_free(&acts);
             return;
         }
+        if (acts.v[i].kind == D2K_EMIT_PAYLOAD && out->first_payload == 0xFF) {
+            out->first_payload = (uint8_t)i;
+        }
         out->out[i].delay_us = acts.v[i].delay_us;
         out->out[i].off = used;
         out->out[i].len = made;
@@ -589,6 +592,9 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
     memset(out, 0, sizeof *out);
+    /* 0xFF — «нагрузки в плане нет». Ноль был бы законным НОМЕРОМ посылки, и
+       отличить «первая посылка — нагрузка» от «нагрузки нет» стало бы нечем. */
+    out->first_payload = 0xFF;
     out->verdict = D2K_VERDICT_ACCEPT;
     if (!s || !pkt) {
         out->skipped = "нет сессии или пакета";
@@ -1075,6 +1081,9 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             d2k_actions_free(&acts);
             return 0;
         }
+        if (acts.v[i].kind == D2K_EMIT_PAYLOAD && out->first_payload == 0xFF) {
+            out->first_payload = (uint8_t)i;
+        }
         out->out[i].delay_us = acts.v[i].delay_us;
         out->out[i].off = used;
         out->out[i].len = made;
@@ -1275,6 +1284,16 @@ void d2k_session_sent(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     if (fl->sends_left == 0 && !fl->sends_failed) {
         d2k_journal_add_fate(s->jrn, at_ns, k, D2K_JRN_PLAN_DONE,
                              D2K_REFUSE_NONE, fl->execution_plan_id);
+    }
+}
+
+void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution) {
+    if (!s || !k || execution == 0) {
+        return;
+    }
+    d2k_flow *fl = d2k_track_find(table_of(s, k), k);
+    if (fl && fl->execution_id == execution) {
+        fl->damaged = 1;
     }
 }
 
