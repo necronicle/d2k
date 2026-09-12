@@ -503,7 +503,11 @@ static void print_snapshot(const char *label, int have_bytes, int timed_out,
 /* Позиция в фиксированном порядке опроса d2k_props_ask: 0 перекрытие слева,
  * 1 счёт дубликатов, 2 порядок сегментов, 3 контрольная сумма, 4 разбор
  * протокола (см. её doc-комментарий в d2k_compose.h и цикл в compose.c). */
-enum { POS_OVERLAP = 0, POS_DUP = 1, POS_REORDER = 2, POS_CHECKSUM = 3, POS_PARSE = 4 };
+/* Позиции вопросов в отчёте. Порядок ДОНОРСКИЙ и обязан совпадать с
+   d2k_props_question_plan (compose.c): перекрытие, порядок сегментов, сумма,
+   разбор протокола, счёт дубликатов. Разойдясь, отчёт назовёт номером не тот
+   вопрос, который задавался. */
+enum { POS_OVERLAP = 0, POS_REORDER = 1, POS_CHECKSUM = 2, POS_PARSE = 3, POS_DUP = 4 };
 
 /* Решено ли положение pos САМО ПО СЕБЕ (т.е. итоговое поле, за которое оно
  * отвечает, не D2K_P_UNKNOWN) — за вычетом случая, когда НЕТ (checksum),
@@ -636,7 +640,7 @@ static void print_question(int idx1, int pos, const char *field, const char *doc
             return;
         }
     }
-    if ((pos == POS_DUP || pos == POS_PARSE) && !have_control) {
+    if (pos == POS_PARSE && !have_control) {
         printf("  спрошен: нет\n  причина: нет control-приветствия (второе реальное имя на ту же "
               "цель не снято)\n");
         return;
@@ -662,7 +666,7 @@ static void print_question(int idx1, int pos, const char *field, const char *doc
               "— проверьте pos_decided\n");
     }
     if (pos == POS_PARSE && v == D2K_P_YES) {
-        printf("  примечание: тем же фактом снят вопрос [4/5] (контрольная сумма = %s) — "
+        printf("  примечание: тем же фактом снят вопрос [3/5] (контрольная сумма = %s) — "
               "\"разбор протокола пишет ОБА поля из одного факта\" (compose.c)\n",
               pval_str(pr->validates_checksum));
     }
@@ -873,11 +877,14 @@ int main(int argc, char **argv) {
     }
 
     printf("\nвопросы (порядок = порядок опроса d2k_props_ask):\n");
+    /* Порядок печати — порядок ЗАДАВАНИЯ (донорский, compose.go:33-91), и
+       номер шага в трассе обязан совпадать с позицией: steps[i] принадлежит
+       вопросу i, а не тому, кто когда-то стоял на этом месте. */
     print_question(1, POS_OVERLAP, "перекрытие слева", "держит ли сегмент, начинающийся левее данных", &pr, have_ctrl, &steps[0]);
-    print_question(2, POS_DUP, "счёт дубликатов", "считает ли разнесённые копии за одно", &pr, have_ctrl, &steps[1]);
-    print_question(3, POS_REORDER, "порядок сегментов", "держит ли сегменты не по порядку прихода", &pr, have_ctrl, &steps[2]);
-    print_question(4, POS_CHECKSUM, "контрольная сумма", "сверяет ли контрольную сумму TCP", &pr, have_ctrl, &steps[3]);
-    print_question(5, POS_PARSE, "разбор протокола", "разбирает ли TLS, а не просто смотрит байты", &pr, have_ctrl, &steps[4]);
+    print_question(2, POS_REORDER, "порядок сегментов", "держит ли сегменты не по порядку прихода", &pr, have_ctrl, &steps[1]);
+    print_question(3, POS_CHECKSUM, "контрольная сумма", "сверяет ли контрольную сумму TCP", &pr, have_ctrl, &steps[2]);
+    print_question(4, POS_PARSE, "разбор протокола", "разбирает ли TLS, а не просто смотрит байты", &pr, have_ctrl, &steps[3]);
+    print_question(5, POS_DUP, "счёт дубликатов", "считает ли разнесённые копии за одно", &pr, have_ctrl, &steps[4]);
 
     print_vector(&pr);
 

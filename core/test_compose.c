@@ -1235,10 +1235,12 @@ int main(void) {
         peerstand ps;
         uint16_t target_port = peerstand_start(&ps);
 
-        int outcomes[] = { 0, 1 }; /* 1-й вопрос — рукопожатие без appdata (промах), 2-й проходит */
+        /* Порядок вопросов донорский: перекрытие, порядок сегментов,
+           сумма, разбор протокола, счёт дубликатов. Дубликаты теперь ПЯТЫЕ. */
+        int outcomes[] = { 0, 0, 0, 0, 1 };
         fakeend_args fa; memset(&fa, 0, sizeof fa);
         fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
-        fa.outcomes = outcomes; fa.n = 2; fa.foreign_before_round = -1;
+        fa.outcomes = outcomes; fa.n = 5; fa.foreign_before_round = -1;
         pthread_t th;
         CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b2: поддельный конец связи не запустился");
 
@@ -1436,9 +1438,9 @@ int main(void) {
         CHECK(steps[0].local_port != 0, "b5: трасса первого вопроса без местного порта обращения");
         /* Без control незаданным остаётся ТОЛЬКО разбор протокола: счёт
            дубликатов стал однофакторным и берёт от приветствия лишь длину. */
-        CHECK(steps[4].rc == D2K_STEP_NOT_ASKED,
+        CHECK(steps[3].rc == D2K_STEP_NOT_ASKED,
               "b5: вопрос без control должен быть отмечен как незаданный");
-        CHECK(steps[1].rc != D2K_STEP_NOT_ASKED,
+        CHECK(steps[4].rc != D2K_STEP_NOT_ASKED,
               "b5: счёт дубликатов пропущен, хотя control ему больше не нужен");
         /* Три законных исхода промаха, и все три — «не измерено»: плана не
            применили к нашему потоку, обмена не было вовсе, обмен был без
@@ -1472,10 +1474,12 @@ int main(void) {
         peerstand ps;
         uint16_t target_port = peerstand_start(&ps);
 
-        int outcomes[] = { 0, 0, 0, 0, 1 };
+        /* Разбор протокола теперь ЧЕТВЁРТЫЙ вопрос, а не пятый:
+           порядок вопросов донорский. */
+        int outcomes[] = { 0, 0, 0, 1 };
         fakeend_args fa; memset(&fa, 0, sizeof fa);
         fa.fd = sv[1]; fa.ps = &ps; fa.target_port = target_port;
-        fa.outcomes = outcomes; fa.n = 5; fa.foreign_before_round = -1;
+        fa.outcomes = outcomes; fa.n = 4; fa.foreign_before_round = -1;
         pthread_t th;
         CHECK(pthread_create(&th, NULL, fakeend_run, &fa) == 0, "b4: поддельный конец связи не запустился");
 

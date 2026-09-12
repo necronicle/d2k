@@ -618,28 +618,37 @@ int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
     static uint8_t fake[2 * D2K_COMPOSE_HELLO_MAX];
     d2k_hello nodecoy; nodecoy.bytes = NULL; nodecoy.len = 0;
     size_t flen = 0;
+    /* ПОРЯДОК — ДОНОРСКИЙ (propProbes, z2k-detect/internal/classify/
+       compose.go:33-91): перекрытие, порядок сегментов, контрольная сумма,
+       разбор протокола, счёт дубликатов. Порядок здесь не косметика:
+       runProperties возвращается на ПЕРВОМ прошедшем вопросе, поэтому он
+       решает, какое плечо станет стратегией, а не только скорость. Вдобавок
+       вопрос про разбор протокола осмыслен лишь ПОСЛЕ промаха вопроса про
+       сумму — у донора это сказано прямо в комментарии к его Set, и наш
+       прежний порядок (дубликаты вторыми) эту связку не ломал только
+       случайно. */
     switch (q) {
     case 0:
         return overlap_plan_tlv(buf, cap, out_len);
     case 1:
-        /* Счёт дубликатов: НАБИВКА, а не приветствие — вопрос однофакторный
-           (см. build_fake_body). Нужна только длина правды. */
-        flen = build_fake_body(fake, sizeof fake, truth_len, nodecoy);
-        return flen ? badsum_fake_plan_tlv(fake, flen, 2, 20000, buf, cap, out_len)
-                    : -1;
-    case 2:
         return reorder_plan_tlv(buf, cap, out_len);
-    case 3:
+    case 2:
         flen = build_fake_body(fake, sizeof fake, truth_len, nodecoy);
         return flen ? badsum_fake_plan_tlv(fake, flen, 1, 0, buf, cap, out_len)
                     : -1;
-    case 4:
+    case 3:
         /* Разбор протокола: приветствие в голове фальшивки, хвост — набивка.
            Без control вопрос не задать: он ровно про то, берёт ли коробка
            осмысленное приветствие там, где набивку не взяла. */
         if (!control.bytes || control.len == 0) { return -1; }
         flen = build_fake_body(fake, sizeof fake, truth_len, control);
         return flen ? badsum_fake_plan_tlv(fake, flen, 1, 0, buf, cap, out_len)
+                    : -1;
+    case 4:
+        /* Счёт дубликатов: НАБИВКА, а не приветствие — вопрос однофакторный
+           (см. build_fake_body). Нужна только длина правды. */
+        flen = build_fake_body(fake, sizeof fake, truth_len, nodecoy);
+        return flen ? badsum_fake_plan_tlv(fake, flen, 2, 20000, buf, cap, out_len)
                     : -1;
     default:
         return -1;
@@ -650,12 +659,13 @@ int d2k_props_question_plan(int q, d2k_hello control, size_t truth_len,
  * ничего (§2.4, каждый Set в Go начинается с `if !passed { return }`). */
 void d2k_props_question_passed(int q, d2k_props *pr) {
     if (!pr) { return; }
+    /* Порядок тот же, что у d2k_props_question_plan, и меняться они обязаны
+       вместе: разойдясь, они стали бы писать свойство не того вопроса. */
     switch (q) {
     case 0: pr->tolerates_left_overlap = D2K_P_NO; break;
-    case 1: pr->counts_duplicates = D2K_P_YES; break;
-    case 2: pr->tolerates_reorder = D2K_P_NO; break;
-    case 3: pr->validates_checksum = D2K_P_NO; break;
-    case 4:
+    case 1: pr->tolerates_reorder = D2K_P_NO; break;
+    case 2: pr->validates_checksum = D2K_P_NO; break;
+    case 3:
         /* Разбор протокола пишет ОБА поля из ОДНОГО факта (properties.go,
            комментарий у Set вопроса «разбор протокола»): коробка разобрала
            приманку как TLS И проглотила сегмент с битой суммой — иначе
@@ -663,6 +673,7 @@ void d2k_props_question_passed(int q, d2k_props *pr) {
         pr->parses_l7 = D2K_P_YES;
         pr->validates_checksum = D2K_P_NO;
         break;
+    case 4: pr->counts_duplicates = D2K_P_YES; break;
     default: break;
     }
 }
