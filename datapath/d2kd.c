@@ -140,6 +140,8 @@ static struct {
     uint64_t emitted;          /* собственных пакетов выпущено */
     uint64_t deferred;         /* отложено до срока */
     uint64_t stale_deferred;   /* созревшая посылка не ушла: поток забыт/отказал */
+    uint64_t emitted_now;      /* ушло сразу, без задержки */
+    uint64_t emitted_late;     /* ушло из очереди отложенных */
     uint64_t truncated;        /* ядро отдало кусок пакета */
     uint64_t no_payload;       /* атрибута с пакетом не было вовсе */
     uint64_t no_hdr;           /* некому отвечать вердиктом */
@@ -210,8 +212,10 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
        минутой писал «план применён». Один факт не может иметь двух счётчиков. */
     printf("план подготовлен %" PRIu64 ", ДОИСПОЛНЕН %" PRIu64
            ", выпущено %" PRIu64 ", отложено %" PRIu64
+           " (сразу %" PRIu64 ", из очереди %" PRIu64 ")"
            ", потоков испорчено %" PRIu64 ", отложенных протухло %" PRIu64 ", уведомлений потеряно %" PRIu64 "\n",
            d2k_session_applied(s), d2k_session_done(s), st.emitted, st.deferred,
+           st.emitted_now, st.emitted_late,
            d2k_session_damaged_count(s), st.stale_deferred, d2k_session_sent_lost(s));
     /* Второе число — предел таблицы, а не что попало. В первом полевом
        прогоне здесь стояла длина очереди отправки, и строка читалась как
@@ -560,7 +564,12 @@ int main(int argc, char **argv) {
 
     static uint8_t rbuf[RECV_BUF];
     static uint8_t obuf[OUT_BUF];
-    static uint8_t sbuf[MAX_PKT];
+    /* Буфер выдачи отложенных обязан вмещать САМУЮ ДЛИННУЮ посылку, какую
+       способна принять очередь: её вместимость задана пределом отправки
+       (d2k_raw_maxlen), а не размером входящего пакета. Меньший буфер
+       превращал выдачу в отказ, и до правки 13.09 одна такая посылка
+       запирала очередь целиком. */
+    static uint8_t sbuf[D2K_SCHED_SLOT_MAX];
 
     const uint64_t start = now_ns();
     const uint64_t idle_ns = (uint64_t)idle_s * NS_PER_S;
@@ -794,6 +803,7 @@ int main(int argc, char **argv) {
                                 break;
                             }
                             st.emitted++;
+                            st.emitted_now++;
                             if (k == res.first_payload) { payload_on_wire = 1; }
                             if (res.applied) {
                                 d2k_session_sent(sess, t, &res.key, res.execution_id);
@@ -869,6 +879,7 @@ int main(int argc, char **argv) {
                     }
                 } else {
                     st.emitted++;
+                    st.emitted_late++;
                     if (named) {
                         d2k_session_sent(sess, t, &skey, execution);
                     }

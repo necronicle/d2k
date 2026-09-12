@@ -75,4 +75,10 @@ uint64_t d2k_sched_next_ns(const d2k_sched *s);
 size_t   d2k_sched_count(const d2k_sched *s);
 uint64_t d2k_sched_refusals(const d2k_sched *s);
 
+/* Потолок вместимости одной ячейки очереди. Нужен тому, кто выдаёт: его буфер
+ * обязан вмещать самую длинную посылку, какую очередь способна принять, иначе
+ * выдача превращается в отказ. 65536 — предел длины пакета IPv4, то есть
+ * заведомо больше любого MTU, включая петлю. */
+#define D2K_SCHED_SLOT_MAX 65536
+
 #endif /* D2K_SCHED_H */
