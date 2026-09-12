@@ -91,6 +91,19 @@ typedef struct d2k_session d2k_session;
  * игнорируется, как и в остальных уведомлениях. */
 void d2k_session_damaged(d2k_session *s, const d2k_key *k, uint64_t execution);
 
+/* ОБЩИЙ ИСХОД ОТКАЗА ИСПОЛНЕНИЯ — один на все ветки отправляющего:
+ * немедленная посылка, очередь, вердикт, созревшая отложенная.
+ *
+ * payload_on_wire — хоть один кусок НАГРУЗКИ уже покинул машину.
+ * orig_spent — оригиналом уже распорядились (вердикт ушёл ядру).
+ *
+ * Возвращает 1, если оригинал ещё наш и обязан уйти нетронутым; 0 — чистого
+ * выхода нет и поток объявлен испорченным. Подробности и обоснование — у
+ * определения (session.c). */
+int d2k_session_exec_failed(d2k_session *s, uint64_t at_ns, const d2k_key *k,
+                            const uint8_t *plan_id, uint8_t code,
+                            uint64_t execution, int payload_on_wire, int orig_spent);
+
 /* capacity — предел числа отслеживаемых потоков,
  * journal — глубина диагностического журнала в записях (0 — без журнала). */
 d2k_session *d2k_session_new(size_t capacity, size_t journal);

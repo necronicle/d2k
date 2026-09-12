@@ -665,6 +665,11 @@ int main(int argc, char **argv) {
                     d2k_result res;
                     memset(&res, 0, sizeof res);
                     res.verdict = D2K_VERDICT_ACCEPT;
+                    /* memset обнулил бы номер первой посылки нагрузки, а ноль
+                       — законный НОМЕР. Ставим «нагрузки нет» явно: ветки, до
+                       которых сессия не дошла, не должны выглядеть так, будто
+                       нагрузка стоит первой. */
+                    res.first_payload = 0xFF;
 
                     if (!np.have_payload) {
                         st.no_payload++;
@@ -728,19 +733,24 @@ int main(int argc, char **argv) {
                         }
                         if (too_long) {
                             fprintf(stderr,
-                                "d2kd: план не исполнен: посылка %zu байт при пределе %zu; "
-                                "оригинал отпущен нетронутым\n", too_long, cap);
-                            d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                               D2K_REFUSE_TOO_LONG, res.execution_id);
+                                "d2kd: план не исполнен: посылка %zu байт при пределе %zu\n",
+                                too_long, cap);
                             st.send_fail++;
                             res.n_out = 0;
-                            /* Ничего не ушло — оригинал обязан пройти: снять
-                               его значило бы оборвать соединение человеку
-                               из-за нашей внутренней причины (§4.1). */
-                            verdict = D2K_NF_ACCEPT;
+                            /* Ничего не ушло и вердикт не отправлен — исход
+                               считает общая политика, а не эта ветка. */
+                            if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                        D2K_REFUSE_TOO_LONG,
+                                                        res.execution_id, 0, 0)) {
+                                verdict = D2K_NF_ACCEPT;
+                            }
                         }
                     }
 
+                    /* Ушла ли уже НАГРУЗКА. Берётся из факта отправки, а не
+                       из арифметики по номеру: номер не отличает ушедшее от
+                       положенного в очередь. */
+                    int payload_on_wire = 0;
                     uint64_t at = t;
                     for (size_t k = 0; k < res.n_out && mode == MODE_APPLY; k++) {
                         at += (uint64_t)res.out[k].delay_us * NS_PER_US;
@@ -758,21 +768,17 @@ int main(int argc, char **argv) {
                                    отдельным фактом, привязанным к потоку и
                                    плану. */
                                 if (res.applied) {
-                                    d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                                       failure, res.execution_id);
-                                    /* УШЛА ЛИ УЖЕ НАГРУЗКА. Пока на провод
-                                       уходили одни фальшивки, клиентский поток
-                                       цел: коробка увидела лишнее, но байты
-                                       человека не разорваны, и оригинал ниже
-                                       пройдёт. Как только ушёл хоть один кусок
-                                       нагрузки, чистого выхода нет — поток
-                                       испорчен, и утверждать, что трафик
-                                       остался нетронутым, мы больше не вправе
-                                       (§4.1). */
-                                    if (res.first_payload != 0xFF &&
-                                        res.first_payload < k) {
-                                        d2k_session_damaged(sess, &res.key,
-                                                            res.execution_id);
+                                    /* Пока на провод уходили одни фальшивки,
+                                       клиентский поток цел: коробка увидела
+                                       лишнее, но байты человека не разорваны,
+                                       и оригинал обязан пройти. Как только
+                                       ушёл кусок нагрузки, чистого выхода
+                                       нет. Решает общая политика. */
+                                    if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                                failure, res.execution_id,
+                                                                payload_on_wire, 0)) {
+                                        verdict = D2K_NF_ACCEPT;
+                                    } else {
                                         fprintf(stderr,
                                             "d2kd: поток испорчен: ушло %zu посылок из %zu, "
                                             "нагрузка уже на проводе\n", k, res.n_out);
@@ -781,15 +787,18 @@ int main(int argc, char **argv) {
                                 break;
                             }
                             st.emitted++;
+                            if (k == res.first_payload) { payload_on_wire = 1; }
                             if (res.applied) {
                                 d2k_session_sent(sess, t, &res.key, res.execution_id);
                             }
                         } else if (d2k_sched_push_serial(sched, at, p, plen,
                                                   res.applied ? &res.key : NULL, res.execution_id) != 0) {
                             st.send_fail++;
-                            if (res.applied) {
-                                d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                                   D2K_REFUSE_QUEUE, res.execution_id);
+                            if (res.applied &&
+                                d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                        D2K_REFUSE_QUEUE, res.execution_id,
+                                                        payload_on_wire, 0)) {
+                                verdict = D2K_NF_ACCEPT;
                             }
                             break;
                         } else {
@@ -800,8 +809,11 @@ int main(int argc, char **argv) {
                     if (d2k_nfq_verdict(q, np.id, verdict, err, sizeof err) != 0) {
                         st.verdict_fail++;
                         if (res.applied && mode == MODE_APPLY) {
-                            d2k_session_unsent(sess, t, &res.key, res.plan_id,
-                                               D2K_REFUSE_SEND, res.execution_id);
+                            /* Возврат игнорируется намеренно: вердикт ядру не
+                               дошёл, отпускать оригинал уже нечем. */
+                            (void)d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                          D2K_REFUSE_SEND, res.execution_id,
+                                                          payload_on_wire, 1);
                         }
                     } else if (res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
@@ -834,7 +846,15 @@ int main(int argc, char **argv) {
                     st.send_fail++;
                     fprintf(stderr, "d2kd: отложенная посылка: %s\n", err);
                     if (named) {
-                        d2k_session_unsent(sess, t, &skey, NULL, failure, execution);
+                        /* Вердикт этой попытки ядру уже ушёл: оригинал либо на
+                           проводе, либо уничтожен, и копии у нас нет. Хранить
+                           его ради этого нельзя — это память на каждый
+                           применённый план и риск послать байты дважды.
+                           Решает сохранённое владение: план забирал оригинал —
+                           поток испорчен; план из одних фальшивок — поток цел,
+                           и факт только один: воздействие неполно. */
+                        (void)d2k_session_exec_failed(sess, t, &skey, NULL, failure,
+                                                      execution, 0, 1);
                     }
                 } else {
                     st.emitted++;

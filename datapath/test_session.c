@@ -109,6 +109,24 @@ static const uint8_t plan_with_send_id[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
+/* Тот же план, но ВЛАДЕЮЩИЙ НАГРУЗКОЙ: добавлена запись REC_PACE (0x0105,
+ * 4 байта, 12000 мкс). Наличие разноса во времени означает, что правду
+ * выпускает план, а не ядро, — оригинал снимается (fate DROP). Нужен веткам
+ * отказа: только у такого плана «оригинал уже не наш» вообще возможно.
+ * Записей шесть: ID, PAYLOAD, POISON, FAKE, ORDER, PACE. */
+static const uint8_t plan_owns_payload[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 6,
+    0x00, 0x01, 0x00, 0x10,
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7,
+    0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x01, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00,
+    0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x2E, 0xE0
+};
+
 /* План с ОДНОЙ фальшивкой и repeats=20 (ревью задачи 4, круг 2): repeats —
  * байт TLV без потолка (d2k_plan.h/plan_parse.c), а d2k_result.out[] вмещает
  * 16 посылок (d2k_session.h) — 20 > 16. Нужен для проверки, что план,
@@ -728,6 +746,80 @@ int main(void) {
         CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 0,
               "успешная отправка записана недоисполнением");
 
+        d2k_session_free(g);
+    }
+
+    /* --- ОБЩИЙ ИСХОД ОТКАЗА ИСПОЛНЕНИЯ (0009, U3) ----------------------
+     *
+     * Пять веток отказа у отправляющего вели себя по-разному: учёт повреждения
+     * стоял ровно в одной, а обещание «оригинал пройдёт» не выполнялось
+     * нигде — вердикт оставался DROP, и ClientHello клиента не уходил на
+     * провод вовсе из-за НАШЕЙ внутренней ошибки.
+     *
+     * Чистый выход существует ровно в одном случае: ни один кусок нагрузки не
+     * ушёл И вердикт ещё не отправлен. */
+    {
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &gp,
+                            err, sizeof err) == 0, "план для проверки отказа");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 46010, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied == 1, "план не применился");
+        d2k_key key0 = r.key;
+        uint64_t exec0 = r.execution_id;
+
+        /* Нагрузка не ушла, вердикт не отправлен — оригинал ещё наш. */
+        CHECK(d2k_session_exec_failed(g, 1100, &r.key, r.plan_id, D2K_REFUSE_QUEUE,
+                                      r.execution_id, 0, 0) == 1,
+              "оригинал не отпущен, хотя на провод не ушло ни байта нагрузки");
+        CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 1, "отказ не записан");
+
+        /* Вторая неудача той же попытки не удваивает запись: «ошибка посылки,
+           затем ошибка вердикта» — один несостоявшийся опыт, а не два. */
+        CHECK(d2k_session_exec_failed(g, 1150, &r.key, r.plan_id, D2K_REFUSE_SEND,
+                                      r.execution_id, 0, 1) == 0,
+              "вердикт уже ушёл, а оригинал объявлен отпускаемым");
+        CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 1,
+              "двойной отказ одной попытки записан дважды");
+
+        /* Повреждение стало НАБЛЮДАЕМЫМ: следующее приветствие того же потока
+           получает именно его, а не «план уже применён». */
+        /* Другой ПОРТ — тот же поток? Нет: ключ другой. Берём тот же порт,
+           но проверяем через send_pending, что поток жив и это он. */
+        CHECK(!d2k_session_send_pending(g, &key0, exec0),
+              "после отказа поток всё ещё принимает посылки этой попытки");
+        n = build_pkt(pkt, 46010, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.skipped != NULL && strstr(r.skipped, "испорчен") != NULL,
+              "повреждение потока не наблюдаемо — флаг остался write-only");
+        d2k_session_free(g);
+    }
+
+    {
+        /* План ИЗ ОДНИХ ФАЛЬШИВОК оригинал не забирает. Отказ отложенной
+           посылки по такому плану поток НЕ портит: байты клиента целы, и
+           единственный факт — воздействие неполно. Слишком широкая политика
+           «отложенный отказ = всегда порча» этот случай завалит. */
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0,
+              "план из одних фальшивок не загрузился");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 46011, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied == 1 && r.verdict == D2K_VERDICT_ACCEPT,
+              "план из одних фальшивок забрал оригинал");
+        CHECK(r.first_payload == 0xFF, "у плана без нагрузки объявлен номер её посылки");
+
+        CHECK(d2k_session_exec_failed(g, 1100, &r.key, r.plan_id, D2K_REFUSE_SEND,
+                                      r.execution_id, 0, 1) == 1,
+              "поток объявлен испорченным, хотя оригинал не наш и байты клиента целы");
+        n = build_pkt(pkt, 46011, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.skipped != NULL && strstr(r.skipped, "испорчен") == NULL,
+              "целый поток объявлен испорченным");
         d2k_session_free(g);
     }
 
