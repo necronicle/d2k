@@ -134,6 +134,110 @@ static void check_transport_default_zero_on_old_file(void) {
     d2k_catalog_free(&c);
 }
 
+/* Тот же снимок — и то же требование к ПОЛЯМ КОНТЕКСТА ПРОВЕРКИ (shape,
+ * verified_by, задача 5). Проверяется ОТДЕЛЬНО и по ВСЕМ привязкам файла, а
+ * не по первой: на роутере автора лежит каталог, накопленный неделями, и
+ * ноль в новом поле обязан означать "не записано" у каждой записи. Ключ
+ * привязки стал тройкой (цель, транспорт, форма), и если бы ноль не был
+ * совместим с любой формой, всё накопленное знание обнулилось бы разом —
+ * первая же проверка завела бы рядом со старой записью вторую.
+ *
+ * Отсюда две половины: сами поля читаются нулями (ниже) и ноль совместим с
+ * любой формой (check_shape_fits_rule). */
+static void check_shape_default_zero_on_old_file(void) {
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0,
+          "старый файл (без shape/verified_by) не прочитался");
+    size_t seen = 0, dirty = 0;
+    for (size_t i = 0; i < c.n_boxes; i++) {
+        for (size_t j = 0; j < c.boxes[i].n_binds; j++) {
+            seen++;
+            if (c.boxes[i].binds[j].shape != 0 ||
+                c.boxes[i].binds[j].verified_by != 0) { dirty++; }
+        }
+    }
+    CHECK(seen >= 100, "привязок подозрительно мало — проверять контекст не на чем");
+    CHECK(dirty == 0,
+          "поля контекста проверки не 0 в файле, где их вообще нет");
+    d2k_catalog_free(&c);
+}
+
+/* Правило совместимости форм — ТРЕТЬЯ составляющая ключа привязки, и оно
+ * несимметрично по смыслу, но симметрично по устройству: ноль с ЛЮБОЙ
+ * стороны означает "не измерено" (§2.4), а "не измерено" не противоречит
+ * ничему. Противоречат только две РАЗНЫЕ измеренные формы.
+ *
+ * Правило проверяется здесь, а не только через планировщика: от него зависит,
+ * удвоится ли накопленный каталог при первом же обновлении. */
+static void check_shape_fits_rule(void) {
+    CHECK(d2k_cat_shape_fits(0, D2K_SHAPE_MODERN) == 1,
+          "записанное \"не измерено\" не приняло современную форму");
+    CHECK(d2k_cat_shape_fits(0, D2K_SHAPE_LEGACY) == 1,
+          "записанное \"не измерено\" не приняло старую форму");
+    CHECK(d2k_cat_shape_fits(D2K_SHAPE_MODERN, 0) == 1,
+          "неизмеренная форма проверки не подошла к записанной");
+    CHECK(d2k_cat_shape_fits(0, 0) == 1, "два \"не измерено\" разошлись между собой");
+    CHECK(d2k_cat_shape_fits(D2K_SHAPE_MODERN, D2K_SHAPE_MODERN) == 1,
+          "одинаковые формы не сошлись");
+    CHECK(d2k_cat_shape_fits(D2K_SHAPE_LEGACY, D2K_SHAPE_LEGACY) == 1,
+          "одинаковые формы не сошлись");
+    CHECK(d2k_cat_shape_fits(D2K_SHAPE_MODERN, D2K_SHAPE_LEGACY) == 0,
+          "успех современной формы перенесён на старую");
+    CHECK(d2k_cat_shape_fits(D2K_SHAPE_LEGACY, D2K_SHAPE_MODERN) == 0,
+          "успех старой формы перенесён на современную");
+}
+
+/* Форма приветствия — часть ключа привязки, значит файл обязан нести ДВЕ
+ * привязки одной цели, различающиеся только формой, и круговой обход обязан
+ * вернуть обе СО СВОИМИ формами, а не схлопнуть их в одну.
+ *
+ * Берётся настоящий снимок, а не синтетика: так проверяется и то, что новые
+ * поля не портят соседей в реальной раскладке файла. */
+static void check_two_shapes_of_one_target_survive(void) {
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0,
+          "загрузка перед проверкой двух форм");
+    if (c.n_boxes == 0 || c.boxes[0].n_binds == 0) {
+        CHECK(0, "в снимке нет привязок — проверять нечего");
+        d2k_catalog_free(&c);
+        return;
+    }
+    d2k_cat_box *b = &c.boxes[0];
+    d2k_cat_binding *grown = realloc(b->binds, (b->n_binds + 1) * sizeof *grown);
+    CHECK(grown != NULL, "не хватило памяти на вторую привязку");
+    if (!grown) { d2k_catalog_free(&c); return; }
+    b->binds = grown;
+    b->binds[b->n_binds] = b->binds[0];   /* та же цель, тот же транспорт */
+    b->binds[0].shape = (uint8_t)D2K_SHAPE_MODERN;
+    b->binds[0].verified_by = D2K_VERBY_PROBE;
+    b->binds[b->n_binds].shape = (uint8_t)D2K_SHAPE_LEGACY;
+    b->binds[b->n_binds].verified_by = D2K_VERBY_CLIENT;
+    b->n_binds++;
+
+    char target[256];
+    snprintf(target, sizeof target, "%s", b->binds[0].target);
+    CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-shape.json", err, sizeof err) == 0,
+          "запись двух форм одной цели");
+    d2k_catalog_free(&c);
+
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-shape.json", &c, err, sizeof err) == 0,
+          "перечитывание двух форм одной цели");
+    int modern = 0, legacy = 0;
+    if (c.n_boxes > 0) {
+        for (size_t j = 0; j < c.boxes[0].n_binds; j++) {
+            const d2k_cat_binding *bd = &c.boxes[0].binds[j];
+            if (strcmp(bd->target, target) != 0) { continue; }
+            if (bd->shape == (uint8_t)D2K_SHAPE_MODERN &&
+                bd->verified_by == D2K_VERBY_PROBE) { modern++; }
+            if (bd->shape == (uint8_t)D2K_SHAPE_LEGACY &&
+                bd->verified_by == D2K_VERBY_CLIENT) { legacy++; }
+        }
+    }
+    CHECK(modern == 1, "привязка современной формы не пережила круговой обход");
+    CHECK(legacy == 1, "привязка старой формы не пережила круговой обход");
+    d2k_catalog_free(&c);
+}
+
 /* "Плавающей арифметики нет" (Global Constraints) — дробное число ЛЮБОГО
  * целочисленного поля обязано быть отказом с причиной, а не atof и не
  * молчаливым обрезанием до целой части. */
@@ -388,6 +492,9 @@ static void check_free_is_safe(void) {
 int main(void) {
     check_time_roundtrip();
     check_transport_default_zero_on_old_file();
+    check_shape_default_zero_on_old_file();
+    check_shape_fits_rule();
+    check_two_shapes_of_one_target_survive();
     check_rejects_float_number();
     check_rejects_oversized_string();
     check_rejects_too_many_signals();

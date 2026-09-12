@@ -496,7 +496,7 @@ static void send_ack_ok(int fd, uint16_t cmd) {
 }
 
 /* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
- * (1<<(22-20))=0x04 (см. d2k_ev_has_appdata, d2k_link.h). code/num — тут не
+ * (1<<(22-20))=0x04 (см. d2k_ev_outer_appdata, d2k_link.h). code/num — тут не
  * важны для порога (см. её же большой комментарий про липкое поле code),
  * заполнены правдоподобно, не нулём, чтобы не полагаться на memset. */
 static void send_exchange(int fd, const uint8_t *ip_a, uint16_t port_a,

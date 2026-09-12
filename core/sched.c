@@ -128,6 +128,24 @@
    только путь объёма, которого здесь ещё нет; когда появится — брать его. */
 #define SCHED_DECOY "disk.rzd.ru"
 
+/* Форма приветствия СОБСТВЕННОГО зонда — то, в чём проверка состоялась, и то,
+ * что уезжает в привязку (d2k_catalog.h про shape/verified_by).
+ *
+ * Не назначено, а ВЫТЕКАЕТ из того, чем зонд доказывает: D2K_VER_APPLICATION
+ * достижим только через ЗАВЕРШЁННОЕ рукопожатие TLS 1.3 (core/tls13.c ведёт
+ * его своим ключом), а такое рукопожатие по RFC 8446 §4.2.1 невозможно без
+ * расширения supported_versions с 0x0304 — ровно того признака, по которому
+ * d2k_hello_shape и отличает MODERN от LEGACY. Константа, а не запрос у
+ * зонда на каждом успехе: форма его приветствия не меняется от цели к цели.
+ * Связь с проводом проверяется замером, а не на слово — test_sched.c,
+ * probe_hello_shape: приветствие снимается с сокета и разбирается той же
+ * d2k_hello_shape.
+ *
+ * Когда появится второй зонд (скажем, старой формы или для QUIC), форме
+ * придётся приехать из d2k_ver_result, а не отсюда: одна константа на два
+ * разных обращения снова превратила бы контекст проверки в догадку. */
+#define SCHED_PROBE_SHAPE D2K_SHAPE_MODERN
+
 /* --------------------------------------------------------------------
  * Подменяемые оракулы (см. d2k_sched.h).
  * -------------------------------------------------------------------- */
@@ -201,6 +219,12 @@ typedef struct {
     uint8_t    ctrl[2048];
     size_t     ctrl_len;
     int        shape_armed;
+    /* Снимок в trig СНЯТ С ПРОВОДА, а не собран из профиля холодного старта.
+       Различать обязательно: fill_hellos при пустом снимке подставляет
+       профиль MODERN, и без этого признака «форма живого клиента» читалась бы
+       по заготовке — то есть выдавалась бы за измерение то, что им не
+       является (§2.4). Ноль означает «форма клиента не измерена». */
+    int        trig_snapped;
 
     /* Кандидаты, собранные d2k_compose по вердикту. */
     char       plans[SCHED_MAX_PLANS][4096];
@@ -682,9 +706,22 @@ static d2k_cat_box *box_ensure(d2k_catalog *c, const char *id) {
     return b;
 }
 
+/* Записывает подтверждённую привязку.
+ *
+ * КЛЮЧ — ТРОЙКА: цель, транспорт и форма приветствия (d2k_cat_shape_fits).
+ * Форма в ключе затем, что успех добыт КОНКРЕТНЫМ приветствием, а коробка
+ * вправе относиться к формам по-разному (§6): без неё успех собственного
+ * зонда молча выдавался бы за успех любого клиента. Ноль в записи — «форма не
+ * измерена» (старый файл): он совместим с любой формой, и такая привязка
+ * ОБНОВЛЯЕТСЯ, а не дублируется — иначе каталог, копившийся неделями,
+ * удвоился бы на первой же проверке.
+ *
+ * shape/verified_by кладутся только измеренными: ноль поверх записанного не
+ * пишется никогда — «не измерено» не отменяет измеренного (§2.4). */
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
-                          const char *target, uint8_t transport, int64_t now_ms,
+                          const char *target, uint8_t transport,
+                          uint8_t shape, uint8_t verified_by, int64_t now_ms,
                           const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
@@ -719,10 +756,13 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
 
     for (size_t i = 0; i < b->n_binds; i++) {
         d2k_cat_binding *bd = &b->binds[i];
-        if (bd->transport == transport && strcmp(bd->target, target) == 0) {
+        if (bd->transport == transport && strcmp(bd->target, target) == 0 &&
+            d2k_cat_shape_fits(bd->shape, shape)) {
             bd->successes++;
             bd->confirmed = now_ms / 1000;
             snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
+            if (shape) { bd->shape = shape; }
+            if (verified_by) { bd->verified_by = verified_by; }
             return 0;
         }
     }
@@ -739,6 +779,8 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->successes = 1;
     bd->enabled = 1;
     bd->transport = transport;
+    bd->shape = shape;
+    bd->verified_by = verified_by;
     b->n_binds++;
     return 0;
 }
@@ -758,15 +800,23 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
  * здесь никто не мерил (проба объёма живёт отдельно, d2k_volume.h). Назвать
  * им запись значило бы сказать о ней больше, чем измерено (§2.4). */
 static int bind_raise_level(d2k_catalog *c, const char *box_id, const char *target,
-                            uint8_t transport, int level, int64_t now_ms) {
+                            uint8_t transport, uint8_t shape, uint8_t verified_by,
+                            int level, int64_t now_ms) {
     for (size_t i = 0; i < c->n_boxes; i++) {
         d2k_cat_box *b = &c->boxes[i];
         if (box_id && box_id[0] && strcmp(b->id, box_id) != 0) { continue; }
         for (size_t j = 0; j < b->n_binds; j++) {
             d2k_cat_binding *bd = &b->binds[j];
             if (bd->transport != transport || strcmp(bd->target, target) != 0) { continue; }
+            /* Форма — часть ключа и здесь: запись, добытая одним
+               приветствием, не поднимается обменом ДРУГОГО. Ноль с любой
+               стороны означает «не измерено» и не спорит ни с чем
+               (d2k_cat_shape_fits). */
+            if (!d2k_cat_shape_fits(bd->shape, shape)) { continue; }
             if (bd->level >= level) { return -1; }
             bd->level = level;
+            if (shape) { bd->shape = shape; }
+            if (verified_by) { bd->verified_by = verified_by; }
             b->updated = now_ms / 1000;
             return 0;
         }
@@ -1422,7 +1472,16 @@ int d2k_sched_sync_step(d2k_sched *s) {
             /* transport привязки проверяется, но на провод не едет: у SET_NAME
                сегодня нет места под него (d2k_link.h). Ноль — старый файл,
                снятый до появления поля; принимаем как TCP, потому что до
-               задачи 5 иных привязок не заводилось. */
+               задачи 5 иных привязок не заводилось.
+
+               Форма приветствия (shape) на провод не едет тем более: датапат
+               выбирает план по имени и не разбирает, какой формой пришёл
+               клиент. Значит две привязки одной цели, различающиеся только
+               формой, поставят план ДВАЖДЫ, и победит последняя по файлу.
+               Сегодня такой пары не бывает по построению — зонд один и форма
+               у него одна (SCHED_PROBE_SHAPE), а наблюдение привязок не
+               заводит; когда появится второй зонд, здесь понадобится правило
+               выбора, и его придётся вывести из замера, а не назначить. */
             uint8_t tr = bd->transport ? bd->transport : 6;
             rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
         }
@@ -1548,6 +1607,7 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         if (t->state != T_FREE && strcmp(t->name, name) == 0) {
             memcpy(t->trig, ev->shape, ev->shape_len);
             t->trig_len = ev->shape_len;
+            t->trig_snapped = 1;
             say(s, "по %s поймана форма приветствия: %zu байт", t->name, ev->shape_len);
         }
     }
@@ -1587,9 +1647,15 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         h ^= fnv1a(text);
         snprintf(box_id, sizeof box_id, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
     }
+    /* Контекст: проверку вёл СОБСТВЕННЫЙ зонд и СВОЕЙ формой приветствия
+       (SCHED_PROBE_SHAPE). Записывается вместе с успехом, а не выводится
+       потом: через день по файлу будет не восстановить, чем именно он
+       добыт. */
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, t->transport, now_ms, &t->fp);
+                         t->name, t->transport,
+                         (uint8_t)SCHED_PROBE_SHAPE, D2K_VERBY_PROBE,
+                         now_ms, &t->fp);
     /* Коробку запоминаем: живое соединение потом поднимет уровень ИМЕННО этой
        записи, а не первой подходящей по имени цели. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
@@ -1774,7 +1840,15 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
            вдобавок «последующим соединением» значит подтвердить себя собой. */
         return;
     }
-    if (bind_raise_level(s->cat, t->box_id, t->name, t->transport, 5, now_ms) == 0) {
+    /* Форма ЖИВОГО клиента — только из снятого с провода приветствия. Не
+       снято (trig держит профиль холодного старта) — «не измерено», и ноль
+       честнее заготовки: заготовка всегда MODERN и сказала бы про клиента то,
+       чего никто не мерил. */
+    uint8_t live_shape = t->trig_snapped
+                             ? (uint8_t)d2k_hello_shape(t->trig, t->trig_len)
+                             : (uint8_t)D2K_SHAPE_UNKNOWN;
+    if (bind_raise_level(s->cat, t->box_id, t->name, t->transport,
+                         live_shape, D2K_VERBY_CLIENT, 5, now_ms) == 0) {
         say(s, "по %s (%s) последующее живое соединение дошло до обмена (%u байт) "
                "— уровень записи поднят до 5",
             t->name, t->transport == 17 ? "QUIC" : "TCP", (unsigned)ev->num);

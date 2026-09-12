@@ -818,7 +818,10 @@ static int elem_plan(jctx *j, void *o, int depth, char *err, size_t errcap) {
  * снятого до его появления, ключ "transport" в объекте попросту
  * отсутствует — handle_binding_key на него не попадёт, а memset в
  * parse_binding уже оставил 0 ("не записано"), см. testdata и
- * check_transport_default_zero_on_old_file. */
+ * check_transport_default_zero_on_old_file. Ровно то же и по той же
+ * механике верно для shape/verified_by, заведённых позже (см. d2k_catalog.h
+ * про контекст проверки): ключей нет — поля остаются нулями, и такая
+ * привязка совместима с любой формой. */
 static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_binding *out = (d2k_cat_binding *)ctx;
     if (strcmp(key, "kind") == 0)
@@ -837,6 +840,10 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_bool_i(j, &out->enabled, "binding.enabled", err, errcap);
     if (strcmp(key, "transport") == 0)
         return jparse_u8(j, &out->transport, "binding.transport", err, errcap);
+    if (strcmp(key, "shape") == 0)
+        return jparse_u8(j, &out->shape, "binding.shape", err, errcap);
+    if (strcmp(key, "verified_by") == 0)
+        return jparse_u8(j, &out->verified_by, "binding.verified_by", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -845,6 +852,25 @@ static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, si
 }
 static int elem_binding(jctx *j, void *o, int depth, char *err, size_t errcap) {
     return parse_binding(j, (d2k_cat_binding *)o, depth, err, errcap);
+}
+
+/* Числа поля d2k_cat_binding.shape — ЭТО ЗНАЧЕНИЯ d2k_shape, а не своя
+ * нумерация (см. d2k_catalog.h). Связь закреплена на сборке, потому что
+ * проверить её иначе нечем: перестановка перечисления в d2k_hello.h ничего
+ * здесь не сломает — она молча переименует то, что уже записано в файл на
+ * роутере, и накопленные привязки начнут утверждать про форму приветствия
+ * обратное тому, что измерялось. Отрицательный размер массива — способ
+ * сказать это компилятору на C99, где _Static_assert ещё нет. */
+typedef char d2k_cat_shape_numbering_check[
+    (D2K_SHAPE_MODERN == 1 && D2K_SHAPE_LEGACY == 2) ? 1 : -1];
+
+int d2k_cat_shape_fits(uint8_t stored, uint8_t got) {
+    /* Ноль с любой стороны — «не измерено» (§2.4), и оно не противоречит
+       ничему: старый файл без поля совместим с любой формой, а проверка без
+       измеренной формы не спорит с записанной. Противоречат только две
+       РАЗНЫЕ измеренные формы. */
+    if (stored == 0 || got == 0) { return 1; }
+    return stored == got ? 1 : 0;
 }
 
 /* --------------------------------------------------------------------
@@ -1122,7 +1148,14 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        незнакомое поле молча пропустит (см. d2k_catalog.h), а сохранить
        для НЕЁ omitempty-поведение Go смысла не имеет: этого поля в её
        структуре нет вообще, ей нечего сравнивать с нулём. */
-    wr_indent(f, depth + 1); fprintf(f, "\"transport\": %u\n", (unsigned)bd->transport);
+    wr_indent(f, depth + 1); fprintf(f, "\"transport\": %u,\n", (unsigned)bd->transport);
+    /* shape/verified_by — контекст, в котором проверка состоялась; тем же
+       порядком и по тем же правилам, что transport (Go их тоже не знает и
+       молча пропустит). Ноль выводится наравне с остальным: «не измерено» —
+       такое же состояние записи, как измеренное, и молчать о нём значило бы
+       делать вид, что поля нет вовсе. */
+    wr_indent(f, depth + 1); fprintf(f, "\"shape\": %u,\n", (unsigned)bd->shape);
+    wr_indent(f, depth + 1); fprintf(f, "\"verified_by\": %u\n", (unsigned)bd->verified_by);
     wr_indent(f, depth); fputc('}', f);
 }
 

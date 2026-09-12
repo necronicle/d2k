@@ -676,7 +676,7 @@ static void send_ack_ok(int fd, uint16_t cmd) {
 static const uint8_t FAKECTL_LOOPBACK4[4] = { 127, 0, 0, 1 };
 
 /* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
- * (1<<(22-20))=0x04 (см. d2k_ev_has_appdata, d2k_link.h). */
+ * (1<<(22-20))=0x04 (см. d2k_ev_outer_appdata, d2k_link.h). */
 static void send_exchange(int fd, uint16_t target_port,
                           const uint8_t *peer_ip, uint16_t peer_port,
                           uint8_t seen_types) {

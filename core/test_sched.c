@@ -44,6 +44,7 @@
 
 #include "d2k_compose_internal.h"
 #include "d2k_sched.h"
+#include "d2k_tls13.h"
 
 /* Что планировщик говорил о себе. Нужен не для красоты: узнавание коробки
    снаружи иначе НЕ отличить от совпадения имени — имя коробки выводится из
@@ -314,6 +315,35 @@ static size_t total_bindings(const d2k_catalog *c) {
     return n;
 }
 
+/* Форма приветствия СОБСТВЕННОГО зонда — ИЗМЕРЕННАЯ, а не назначенная.
+ *
+ * Планировщик записывает её в привязку константой (SCHED_PROBE_SHAPE,
+ * sched.c): спрашивать зонд о форме его же приветствия на каждом успехе
+ * незачем, она не меняется. Но константа, назначенная из головы, — это тот
+ * самый параметр без замера, который здесь запрещён. Поэтому тест ДОБЫВАЕТ
+ * её: поднимает клиента TLS 1.3 (core/tls13.c — тот самый, которым ходит
+ * зонд) поверх socketpair, снимает с провода его приветствие и отдаёт на
+ * разбор d2k_hello_shape — ровно тем же способом, которым планировщик
+ * определяет форму снятого приветствия цели.
+ *
+ * Рукопожатие при этом не состоится (на том конце socketpair никто не
+ * отвечает), и это неважно: приветствие уходит ПЕРВЫМ, до любого чтения. */
+static d2k_shape probe_hello_shape(void) {
+    int p[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) != 0) { return D2K_SHAPE_UNKNOWN; }
+    d2k_tls *t = NULL;
+    char e[200];
+    /* Потолок маленький: ждать здесь нечего, а тест платит за это временем. */
+    (void)d2k_tls_connect(p[0], "пример.цель", 50, &t, e, sizeof e);
+    d2k_tls_free(t);
+    uint8_t buf[2048];
+    ssize_t n = read(p[1], buf, sizeof buf);
+    close(p[0]);
+    close(p[1]);
+    if (n <= 0) { return D2K_SHAPE_UNKNOWN; }
+    return d2k_hello_shape(buf, (size_t)n);
+}
+
 static const d2k_cat_binding *binding_of(const d2k_catalog *c, const char *target,
                                           uint8_t transport) {
     for (size_t i = 0; i < c->n_boxes; i++) {
@@ -323,6 +353,59 @@ static const d2k_cat_binding *binding_of(const d2k_catalog *c, const char *targe
         }
     }
     return NULL;
+}
+
+/* Сколько привязок у одной цели по одному транспорту. До задачи 5 ответ был
+   «не больше одной» по построению; теперь ключ — тройка с формой приветствия,
+   и число записей стало наблюдаемым различием между «обновили» и «завели
+   рядом». */
+static size_t bindings_of(const d2k_catalog *c, const char *target, uint8_t transport) {
+    size_t n = 0;
+    for (size_t i = 0; i < c->n_boxes; i++) {
+        for (size_t j = 0; j < c->boxes[i].n_binds; j++) {
+            const d2k_cat_binding *b = &c->boxes[i].binds[j];
+            if (strcmp(b->target, target) == 0 && b->transport == transport) { n++; }
+        }
+    }
+    return n;
+}
+
+/* Тот же поиск, но для правки: тест изображает файл, снятый ДО появления
+   полей (shape = 0), и файл, где записана ДРУГАЯ форма. Настоящих путей
+   завести такую запись у планировщика сегодня нет — зонд один, и форма у
+   него одна, — а проверить ключ надо сейчас, а не когда появится второй. */
+static d2k_cat_binding *binding_mut(d2k_catalog *c, const char *target, uint8_t transport) {
+    for (size_t i = 0; i < c->n_boxes; i++) {
+        for (size_t j = 0; j < c->boxes[i].n_binds; j++) {
+            d2k_cat_binding *b = &c->boxes[i].binds[j];
+            if (strcmp(b->target, target) == 0 && b->transport == transport) { return b; }
+        }
+    }
+    return NULL;
+}
+
+/* Один полный проход поиска до подтверждения: подозрение, испытание зондом,
+   событие применения по ключу потока зонда. Результат остаётся в каталоге —
+   его вызывающий и смотрит; планировщик после прохода закрывается, потому что
+   проверяется именно НАКОПЛЕННОЕ в файле, а не живое состояние задачи. Порт
+   клиента задаёт вызывающий: по нему сходятся зонд и событие. */
+static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
+                         uint16_t cport) {
+    d2k_sched *s = d2k_sched_new(cat, link_fd, 0x2d);
+    if (!s) { CHECK(0, "планировщик не завёлся"); return; }
+    d2k_sched_set_say(s, collect_say, NULL);
+    ver_answer_port = cport;
+    ver_calls = 0;
+    forget_sent();
+    d2k_ev h = ev_hello(6, cport, target);
+    d2k_sched_event(s, &h);
+    d2k_ev su = ev_suspect(6, cport);
+    d2k_sched_event(s, &su);
+    settle(s);
+    d2k_ev ap = ev_applied(6, cport);
+    d2k_sched_event(s, &ap);
+    spin(s, 40);
+    d2k_sched_free(s);
 }
 
 int main(void) {
@@ -1124,8 +1207,199 @@ int main(void) {
         CHECK(bd != NULL && bd->level == 5,
               "последующее живое соединение не подняло уровень записи до пятого");
         CHECK(said("уровень записи поднят до 5"), "подъём уровня не назван в отчёте");
+        /* Контекст проверки переехал вместе с уровнем: подтверждает запись
+           теперь ЖИВОЙ клиент, а не наш зонд. Без этого поля пятый уровень
+           говорил бы «подтверждён последующими соединениями», а привязка
+           продолжала бы утверждать, что проверял её зонд. */
+        CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
+              "живое соединение подняло уровень, но контекст проверки остался зондовым");
+        /* А форма осталась той, что ИЗМЕРЕНА зондом: приветствие живого
+           клиента датапат не присылал, и «не измерено» не отменяет
+           измеренного (§2.4). */
+        CHECK(bd != NULL && bd->shape == (uint8_t)D2K_SHAPE_MODERN,
+              "измеренная форма затёрта нулём от клиента, чьё приветствие не снято");
         d2k_sched_free(s);
         d2k_catalog_free(&cC);
+    }
+
+    /* --- контекст проверки записан в привязке (задача 5) ---------------- */
+    {
+        /* У зонда СВОЯ форма приветствия — не та, которой ходит браузер, и
+           коробка вправе относиться к ним по-разному (§6). Значит успех,
+           добытый зондом, нельзя молча переносить на произвольную форму: в
+           привязке обязан стоять контекст, в котором проверка ДЕЙСТВИТЕЛЬНО
+           состоялась. */
+        d2k_shape probe_shape = probe_hello_shape();
+        CHECK(probe_shape == D2K_SHAPE_MODERN,
+              "приветствие собственного зонда оказалось не современной формы — "
+              "константа планировщика разошлась с тем, что уходит на провод");
+
+        d2k_catalog cD;
+        memset(&cD, 0, sizeof cD);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+
+        confirm_once(&cD, sv[0], "контекст.цель", 40130);
+        CHECK(bindings_of(&cD, "контекст.цель", 6) == 1, "подтверждение не записано");
+        const d2k_cat_binding *bd = binding_of(&cD, "контекст.цель", 6);
+        CHECK(bd != NULL && bd->shape == (uint8_t)probe_shape,
+              "в привязке не та форма приветствия, которой зонд ходил на самом деле");
+        CHECK(bd != NULL && bd->verified_by == D2K_VERBY_PROBE,
+              "в привязке не записано, что проверял собственный зонд");
+
+        /* Файл, снятый ДО появления полей: форма не записана. Такая привязка
+           совместима с любой формой, и повторное подтверждение обязано её
+           ОБНОВИТЬ, а не завести рядом вторую. Иначе каталог роутера (376
+           подтверждённых целей, копившихся неделями) удвоился бы на первой же
+           проверке. */
+        d2k_cat_binding *m = binding_mut(&cD, "контекст.цель", 6);
+        CHECK(m != NULL, "нечего помечать под старый файл");
+        if (m) { m->shape = 0; m->verified_by = 0; }
+        confirm_once(&cD, sv[0], "контекст.цель", 40131);
+        CHECK(bindings_of(&cD, "контекст.цель", 6) == 1,
+              "запись без формы (старый файл) не обновлена, а продублирована");
+        bd = binding_of(&cD, "контекст.цель", 6);
+        CHECK(bd != NULL && bd->successes == 2,
+              "повторное подтверждение не досталось прежней записи");
+        CHECK(bd != NULL && bd->shape == (uint8_t)probe_shape,
+              "измеренная форма не записана поверх «не измерено»");
+
+        /* А ДРУГАЯ форма — уже другая запись: ключ привязки стал тройкой
+           (цель, транспорт, форма приветствия). Успех современной формы не
+           имеет права лечь в запись, добытую старой. */
+        m = binding_mut(&cD, "контекст.цель", 6);
+        if (m) { m->shape = (uint8_t)D2K_SHAPE_LEGACY; }
+        confirm_once(&cD, sv[0], "контекст.цель", 40132);
+        CHECK(bindings_of(&cD, "контекст.цель", 6) == 2,
+              "успех одной формы приветствия лёг в запись, добытую другой");
+        {
+            int legacy_kept = 0, modern_new = 0;
+            for (size_t i = 0; i < cD.n_boxes; i++) {
+                for (size_t j = 0; j < cD.boxes[i].n_binds; j++) {
+                    const d2k_cat_binding *x = &cD.boxes[i].binds[j];
+                    if (strcmp(x->target, "контекст.цель") != 0) { continue; }
+                    if (x->shape == (uint8_t)D2K_SHAPE_LEGACY && x->successes == 2) { legacy_kept++; }
+                    if (x->shape == (uint8_t)probe_shape && x->successes == 1) { modern_new++; }
+                }
+            }
+            CHECK(legacy_kept == 1, "чужая по форме запись изменена, а не оставлена в покое");
+            CHECK(modern_new == 1, "новая форма не завела своей записи");
+        }
+        d2k_catalog_free(&cD);
+    }
+
+    /* --- живой клиент ДРУГОЙ формы уровень не поднимает ------------------ */
+    {
+        /* Зеркало предыдущего блока со стороны наблюдения. Запись добыта
+           современной формой; живой клиент, чьё приветствие снято датапатом и
+           оказалось СТАРОЙ формы, — это другой контекст, и его обмен ничего
+           не говорит о записанном. Уровень остаётся третьим.
+           Пара к проверке выше по файлу, где форма живого клиента не снята
+           вовсе («не измерено») и уровень поднимается. */
+        d2k_catalog cE;
+        memset(&cE, 0, sizeof cE);
+        d2k_sched *s = d2k_sched_new(&cE, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40140;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40140, "форма.важна");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40140);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40140);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        const d2k_cat_binding *bd = binding_of(&cE, "форма.важна", 6);
+        CHECK(bd != NULL && bd->level == 3, "подтверждение зондом не записано третьим уровнем");
+
+        /* Датапат снял приветствие живого клиента — и оно СТАРОЙ формы.
+           Профиль берётся тот же, что у холодного старта (core/profiles), а
+           не собирается в тесте руками. */
+        {
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "форма.важна",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "приветствие старой формы не собралось — проверять нечем");
+            CHECK(d2k_hello_shape(sh.shape, sh.shape_len) == D2K_SHAPE_LEGACY,
+                  "собранное приветствие оказалось не старой формы");
+            d2k_sched_event(s, &sh);
+            CHECK(said("поймана форма приветствия"),
+                  "снимок приветствия не дошёл до задачи — проверка ниже ничего не значит");
+        }
+
+        d2k_ev h2 = ev_hello(6, 40141, "форма.важна");
+        d2k_sched_event(s, &h2);
+        d2k_ev live = ev_exchange(6, 40141, 1);
+        d2k_sched_event(s, &live);
+        bd = binding_of(&cE, "форма.важна", 6);
+        CHECK(bd != NULL && bd->level == 3,
+              "обмен клиента ДРУГОЙ формы поднял уровень записи, добытой не им");
+        CHECK(bd != NULL && bd->verified_by == D2K_VERBY_PROBE,
+              "контекст проверки переписан обменом клиента другой формы");
+        CHECK(bindings_of(&cE, "форма.важна", 6) == 1,
+              "наблюдение завело привязку — заводить её может только подтверждение");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cE);
+    }
+
+    /* --- живой обмен не ВЫДУМЫВАЕТ форму клиента ------------------------ */
+    {
+        /* Обратная сторона предыдущей проверки. Приветствия живого клиента
+           датапат не присылал — значит его форма НЕ ИЗМЕРЕНА, и взять её из
+           заготовки холодного старта (fill_hellos подставляет туда MODERN)
+           нельзя: заготовка — это то, чем планировщик ходит сам, а не то, чем
+           ходит клиент. Запись изображает старый файл (формы в ней нет), и
+           после подъёма уровня формы в ней по-прежнему быть не должно. */
+        d2k_catalog cF;
+        memset(&cF, 0, sizeof cF);
+        d2k_sched *s = d2k_sched_new(&cF, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40150;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40150, "снимка.нет");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40150);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40150);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+
+        d2k_cat_binding *m = binding_mut(&cF, "снимка.нет", 6);
+        CHECK(m != NULL, "подтверждение не записано");
+        if (m) { m->shape = 0; }   /* запись из файла, снятого до появления поля */
+
+        d2k_ev h2 = ev_hello(6, 40151, "снимка.нет");
+        d2k_sched_event(s, &h2);
+        d2k_ev live = ev_exchange(6, 40151, 1);
+        d2k_sched_event(s, &live);
+        const d2k_cat_binding *bd = binding_of(&cF, "снимка.нет", 6);
+        CHECK(bd != NULL && bd->level == 5,
+              "живое соединение не подняло уровень записи без записанной формы");
+        CHECK(bd != NULL && bd->shape == 0,
+              "форма клиента не измерена, а в записи появилась — заготовка выдана за замер");
+        CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
+              "подъём уровня не записал, чьим обращением он получен");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cF);
     }
 
     close(sv[0]);
