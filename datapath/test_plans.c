@@ -57,12 +57,12 @@ int main(void) {
         CHECK(d2k_plantab_set_addr(t, addr(1, 2, 3, 4), 1, b) == 0, "план по адресу не встал");
         CHECK(d2k_plantab_count(t) == 2, "счётчик записей неверен");
 
-        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, addr(9, 9, 9, 9), 2) == a,
+        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, addr(9, 9, 9, 9), 2, D2K_PLAN_SHAPE_ANY) == a,
               "план по имени не нашёлся");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 2, 3, 4), 2) == b,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 2, 3, 4), 2, D2K_PLAN_SHAPE_ANY) == b,
               "план по адресу не нашёлся");
         CHECK(d2k_plantab_find(t, (const uint8_t *)"nope.example", 12,
-                               addr(9, 9, 9, 9), 2) == NULL,
+                               addr(9, 9, 9, 9), 2, D2K_PLAN_SHAPE_ANY) == NULL,
               "нашёлся план для незнакомой цели");
         d2k_plantab_free(t);
     }
@@ -76,12 +76,12 @@ int main(void) {
         d2k_plan *by_name = mkplan(), *by_addr = mkplan();
         d2k_plantab_set_name(t, nm, sizeof nm - 1, 1, by_name);
         d2k_plantab_set_addr(t, addr(162, 159, 135, 232), 1, by_addr);
-        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, addr(162, 159, 135, 232), 2) == by_name,
+        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, addr(162, 159, 135, 232), 2, D2K_PLAN_SHAPE_ANY) == by_name,
               "адрес перебил имя");
         /* Другое имя на том же адресе падает на адресный план — это законный
            запасной путь, а не приписывание домена. */
         CHECK(d2k_plantab_find(t, (const uint8_t *)"other.example", 13,
-                               addr(162, 159, 135, 232), 2) == by_addr,
+                               addr(162, 159, 135, 232), 2, D2K_PLAN_SHAPE_ANY) == by_addr,
               "запасной поиск по адресу не сработал");
         d2k_plantab_free(t);
     }
@@ -91,9 +91,9 @@ int main(void) {
         d2k_plantab *t = d2k_plantab_new(4);
         d2k_plan *p = mkplan();
         d2k_plantab_set_name(t, (const uint8_t *)"Example.COM", 11, 1, p);
-        CHECK(d2k_plantab_find(t, (const uint8_t *)"example.com", 11, 0, 2) == p,
+        CHECK(d2k_plantab_find(t, (const uint8_t *)"example.com", 11, 0, 2, D2K_PLAN_SHAPE_ANY) == p,
               "регистр имени оказался значимым");
-        CHECK(d2k_plantab_find(t, (const uint8_t *)"example.co", 10, 0, 2) == NULL,
+        CHECK(d2k_plantab_find(t, (const uint8_t *)"example.co", 10, 0, 2, D2K_PLAN_SHAPE_ANY) == NULL,
               "префикс имени принят за имя");
         d2k_plantab_free(t);
     }
@@ -106,7 +106,7 @@ int main(void) {
         d2k_plantab_set_name(t, nm, sizeof nm - 1, 1, first);
         d2k_plantab_set_name(t, nm, sizeof nm - 1, 2, second);
         CHECK(d2k_plantab_count(t) == 1, "замена завела вторую запись");
-        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 3) == second,
+        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 3, D2K_PLAN_SHAPE_ANY) == second,
               "после замены нашёлся прежний план");
         d2k_plantab_free(t);
     }
@@ -119,7 +119,7 @@ int main(void) {
         d2k_plantab_set_addr(t, addr(5, 6, 7, 8), 1, mkplan());
         CHECK(d2k_plantab_del_name(t, nm, sizeof nm - 1) == 1, "удаление по имени не сработало");
         CHECK(d2k_plantab_del_name(t, nm, sizeof nm - 1) == 0, "повторное удаление что-то нашло");
-        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 2) == NULL, "удалённый план находится");
+        CHECK(d2k_plantab_find(t, nm, sizeof nm - 1, 0, 2, D2K_PLAN_SHAPE_ANY) == NULL, "удалённый план находится");
         CHECK(d2k_plantab_del_addr(t, addr(5, 6, 7, 8)) == 1, "удаление по адресу не сработало");
         CHECK(d2k_plantab_count(t) == 0, "счётчик после удаления неверен");
         /* Освобождённое место снова годится. */
@@ -146,11 +146,11 @@ int main(void) {
         CHECK(d2k_plantab_set_addr(t, addr(3, 3, 3, 3), 20, mkplan()) == 0,
               "переполнение отказало вместо вытеснения");
         CHECK(d2k_plantab_count(t) == 2, "вытеснение изменило число записей");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(3, 3, 3, 3), 21) != NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(3, 3, 3, 3), 21, D2K_PLAN_SHAPE_ANY) != NULL,
               "новая запись после вытеснения не находится");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 21) == NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 21, D2K_PLAN_SHAPE_ANY) == NULL,
               "самая давняя запись пережила вытеснение");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(2, 2, 2, 2), 21) != NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(2, 2, 2, 2), 21, D2K_PLAN_SHAPE_ANY) != NULL,
               "вытеснена не самая давняя запись, а более свежая");
         d2k_plantab_free(t);
     }
@@ -166,13 +166,13 @@ int main(void) {
         /* Без обращения (1,1,1,1) — самая давняя и вытеснилась бы первой.
            Трогаем именно её отметкой новее соседки — порядок вытеснения
            обязан развернуться. */
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 100) != NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 100, D2K_PLAN_SHAPE_ANY) != NULL,
               "обращение к записи её не находит");
         CHECK(d2k_plantab_set_addr(t, addr(3, 3, 3, 3), 101, mkplan()) == 0,
               "вытеснение после обращения отказало");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 200) != NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(1, 1, 1, 1), 200, D2K_PLAN_SHAPE_ANY) != NULL,
               "тронутая запись не пережила вытеснение");
-        CHECK(d2k_plantab_find(t, NULL, 0, addr(2, 2, 2, 2), 200) == NULL,
+        CHECK(d2k_plantab_find(t, NULL, 0, addr(2, 2, 2, 2), 200, D2K_PLAN_SHAPE_ANY) == NULL,
               "нетронутая соседка пережила вытеснение вместо тронутой");
         d2k_plantab_free(t);
     }
@@ -190,8 +190,45 @@ int main(void) {
 
         CHECK(d2k_plantab_new(0) == NULL, "таблица на ноль записей создалась");
         d2k_plantab_free(NULL);
-        CHECK(d2k_plantab_find(NULL, NULL, 0, 0, 1) == NULL, "поиск в нулевой таблице");
+        CHECK(d2k_plantab_find(NULL, NULL, 0, 0, 1, D2K_PLAN_SHAPE_ANY) == NULL, "поиск в нулевой таблице");
         CHECK(d2k_plantab_count(NULL) == 0, "счётчик нулевой таблицы");
+    }
+
+    /* --- ФОРМА ПРИВЕТСТВИЯ ОГРАНИЧИВАЕТ ПРИМЕНЕНИЕ (0009, U5) -----------
+     *
+     * Успех собственного зонда на TLS 1.3 ничего не говорит про браузер с
+     * TLS 1.2: это разные приветствия, и коробка разбирает их по-разному.
+     * До этой правки shape жил только в каталоге контроллера и применение
+     * плана не ограничивал вовсе — датапат отдавал план любому обращению к
+     * имени.
+     *
+     * Ноль с любой стороны означает «не объявлено» и совместим со всем: у
+     * записи это старый каталог, у наблюдения — приветствие, форму которого
+     * разобрать не удалось. Молча перестать применять планы старого каталога
+     * нельзя, и выдумывать форму неразобранному приветствию — тоже. */
+    {
+        d2k_plantab *t = d2k_plantab_new(4);
+        CHECK(t != NULL, "таблица для проверки формы не создалась");
+        static const uint8_t nm[] = "shape.example";
+        size_t nl = sizeof nm - 1;
+
+        CHECK(d2k_plantab_set_name_shaped(t, nm, nl, 1, mkplan(),
+                                          D2K_PLAN_SHAPE_MODERN) == 0,
+              "план с объявленной формой не поставился");
+        CHECK(d2k_plantab_find(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN) != NULL,
+              "план не отдан приветствию СВОЕЙ формы");
+        CHECK(d2k_plantab_find(t, nm, nl, 0, 3, D2K_PLAN_SHAPE_LEGACY) == NULL,
+              "план, подтверждённый на TLS 1.3, отдан приветствию TLS 1.2");
+        CHECK(d2k_plantab_find(t, nm, nl, 0, 4, D2K_PLAN_SHAPE_ANY) != NULL,
+              "неразобранному приветствию план не отдан — выдумали форму вместо «не измерено»");
+
+        /* Старая запись (форма не объявлена) остаётся совместимой с любой. */
+        CHECK(d2k_plantab_set_name(t, nm, nl, 5, mkplan()) == 0,
+              "план без объявленной формы не поставился");
+        CHECK(d2k_plantab_find(t, nm, nl, 0, 6, D2K_PLAN_SHAPE_MODERN) != NULL &&
+              d2k_plantab_find(t, nm, nl, 0, 7, D2K_PLAN_SHAPE_LEGACY) != NULL,
+              "старый каталог перестал применяться — «не записано» принято за «не подходит»");
+        d2k_plantab_free(t);
     }
 
     if (fails) {

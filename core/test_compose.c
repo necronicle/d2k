@@ -452,7 +452,7 @@ static int peer_closed(int c) {
 static int plan_id_from_setname(const uint8_t *body, size_t len,
                                 uint8_t out[D2K_PLAN_ID_LEN]) {
     if (len < 1) { return -1; }
-    size_t off = (size_t)1 + body[0] + 12 + 4;
+    size_t off = (size_t)2 + body[0] + 12 + 4;   /* +1 байт формы приветствия */
     if (off + D2K_PLAN_ID_LEN > len) { return -1; }
     memcpy(out, body + off, D2K_PLAN_ID_LEN);
     return 0;
@@ -1411,7 +1411,7 @@ int main(void) {
         }
         hex[2 * plen] = '\0';
 
-        CHECK(d2k_link_set_name(fd, name, 6, hex, err, sizeof err) == 0,
+        CHECK(d2k_link_set_name(fd, name, 6, hex, D2K_PLAN_SHAPE_ANY, err, sizeof err) == 0,
               "b5: SET_NAME по имени из триггера не отправился");
         drain_all(fd);
         (void)probe_say(&p, "hello b5.example");

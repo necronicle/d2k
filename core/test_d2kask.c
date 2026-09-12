@@ -655,7 +655,7 @@ static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have
         remaining -= (size_t)n;
     }
     if (plan_id && have >= 1) {
-        size_t off = (size_t)1 + body[0] + 12 + 4;
+        size_t off = (size_t)2 + body[0] + 12 + 4;   /* +1 байт формы приветствия */
         if (off + D2K_PLAN_ID_LEN <= have) {
             memcpy(plan_id, body + off, D2K_PLAN_ID_LEN);
             if (have_id) { *have_id = 1; }

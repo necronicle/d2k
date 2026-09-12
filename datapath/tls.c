@@ -18,6 +18,8 @@
 #define HS_CLIENT_HELLO 0x01
 #define HS_SERVER_HELLO 0x02
 #define EXT_SERVER_NAME 0x0000
+#define EXT_SUPPORTED_VERSIONS 0x002b
+#define TLS13_VERSION   0x0304
 #define SNI_HOST_NAME   0x00
 
 static uint16_t rd16(const uint8_t *p) {
@@ -52,6 +54,40 @@ static int skip_u16_vec(const uint8_t *b, size_t len, size_t *off) {
 
 /* Ищет имя в блоке расширений. Возвращает 0 и заполняет смещение, если имя
  * найдено и целиком помещается. */
+/* Объявляет ли приветствие TLS 1.3 — расширение supported_versions со
+ * значением 0x0304 (RFC 8446 §4.2.1).
+ *
+ * Тот же признак, по которому форму приветствия различает контроллер
+ * (d2k_hello_shape, core/hello.c: have_tls13 → MODERN, иначе LEGACY).
+ * Считается ЗДЕСЬ, а не приносится извне, потому что нужен на ПАКЕТНОМ пути:
+ * датапат обязан знать форму приветствия, чтобы не применять к браузеру план,
+ * подтверждённый на приветствии другой формы (0009, U5). Переносить ради
+ * этого core/hello.c в датапат незачем — признак читается из тех же
+ * расширений, что уже разбираются ради имени. */
+static int has_tls13(const uint8_t *b, size_t exts_off, size_t exts_end) {
+    size_t off = exts_off;
+    while (off + 4 <= exts_end) {
+        uint16_t type = rd16(b + off);
+        size_t elen = rd16(b + off + 2);
+        off += 4;
+        if (off + elen > exts_end) {
+            return 0;
+        }
+        if (type == EXT_SUPPORTED_VERSIONS) {
+            if (elen < 1) { return 0; }
+            size_t list_len = b[off];
+            size_t p = off + 1;
+            if (p + list_len > off + elen) { return 0; }
+            for (size_t q = p; q + 2 <= p + list_len; q += 2) {
+                if (rd16(b + q) == TLS13_VERSION) { return 1; }
+            }
+            return 0;
+        }
+        off += elen;
+    }
+    return 0;
+}
+
 static int find_sni(const uint8_t *b, size_t exts_off, size_t exts_end,
                     size_t *sni_off, size_t *sni_len) {
     size_t off = exts_off;
@@ -234,6 +270,8 @@ int d2k_tls_parse(const uint8_t *b, size_t len, d2k_tls_info *out) {
            блока, а набивку в конец. */
         exts_end = hs_end;
     }
+
+    out->is_tls13 = has_tls13(b, off, exts_end);
 
     size_t so = 0, sl = 0;
     if (find_sni(b, off, exts_end, &so, &sl) == 0) {

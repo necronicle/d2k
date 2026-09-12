@@ -99,8 +99,21 @@ void         d2k_plantab_free(d2k_plantab *t);
  *      d2k_plantab_new, тот не пускает таблицу нулевой ёмкости, а при
  *      cap >= 1 полная таблица всегда даёт хотя бы одну занятую запись),
  * -2 — аргументы негодны. */
+/* ФОРМА ПРИВЕТСТВИЯ, на которой план подтверждён. Числа те же, что у
+ * d2k_shape контроллера (core/hello.h): 0 — не объявлена, 1 — MODERN
+ * (объявлен TLS 1.3), 2 — LEGACY. Ноль совместим с любым наблюдением: так
+ * выглядит старый каталог, и молча перестать применять его планы нельзя. */
+#define D2K_PLAN_SHAPE_ANY    0
+#define D2K_PLAN_SHAPE_MODERN 1
+#define D2K_PLAN_SHAPE_LEGACY 2
+
 int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
                          uint64_t now_ns, d2k_plan *p);
+/* То же, но с объявленной формой приветствия: план не применится к
+ * приветствию ДРУГОЙ объявленной формы. Успех собственного зонда на TLS 1.3
+ * ничего не говорит про браузер с TLS 1.2 (docs/decisions/0009 U5). */
+int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
+                                uint64_t now_ns, d2k_plan *p, uint8_t shape);
 int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
                          d2k_plan *p);
 
@@ -116,8 +129,12 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be);
  * реально идёт трафик, вытеснялась бы наравне с той, про которую забыли.
  * Вызывается на пакетном пути (раз на приветствие) — ничего не выделяется и
  * не вытесняется, только читается запись и правится её отметка времени. */
+/* seen_shape — форма НАБЛЮДАЕМОГО приветствия (D2K_PLAN_SHAPE_*). Ноль с
+ * любой стороны означает «не объявлено» и совместим со всем: ограничение
+ * действует, только когда обе стороны объявлены и не совпали. */
 const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
-                                 size_t len, uint32_t addr_be, uint64_t now_ns);
+                                 size_t len, uint32_t addr_be, uint64_t now_ns,
+                                 uint8_t seen_shape);
 
 size_t d2k_plantab_count(const d2k_plantab *t);
 size_t d2k_plantab_capacity(const d2k_plantab *t);

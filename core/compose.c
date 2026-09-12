@@ -776,7 +776,11 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         to_hex(planbuf, plan_len, hexbuf);
 
         char err[128];
-        if (d2k_link_set_name(link_fd, name, 6, hexbuf, err, sizeof err) != 0) {
+        /* Форма ПРИВЕТСТВИЯ ВОПРОСА: зонд пойдёт к цели ровно этим триггером,
+           и план-вопрос не должен примениться к чужому обращению другой
+           формы, случившемуся в то же время (0009, U5). */
+        uint8_t qshape = (uint8_t)d2k_hello_shape(trigger.bytes, trigger.len);
+        if (d2k_link_set_name(link_fd, name, 6, hexbuf, qshape, err, sizeof err) != 0) {
             step_rc(steps, i, D2K_STEP_SEND_FAIL, err);
             continue; /* план не отправился вовсе — не измерено */
         }

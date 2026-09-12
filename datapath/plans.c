@@ -16,6 +16,12 @@ typedef struct {
        каждую запись ради таблицы, которую и так обходят целиком раз на
        установку плана (см. d2k_plans.h). */
     uint64_t last_used_ns;
+    /* ФОРМА ПРИВЕТСТВИЯ, на которой план подтверждён (D2K_PLAN_SHAPE_*).
+       0 — не объявлена: старая запись, совместимая с любой формой. Ненулевая
+       означает, что к приветствию ДРУГОЙ формы этот план не применяется:
+       успех собственного зонда на TLS 1.3 ничего не говорит про браузер с
+       TLS 1.2 (docs/decisions/0009 U5). */
+    uint8_t  shape;
     d2k_plan *plan;
 } entry;
 
@@ -189,8 +195,8 @@ static entry *take_free_or_evict(d2k_plantab *t) {
     return last;
 }
 
-int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
-                         uint64_t now_ns, d2k_plan *p) {
+int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
+                                uint64_t now_ns, d2k_plan *p, uint8_t shape) {
     if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX) {
         d2k_plan_free(p);
         return -2;
@@ -208,11 +214,19 @@ int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
         memcpy(e->name, name, len);
     }
     e->last_used_ns = now_ns;
+    e->shape = shape;
     /* Прежний план освобождается здесь, а не у вызывающего: иначе замена
        плана цели молча текла бы. */
     d2k_plan_free(e->plan);
     e->plan = p;
     return 0;
+}
+
+/* Прежняя форма вызова — «форма приветствия не объявлена». Оставлена, потому
+   что план по АДРЕСУ формы не несёт вовсе: адрес не приветствие. */
+int d2k_plantab_set_name(d2k_plantab *t, const uint8_t *name, size_t len,
+                         uint64_t now_ns, d2k_plan *p) {
+    return d2k_plantab_set_name_shaped(t, name, len, now_ns, p, 0);
 }
 
 int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
@@ -268,8 +282,21 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
     return t ? drop(t, find_addr(t, addr_be)) : 0;
 }
 
+/* Подходит ли запись наблюдаемой форме приветствия.
+ *
+ * Ноль с ЛЮБОЙ стороны означает «не объявлено» и совместим со всем: у записи
+ * это старый каталог, у наблюдения — приветствие, форму которого разобрать не
+ * удалось. Обе поблажки осознанные: молча не применить план там, где он
+ * работал, так же плохо, как применить его не туда, и §2.4 требует различать
+ * «не измерено» от «нет». Ограничение начинает действовать, только когда обе
+ * стороны объявлены и НЕ СОВПАЛИ. */
+static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
+    return entry_shape == 0 || seen_shape == 0 || entry_shape == seen_shape;
+}
+
 const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
-                                 size_t len, uint32_t addr_be, uint64_t now_ns) {
+                                 size_t len, uint32_t addr_be, uint64_t now_ns,
+                                 uint8_t seen_shape) {
     if (!t) {
         return NULL;
     }
@@ -277,9 +304,16 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
         entry *e = find_name(t, name, len);
         if (e) {
             /* Обращение продлевает жизнь записи — см. d2k_plans.h про то,
-               почему рабочая цель не должна вытесняться наравне с забытой. */
+               почему рабочая цель не должна вытесняться наравне с забытой.
+               Отметку ставим и тогда, когда форма не подошла: обращение к
+               цели было, и забывать запись раньше времени незачем. */
             e->last_used_ns = now_ns;
-            return e->plan;
+            if (shape_fits(e->shape, seen_shape)) {
+                return e->plan;
+            }
+            /* Форма не та — по адресу тоже не ищем: имя названо, и план
+               соседа по CDN подставлять вместо него нельзя. */
+            return NULL;
         }
     }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
@@ -287,7 +321,9 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
     entry *e = find_addr(t, addr_be);
     if (e) {
         e->last_used_ns = now_ns;
-        return e->plan;
+        if (shape_fits(e->shape, seen_shape)) {
+            return e->plan;
+        }
     }
     return NULL;
 }

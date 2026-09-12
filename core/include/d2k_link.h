@@ -204,8 +204,19 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * спиной этого цикла и рисковать украсть у него событие (например,
  * D2K_EV_SHAPE, которое сервер может прислать ПЕРЕД ack на ARM_SHAPE, см.
  * d2k_link_arm_shape). */
+/* shape — ФОРМА ПРИВЕТСТВИЯ, на которой план подтверждён
+ * (D2K_PLAN_SHAPE_* из d2k_plans.h): 0 — не объявлена и совместима с любой,
+ * 1 — MODERN (клиент объявил TLS 1.3), 2 — LEGACY. Датапат не применит план
+ * к приветствию ДРУГОЙ объявленной формы: успех собственного зонда на
+ * TLS 1.3 ничего не говорит про браузер с TLS 1.2 (0009, U5).
+ *
+ * Едет байтом ПЕРЕД планом: длина плана в теле не объявлена, план это «всё,
+ * что осталось», и поле после него было бы съедено как его часть. Формат
+ * тела сменился — d2kd и d2kc обязаны обновляться согласованно, как и с
+ * кодом APPLIED (см. d2k_ctl.h). */
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
-                       const char *plan_text, char *err, size_t errcap);
+                       const char *plan_text, uint8_t shape,
+                       char *err, size_t errcap);
 
 /* Взводит ловушку формы приветствия для имени цели: команда
  * D2K_CMD_ARM_SHAPE. Как и d2k_link_set_name, только отправляет команду и не

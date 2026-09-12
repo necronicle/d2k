@@ -98,7 +98,12 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     switch (type) {
     case D2K_CMD_SET_NAME:
     case D2K_CMD_SET_ADDR: {
-        size_t hdr = (type == D2K_CMD_SET_NAME) ? (len ? 1u + b[0] : 1u) : 4u;
+        /* SET_NAME: [длина имени][имя][ФОРМА][план]. Форма байтом перед
+           планом, а не после: длина плана в теле не объявлена, план это «всё,
+           что осталось», и поле после него было бы съедено как его часть.
+           Формат сменился 12.09.2026 вместе с кодом APPLIED — d2kd и d2kc
+           обновляются согласованно (d2k_ctl.h, d2k_link.h). */
+        size_t hdr = (type == D2K_CMD_SET_NAME) ? (len ? 2u + b[0] : 2u) : 4u;
         if (len < hdr) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
@@ -117,7 +122,8 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         }
         int rc;
         if (type == D2K_CMD_SET_NAME) {
-            rc = d2k_plantab_set_name(tab, b + 1, b[0], cx->now_ns, p);
+            rc = d2k_plantab_set_name_shaped(tab, b + 1, b[0], cx->now_ns, p,
+                                             b[1u + b[0]]);
         } else {
             uint32_t addr;
             memcpy(&addr, b, 4);

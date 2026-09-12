@@ -409,8 +409,12 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 
     uint32_t dst_be;
     memcpy(&dst_be, pkt + 16, 4);
+    /* Форма приветствия — ноль: это путь QUIC, где ClientHello не TLS-запись
+       и понятия MODERN/LEGACY к нему не применяются. Ноль означает «не
+       объявлено» и совместим с любой записью каталога. */
     const d2k_plan *use = d2k_plantab_find(s->plans, (const uint8_t *)name,
-                                           name_len, dst_be, now_ns);
+                                           name_len, dst_be, now_ns,
+                                           D2K_PLAN_SHAPE_ANY);
     if (!use) {
         use = s->plan;
     }
@@ -951,10 +955,22 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     if (tls.is_client_hello) {
         uint32_t dst_be;
         memcpy(&dst_be, pkt + 16, 4);
+        /* ФОРМА НАБЛЮДАЕМОГО ПРИВЕТСТВИЯ. План, подтверждённый на приветствии
+           одной формы, не применяется к приветствию другой: успех
+           собственного зонда на TLS 1.3 ничего не говорит про браузер с
+           TLS 1.2 (0009, U5). Обрывок, в котором расширения ещё не пришли,
+           даёт LEGACY по отсутствию признака — но это НЕ «не измерено»: у
+           такого приветствия supported_versions просто нет в пришедших
+           байтах, и объявлять его формой мы права не имеем. Поэтому
+           неразобранное приветствие идёт как ANY. */
+        uint8_t seen_shape = D2K_PLAN_SHAPE_ANY;
+        if (tls.is_client_hello && tls.have_sni) {
+            seen_shape = tls.is_tls13 ? D2K_PLAN_SHAPE_MODERN : D2K_PLAN_SHAPE_LEGACY;
+        }
         use = d2k_plantab_find(s->plans,
                                tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
                                tls.have_sni ? tls.sni_len : 0,
-                               dst_be, now_ns);
+                               dst_be, now_ns, seen_shape);
         if (!use) {
             use = s->plan;
         }

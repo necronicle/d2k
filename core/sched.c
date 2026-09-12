@@ -992,7 +992,10 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         }
         hex[2 * plan_len] = '\0';
         char err[160];
-        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) != 0) {
+        /* Форма приветствия вопроса — та же, что у снятого триггера. */
+        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
+                              (uint8_t)d2k_hello_shape(t->trig, t->trig_len),
+                              err, sizeof err) != 0) {
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
         t->props_asked = 1;
@@ -1163,7 +1166,9 @@ static int install_next(d2k_sched *s, task *t) {
         if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
-        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex, err, sizeof err) == 0) {
+        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
+                              (uint8_t)d2k_hello_shape(t->trig, t->trig_len),
+                              err, sizeof err) == 0) {
             t->trial_installed = 1;
             return 0;
         }
@@ -1576,7 +1581,12 @@ int d2k_sched_sync_step(d2k_sched *s) {
                заводит; когда появится второй зонд, здесь понадобится правило
                выбора, и его придётся вывести из замера, а не назначить. */
             uint8_t tr = bd->transport ? bd->transport : 6;
-            rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex, err, sizeof err);
+            /* Форма — ИЗ ЗАПИСИ КАТАЛОГА, а не из текущего наблюдения: план
+               подтверждён на той форме, и применять его к другой нельзя.
+               Ноль в старой записи означает «не записано» и остаётся
+               совместимым с любой формой (0009, U5). */
+            rc = d2k_link_set_name(s->link_fd, bd->target, tr, hex,
+                                   (uint8_t)bd->shape, err, sizeof err);
         }
         if (rc != 0) {
             say(s, "каталог: план для %s не отправился: %s", bd->target, err);

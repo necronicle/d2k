@@ -341,7 +341,7 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
 }
 
 int d2k_link_set_name(int fd, const char *name, uint8_t transport,
-                      const char *plan_text, char *err, size_t errcap) {
+                      const char *plan_text, uint8_t shape, char *err, size_t errcap) {
     if (fd < 0) {
         say(err, errcap, "сокет не открыт");
         return -1;
@@ -370,7 +370,7 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
         say(err, errcap, "план не hex: нечётное число символов (%zu)", hexlen);
         return -1;
     }
-    size_t plan_cap = sizeof g_scratch - HDR - 1 - nl;
+    size_t plan_cap = sizeof g_scratch - HDR - 2 - nl;   /* 1 длина имени + 1 форма */
     if (hexlen / 2 > plan_cap) {
         say(err, errcap, "план длиннее предела кадра");
         return -1;
@@ -380,6 +380,10 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
     g_scratch[o++] = (uint8_t)nl;
     memcpy(g_scratch + o, name, nl);
     o += nl;
+    /* ФОРМА ПРИВЕТСТВИЯ — байтом ПЕРЕД планом, а не после.
+       Длина плана в теле не объявлена: план это «всё, что осталось». Поле
+       после него было бы съедено как часть плана. */
+    g_scratch[o++] = shape;
     long planlen = hex_decode(plan_text, g_scratch + o, sizeof g_scratch - o);
     if (planlen < 0) {
         say(err, errcap, "план не hex: недопустимый символ");

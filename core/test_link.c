@@ -662,18 +662,18 @@ int main(void) {
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (валидация set_name) не создался");
         if (sv[0] >= 0) {
             char err[200] = {0};
-            CHECK(d2k_link_set_name(sv[0], "x.example", 6, "abc", err, sizeof err) == -1,
+            CHECK(d2k_link_set_name(sv[0], "x.example", 6, "abc", D2K_PLAN_SHAPE_ANY, err, sizeof err) == -1,
                   "нечётная длина hex должна отклоняться");
-            CHECK(d2k_link_set_name(sv[0], "x.example", 6, "zz", err, sizeof err) == -1,
+            CHECK(d2k_link_set_name(sv[0], "x.example", 6, "zz", D2K_PLAN_SHAPE_ANY, err, sizeof err) == -1,
                   "недопустимый hex-символ должен отклоняться");
-            CHECK(d2k_link_set_name(sv[0], "", 6, "", err, sizeof err) == -1,
+            CHECK(d2k_link_set_name(sv[0], "", 6, "", D2K_PLAN_SHAPE_ANY, err, sizeof err) == -1,
                   "пустое имя должно отклоняться");
-            CHECK(d2k_link_set_name(sv[0], "x.example", 99, "", err, sizeof err) == -1,
+            CHECK(d2k_link_set_name(sv[0], "x.example", 99, "", D2K_PLAN_SHAPE_ANY, err, sizeof err) == -1,
                   "транспорт вне {6,17} должен отклоняться до похода к серверу");
             char longname[300];
             memset(longname, 'a', sizeof longname - 1);
             longname[sizeof longname - 1] = '\0';
-            CHECK(d2k_link_set_name(sv[0], longname, 6, "", err, sizeof err) == -1,
+            CHECK(d2k_link_set_name(sv[0], longname, 6, "", D2K_PLAN_SHAPE_ANY, err, sizeof err) == -1,
                   "имя длиннее 255 байт должно отклоняться");
             close(sv[0]);
             close(sv[1]);
@@ -776,7 +776,7 @@ int main(void) {
         to_hex(tiny, sizeof tiny, tiny_hex);
 
         char e1[200] = {0};
-        CHECK(d2k_link_set_name(fd, "ok.example", 6, tiny_hex, e1, sizeof e1) == 0,
+        CHECK(d2k_link_set_name(fd, "ok.example", 6, tiny_hex, D2K_PLAN_SHAPE_ANY, e1, sizeof e1) == 0,
               "SET_NAME с годным планом не отправилась");
 
         d2k_ev ack;
@@ -790,7 +790,7 @@ int main(void) {
     /* --- SET_NAME с негодным планом — ack ok=0, причина D2K_ACK_BAD_PLAN --- */
     {
         char e1[200] = {0};
-        CHECK(d2k_link_set_name(fd, "bad.example", 6, "0000000000000000", e1, sizeof e1) == 0,
+        CHECK(d2k_link_set_name(fd, "bad.example", 6, "0000000000000000", D2K_PLAN_SHAPE_ANY, e1, sizeof e1) == 0,
               "SET_NAME с негодным планом должна ДОЕХАТЬ — отказ приходит по ack, не по rc отправки");
 
         d2k_ev ack;
@@ -885,7 +885,7 @@ int main(void) {
      * моменту вызова (иначе тест мог бы зависнуть навечно при поломке). --- */
     {
         char e1[200] = {0};
-        CHECK(d2k_link_set_name(fd, "forever.example", 17, "", e1, sizeof e1) == 0,
+        CHECK(d2k_link_set_name(fd, "forever.example", 17, "", D2K_PLAN_SHAPE_ANY, e1, sizeof e1) == 0,
               "SET_NAME для проверки wait_ms<0 не отправилась");
         nap_ms(100); /* ack успевает дойти и лечь в буфер сокета */
 

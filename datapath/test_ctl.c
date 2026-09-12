@@ -95,13 +95,25 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
 }
 
 /* Тело команды SET_NAME: [длина имени u8][имя][план TLV]. */
-static size_t set_name_body(uint8_t *body, const char *name,
-                            const uint8_t *plan, size_t planlen) {
+/* Тело SET_NAME: [длина имени][имя][ФОРМА][план]. Форма байтом перед планом
+   — длина плана в теле не объявлена, и поле после него было бы съедено как
+   его часть (см. d2k_link.h). D2K_PLAN_SHAPE_ANY здесь потому, что эти
+   проверки про разбор команды, а не про ограничение по форме: оно проверяется
+   отдельно, ниже. */
+static size_t set_name_body_shaped(uint8_t *body, const char *name,
+                                   const uint8_t *plan, size_t planlen,
+                                   uint8_t shape) {
     size_t nl = strlen(name);
     body[0] = (uint8_t)nl;
     memcpy(body + 1, name, nl);
-    memcpy(body + 1 + nl, plan, planlen);
-    return 1 + nl + planlen;
+    body[1 + nl] = shape;
+    memcpy(body + 2 + nl, plan, planlen);
+    return 2 + nl + planlen;
+}
+
+static size_t set_name_body(uint8_t *body, const char *name,
+                            const uint8_t *plan, size_t planlen) {
+    return set_name_body_shaped(body, name, plan, planlen, D2K_PLAN_SHAPE_ANY);
 }
 
 /* Минимальный годный план: только порядок. Общий для обоих блоков разбора
@@ -443,8 +455,9 @@ int main(void) {
         {
             uint8_t body[32], f[48];
             body[0] = 0;
-            memcpy(body + 1, tiny, sizeof tiny);
-            size_t blen = 1 + sizeof tiny;
+            body[1] = D2K_PLAN_SHAPE_ANY;
+            memcpy(body + 2, tiny, sizeof tiny);
+            size_t blen = 2 + sizeof tiny;
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "команда с пустым именем не отправилась");
             CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "команда с пустым именем не разобралась");
@@ -616,11 +629,11 @@ int main(void) {
            выставлено и не должно быть. */
         d2k_plantab *tab = d2k_session_plans(sess);
         CHECK(d2k_plantab_find(tab, (const uint8_t *)"fresh.example",
-                               strlen("fresh.example"), 0, 9999999) != NULL,
+                               strlen("fresh.example"), 0, 9999999, D2K_PLAN_SHAPE_ANY) != NULL,
               "давность не дошла до таблицы: вытеснена свежая запись вместо старой "
               "(похоже на cx->now_ns, подменённый константой в ctlsrv.c)");
         CHECK(d2k_plantab_find(tab, (const uint8_t *)"filler1.example",
-                               strlen("filler1.example"), 0, 9999999) == NULL,
+                               strlen("filler1.example"), 0, 9999999, D2K_PLAN_SHAPE_ANY) == NULL,
               "самая старая по факту запись пережила вытеснение вместо свежей");
 
         close(cli);
