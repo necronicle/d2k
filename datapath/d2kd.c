@@ -620,6 +620,8 @@ int main(int argc, char **argv) {
         if (ctl) {
             if (il != (nfds_t)-1 && (pfd[il].revents & POLLIN)) {
                 d2k_ctl_accept(ctl);
+                /* Версия провода — первым делом, до любых других событий. */
+                d2k_ctlsrv_greet(ctl);
             }
             if (ip != (nfds_t)-1 && (pfd[ip].revents & (POLLIN | POLLHUP))) {
                 d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);

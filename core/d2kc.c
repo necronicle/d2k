@@ -199,6 +199,9 @@ int main(int argc, char **argv) {
        идёт» было нечем — а это разные беды, одна про линию, другая про нас. */
     unsigned long seen_events = 0, seen_hello = 0, seen_suspect = 0;
     unsigned long seen_exchange = 0, seen_applied = 0, seen_refused = 0;
+    /* Версия провода: объявлена ли вообще и совпала ли. Оба «нет» означают
+       «мы не знаем, с кем говорили», и оба обязаны быть слышны. */
+    int proto_seen = 0, proto_bad = 0;
     int64_t last_report = now_ms();
 
     /* Путь вида для панели: рядом с каталогом, если не задан явно. Панель
@@ -255,11 +258,28 @@ int main(int argc, char **argv) {
                 case D2K_EV_EXCHANGE: seen_exchange++; break;
                 case D2K_EV_APPLIED:  seen_applied++; break;
                 case D2K_EV_REFUSED:  seen_refused++; break;
+                case D2K_EV_PROTO:
+                    /* ВЕРСИЯ ПРОВОДА. Чужая — работать нельзя: смешанная пара
+                       не падает и не ругается, она молча не даёт
+                       подтверждений, и всё измерение уходит в никуда. Лучше
+                       громкий отказ сейчас, чем полдня пустых замеров. */
+                    proto_seen = 1;
+                    if (ev.num != (uint32_t)D2K_CTL_PROTO_VERSION) {
+                        fprintf(stderr,
+                            "d2kc: датапат говорит на версии протокола %u, наша %u — "
+                            "работать с такой парой нельзя: подтверждений она не даст, "
+                            "а измерения будут пустыми. Обновите d2kd, d2kc и d2kask "
+                            "вместе, из одного дерева.\n",
+                            (unsigned)ev.num, (unsigned)D2K_CTL_PROTO_VERSION);
+                        proto_bad = 1;
+                    }
+                    break;
                 default: break;
                 }
                 d2k_sched_event(s, &ev);
             }
         }
+        if (proto_bad) { break; }
 
         /* Порция прохода по каталогу — ПОСЛЕ чтения событий и до следующего
            круга poll: так между командами всегда есть чтение, и датапату
@@ -304,6 +324,16 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (proto_bad) {
+        printf("d2kc: остановлен из-за несовпадения версии протокола\n");
+    }
+    if (!proto_seen) {
+        /* Версии не было вовсе — либо датапат старый (до появления
+           объявления), либо событие потерялось. Оба случая одинаково значат
+           «мы не знаем, с кем говорили», и молчать об этом нельзя. */
+        fprintf(stderr, "d2kc: датапат версию протокола не объявил — "
+                        "работоспособность пары НЕ подтверждена\n");
+    }
     printf("d2kc: останавливаюсь\n");
     d2k_sched_free(s);
     size_t n = 0;

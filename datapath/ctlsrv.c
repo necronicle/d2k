@@ -90,6 +90,21 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     }
 }
 
+void d2k_ctlsrv_greet(d2k_ctl *ctl) {
+    if (!ctl) { return; }
+    /* ПЕРВОЕ, ЧТО СЛЫШИТ КОНТРОЛЛЕР — ВЕРСИЯ ПРОВОДА.
+       До неё он не знает, с кем разговаривает, а провод менялся несовместимо
+       уже дважды за один день. Смешанная пара при этом не падает и не
+       ругается: она молча не даёт подтверждений, и полдня измерений уходит в
+       никуда. Событие лосси, как и все прочие, — не дошло, значит контроллер
+       версии не увидел и обязан считать это несовпадением. */
+    uint8_t body[D2K_KEY_WIRE_LEN + 2];
+    memset(body, 0, sizeof body);
+    body[D2K_KEY_WIRE_LEN]     = (uint8_t)(D2K_CTL_PROTO_VERSION >> 8);
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)D2K_CTL_PROTO_VERSION;
+    d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
+}
+
 void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len) {
     d2k_ctlsrv *cx = vctx;
     char why[200];
