@@ -114,6 +114,26 @@ static uint8_t ver_last_transport;
 static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
 static uint16_t ver_answer_port;
 
+/* Подменённый подбор плеча QUIC: настоящий ходит в сеть десятками опытов, а
+   тест обязан утверждать поведение планировщика, не выходя наружу. */
+static d2k_quic_arm_kind arm_kind = D2K_QA_BLOB;
+static int arm_calls;
+
+static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
+                             d2k_hello trigger, uint32_t mark) {
+    (void)ip; (void)port; (void)sni; (void)trigger; (void)mark;
+    arm_calls++;
+    d2k_quic_arm a;
+    memset(&a, 0, sizeof a);
+    a.kind = arm_kind;
+    a.blob_id = D2K_QUIC_ARM_BLOB_SHAPED;
+    a.copies = 6;
+    a.ttl = 3;
+    a.probes = 4;
+    snprintf(a.reason, sizeof a.reason, "подменённый подбор");
+    return a;
+}
+
 static size_t ver_last_wire;
 
 /* Что подменённый зонд говорит про имя сервера: -1 «сказать нечего» (так
@@ -497,6 +517,7 @@ int main(void) {
        рукопожатием TLS 1.3, а стенд этого теста TLS не умеет — тест мерил бы
        стенд. */
     d2k_sched_ver_hook = stub_ver;
+    d2k_sched_arm_hook = stub_arm;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -2012,6 +2033,86 @@ int main(void) {
               "на провод вернулся план не той цели");
         d2k_sched_free(s);
         d2k_catalog_free(&cR);
+    }
+
+    /* --- ПЕТЛЯ ПО QUIC ЗАМКНУТА: плечо → план → подтверждение ---------- */
+    {
+        /* До этой правки задача транспорта 17 шла в d2k_compose, который про
+           QUIC не знает, и получала разрезы — а датаграмму резать нельзя.
+           Подбор плеча был написан и не звался ниоткуда, кроме тестов. */
+        d2k_catalog cQ;
+        memset(&cQ, 0, sizeof cQ);
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40220;
+        ver_calls = 0;
+        arm_calls = 0;
+        arm_kind = D2K_QA_COPIES;
+        forget_sent();
+
+        d2k_ev h = ev_hello(17, 40220, "квик.обход");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40220);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(arm_calls == 1, "плечо QUIC не подбиралось вовсе");
+        CHECK(said("плечо подобрано"), "подбор плеча не назван вслух");
+
+        d2k_ev ap = ev_applied(17, 40220);
+        d2k_sched_event(s, &ap);
+        spin(s, 40);
+        const d2k_cat_binding *bd = binding_of(&cQ, "квик.обход", 17);
+        CHECK(bd != NULL, "подтверждённый обход по QUIC не записан в каталог");
+        CHECK(bd != NULL && bd->level == 3, "уровень записи по QUIC не третий");
+        /* Текст записанного плана — из плеча, а не из разрезов: датаграмму
+           резать нельзя, и план обязан объявлять udp/quic. На проводе он едет
+           байтами TLV, поэтому сверяем то, что легло в каталог. */
+        {
+            int quic_text = 0;
+            for (size_t bi = 0; bi < cQ.n_boxes; bi++) {
+                for (size_t pj = 0; pj < cQ.boxes[bi].n_plans; pj++) {
+                    const char *txt = cQ.boxes[bi].plans[pj].text;
+                    if (txt && strstr(txt, "proto udp quic")) { quic_text = 1; }
+                }
+            }
+            CHECK(quic_text,
+                  "записанный план не объявляет udp/quic — он собран не из плеча");
+        }
+        d2k_sched_free(s);
+        d2k_catalog_free(&cQ);
+    }
+
+    /* --- невыразимое плечо QUIC не подменяется похожим ------------------ */
+    {
+        d2k_catalog cF2;
+        memset(&cF2, 0, sizeof cF2);
+        d2k_sched *s = d2k_sched_new(&cF2, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_answer_port = 40221;
+        arm_kind = D2K_QA_FRAG;     /* фрагментации язык плана не знает */
+        forget_sent();
+
+        d2k_ev h = ev_hello(17, 40221, "фрагмент.квик");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40221);
+        d2k_sched_event(s, &su);
+        run_out(s);
+
+        CHECK(said("не выразимо"),
+              "невыразимое плечо не названо пробелом реализации");
+        CHECK(binding_of(&cF2, "фрагмент.квик", 17) == NULL,
+              "по невыразимому плечу появилась привязка");
+        arm_kind = D2K_QA_BLOB;
+        quic_answer = D2K_V_CLEAR;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cF2);
     }
 
     /* --- подтверждать нечем: перебор кандидатов не начинается ---------- */

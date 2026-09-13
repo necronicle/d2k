@@ -209,6 +209,15 @@ static d2k_ver_result verify_default(const char *ip, uint16_t port, uint8_t tran
     return d2k_verify_probe(ip, port, sni, deadline_ms, hello_wire);
 }
 
+/* Умолчание подбора плеча QUIC. Отдельным хуком по той же причине, что и
+ * прочие оракулы: подбор ходит в сеть десятками опытов, и модульный тест
+ * обязан утверждать поведение планировщика, не выходя наружу. */
+static d2k_quic_arm pick_arm_default(const char *ip, uint16_t port, const char *sni,
+                                     d2k_hello trigger, uint32_t mark) {
+    return d2k_quic_pick_arm(ip, port, sni, trigger, mark);
+}
+
+d2k_sched_arm_fn  d2k_sched_arm_hook  = pick_arm_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = d2k_classify;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
@@ -374,6 +383,12 @@ typedef struct {
     d2k_vres   res;
     d2k_vol_result vol;
     int        res_ready;   /* пишется потоком под мьютексом планировщика */
+    /* Подобранное плечо QUIC и признак того, что подбор состоялся. Отдельно
+       от вердикта: «плечо не найдено» и «вердикта нет» — разные утверждения,
+       и складывать их в одно поле значило бы потерять различие. */
+    d2k_quic_arm arm;
+    int        arm_ready;
+
     /* Итог JOB_CONTACT. */
     uint8_t    c_ip[4];
     uint16_t   c_port;
@@ -773,6 +788,22 @@ static void *worker_run(void *vp) {
     d2k_vres r;
     if (t->transport == 17) {
         r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->mark);
+        /* ПОДБОР ПЛЕЧА — ЗДЕСЬ ЖЕ, В РАБОЧЕМ ПОТОКЕ.
+           У датаграммы нет разреза (резать её — порча, а не разрез), и
+           d2k_compose, выводящий разрезы из вектора свойств, для UDP не
+           производит НИЧЕГО применимого. Плечо QUIC подбирается своим
+           перебором: блобы-приманки, затем число копий, затем развёртка TTL —
+           донорский порядок. Без этого вызова вертикаль обрывалась посередине:
+           подбор был написан и не звался ниоткуда, кроме тестов.
+
+           Спрашиваем только когда решает СОДЕРЖИМОЕ: при «проходит как есть»
+           и «до цели нет транспорта» воздействовать не на что, и тратить
+           десятки опытов было бы тратой чужого канала. */
+        if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX ||
+            r.verdict == D2K_V_WHOLE) {
+            t->arm = d2k_sched_arm_hook(t->ip, t->port, t->name, trig, s->mark);
+            t->arm_ready = 1;
+        }
     } else {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
@@ -1458,8 +1489,40 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     /* Вектор — накопленный вопросами, а не пустой: в этом весь смысл опроса.
        Пустой вектор d2k_compose честно превращает в ОДИН запасной план, и до
        появления вопросов планировщик только его и получал. */
-    d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     size_t cap = sizeof t->plans / sizeof t->plans[0];
+
+    if (t->transport == 17) {
+        /* У QUIC свой источник кандидатов — подобранное плечо. Разрезы и
+           перекрытия, которые выводит d2k_compose, к датаграмме не
+           применимы вовсе, и предлагать их значило бы тратить бюджет зондов
+           на планы, которые датапат честно отвергнет. */
+        if (!t->arm_ready) {
+            say(s, "по %s (QUIC) плечо не подбиралось — воздействовать не на что",
+                t->name);
+            return;
+        }
+        size_t blen = 0;
+        const uint8_t *blob = d2k_quic_arm_blob(t->arm.blob_id, &blen);
+        char text[sizeof t->plans[0]];
+        if (blob && blen > 0 &&
+            d2k_quic_arm_plan(&t->arm, blob, blen, text, sizeof text) == 0) {
+            if (t->n_plans < cap) {
+                memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
+                t->n_plans++;
+            }
+            say(s, "по %s (QUIC) плечо подобрано за %d опытов: %s",
+                t->name, t->arm.probes, t->arm.reason);
+        } else {
+            /* Плечо есть, а выразить его языком Plan нечем (например,
+               фрагментация) — это пробел РЕАЛИЗАЦИИ, а не свойство коробки
+               (0007 п.3), и подменять его похожим запрещено. */
+            say(s, "по %s (QUIC) плечо не выразимо сегодняшним языком плана: %s",
+                t->name, t->arm.reason);
+        }
+        return;
+    }
+
+    d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     if (t->n_plans < cap) {
         t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY, s->send_cap,
                                   t->plans + t->n_plans, cap - t->n_plans);

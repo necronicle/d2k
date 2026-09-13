@@ -56,6 +56,7 @@
 #include "d2k_catalog.h"
 #include "d2k_link.h"
 #include "d2k_verdict.h"
+#include "d2k_quicprobe.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
 
@@ -79,6 +80,13 @@ typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char 
 typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
                                            const char *sni, int plain, uint32_t mark);
 extern d2k_sched_vol_fn  d2k_sched_vol_hook;
+
+/* Подбор плеча QUIC (d2k_quic_pick_arm). Подменяем по той же причине, что и
+ * прочие оракулы: настоящий подбор ходит в сеть десятками опытов. */
+typedef d2k_quic_arm (*d2k_sched_arm_fn)(const char *ip, uint16_t port,
+                                         const char *sni, d2k_hello trigger,
+                                         uint32_t mark);
+extern d2k_sched_arm_fn  d2k_sched_arm_hook;
 
 /* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и
  * три выше, и ещё по одной: этот зонд ведёт НАСТОЯЩЕЕ рукопожатие TLS 1.3 с
