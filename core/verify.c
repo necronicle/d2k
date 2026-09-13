@@ -30,6 +30,8 @@
 #include <unistd.h>
 
 #include "d2k_compose_internal.h" /* d2k_props_contact — общее обращение к цели */
+#include "d2k_h3.h"
+#include "d2k_quicconn.h"
 #include "d2k_tls13.h"
 #include "d2k_verify.h"
 
@@ -154,4 +156,108 @@ void d2k_verify_close(d2k_ver_result *r) {
         close(r->fd);
         r->fd = -1;
     }
+}
+
+/* --- то же самое, но по QUIC --------------------------------------------- */
+
+d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *sni,
+                                     int deadline_ms, size_t hello_wire) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    snprintf(r.reason, sizeof r.reason, "проба не начиналась");
+    const char *host = (sni && sni[0]) ? sni : ip;
+    if (!host || !host[0]) { return r; }
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        if (*p <= 32 || *p == 127) {
+            snprintf(r.reason, sizeof r.reason, "недопустимый символ в имени");
+            return r;
+        }
+    }
+
+    d2k_qc_opts o;
+    memset(&o, 0, sizeof o);
+    o.ip = ip;
+    o.port = port ? port : 443;
+    o.sni = sni;
+    o.alpn = "h3";
+    o.deadline_ms = deadline_ms > 0 ? deadline_ms : 5000;
+    o.pad_to = hello_wire;
+    /* Метки НЕТ намеренно — ровно по той же причине, что у TCP-зонда: к
+       помеченному пакету поставленный план не применится, и зонд мерил бы
+       линию БЕЗ обхода, считая, что мерит с обходом. */
+
+    d2k_qc *c = NULL;
+    char err[200];
+    err[0] = '\0';
+    if (d2k_qc_connect(&o, &c, err, sizeof err) != 0) {
+        /* Транспорт у QUIC не «встал» отдельно от рукопожатия: датаграмма
+           уходит всегда, и отличить «ушла в никуда» от «ушла и не понравилась»
+           можно только по тому, ответил ли сервер хоть чем-то. Оба случая для
+           нас — «не измерено», и приписывать им уровень транспорта значило бы
+           дописать доказательство. */
+        snprintf(r.reason, sizeof r.reason, "рукопожатия нет: %.150s", err);
+        return r;
+    }
+    r.level = D2K_VER_HANDSHAKE;
+    r.name_ok = d2k_qc_peer_name(c);
+    d2k_qc_local(c, r.local_ip4, &r.local_port);
+    r.fd = d2k_qc_fd(c);
+    snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
+
+    /* Управляющий поток обязателен: без SETTINGS сервер вправе не отвечать
+       вовсе, и молчание записалось бы блокировкой. */
+    uint8_t ctl[16];
+    size_t cn = d2k_h3_control(ctl, sizeof ctl);
+    if (cn == 0 || d2k_qc_stream_send(c, 2, ctl, cn, 0, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "управляющий поток не ушёл: %.140s", err);
+        r.fd = d2k_qc_release(c);
+        return r;
+    }
+    /* Пауза между управляющим потоком и вопросом. Измерено 13.09.2026 на
+       живых серверах: без неё отвечает только один стек из четырёх — сервер
+       обязан увидеть SETTINGS раньше запроса, а за это же время доезжает его
+       NEW_CONNECTION_ID и меняется адрес ответа. */
+    {
+        uint64_t sid = 0;
+        uint8_t drop[2048];
+        (void)d2k_qc_stream_recv(c, &sid, drop, sizeof drop, 400, err, sizeof err);
+    }
+
+    uint8_t req[512];
+    size_t rn = d2k_h3_request(host, "/", req, sizeof req);
+    if (rn == 0 || d2k_qc_stream_send(c, 0, req, rn, 1, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
+        r.fd = d2k_qc_release(c);
+        return r;
+    }
+
+    uint8_t rx[8192];
+    size_t got = 0;
+    int64_t until = verify_now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
+    while (got < sizeof rx && verify_now_ms() < until) {
+        uint64_t sid = 0;
+        long n = d2k_qc_stream_recv(c, &sid, rx + got, sizeof rx - got, 200,
+                                    err, sizeof err);
+        if (n < 0) { break; }
+        if (n > 0) { got += (size_t)n; }
+        int st = 0;
+        if (got > 0 && d2k_h3_status(rx, got, &st) == 0) {
+            r.level = D2K_VER_APPLICATION;
+            r.status = st;
+            snprintf(r.reason, sizeof r.reason,
+                     "заголовки HTTP/3 получены, статус %d", st);
+            break;
+        }
+    }
+    if (r.level != D2K_VER_APPLICATION) {
+        snprintf(r.reason, sizeof r.reason,
+                 "кода ответа HTTP/3 нет: принято %zu байт", got);
+    }
+    /* Сокет остаётся ОТКРЫТЫМ до d2k_verify_close — по той же причине, что у
+       TCP-зонда: закрытие удаляет ячейку потока в датапате раньше, чем придёт
+       событие применения плана. */
+    r.fd = d2k_qc_release(c);
+    return r;
 }

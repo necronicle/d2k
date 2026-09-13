@@ -101,6 +101,17 @@ typedef struct {
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
                                 int deadline_ms, size_t hello_wire);
 
+/* ТО ЖЕ САМОЕ, НО ПО QUIC. Уровни и их смысл не меняются ни на йоту:
+ * TRANSPORT — датаграммы уходят, ответа нет; HANDSHAKE — рукопожатие
+ * завершено, приложение молчит; APPLICATION — пришёл код ответа HTTP/3.
+ * Послаблений для QUIC нет и быть не может: доказательством считается
+ * прикладной обмен, а не «сервер что-то прислал».
+ *
+ * hello_wire — длина приветствия, снятого с клиента, до которой зонд добивает
+ * своё; смысл тот же, что у d2k_verify_probe. */
+d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *sni,
+                                     int deadline_ms, size_t hello_wire);
+
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */
 void d2k_verify_close(d2k_ver_result *r);

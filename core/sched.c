@@ -191,13 +191,19 @@ static int refuse_is_damage(uint8_t code) {
 static d2k_ver_result verify_default(const char *ip, uint16_t port, uint8_t transport,
                                      const char *sni, int deadline_ms,
                                      size_t hello_wire) {
+    if (transport == 17) {
+        /* Зонд QUIC появился: доводит рукопожатие до прикладных ключей и
+           берёт код ответа HTTP/3. Порог доказательства тот же, что у TCP, —
+           прикладной обмен, а не «сервер что-то прислал» (§4.2). */
+        return d2k_verify_probe_quic(ip, port, sni, deadline_ms, hello_wire);
+    }
     if (transport != 6) {
         d2k_ver_result r;
         memset(&r, 0, sizeof r);
         r.fd = -1;
         r.unsupported = 1;
         snprintf(r.reason, sizeof r.reason,
-                 "зонда подтверждения для QUIC нет — не измерено");
+                 "зонда подтверждения для этого транспорта нет — не измерено");
         return r;
     }
     return d2k_verify_probe(ip, port, sni, deadline_ms, hello_wire);

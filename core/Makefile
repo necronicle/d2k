@@ -30,7 +30,7 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quicwire.c tls13core.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c verify.c
+SRC     = meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
@@ -64,11 +64,11 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_meas test_verdict test_crypto test_quicwire test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
+TESTS   = test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o verify.o d2kask d2kc
+all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o verify.o quicconn.o quicwire.o h3.o d2kask d2kc
 
 
 meas.o: meas.c $(HDR)
@@ -146,10 +146,16 @@ x25519.o: x25519.c $(HDR)
 # Минимальный клиент TLS 1.3: нужен пробе на блокировку по объёму, потому что
 # объём приходится качать ВНУТРИ настоящей сессии. Что он намеренно не делает —
 # в шапке d2k_tls13.h.
-tls13.o: tls13.c $(HDR)
+tls13.o: tls13.c tls13core.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 tls13core.o: tls13core.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+quicconn.o: quicconn.c quicwire.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+h3.o: h3.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Проба на блокировку по объёму (перенос internal/volume): качает объём внутри
@@ -167,7 +173,7 @@ plantlv.o: plantlv.c $(HDR)
 # compose.o (её же оговорки про метку и про FIN, см. d2k_compose_internal.h).
 # Повтор снятого чужого приветствия завершить рукопожатие не может: секретов
 # того клиента у нас нет, и наружу виден только чужой второй полёт.
-verify.o: verify.c $(HDR)
+verify.o: verify.c quicconn.c quicwire.c h3.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sched.o: sched.c $(HDR)
@@ -235,6 +241,9 @@ test_verdict: test_verdict.c meas.o verdict.o hello.o $(HDR) $(TESTHDR)
 
 test_crypto: test_crypto.c crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_crypto.c crypto.o $(TEST_LDFLAGS)
+
+test_h3: test_h3.c h3.o quicwire.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_h3.c h3.o quicwire.o crypto.o $(TEST_LDFLAGS)
 
 test_quicwire: test_quicwire.c quicwire.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicwire.c quicwire.o crypto.o $(TEST_LDFLAGS)
@@ -453,11 +462,11 @@ cross: hello_profiles.inc
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
 		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c -lpthread || exit 1
+		verify.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
 		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c -lpthread || exit 1
+		verify.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
@@ -465,20 +474,20 @@ cross: hello_profiles.inc
 		d2kask.c compose.c hello.c meas.c link.c || exit 1
 	@echo "== test_verify целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verify-a64 \
-		test_verify.c verify.c compose.c hello.c meas.c link.c tls13.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c hello.c meas.c link.c tls13.c tls13core.c x25519.c crypto.c \
 		-lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verify-mipsel \
-		test_verify.c verify.c compose.c hello.c meas.c link.c tls13.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c hello.c meas.c link.c tls13.c tls13core.c x25519.c crypto.c \
 		-lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c -lpthread || exit 1
+		verify.c quicconn.c h3.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c -lpthread || exit 1
+		verify.c quicconn.c h3.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1
@@ -501,7 +510,7 @@ d2kc-aarch64: hello_profiles.inc
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
 		-o $(BUILDDIR)/d2kc-aarch64 d2kc.c sched.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicwire.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
-		volume.c tls13.c tls13core.c x25519.c verify.c -lpthread
+		volume.c tls13.c tls13core.c x25519.c verify.c quicconn.c h3.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-aarch64
 
 d2kask-aarch64: hello_profiles.inc
@@ -519,16 +528,16 @@ test-plantlv: test_plantlv
 test_plantlv: test_plantlv.c plantlv.o compose.o hello.o meas.o link.o $(HDR) ../datapath/planlab
 	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o hello.o meas.o link.o $(TEST_LDFLAGS)
 
-test-sched: test_sched sched.o plantlv.o verify.o
+test-sched: test_sched sched.o plantlv.o verify.o quicconn.o quicwire.o h3.o
 	./test_sched
 
-# verify.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
+# verify.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
 test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-            hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o $(HDR)
+            hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o $(TEST_LDFLAGS)
+		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
 # довести рукопожатие TLS 1.3 до конца и умеет НЕ довести, а без этого уровни
@@ -536,17 +545,17 @@ test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quic
 # связывании — тем же расписанием ключей, что у клиента, стенд работает с
 # другой стороны. compose.o тянет за собой hello.o/meas.o/link.o: зонд зовёт
 # d2k_props_contact, а она живёт там же, где остальной опрос свойств.
-test_verify: test_verify.c verify.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< verify.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify: test_verify.c verify.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o quicconn.o quicwire.o h3.o compose.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 
 test-verify: test_verify
 	./test_verify
 
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
 d2kc: d2kc.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-      hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o $(HDR)
+      hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o $(TEST_LDFLAGS)
+		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(TEST_LDFLAGS)
 
 clean:
 	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc
