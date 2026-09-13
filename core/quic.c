@@ -583,27 +583,55 @@ static int find_client_hello_sni(const uint8_t *stream, size_t filled,
  * Публичный вход.
  * --------------------------------------------------------------------- */
 
+/* Общая часть d2k_quic_sni и d2k_quic_client_hello: из защищённой датаграммы
+ * — собранный поток CRYPTO. Возвращает длину собранного (0 — не вышло). */
+static size_t crypto_stream_of(const uint8_t *p, size_t n,
+                               uint8_t *stream, size_t cap) {
+    quic_hdr h;
+    if (parse_initial_header(p, n, &h) != 0) {
+        return 0;
+    }
+    uint8_t plain[D2K_QUIC_MAX_DGRAM];
+    size_t plain_len;
+    if (decrypt_initial(p, &h, plain, &plain_len) != 0) {
+        return 0;
+    }
+    crypto_chunk chunks[D2K_QUIC_MAX_CRYPTO_CHUNKS];
+    size_t n_chunks = collect_crypto_frames(plain, plain_len, chunks);
+    return reassemble_crypto_stream(plain, chunks, n_chunks, stream, cap);
+}
+
+int d2k_quic_client_hello(const uint8_t *p, size_t n,
+                          uint8_t *out, size_t cap, size_t *out_len) {
+    if (!p || !out || !out_len) {
+        return -1;
+    }
+    uint8_t stream[D2K_QUIC_MAX_DGRAM];
+    size_t filled = crypto_stream_of(p, n, stream, sizeof stream);
+    if (filled < HS_HDR || stream[0] != HS_CLIENT_HELLO) {
+        return -1;
+    }
+    size_t claimed = ((size_t)stream[1] << 16) | ((size_t)stream[2] << 8) | stream[3];
+    size_t whole = HS_HDR + claimed;
+    /* ЦЕЛИКОМ — по СОБСТВЕННОЙ заявленной длине, а не «сколько собралось».
+       Тот же разбор границ, что и всюду в этом файле: claimed и filled —
+       разные величины, и отдать вызывающему обрывок как приветствие значило
+       бы отдать ему пакет, который никто не примет. */
+    if (whole > filled || whole > cap) {
+        return -1;
+    }
+    memcpy(out, stream, whole);
+    *out_len = whole;
+    return 0;
+}
+
 int d2k_quic_sni(const uint8_t *p, size_t n, char *out, size_t cap) {
     if (!p || !out || cap == 0) {
         return -1;
     }
 
-    quic_hdr h;
-    if (parse_initial_header(p, n, &h) != 0) {
-        return -1;
-    }
-
-    uint8_t plain[D2K_QUIC_MAX_DGRAM];
-    size_t plain_len;
-    if (decrypt_initial(p, &h, plain, &plain_len) != 0) {
-        return -1;
-    }
-
-    crypto_chunk chunks[D2K_QUIC_MAX_CRYPTO_CHUNKS];
-    size_t n_chunks = collect_crypto_frames(plain, plain_len, chunks);
-
     uint8_t stream[D2K_QUIC_MAX_DGRAM];
-    size_t filled = reassemble_crypto_stream(plain, chunks, n_chunks, stream, sizeof stream);
+    size_t filled = crypto_stream_of(p, n, stream, sizeof stream);
 
     size_t sni_off, sni_len;
     if (find_client_hello_sni(stream, filled, &sni_off, &sni_len) != 0) {

@@ -119,6 +119,20 @@ size_t d2k_qw_varint_write(uint8_t *p, size_t cap, uint64_t v);
 int d2k_qw_hdr_parse(const uint8_t *p, size_t n, size_t dcid_len_short,
                      d2k_qw_hdr *out);
 
+/* Собирает НЕЗАЩИЩЁННЫЙ длинный заголовок вплоть до поля Length включительно
+ * — ровно то, что принимает d2k_qw_seal. Номер пакета и тело допишет он.
+ *
+ * payload_len — длина тела ДО шифрования: поле Length обязано учесть номер
+ * пакета, тело и тег AEAD (16 байт), иначе получатель отрежет пакет не там.
+ *
+ * out обязан вмещать 1+4+1+dcid_len+1+scid_len (+1 на пустой токен у Initial)
+ * +8; на практике хватает 64 байт. Возвращает длину заголовка, 0 — отказ
+ * (слишком длинный идентификатор либо непредставимая длина). */
+size_t d2k_qw_long_hdr(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
+                       const uint8_t *dcid, size_t dcid_len,
+                       const uint8_t *scid, size_t scid_len,
+                       size_t pn_len, size_t payload_len);
+
 /* --- номера пакетов (RFC 9000 §17.1, A.2/A.3) --------------------------- */
 
 /* Сколько байт нужно, чтобы закодировать pn при подтверждённом largest_acked

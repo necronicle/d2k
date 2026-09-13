@@ -110,6 +110,41 @@ static uint8_t long_type_v1(uint32_t version, uint8_t raw) {
     }
 }
 
+/* Обратное long_type_v1: из номера v1 в тот, который положено написать на
+ * проводе для этой версии. Пишется здесь, рядом с прямым преобразованием, —
+ * разъехаться они могут только вместе. */
+static uint8_t long_type_wire(uint32_t version, uint8_t v1) {
+    if (version != D2K_QW_V2) { return v1; }
+    switch (v1) {
+    case D2K_QW_LT_INITIAL:   return 1;
+    case D2K_QW_LT_0RTT:      return 2;
+    case D2K_QW_LT_HANDSHAKE: return 3;
+    default:                  return 0;   /* Retry в v2 — нулевой */
+    }
+}
+
+size_t d2k_qw_long_hdr(uint8_t *out, size_t cap, uint32_t version, uint8_t type,
+                       const uint8_t *dcid, size_t dcid_len,
+                       const uint8_t *scid, size_t scid_len,
+                       size_t pn_len, size_t payload_len) {
+    if (!out || dcid_len > D2K_QW_CID_MAX || scid_len > D2K_QW_CID_MAX) { return 0; }
+    if ((dcid_len && !dcid) || (scid_len && !scid)) { return 0; }
+    size_t need = 1 + 4 + 1 + dcid_len + 1 + scid_len + 1 + 8;
+    if (cap < need) { return 0; }
+
+    uint8_t w = long_type_wire(version, type);
+    size_t o = 0;
+    out[o++] = (uint8_t)(0xc0 | (uint8_t)(w << 4));   /* форма, фикс. бит, тип */
+    out[o++] = (uint8_t)(version >> 24); out[o++] = (uint8_t)(version >> 16);
+    out[o++] = (uint8_t)(version >> 8);  out[o++] = (uint8_t)version;
+    out[o++] = (uint8_t)dcid_len; memcpy(out + o, dcid, dcid_len); o += dcid_len;
+    out[o++] = (uint8_t)scid_len; memcpy(out + o, scid, scid_len); o += scid_len;
+    if (type == D2K_QW_LT_INITIAL) { out[o++] = 0x00; }   /* токена нет */
+    size_t vl = d2k_qw_varint_write(out + o, cap - o, (uint64_t)(pn_len + payload_len + 16));
+    if (vl == 0) { return 0; }
+    return o + vl;
+}
+
 int d2k_qw_hdr_parse(const uint8_t *p, size_t n, size_t dcid_len_short,
                      d2k_qw_hdr *out) {
     if (!p || !out || n < 1) { return -1; }

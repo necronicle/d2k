@@ -179,23 +179,6 @@ static size_t crypto_ready(const crypto_rx *c) {
 
 /* --- отправка -------------------------------------------------------------- */
 
-/* Собирает длинный заголовок вплоть до поля Length включительно. Возвращает
- * длину заголовка; payload_len нужен, чтобы поле Length сошлось. */
-static size_t long_hdr(uint8_t *out, uint32_t version, uint8_t type,
-                       const uint8_t *dcid, size_t dcid_len,
-                       const uint8_t *scid, size_t scid_len,
-                       size_t pn_len, size_t payload_len) {
-    size_t o = 0;
-    out[o++] = (uint8_t)(0xc0 | (type << 4));   /* форма, фикс. бит, тип */
-    out[o++] = (uint8_t)(version >> 24); out[o++] = (uint8_t)(version >> 16);
-    out[o++] = (uint8_t)(version >> 8);  out[o++] = (uint8_t)version;
-    out[o++] = (uint8_t)dcid_len; memcpy(out + o, dcid, dcid_len); o += dcid_len;
-    out[o++] = (uint8_t)scid_len; memcpy(out + o, scid, scid_len); o += scid_len;
-    if (type == D2K_QW_LT_INITIAL) { out[o++] = 0x00; }   /* токена нет */
-    o += d2k_qw_varint_write(out + o, 8, (uint64_t)(pn_len + payload_len + 16));
-    return o;
-}
-
 /* Кадр ACK по одному диапазону: наибольший принятый и сколько идёт подряд.
  * Диапазонами сложнее нам не нужно — за два пакета рукопожатия дыр не
  * набирается, а соврать в ACK нельзя: сервер поверит и не переотправит. */
@@ -240,8 +223,10 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                от поля Length, то есть от длины тела. Два прохода дешевле, чем
                гадание. */
             uint8_t probe[64];
-            size_t h0 = long_hdr(probe, c->version, type, c->dcid, c->dcid_len,
-                                 c->scid, c->scid_len, pn_len, blen);
+            size_t h0 = d2k_qw_long_hdr(probe, sizeof probe, c->version, type,
+                                        c->dcid, c->dcid_len,
+                                        c->scid, c->scid_len, pn_len, blen);
+            if (h0 == 0) { say(err, errcap, "заголовок не собрался"); return -1; }
             size_t total = h0 + pn_len + blen + 16;
             if (total < pad_to && blen + (pad_to - total) <= sizeof body) {
                 size_t add = pad_to - total;
@@ -249,8 +234,9 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                 blen += add;
             }
         }
-        hlen = long_hdr(pkt, c->version, type, c->dcid, c->dcid_len,
-                        c->scid, c->scid_len, pn_len, blen);
+        hlen = d2k_qw_long_hdr(pkt, sizeof pkt, c->version, type,
+                               c->dcid, c->dcid_len,
+                               c->scid, c->scid_len, pn_len, blen);
     }
 
     size_t n = d2k_qw_seal(&L->tx, lvl != D2K_QW_LEVEL_APP, pkt, hlen,

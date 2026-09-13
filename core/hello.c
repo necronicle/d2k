@@ -431,6 +431,43 @@ static uint8_t g_profile_legacy[TEMPLATE_MAX];
 static size_t  g_profile_legacy_len;
 static int     g_profile_legacy_ready;
 
+int d2k_hello_rename(const uint8_t *ch, size_t n, const char *sni,
+                     uint8_t *out, size_t cap, size_t *out_len) {
+    if (!ch || !sni || !out || !out_len) {
+        return -1;
+    }
+    size_t name_len = strlen(sni);
+    if (name_len == 0) {
+        return -1;
+    }
+    /* Разбор в этом файле начинается с ЗАПИСИ TLS, а на входе её нет. Вместо
+       второго разбора (без записи) приветствие оборачивается записью здесь и
+       разворачивается обратно ниже: запись — три байта типа и версии плюс
+       длина, и ничего о содержимом она не меняет. Второй экземпляр разбора
+       обошёлся бы дороже и разъехался бы с первым — ровно то, чего §2.5 не
+       разрешает. */
+    if (n > 0xFFFF || n + 5 > TEMPLATE_MAX) {
+        return -1;
+    }
+    uint8_t rec[TEMPLATE_MAX];
+    rec[0] = 0x16;              /* handshake */
+    rec[1] = 0x03; rec[2] = 0x01; /* legacy_record_version, как у всех клиентов */
+    wr16(rec + 3, (uint16_t)n);
+    memcpy(rec + 5, ch, n);
+
+    uint8_t spliced[TEMPLATE_MAX];
+    size_t slen = 0;
+    if (splice_sni(rec, n + 5, sni, name_len, spliced, sizeof spliced, &slen) != 0) {
+        return -1;
+    }
+    if (slen < 5 || slen - 5 > cap) {
+        return -1;
+    }
+    memcpy(out, spliced + 5, slen - 5);
+    *out_len = slen - 5;
+    return 0;
+}
+
 int d2k_hello_from_profile(d2k_shape s, const char *sni, uint8_t *out, size_t cap, size_t *out_len) {
     if (!sni || !out || !out_len) {
         return -1;
