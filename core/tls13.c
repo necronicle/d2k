@@ -48,6 +48,7 @@
 #define HS_CLIENT_HELLO 1
 #define HS_SERVER_HELLO 2
 #define HS_FINISHED     20
+#define HS_CERTIFICATE  11
 
 /* Предел одной записи TLS (RFC 8446 §5.1: 2^14 открытого текста плюс накладные). */
 #define REC_MAX 18432
@@ -60,6 +61,9 @@ struct d2k_tls {
     /* Каждый параллельный зонд владеет своим транскриптом. Не static и не
        большой буфер на стеке рабочего потока роутера. */
     uint8_t  transcript[REC_MAX * 4];
+    /* Сверка имени из сертификата сервера: 1 совпало, 0 не совпало,
+       -1 сказать нечего. См. большой комментарий у cert_name_ok. */
+    int      peer_name;
     uint8_t  raw[REC_MAX], wire[REC_MAX + 5];
 
     /* Остаток прочитанного, ещё не отданный вызывающему. */
@@ -147,6 +151,138 @@ static int fill_random(uint8_t *b, size_t n) {
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 static uint16_t get16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
+
+/* --- ИМЯ В СЕРТИФИКАТЕ СЕРВЕРА ------------------------------------------
+ *
+ * ЧТО ЭТО И ЧЕГО ЭТО НЕ ДЕЛАЕТ. Здесь сверяется имя, которым сервер
+ * ПРЕДСТАВИЛСЯ, с именем, которое мы спросили. Это НЕ проверка подлинности:
+ * цепочка не строится, доверенных корней у нас нет, и самоподписанный
+ * сертификат с правильным именем проверку пройдёт. Уровень доказательства от
+ * этого не растёт и расти не может (§4.2: зонд как был на третьем, так и
+ * остался) — задача ровно одна, зато важная в поле: не записать в
+ * «подтверждено» разговор с ЧУЖИМ сервером.
+ *
+ * Зачем это нужно именно на цензурируемой линии. Коробка, которая
+ * ТЕРМИНИРУЕТ TLS и отдаёт страницу блокировки, даёт зонду ровно ту же
+ * картину, что рабочий обход: рукопожатие сошлось, HTTP ответил 200. Без
+ * сверки имени такой ответ записывается успехом плана, и каталог наполняется
+ * «обходами», которые ведут в страницу блокировки. Различить это дёшево:
+ * у своего сертификата коробки в SAN будет не то имя.
+ *
+ * Ответ трёхзначный, как и всё в этом проекте: 1 — имя совпало, 0 — имя
+ * НЕ совпало, -1 — сказать нечего (сертификата не было, SAN не нашлось,
+ * разбор не сошёлся). «Не измерено» не превращается в «нет» (§2.4). */
+
+/* Длина DER по месту. 0 — разобрать не вышло; *hdr — сколько байт занял сам
+   заголовок длины. Неопределённая длина (0x80) в DER запрещена, и здесь она
+   считается ошибкой, а не «до конца». */
+static size_t der_len(const uint8_t *p, size_t avail, size_t *hdr) {
+    if (avail < 1) { return 0; }
+    if (p[0] < 0x80) { *hdr = 1; return p[0]; }
+    size_t n = (size_t)(p[0] & 0x7F);
+    if (n == 0 || n > 4 || avail < 1 + n) { return 0; }
+    size_t v = 0;
+    for (size_t i = 0; i < n; i++) { v = (v << 8) | p[1 + i]; }
+    *hdr = 1 + n;
+    return v;
+}
+
+static int ascii_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+/* Совпадает ли имя из сертификата с тем, что мы спросили.
+ *
+ * Подстановочный знак — ТОЛЬКО в первой метке и только целой меткой
+ * (RFC 6125 §6.4.3): "*.example.com" покрывает "a.example.com" и не покрывает
+ * ни "example.com", ни "a.b.example.com". Частичные вида "w*.example.com" не
+ * поддерживаются намеренно: они выведены из обращения и их поддержка
+ * расширяла бы совпадение там, где сегодня оно сузилось бы честно. */
+static int name_matches(const char *pat, size_t plen, const char *host) {
+    size_t hlen = strlen(host);
+    if (plen == 0 || hlen == 0) { return 0; }
+    if (plen > 2 && pat[0] == '*' && pat[1] == '.') {
+        const char *dot = strchr(host, '.');
+        if (!dot || dot == host) { return 0; }
+        const char *rest = dot + 1;
+        size_t rlen = strlen(rest);
+        if (rlen != plen - 2) { return 0; }
+        for (size_t i = 0; i < rlen; i++) {
+            if (ascii_lower((unsigned char)rest[i]) != ascii_lower((unsigned char)pat[2 + i])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (plen != hlen) { return 0; }
+    for (size_t i = 0; i < hlen; i++) {
+        if (ascii_lower((unsigned char)host[i]) != ascii_lower((unsigned char)pat[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Ищет расширение subjectAltName в DER сертификата и сверяет его dNSName с
+   host. OID 2.5.29.17 на проводе — 06 03 55 1D 11.
+
+   Поиск идёт ПО БАЙТАМ, а не полным обходом X.509: полный обход означал бы
+   разбор всей структуры сертификата ради одного поля, а совпадение этих пяти
+   байт вне расширения возможно только в данных, которые мы всё равно не
+   примем за SAN — следом обязаны идти OCTET STRING и SEQUENCE нужной формы,
+   иначе разбор честно отвечает «сказать нечего». */
+static int cert_name_ok(const uint8_t *der, size_t len, const char *host) {
+    static const uint8_t oid[] = { 0x06, 0x03, 0x55, 0x1D, 0x11 };
+    for (size_t i = 0; i + sizeof oid <= len; i++) {
+        if (memcmp(der + i, oid, sizeof oid) != 0) { continue; }
+        size_t q = i + sizeof oid;
+        /* Необязательный признак critical. */
+        if (q + 3 <= len && der[q] == 0x01 && der[q + 1] == 0x01) { q += 3; }
+        if (q >= len || der[q] != 0x04) { continue; }     /* OCTET STRING */
+        size_t hdr = 0;
+        size_t olen = der_len(der + q + 1, len - q - 1, &hdr);
+        if (olen == 0 || q + 1 + hdr + olen > len) { continue; }
+        const uint8_t *gn = der + q + 1 + hdr;
+        size_t gnlen = olen;
+        if (gnlen < 2 || gn[0] != 0x30) { continue; }     /* GeneralNames */
+        size_t shdr = 0;
+        size_t slen = der_len(gn + 1, gnlen - 1, &shdr);
+        if (slen == 0 || 1 + shdr + slen > gnlen) { continue; }
+        const uint8_t *e = gn + 1 + shdr;
+        size_t left = slen;
+        int saw_dns = 0;
+        while (left >= 2) {
+            uint8_t tag = e[0];
+            size_t ehdr = 0;
+            size_t elen = der_len(e + 1, left - 1, &ehdr);
+            if (1 + ehdr + elen > left) { break; }
+            if (tag == 0x82) {                            /* dNSName */
+                saw_dns = 1;
+                if (name_matches((const char *)(e + 1 + ehdr), elen, host)) { return 1; }
+            }
+            e += 1 + ehdr + elen;
+            left -= 1 + ehdr + elen;
+        }
+        return saw_dns ? 0 : -1;
+    }
+    return -1;
+}
+
+/* Достаёт ЛИСТОВОЙ сертификат из сообщения Certificate (TLS 1.3, RFC 8446
+   §4.4.2) и сверяет его имя. Тело: длина контекста (байт), затем список,
+   каждая запись — трёхбайтная длина, DER, двухбайтные расширения. Нужен
+   только первый: подписывает ответ сервера именно он. */
+static int cert_msg_name_ok(const uint8_t *body, size_t len, const char *host) {
+    if (len < 1) { return -1; }
+    size_t ctx = body[0];
+    size_t o = 1 + ctx;
+    if (o + 3 > len) { return -1; }
+    size_t list = (size_t)body[o] << 16 | (size_t)body[o + 1] << 8 | body[o + 2];
+    o += 3;
+    if (list < 3 || o + list > len) { return -1; }
+    size_t clen = (size_t)body[o] << 16 | (size_t)body[o + 1] << 8 | body[o + 2];
+    o += 3;
+    if (clen == 0 || o + clen > len) { return -1; }
+    return cert_name_ok(body + o, clen, host);
+}
 
 /* --- сборка ClientHello -------------------------------------------------- */
 
@@ -385,6 +521,7 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
     d2k_tls *t = calloc(1, sizeof *t);
     if (!t) { say(err, errcap, "не хватило памяти"); return -1; }
     t->fd = fd;
+    t->peer_name = -1;   /* пока не смотрели — «сказать нечего», а не «нет» */
     uint8_t *tr = t->transcript;
     size_t tr_len = 0;
 
@@ -530,6 +667,23 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
         if (done) { break; }
     }
 
+    /* ИМЯ СЕРВЕРА — из транскрипта, а не из отдельной записи: сообщение
+       рукопожатия вправе быть разрезано между записями, и разбор по одной
+       записи нашёл бы половину сертификата. Транскрипт же собран подряд и
+       без заголовков записей — по нему сообщения ходятся заголовками. */
+    if (sni && sni[0]) {
+        size_t o = 0;
+        while (o + 4 <= tr_len) {
+            size_t blen = (size_t)tr[o + 1] << 16 | (size_t)tr[o + 2] << 8 | tr[o + 3];
+            if (o + 4 + blen > tr_len) { break; }
+            if (tr[o] == HS_CERTIFICATE) {
+                t->peer_name = cert_msg_name_ok(tr + o + 4, blen, sni);
+                break;
+            }
+            o += 4 + blen;
+        }
+    }
+
     /* Прикладные ключи считаются от транскрипта ДО нашего Finished. */
     uint8_t derived2[32], master[32], c_ap[32], s_ap[32];
     if (derive_secret(hs, "derived", NULL, 0, derived2) != 0) {
@@ -623,5 +777,7 @@ long d2k_tls_read(d2k_tls *t, uint8_t *buf, size_t cap, int wait_ms,
         return (long)take;
     }
 }
+
+int d2k_tls_peer_name(const d2k_tls *t) { return t ? t->peer_name : -1; }
 
 void d2k_tls_free(d2k_tls *t) { free(t); }

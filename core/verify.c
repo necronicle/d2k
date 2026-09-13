@@ -85,6 +85,7 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
+    r.name_ok = -1;   /* не смотрели — «сказать нечего», а не «нет» (§2.4) */
     snprintf(r.reason, sizeof r.reason, "проба не начиналась");
     const char *host = (sni && sni[0]) ? sni : ip;
     if (!host || !host[0]) { return r; }
@@ -118,6 +119,7 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
         return r;
     }
     r.level = D2K_VER_HANDSHAKE;
+    r.name_ok = d2k_tls_peer_name(t);
     snprintf(r.reason, sizeof r.reason, "рукопожатие завершено, приложение молчит");
 
     char req[512];

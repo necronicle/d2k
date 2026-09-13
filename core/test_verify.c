@@ -276,6 +276,16 @@ static int parse_client_hello(const uint8_t *ch, size_t len,
    стенда, читается тестом после join — гонки нет. */
 static size_t stand_ch_wire;
 
+/* Имя, которым мишень представляется в сертификате. NULL — сертификата нет
+   вовсе (так стенд вёл себя всегда: подлинность здесь не измеряется).
+   Ставится тестом ДО запуска потока стенда.
+
+   Сертификат ненастоящий и настоящим быть не обязан: зонд ищет в нём ровно
+   расширение subjectAltName и ровно его dNSName, а цепочку не строит и
+   строить не будет (см. d2k_tls_peer_name). Стенд кладёт эти байты и ничего
+   больше — так проверяется РАЗБОР, а не чужая библиотека X.509. */
+static const char *stand_cert_name;
+
 static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     uint8_t tr[REC_MAX * 2];
     size_t tr_len = 0;
@@ -353,10 +363,38 @@ static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
 
     /* EncryptedExtensions и Finished — ОДНОЙ записью: клиент обязан искать
        Finished среди нескольких сообщений записи, а не по первому байту. */
-    uint8_t flight[4 + 2 + 4 + 32];
+    uint8_t flight[1024];
     size_t f = 0;
     flight[f++] = 8; flight[f++] = 0; flight[f++] = 0; flight[f++] = 2;
     put16(flight + f, 0); f += 2;                 /* расширений нет */
+    if (stand_cert_name) {
+        size_t nlen = strlen(stand_cert_name);
+        if (nlen > 100) { return -1; }            /* всё длины однобайтные */
+        uint8_t der[128];
+        size_t d = 0;
+        der[d++] = 0x06; der[d++] = 0x03;         /* OID 2.5.29.17 */
+        der[d++] = 0x55; der[d++] = 0x1D; der[d++] = 0x11;
+        der[d++] = 0x04; der[d++] = (uint8_t)(2 + 2 + nlen);   /* OCTET STRING */
+        der[d++] = 0x30; der[d++] = (uint8_t)(2 + nlen);       /* GeneralNames */
+        der[d++] = 0x82; der[d++] = (uint8_t)nlen;             /* dNSName */
+        memcpy(der + d, stand_cert_name, nlen); d += nlen;
+
+        size_t body = 1 + 3 + 3 + d + 2;
+        flight[f++] = 11;                                       /* Certificate */
+        flight[f++] = (uint8_t)(body >> 16);
+        flight[f++] = (uint8_t)(body >> 8);
+        flight[f++] = (uint8_t)body;
+        flight[f++] = 0;                                        /* контекст пуст */
+        size_t list = 3 + d + 2;
+        flight[f++] = (uint8_t)(list >> 16);
+        flight[f++] = (uint8_t)(list >> 8);
+        flight[f++] = (uint8_t)list;
+        flight[f++] = (uint8_t)(d >> 16);
+        flight[f++] = (uint8_t)(d >> 8);
+        flight[f++] = (uint8_t)d;
+        memcpy(flight + f, der, d); f += d;
+        flight[f++] = 0; flight[f++] = 0;                       /* расширений нет */
+    }
     memcpy(tr + tr_len, flight, f);
     tr_len += f;
 
@@ -364,9 +402,10 @@ static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     if (d2k_hkdf_expand_label(s_hs, "finished", fin_key, 32) != 0) { return -1; }
     d2k_sha256(tr, tr_len, th);
     d2k_hmac_sha256(fin_key, 32, th, 32, verify);
+    size_t fin_at = f;
     flight[f++] = 20; flight[f++] = 0; flight[f++] = 0; flight[f++] = 32;
     memcpy(flight + f, verify, 32); f += 32;
-    memcpy(tr + tr_len, flight + 6, 4 + 32);
+    memcpy(tr + tr_len, flight + fin_at, 4 + 32);
     tr_len += 4 + 32;
     if (rec_write(c, wr, REC_HANDSHAKE, flight, f) != 0) { return -1; }
 
@@ -600,6 +639,38 @@ int main(void) {
         CHECK(r.fd >= 0, "сокет закрыт до явного d2k_verify_close");
         d2k_verify_close(&r);
         stand_stop(&s);
+    }
+
+    /* --- ИМЯ, КОТОРЫМ ПРЕДСТАВИЛСЯ СЕРВЕР -------------------------------
+       Коробка, ТЕРМИНИРУЮЩАЯ TLS и отдающая страницу блокировки, даёт зонду
+       ровно ту же картину, что рабочий обход: рукопожатие сошлось, HTTP
+       ответил 200. Отличить её можно только по имени в сертификате — и это
+       не проверка подлинности (цепочка не строится), а защита от записи
+       «подтверждено» на разговоре с ЧУЖИМ сервером.
+
+       Ответ трёхзначный: 1 совпало, 0 НЕ совпало, -1 сказать нечего. */
+    {
+        struct { const char *cert; const char *ask; int want; const char *what; } cn[] = {
+            { "стенд.пример",  "стенд.пример", 1,  "точное совпадение" },
+            { "чужой.пример",  "стенд.пример", 0,  "чужое имя" },
+            { "*.пример",      "стенд.пример", 1,  "подстановочная первая метка" },
+            { "*.пример",      "пример",       0,  "подстановка не покрывает голый домен" },
+            { NULL,            "стенд.пример", -1, "сертификата нет вовсе" },
+        };
+        for (size_t i = 0; i < sizeof cn / sizeof cn[0]; i++) {
+            struct stand s;
+            stand_cert_name = cn[i].cert;
+            uint16_t port = stand_start(&s, ROLE_APP);
+            CHECK(port != 0, "стенд для сверки имени не поднялся");
+            d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, cn[i].ask, 3000, 0);
+            CHECK(r.level == D2K_VER_APPLICATION,
+                  "сверка имени сломала рукопожатие — мишень отвечает, а зонд не дошёл");
+            CHECK(r.name_ok == cn[i].want,
+                  "сверка имени сервера дала не тот ответ");
+            d2k_verify_close(&r);
+            stand_stop(&s);
+        }
+        stand_cert_name = NULL;
     }
 
     /* --- ДОБИВКА ДО ДЛИНЫ ПРИВЕТСТВИЯ КЛИЕНТА ---------------------------

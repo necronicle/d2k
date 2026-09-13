@@ -116,6 +116,11 @@ static uint16_t ver_answer_port;
 
 static size_t ver_last_wire;
 
+/* Что подменённый зонд говорит про имя сервера: -1 «сказать нечего» (так
+   ведёт себя стенд без сертификата), 0 — измеренное несовпадение, 1 —
+   совпадение. */
+static int ver_name_ok = -1;
+
 static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire) {
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
@@ -124,6 +129,10 @@ static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
     ver_last_transport = transport;
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
+    /* «Сказать нечего», а не «чужое имя»: ноль здесь значил бы ИЗМЕРЕННОЕ
+       несовпадение, и обнуление структуры молча отменяло бы все
+       подтверждения теста. */
+    r.name_ok = ver_name_ok;
     /* Сокета нет вовсе: ver_close планировщика на отрицательном дескрипторе
        ничего не закрывает, и чужой дескриптор тест не теряет. */
     r.fd = -1;
@@ -1854,6 +1863,42 @@ int main(void) {
               "наблюдение завело привязку — заводить её может только подтверждение");
         d2k_sched_free(s);
         d2k_catalog_free(&cE);
+    }
+
+    /* --- сервер представился ЧУЖИМ именем: это не обход ---------------- */
+    {
+        /* Коробка, терминирующая TLS, доводит зонд до приложения и отвечает
+           страницей блокировки. Уровень «приложение» при этом настоящий —
+           обманывает не он, а вывод из него. */
+        d2k_catalog cN;
+        memset(&cN, 0, sizeof cN);
+        d2k_sched *s = d2k_sched_new(&cN, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40180;
+        ver_calls = 0;
+        ver_name_ok = 0;                 /* ИЗМЕРЕННОЕ несовпадение */
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40180, "подмена.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40180);
+        d2k_sched_event(s, &su);
+        settle(s);
+        d2k_ev ap = ev_applied(6, 40180);
+        d2k_sched_event(s, &ap);
+        run_out(s);
+
+        CHECK(said("представился ЧУЖИМ"),
+              "разговор с чужим сервером не назван своим именем");
+        CHECK(binding_of(&cN, "подмена.цель", 6) == NULL,
+              "страница блокировки записана обходом — каталог наполняется ложью");
+        ver_name_ok = -1;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cN);
     }
 
     /* --- зонд ходит ДЛИНОЙ КЛИЕНТА, а не своей ------------------------- */
