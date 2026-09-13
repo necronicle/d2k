@@ -194,6 +194,7 @@ static d2k_ver_result verify_default(const char *ip, uint16_t port, uint8_t tran
         d2k_ver_result r;
         memset(&r, 0, sizeof r);
         r.fd = -1;
+        r.unsupported = 1;
         snprintf(r.reason, sizeof r.reason,
                  "зонда подтверждения для QUIC нет — не измерено");
         return r;
@@ -2491,6 +2492,22 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             t->ver_flow.b_port = t->port;
             t->ver_flow.transport = t->transport;
             claim_early_refusal(t);
+            if (t->ver.unsupported) {
+                /* НЕ ПРО КАНДИДАТА, А ПРО ТРАНСПОРТ. Следующий кандидат
+                   получит тот же ответ, и перебор потратил бы весь бюджет
+                   зондов на установку планов, которых никто не проверит, —
+                   а на живом роутере таких целей десятки (браузер ходит по
+                   QUIC ко всему подряд). Закрываем задачу и говорим прямо:
+                   мерить умеем, подтверждать нечем. В каталог не идёт
+                   ничего (§10). */
+                say(s, "по %s (%s) подтверждать нечем: %s. Кандидатов не перебираю — "
+                       "ответ будет тот же, а знание в каталог не попадёт",
+                    t->name, t->transport == 17 ? "QUIC" : "TCP", t->ver.reason);
+                ver_close(t);
+                task_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
             if (t->ver.level != D2K_VER_APPLICATION) {
                 /* СПЕРВА — НАША ЛИ ЭТО НЕУДАЧА. Зонд мог не дойти до
                    приложения просто потому, что воздействия не было: посылка

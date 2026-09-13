@@ -121,6 +121,10 @@ static size_t ver_last_wire;
    совпадение. */
 static int ver_name_ok = -1;
 
+/* Умеет ли подменённый зонд такой транспорт. Ноль — умеет (так он вёл себя
+   всегда), единица — «не про кандидата, а про транспорт». */
+static int ver_unsupported;
+
 static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire) {
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
@@ -133,6 +137,7 @@ static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
        несовпадение, и обнуление структуры молча отменяло бы все
        подтверждения теста. */
     r.name_ok = ver_name_ok;
+    r.unsupported = ver_unsupported;
     /* Сокета нет вовсе: ver_close планировщика на отрицательном дескрипторе
        ничего не закрывает, и чужой дескриптор тест не теряет. */
     r.fd = -1;
@@ -1863,6 +1868,43 @@ int main(void) {
               "наблюдение завело привязку — заводить её может только подтверждение");
         d2k_sched_free(s);
         d2k_catalog_free(&cE);
+    }
+
+    /* --- подтверждать нечем: перебор кандидатов не начинается ---------- */
+    {
+        /* У QUIC вопросник есть, а зонда подтверждения нет. Перебор в такой
+           задаче потратил бы весь бюджет зондов на установку планов, которых
+           никто не проверит, — а на живом роутере таких целей десятки. */
+        d2k_catalog cU;
+        memset(&cU, 0, sizeof cU);
+        d2k_sched *s = d2k_sched_new(&cU, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;   /* не важно: до ответа не дойдёт */
+        ver_fail_first = 0;
+        ver_answer_port = 40190;
+        ver_calls = 0;
+        ver_unsupported = 1;
+        forget_sent();
+
+        d2k_ev h = ev_hello(17, 40190, "квик.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40190);
+        d2k_sched_event(s, &su);
+        run_out(s);
+
+        CHECK(said("подтверждать нечем"),
+              "транспорт без зонда подтверждения не назван своим именем");
+        CHECK(ver_calls == 1,
+              "перебор кандидатов пошёл дальше, хотя ответ будет тот же — "
+              "бюджет зондов тратится впустую");
+        CHECK(binding_of(&cU, "квик.цель", 17) == NULL,
+              "непроверяемый транспорт дал запись в каталоге");
+        ver_unsupported = 0;
+        quic_answer = D2K_V_CLEAR;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cU);
     }
 
     /* --- сервер представился ЧУЖИМ именем: это не обход ---------------- */
