@@ -879,6 +879,35 @@ int main(void) {
         d2k_catalog_free(&cP);
     }
 
+    /* То же для QUIC: у него свой сокет внутри рукопожатия, и порт для него
+       занимается ДРУГИМ вызовом (датаграммным). Пока этого не было, в журнале
+       стояло «порт зонда 0» и испытание по QUIC действовало на всех. */
+    {
+        d2k_catalog cQ2;
+        memset(&cQ2, 0, sizeof cQ2);
+        d2k_sched *s = d2k_sched_new(&cQ2, sv[0], 0x2d);
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_last_fd = -2;
+        ver_answer_port = 40302;
+        d2k_ev h = ev_hello(17, 40302, "квик.под.портом");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40302);
+        d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "квик.под.портом") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        settle(s);
+        CHECK(ver_calls >= 1, "зонд QUIC не пошёл вовсе");
+        CHECK(ver_last_fd >= 0,
+              "зонду QUIC достался пустой сокет — испытание по QUIC действует на всех");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cQ2);
+    }
+
     /* --- ПРОБНЫЙ ПЛАН СТАВИТСЯ ПОД ФОРМУ ЗОНДА, А НЕ КЛИЕНТА -------------
      *
      * План ставится РАДИ ИСПЫТАНИЯ, а испытывает его наш зонд: он ведёт своё

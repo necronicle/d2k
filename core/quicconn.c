@@ -589,7 +589,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         say(err, errcap, "открытый ключ не посчитался"); free(c); return -1;
     }
 
-    c->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    c->fd = (o->use_fd > 0) ? o->use_fd : socket(AF_INET, SOCK_DGRAM, 0);
     if (c->fd < 0) { say(err, errcap, "сокет: %s", strerror(errno)); free(c); return -1; }
     if (o->mark) { (void)d2k_mark_hook(c->fd, o->mark); }
 

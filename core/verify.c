@@ -170,6 +170,14 @@ void d2k_verify_close(d2k_ver_result *r) {
 
 d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *sni,
                                      int deadline_ms, size_t hello_wire) {
+    return d2k_verify_probe_quic_on(-1, ip, port, sni, deadline_ms, hello_wire);
+}
+
+/* use_fd — УЖЕ ЗАНЯТЫЙ сокет UDP (d2k_props_bind_udp), под чей местный порт
+   поставлен пробный план. Меньше единицы — завести свой. */
+d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
+                                        const char *sni, int deadline_ms,
+                                        size_t hello_wire) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -192,6 +200,7 @@ d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *
     o.alpn = "h3";
     o.deadline_ms = deadline_ms > 0 ? deadline_ms : 5000;
     o.pad_to = hello_wire;
+    o.use_fd = use_fd;
     /* Метки НЕТ намеренно — ровно по той же причине, что у TCP-зонда: к
        помеченному пакету поставленный план не применится, и зонд мерил бы
        линию БЕЗ обхода, считая, что мерит с обходом. */

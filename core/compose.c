@@ -475,9 +475,9 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
    Читать из сокета по-прежнему не нужно (судит датапат по проводу, см. шапку
    файла): держать открытым и читать — разные вещи, и здесь нужно первое.
    Закрывает вызывающий, ПОСЛЕ ожидания обмена. */
-int d2k_props_bind(int *out_fd, uint16_t *sport_be) {
+static int props_bind_any(int type, int *out_fd, uint16_t *sport_be) {
     if (out_fd) { *out_fd = -1; }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, type, 0);
     if (fd < 0) { return -1; }
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
@@ -491,6 +491,14 @@ int d2k_props_bind(int *out_fd, uint16_t *sport_be) {
     if (sport_be) { *sport_be = got.sin_port; }   /* сетевой порядок, как есть */
     if (out_fd) { *out_fd = fd; } else { close(fd); return -1; }
     return 0;
+}
+
+int d2k_props_bind(int *out_fd, uint16_t *sport_be) {
+    return props_bind_any(SOCK_STREAM, out_fd, sport_be);
+}
+
+int d2k_props_bind_udp(int *out_fd, uint16_t *sport_be) {
+    return props_bind_any(SOCK_DGRAM, out_fd, sport_be);
 }
 
 int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
@@ -1303,6 +1311,13 @@ static const unsigned g_fb_dup_reps[]  = { 2, 3, 4, 7 };
 #define FB_N_OVL  (sizeof g_fb_ovl_len / sizeof g_fb_ovl_len[0])
 #define FB_N_DUP  ((sizeof g_fb_dup_gap / sizeof g_fb_dup_gap[0]) * \
                    (sizeof g_fb_dup_reps / sizeof g_fb_dup_reps[0]))
+
+/* Сколько всего плеч в списке — см. контракт в d2k_compose.h. Складывается из
+   тех же слагаемых, что и разбор индекса в fb_arm_at ниже: голова плюс четыре
+   параметрических семейства. */
+size_t d2k_fallback_arms(void) {
+    return FB_N_HEAD + FB_N_FAKE + FB_N_FAKE + FB_N_OVL * 2 + FB_N_DUP;
+}
 
 /* Плечо по номеру. 0 — заполнено, -1 — номер за концом списка. */
 static int fb_arm_at(size_t idx, fb_arm *a) {

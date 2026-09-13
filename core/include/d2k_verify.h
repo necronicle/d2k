@@ -119,6 +119,12 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
 d2k_ver_result d2k_verify_probe_quic(const char *ip, uint16_t port, const char *sni,
                                      int deadline_ms, size_t hello_wire);
 
+/* То же на УЖЕ ЗАНЯТОМ сокете UDP — испытанию кандидата по QUIC, чтобы его
+ * план достался только потоку зонда (d2k_props_bind_udp). */
+d2k_ver_result d2k_verify_probe_quic_on(int use_fd, const char *ip, uint16_t port,
+                                        const char *sni, int deadline_ms,
+                                        size_t hello_wire);
+
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */
 void d2k_verify_close(d2k_ver_result *r);

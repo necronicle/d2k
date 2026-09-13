@@ -105,6 +105,11 @@ int  d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
  * d2k_props_contact как готовый. Закрывает вызывающий. */
 int  d2k_props_bind(int *out_fd, uint16_t *sport_be);
 
+/* То же для UDP — зонду QUIC. Отдельная функция, а не флаг: тип сокета
+ * задаётся при создании, и «тот же bind, только SOCK_DGRAM» — это другой
+ * вызов, а не другой аргумент. */
+int  d2k_props_bind_udp(int *out_fd, uint16_t *sport_be);
+
 /* Как d2k_props_contact, но на УЖЕ ЗАНЯТОМ сокете (d2k_props_bind). use_fd
  * меньше нуля означает «создать свой» — тогда это в точности
  * d2k_props_contact. */
