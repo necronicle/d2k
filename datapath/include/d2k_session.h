@@ -274,4 +274,10 @@ const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t
 
 const d2k_journal *d2k_session_journal(const d2k_session *s);
 
+/* Сколько потоков с планом вёл conntrack, сколько не вёл (посылки ушли бы
+ * мимо NAT — план отвергнут) и сколько раз таблицы не было вовсе. Нужны
+ * диагностике: без них «обход работает только для самого роутера»
+ * выясняется только захватом трафика (так и выяснялось 13.09.2026). */
+void d2k_session_nat_stats(uint64_t *ok, uint64_t *miss, uint64_t *none);
+
 #endif /* D2K_SESSION_H */

@@ -29,20 +29,20 @@ COREOBJ  = core_quic.o core_quicwire.o core_crypto.o
 COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h
 
 # Переносимый датапат: собирается и проверяется на любой машине.
-SRC     = plan_parse.c plan_apply.c tls.c wire.c wire_udp.c track.c session.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
+SRC     = plan_parse.c plan_apply.c tls.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
 # Системный слой: только Linux. На маке не собирается намеренно — подделывать
 # сокеты ядра ради сборки значило бы проверять подделку. Проверяется целью
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c
 DAEMON   = d2kd.c
-HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
+HDR     = include/d2k_plan.h include/d2k_nat.h include/d2k_tls.h include/d2k_wire.h include/d2k_track.h include/d2k_session.h include/d2k_nl.h include/d2k_sched.h include/d2k_nfq.h include/d2k_raw.h include/d2k_journal.h include/d2k_plans.h include/d2k_ctl.h include/d2k_ctlsrv.h plan_internal.h $(COREHDR)
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
-TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nl test_sched test_journal test_plans test_ctl test_quic_session
+TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_quic_session
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session cross clean
 
 all: planlab ctlprobe
 
@@ -93,10 +93,10 @@ ctl.o: ctl.c $(HDR)
 # настоящим кадром вовсе — отказ «нет места» от отказа «план негоден»
 # различимы на уровне ЭТОГО разбора, и подделывать его нельзя (см. шапку
 # файла). Тот же список объектников, что у test_session/ctlprobe.
-test_ctl: test_ctl.c ctl.o ctlsrv.o session.o journal.o track.o tls.o wire.o \
+test_ctl: test_ctl.c ctl.o ctlsrv.o session.o nat.o journal.o track.o tls.o wire.o \
           wire_udp.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o \
           core_crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o journal.o \
+	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o nat.o journal.o \
 	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
 	    core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
 
@@ -109,14 +109,14 @@ test_journal: test_journal.c journal.o track.o $(HDR)
 # wire_udp.o и core_quic.o/core_crypto.o добавлены задачей 4: session.c теперь
 # зовёт d2k_wire_build_udp и разбор QUIC на UDP-ветке пакетного пути, и без
 # них линковка падает неопределёнными ссылками.
-test_session: test_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
+test_session: test_session.c session.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
 
 # test_quic_session.c (задача 4) — то же самое дерево модулей, что и
 # test_session, тем же списком объектников: обе проверяют d2k_session_packet
 # целиком, только на разных транспортах.
-test_quic_session: test_quic_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
+test_quic_session: test_quic_session.c session.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -129,6 +129,17 @@ wire.o: wire.c $(HDR)
 
 wire_udp.o: wire_udp.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Трансляция NAT: каким адресом поток виден серверу. Нужна ПОТОМУ, что
+# очередь висит на mangle POSTROUTING, а SNAT делается позже — см. d2k_nat.h.
+nat.o: nat.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+test_nat: test_nat.c nat.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_nat.c nat.o $(LDFLAGS)
+
+test-nat: test_nat
+	./test_nat
 
 nl.o: nl.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -289,7 +300,7 @@ d2kd-linux-arm64:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session
+check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session
 
 clean:
 	rm -f *.o $(TESTS) planlab ctlprobe d2kd

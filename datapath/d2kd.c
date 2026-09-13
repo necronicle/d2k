@@ -188,6 +188,11 @@ static int arg_u32(const char *v, uint32_t *out) {
     return 0;
 }
 
+static unsigned port_of(const void *p) {
+    const uint8_t *b = p;
+    return (unsigned)b[0] << 8 | b[1];
+}
+
 static void print_stats(const d2k_session *s, const d2k_sched *sched,
                         const d2k_nfq *q, const d2k_raw *r, uint64_t run_ns) {
     uint64_t cpu_ms = 0, rss_kb = 0;
@@ -258,7 +263,16 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            ", ошибок отправки %" PRIu64 ", ошибок чтения %" PRIu64 "\n",
            d2k_nfq_lost(q), st.verdict_fail, st.send_fail, st.recv_err);
     if (r) {
-        printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
+        {
+        /* Ведётся ли поток conntrack (d2k_nat.h): без этого посылки плана
+           уходят мимо NAT, и обход работает только для трафика самого
+           роутера. */
+        uint64_t nok = 0, nm = 0, nn = 0;
+        d2k_session_nat_stats(&nok, &nm, &nn);
+        printf("поток ведётся conntrack: да %" PRIu64 ", нет %" PRIu64
+               ", таблицы нет %" PRIu64 "\n", nok, nm, nn);
+    }
+    printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));
     }
     printf("отказов по форме приветствия %zu\n",
@@ -274,10 +288,6 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
 /* Порт в ключе лежит в сетевом порядке — ровно как в заголовке. Читаем его
    как сетевой, а не переставляем байты «наугад»: перестановка вслепую уже
    стоила ошибки в контрольных суммах. */
-static unsigned port_of(const void *p) {
-    const uint8_t *b = p;
-    return (unsigned)b[0] << 8 | b[1];
-}
 
 /* Для показа. Источник истины — числовой код в ключе (d2k_key.proto), а не
    этот текст: сравнивать поведение по строке нельзя (тот же принцип, что и
