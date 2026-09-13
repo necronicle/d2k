@@ -652,6 +652,116 @@ int main(void) {
         d2k_catalog_free(&cW);
     }
 
+    /* --- СНИМОК СОСЕДА ЗАКРЫВАЕТ ХОЛОДНЫЙ СТАРТ QUIC ---------------------
+     *
+     * Рилсы Instagram у владельца роутера 13.09.2026 не грузились вовсе:
+     * ролики едут с хостов `scontent-*.cdninstagram.com`, которые меняются от
+     * ролика к ролику, второго обращения к тому же имени не бывает, и задача
+     * умирала с «формы приветствия так и не пришло» — три смерти за тридцать
+     * секунд листания на живой линии.
+     *
+     * Байты приветствия задаёт КЛИЕНТ: снимок, снятый с одной цели, годится
+     * соседней с переписанным именем (d2k_quic_hello_rename — им уже
+     * собирается контроль). Проверяем, что вторая цель мерится СРАЗУ и своим
+     * именем, а не ждёт собственного снимка. */
+    {
+        tcp_calls = quic_calls = 0;
+        d2k_catalog cQ;
+        memset(&cQ, 0, sizeof cQ);
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+
+        d2k_ev h1 = ev_hello(17, 40201, "первая.цель");
+        d2k_sched_event(s, &h1);
+        d2k_ev su1 = ev_suspect(17, 40201);
+        d2k_sched_event(s, &su1);
+        settle(s);
+        CHECK(quic_calls == 0, "первая цель пошла мерить без снимка");
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "первая.цель") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        settle(s);
+        CHECK(quic_calls == 1, "после прихода формы поиск первой цели не начался");
+
+        /* Вторая цель — своего снимка у неё нет и не будет. */
+        d2k_ev h2 = ev_hello(17, 40202, "вторая.цель");
+        d2k_sched_event(s, &h2);
+        d2k_ev su2 = ev_suspect(17, 40202);
+        d2k_sched_event(s, &su2);
+        settle(s);
+        CHECK(quic_calls == 2,
+              "вторая цель QUIC ушла ждать собственный снимок — рилсы так и теряются");
+        CHECK(strcmp(quic_last_trig, "вторая.цель") == 0,
+              "мерить пошли чужим именем: снимок соседа не переименован");
+        CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
+              "контроль из переписанного снимка не собрался");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cQ);
+    }
+
+    /* --- ГОТОВЫЙ ПЛАН УЗНАННОЙ КОРОБКИ СНИМКА НЕ ЖДЁТ -------------------
+     *
+     * Чтобы ИСПЫТАТЬ подтверждённый план, мерить нечего: зонд QUIC ведёт своё
+     * рукопожатие сам, а отпечаток коробки приехал вместе с подозрением.
+     * Прежде эта ветка стояла после требования снимка, и цель с готовым
+     * планом уходила ждать второго обращения наравне с незнакомой. */
+    {
+        tcp_calls = quic_calls = 0;
+        d2k_catalog cK;
+        memset(&cK, 0, sizeof cK);
+        cK.boxes = calloc(1, sizeof *cK.boxes);
+        CHECK(cK.boxes != NULL, "не удалось создать модель коробки");
+        if (cK.boxes) {
+            cK.n_boxes = 1;
+            d2k_cat_box *b = &cK.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-quic-known");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+            b->fp.sig[0].ttl = 127;
+            b->fp.sig[0].tos = 0x88;
+            b->fp.sig[0].ipid = 54321;
+            b->plans = calloc(1, sizeof *b->plans);
+            CHECK(b->plans != NULL, "не удалось создать план модели");
+            if (b->plans) {
+                b->n_plans = 1;
+                b->plans[0].enabled = 1;
+                b->plans[0].successes = 4;
+                snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
+                b->plans[0].text = strdup(
+                    "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                    "proto udp quic\npayload 1 hex aabb\n"
+                    "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
+                    "order forward\n");
+                CHECK(b->plans[0].text != NULL, "текст плана не создался");
+            }
+            if (b->plans && b->plans[0].text) {
+                d2k_sched *s = d2k_sched_new(&cK, sv[0], 0x2d);
+                saidbuf[0] = '\0';
+                d2k_sched_set_say(s, collect_say, NULL);
+                ver_answer = D2K_VER_APPLICATION;
+                ver_fail_first = 0;
+                ver_calls = 0;
+                ver_answer_port = 40203;
+                d2k_ev h = ev_hello(17, 40203, "новый.хост.цдн");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(17, 40203);
+                d2k_sched_event(s, &su);
+                settle(s);
+                CHECK(said("коробка узнана"),
+                      "готовый план узнанной коробки не испытан без снимка");
+                CHECK(quic_calls == 0,
+                      "цель с готовым планом пошла мерить, хотя мерить было незачем");
+                CHECK(ver_calls >= 1, "готовый план не дошёл до зонда");
+                d2k_sched_free(s);
+            }
+        }
+        d2k_catalog_free(&cK);
+    }
+
     /* --- подозрение без предшествующего приветствия: имени нет, искать
      * нечего, и это НЕ отказ ------------------------------------------- */
     {
@@ -974,9 +1084,9 @@ int main(void) {
             c7.boxes[0].plans[0].text = strdup(
                 "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
                 "split payload_start +1\norder reverse\n");
-            c7.boxes[0].binds = calloc(3, sizeof *c7.boxes[0].binds);
-            c7.boxes[0].n_binds = 3;
-            for (int i = 0; i < 3; i++) {
+            c7.boxes[0].binds = calloc(4, sizeof *c7.boxes[0].binds);
+            c7.boxes[0].n_binds = 4;
+            for (int i = 0; i < 4; i++) {
                 snprintf(c7.boxes[0].binds[i].plan_id, sizeof c7.boxes[0].binds[i].plan_id,
                          "plan-эталон");
                 c7.boxes[0].binds[i].transport = 6;
@@ -991,6 +1101,18 @@ int main(void) {
             snprintf(c7.boxes[0].binds[2].kind, sizeof c7.boxes[0].binds[2].kind, "name");
             snprintf(c7.boxes[0].binds[2].target, sizeof c7.boxes[0].binds[2].target, "выключена");
             c7.boxes[0].binds[2].enabled = 0;
+            /* Четвёртая — по АДРЕСУ и с уровнем 2 «сервер ответил»: ровно та
+               запись, что 13.09.2026 сломала контрольную цель на роутере.
+               Доказательство слабее обмена — на провод не едет.
+
+               У первых трёх уровень нулевой, и это НЕ упущение фикстуры: ноль
+               означает «не записано» (старый файл), и он обязан ставиться
+               по-прежнему — иначе правило обнулило бы человеку весь каталог
+               разом. Обе половины правила проверяются одним прогоном. */
+            snprintf(c7.boxes[0].binds[3].kind, sizeof c7.boxes[0].binds[3].kind, "addr");
+            snprintf(c7.boxes[0].binds[3].target, sizeof c7.boxes[0].binds[3].target, "8.47.69.0");
+            c7.boxes[0].binds[3].enabled = 1;
+            c7.boxes[0].binds[3].level = 2;
 
             d2k_sched *s = d2k_sched_new(&c7, sv[0], 0x2d);
             saidbuf[0] = '\0';
@@ -1006,6 +1128,9 @@ int main(void) {
             CHECK(!d2k_sched_sync_pending(s), "проход по каталогу остался незакрытым");
             CHECK(said("поставлено планов по подтверждённым привязкам: 2"),
                   "проход по каталогу не сказал, сколько поставил");
+            CHECK(said("не поставлено привязок со слабым доказательством: 1"),
+                  "привязка уровня «сервер ответил» ушла на провод наравне с "
+                  "подтверждённой либо пропала молча");
             d2k_sched_free(s);
             d2k_catalog_free(&c7);
         }
