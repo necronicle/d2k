@@ -130,8 +130,8 @@ cleanup() {
 trap 'cleanup' EXIT INT TERM
 
 say "== сборка =="
-make -C "$REPO/datapath" d2kd-aarch64 >/dev/null
-BIN="$REPO/builds/d2kd-aarch64"
+make -C "$REPO/datapath" d2kd-linux-arm64 >/dev/null
+BIN="$REPO/builds/d2kd-linux-arm64"
 [ -s "$BIN" ] || { say "бинарник не собрался"; exit 1; }
 LOCAL_SIZE=$(wc -c < "$BIN" | tr -d ' ')
 say "  $LOCAL_SIZE байт"
@@ -178,9 +178,9 @@ if [ "$LEARN" = 1 ]; then
     # Контроллер — d2kc, на C. До 11.09.2026 здесь собирался Go-бинарник и
     # запускался подкомандой `control`; и бинарник, и подкоманда удалены
     # вместе с Go-стороной движка, так что эта ветка скрипта просто падала.
-    make -C "$REPO/core" d2kc-aarch64 >/dev/null
-    CSIZE=$(wc -c < "$REPO/builds/d2kc-aarch64" | tr -d ' ')
-    $SSH_IN "cat > /tmp/d2k.$TOKEN" < "$REPO/builds/d2kc-aarch64"
+    make -C "$REPO/core" d2kc-linux-arm64 >/dev/null
+    CSIZE=$(wc -c < "$REPO/builds/d2kc-linux-arm64" | tr -d ' ')
+    $SSH_IN "cat > /tmp/d2k.$TOKEN" < "$REPO/builds/d2kc-linux-arm64"
     RSIZE=$($SSH "wc -c < /tmp/d2k.$TOKEN" | tr -d ' \r')
     [ "$CSIZE" = "$RSIZE" ] || { say "контроллер доехал испорченным: $CSIZE против $RSIZE"; exit 1; }
     $SSH "chmod +x /tmp/d2k.$TOKEN"

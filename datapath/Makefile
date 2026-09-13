@@ -42,7 +42,7 @@ HDR     = include/d2k_plan.h include/d2k_tls.h include/d2k_wire.h include/d2k_tr
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
 TESTS   = test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nl test_sched test_journal test_plans test_ctl test_quic_session
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-aarch64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session cross clean
+.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session cross clean
 
 all: planlab ctlprobe
 
@@ -263,14 +263,28 @@ cross:
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/planlab-mipsel planlab.c plan_parse.c plan_apply.c || exit 1
 	@echo "переносимость: aarch64 и mipsel собираются, служба линкуется"
 
+# Служба ДЛЯ ЭТОЙ ЖЕ МАШИНЫ. Не удобство, а проверка: лаборатория установки
+# (scripts/lab-install.sh) ставит то, что собрала сама, а не то, что кто-то
+# положил в builds/ неизвестно когда и из какого дерева.
+#
+# На маке НЕ СОБИРАЕТСЯ и не должна: nfq.c/raw.c — Linux (см. LINUXSRC выше).
+# Отказ здесь честен; подделывать сокеты ядра ради сборки значило бы
+# проверять подделку.
+d2kd: $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) $(LDFLAGS)
+
 # Служба для целевого устройства. Статическая musl: на роутере нет ни нужной
 # libc, ни желания зависеть от той, что там есть.
+#
+# ИМЯ ФАЙЛА — то же, что у сборок Go (builds/d2k-linux-arm64): его ищет
+# scripts/install.sh, и расхождение здесь означало бы «скачанного файла нет»
+# на живом роутере. Одно имя на всё, а не два похожих.
 BUILDDIR ?= ../builds
-d2kd-aarch64:
+d2kd-linux-arm64:
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kd-aarch64 $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC)
-	@ls -l $(BUILDDIR)/d2kd-aarch64
+		-o $(BUILDDIR)/d2kd-linux-arm64 $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC)
+	@ls -l $(BUILDDIR)/d2kd-linux-arm64
 
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
@@ -278,4 +292,4 @@ d2kd-aarch64:
 check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nl test-sched test-journal test-plans test-ctl test-quic-session
 
 clean:
-	rm -f *.o $(TESTS) planlab ctlprobe
+	rm -f *.o $(TESTS) planlab ctlprobe d2kd

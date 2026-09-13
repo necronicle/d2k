@@ -43,7 +43,7 @@ fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 echo "== сборка =="
 # Цели d2kd в Makefile нет (на маке он не собирается вовсе — сырые сокеты и
 # NFQUEUE), поэтому собираем тем же списком исходников, что и кросс-цель
-# d2kd-aarch64: DAEMON + LINUXSRC + SRC + CORESRC.
+# d2kd-linux-arm64: DAEMON + LINUXSRC + SRC + CORESRC.
 cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
    -o /tmp/d2kd datapath/d2kd.c datapath/nfq.c datapath/raw.c \
    datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c \

@@ -80,11 +80,11 @@
 Сборка всех трёх, одной серией, в этом порядке:
 
 ```
-make -C /Library/Zapret2/d2k/datapath d2kd-aarch64
-make -C /Library/Zapret2/d2k/core d2kc-aarch64
+make -C /Library/Zapret2/d2k/datapath d2kd-linux-arm64
+make -C /Library/Zapret2/d2k/core d2kc-linux-arm64
 make -C /Library/Zapret2/d2k/core d2kask-aarch64
-shasum -a 256 /Library/Zapret2/d2k/builds/d2kd-aarch64 \
-              /Library/Zapret2/d2k/builds/d2kc-aarch64 \
+shasum -a 256 /Library/Zapret2/d2k/builds/d2kd-linux-arm64 \
+              /Library/Zapret2/d2k/builds/d2kc-linux-arm64 \
               /Library/Zapret2/d2k/builds/d2kask-aarch64
 ```
 
@@ -185,8 +185,8 @@ Relay). `-k` запрещён: проверка цепочки и имени —
 2. Три отдельные доставки потоком (scp на роутере не работает — нет sftp-server):
 
 ```
-ssh -p 222 root@192.168.1.1 'cat > /tmp/d2ku6/d2kd' < /Library/Zapret2/d2k/builds/d2kd-aarch64
-ssh -p 222 root@192.168.1.1 'cat > /tmp/d2ku6/d2kc' < /Library/Zapret2/d2k/builds/d2kc-aarch64
+ssh -p 222 root@192.168.1.1 'cat > /tmp/d2ku6/d2kd' < /Library/Zapret2/d2k/builds/d2kd-linux-arm64
+ssh -p 222 root@192.168.1.1 'cat > /tmp/d2ku6/d2kc' < /Library/Zapret2/d2k/builds/d2kc-linux-arm64
 ssh -p 222 root@192.168.1.1 'cat > /tmp/d2ku6/d2kask' < /Library/Zapret2/d2k/builds/d2kask-aarch64
 ```
 

@@ -66,7 +66,7 @@ TESTHDR = test_stand.h
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
 TESTS   = test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
 all: meas.o verdict.o crypto.o quic.o quicprobe.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o quicconn.o quicwire.o h3.o d2kask d2kc
 
@@ -524,7 +524,7 @@ cross: hello_profiles.inc
 	@echo "переносимость: aarch64 и mipsel собираются, тесты линкуются"
 
 # Утилита для целевого устройства (задача 5в) — тот же приём, что
-# d2kd-aarch64 в datapath/Makefile: статическая musl, потому что на роутере
+# d2kd-linux-arm64 в datapath/Makefile: статическая musl, потому что на роутере
 # нет ни нужной libc, ни желания зависеть от той, что там есть. d2kask не
 # нуждается ни в чём из datapath/ (LINUXSRC там свой, NFQUEUE/raw сокеты) —
 # только в четырёх файлах ядра, тех же, что у d2kask/test_compose выше.
@@ -533,13 +533,17 @@ BUILDDIR ?= ../builds
 # компилирует hello.c напрямую, минуя hello.o, и без этой зависимости падала
 # на чистом дереве: "fatal error: 'hello_profiles.inc' file not found".
 # Тот же приём, что d2kask-aarch64: статический бинарник под роутер.
-d2kc-aarch64: hello_profiles.inc
+#
+# ИМЯ ФАЙЛА — то же, что у сборок Go (builds/d2k-linux-arm64): его ищет
+# scripts/install.sh, и расхождение здесь означало бы «скачанного файла нет»
+# на живом роутере.
+d2kc-linux-arm64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
-		-o $(BUILDDIR)/d2kc-aarch64 d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c \
+		-o $(BUILDDIR)/d2kc-linux-arm64 d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicwire.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
 		volume.c tls13.c tls13core.c x25519.c verify.c quicconn.c h3.c -lpthread
-	@ls -l $(BUILDDIR)/d2kc-aarch64
+	@ls -l $(BUILDDIR)/d2kc-linux-arm64
 
 d2kask-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)

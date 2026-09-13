@@ -64,4 +64,32 @@ printf '%s\n' "$ARCHES" | while IFS="$(printf '\t')" read -r arch extra; do
     printf '  %-22s %8s байт\n' "$(basename "$out")" "$(wc -c < "$out" | tr -d ' ')"
 done
 
+# --- ядро и датапат на C -------------------------------------------------
+#
+# Без них установка НЕПОЛНАЯ: scripts/install.sh качает три бинарника, и
+# отсутствие любого означает «не скачать» на живом роутере. Раньше этот
+# скрипт собирал только обвязку на Go, builds/ содержал одну панель из трёх
+# файлов, и «готовой команды установки нет» стояло в README именно поэтому.
+#
+# Арка одна — arm64: только под неё есть проверенный тулчейн (zig cc,
+# статическая musl) и только на ней прогонялась установка (scripts/
+# lab-install.sh). Дописывать сюда арки, которых никто не собирал и не
+# ставил, значит обещать то, чего нет; отказ ниже честнее.
+if [ "${D2K_GO_ONLY:-0}" = "1" ]; then
+    echo "D2K_GO_ONLY=1 — C-часть не собиралась, установка такой сборкой НЕ пройдёт"
+else
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "нет zig — статические бинарники под роутер собрать нечем." >&2
+        echo "Поставьте zig либо соберите только Go: D2K_GO_ONLY=1 sh $0" >&2
+        exit 1
+    fi
+    HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+    ROOT=$(CDPATH='' cd -- "$HERE/.." && pwd)
+    make -C "$ROOT/datapath" d2kd-linux-arm64 >/dev/null
+    make -C "$ROOT/core"     d2kc-linux-arm64 >/dev/null
+    for f in d2kd-linux-arm64 d2kc-linux-arm64; do
+        printf '  %-22s %8s байт\n' "$f" "$(wc -c < "$OUT/$f" | tr -d ' ')"
+    done
+fi
+
 echo "готово: $OUT"
