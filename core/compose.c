@@ -1347,16 +1347,13 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
     if (!arm || !buf || cap == 0) { return -1; }
     unsigned repeats = 1;
     int ttl = 0;
-    size_t blob_id = 0;
     switch (arm->kind) {
-    case D2K_QA_BLOB:   blob_id = arm->blob_id; break;
+    case D2K_QA_BLOB:   break;
     case D2K_QA_COPIES:
-        blob_id = arm->blob_id;
         if (arm->copies <= 0 || arm->copies > 255) { return -1; }
         repeats = (unsigned)arm->copies;
         break;
     case D2K_QA_TTL:
-        blob_id = arm->blob_id;
         if (arm->ttl <= 0 || arm->ttl > 255) { return -1; }
         ttl = arm->ttl;
         break;
@@ -1364,11 +1361,11 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
         return -1;   /* FRAG не выразим; NOT_FOUND и FLAKY ставить нечего */
     }
 
-    /* Байты приманки приходят ОТ ВЫЗЫВАЮЩЕГО, а не берутся здесь: каталог
-       блобов принадлежит подбору плеч (d2k_quic_arm_blob), и тащить его в
-       сборку планов значило бы связать её с сетевым модулем ради одной
-       таблицы. blob_id проверяется тем, что вызывающий по нему блоб и достал. */
-    (void)blob_id;
+    /* Байты приманки приходят ОТ ВЫЗЫВАЮЩЕГО, а не берутся здесь: приманка
+       выводится из снятого приветствия цели (d2k_quic_decoy_from_trigger), и
+       тащить сетевой модуль в сборку планов ради этого незачем. Номера
+       приманки у плеча нет вовсе — набора, из которого её выбирали бы, не
+       существует. */
     if (!blob || blen == 0) { return -1; }
 
     size_t pos = 0;

@@ -95,9 +95,6 @@ quicprobe.o: quicprobe.c $(HDR)
 # (quicprobe.c, экспортированы задачей 6 — см. их doc-комментарии в
 # d2k_quicprobe.h про то, почему не дублируются) и d2k_mark_hook (d2k_meas.h,
 # как есть — та же метка, что и у остальных отправителей дерева).
-props.o: props.c $(HDR)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
 # core/hello_profiles.inc — приветствия холодного старта, встроенные в
 # бинарник (см. шапку hello.c про то, почему не путь к файлу). Собирается
 # ИЗ profiles/*.hex МЕХАНИЧЕСКИ: вырезаются комментарии (строки на '#') и все
@@ -117,6 +114,9 @@ hello_profiles.inc: profiles/modern.hex profiles/legacy.hex
 		fi; \
 		printf 'static const char d2k_profile_%s_hex[] = "%s";\n' "$$name" "$$hex" >> $@; \
 	done
+
+props.o: props.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # hello.c #include'ит hello_profiles.inc напрямую (см. его шапку) — без
 # этого правила предыдущей сборки объектник просто не найдёт файл.
@@ -529,7 +529,8 @@ cross: hello_profiles.inc
 # нуждается ни в чём из datapath/ (LINUXSRC там свой, NFQUEUE/raw сокеты) —
 # только в четырёх файлах ядра, тех же, что у d2kask/test_compose выше.
 BUILDDIR ?= ../builds
-# hello.c #include'ит hello_profiles.inc (см. hello.o выше) — кросс-сборка
+# hello.c #include'ит hello_profiles.inc, props.c — (см.
+# hello.o/props.o выше) — кросс-сборка
 # компилирует hello.c напрямую, минуя hello.o, и без этой зависимости падала
 # на чистом дереве: "fatal error: 'hello_profiles.inc' file not found".
 # Тот же приём, что d2kask-aarch64: статический бинарник под роутер.

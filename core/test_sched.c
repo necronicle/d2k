@@ -123,13 +123,12 @@ static d2k_quic_arm_kind arm_kind = D2K_QA_BLOB;
 static int arm_calls;
 
 static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
-                             d2k_hello trigger, uint32_t mark) {
-    (void)ip; (void)port; (void)sni; (void)trigger; (void)mark;
+                             const char *decoy_sni, d2k_hello trigger, uint32_t mark) {
+    (void)ip; (void)port; (void)sni; (void)decoy_sni; (void)trigger; (void)mark;
     arm_calls++;
     d2k_quic_arm a;
     memset(&a, 0, sizeof a);
     a.kind = arm_kind;
-    a.blob_id = D2K_QUIC_ARM_BLOB_SHAPED;
     a.copies = 6;
     a.ttl = 3;
     a.probes = 4;
@@ -760,6 +759,84 @@ int main(void) {
             }
         }
         d2k_catalog_free(&cK);
+    }
+
+    /* --- ЗАМЕР ПОСЛЕ ПРОВАЛА ГОТОВЫХ ПЛАНОВ ИДЁТ С КОНТРОЛЕМ ------------
+     *
+     * Задача QUIC входит в испытание готовых планов БЕЗ приветствий вовсе
+     * (коробка узнана, снимка ещё нет — испытать готовый план ими не нужно).
+     * Если готовые планы не помогли, начинается замер — и вот ему приветствия
+     * нужны оба. На живой линии 13.09.2026 замер стартовал со старым пустым
+     * контролем и закончился «вердикта нет (нет контрольного имени)»: вопрос
+     * коробке не задавался вовсе, а восемь кандидатов ушли в никуда.
+     *
+     * Снимок здесь приезжает ПОСЛЕ входа в испытание — ровно как на линии. */
+    {
+        tcp_calls = quic_calls = 0;
+        d2k_catalog cR;
+        memset(&cR, 0, sizeof cR);
+        cR.boxes = calloc(1, sizeof *cR.boxes);
+        CHECK(cR.boxes != NULL, "не удалось создать модель коробки");
+        if (cR.boxes) {
+            cR.n_boxes = 1;
+            d2k_cat_box *b = &cR.boxes[0];
+            snprintf(b->id, sizeof b->id, "box-quic-remeasure");
+            b->fp.method = D2K_FP_METHOD;
+            b->fp.n_sig = 1;
+            snprintf(b->fp.sig[0].kind, sizeof b->fp.sig[0].kind, "rst");
+            b->fp.sig[0].ttl = 127;
+            b->fp.sig[0].tos = 0x88;
+            b->fp.sig[0].ipid = 54321;
+            b->plans = calloc(1, sizeof *b->plans);
+            CHECK(b->plans != NULL, "не удалось создать план модели");
+            if (b->plans) {
+                b->n_plans = 1;
+                b->plans[0].enabled = 1;
+                b->plans[0].successes = 3;
+                snprintf(b->plans[0].proto, sizeof b->plans[0].proto, "quic");
+                b->plans[0].text = strdup(
+                    "d2k-plan 1 1\nid 00000000000000000000000000000000\n"
+                    "proto udp quic\npayload 1 hex aabb\n"
+                    "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
+                    "order forward\n");
+                CHECK(b->plans[0].text != NULL, "текст плана не создался");
+            }
+            if (b->plans && b->plans[0].text) {
+                d2k_sched *s = d2k_sched_new(&cR, sv[0], 0x2d);
+                saidbuf[0] = '\0';
+                d2k_sched_set_say(s, collect_say, NULL);
+                /* Зонд доходит только до рукопожатия — готовый план не
+                   засчитывается, и планы кончаются. */
+                ver_answer = D2K_VER_HANDSHAKE;
+                ver_fail_first = 0;
+                ver_calls = 0;
+                ver_answer_port = 40205;
+                d2k_ev h = ev_hello(17, 40205, "остыл.снимок.позже");
+                d2k_sched_event(s, &h);
+                d2k_ev su = ev_suspect(17, 40205);
+                d2k_sched_event(s, &su);
+                /* Крутим ровно до установки первого готового плана: задача уже
+                   вошла в испытание БЕЗ приветствий, но планы ещё не кончились
+                   — ровно то состояние, в котором на линии приехал снимок. */
+                spin_until_installed(s);
+                CHECK(said("коробка узнана"), "готовый план не пошёл в дело без снимка");
+                {
+                    d2k_ev sh;
+                    CHECK(quic_shape(&sh, "остыл.снимок.позже") == 0, "снимок QUIC не собрался");
+                    d2k_sched_event(s, &sh);
+                }
+                settle(s);
+                CHECK(quic_calls == 1,
+                      "после провала готовых планов замер не пошёл вовсе");
+                CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
+                      "замер пошёл БЕЗ контрольного имени — вопрос коробке не задан, "
+                      "а кандидаты будут потрачены впустую");
+                CHECK(strcmp(quic_last_trig, "остыл.снимок.позже") == 0,
+                      "мерить пошли не приветствием цели");
+                d2k_sched_free(s);
+            }
+        }
+        d2k_catalog_free(&cR);
     }
 
     /* --- подозрение без предшествующего приветствия: имени нет, искать

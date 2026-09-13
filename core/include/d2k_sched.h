@@ -84,8 +84,8 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
 /* Подбор плеча QUIC (d2k_quic_pick_arm). Подменяем по той же причине, что и
  * прочие оракулы: настоящий подбор ходит в сеть десятками опытов. */
 typedef d2k_quic_arm (*d2k_sched_arm_fn)(const char *ip, uint16_t port,
-                                         const char *sni, d2k_hello trigger,
-                                         uint32_t mark);
+                                         const char *sni, const char *decoy_sni,
+                                         d2k_hello trigger, uint32_t mark);
 extern d2k_sched_arm_fn  d2k_sched_arm_hook;
 
 /* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и

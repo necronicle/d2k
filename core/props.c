@@ -35,76 +35,32 @@
 
 #include "d2k_meas.h"
 #include "d2k_quicprobe.h"
+/* d2k_quic_hello_rename — единственный источник приманки (см. ниже). */
+#include "d2k_quichello.h"
 
 /* =========================================================================
  * Каталог блобов — см. контракт в d2k_quicprobe.h.
  * ========================================================================= */
 
-static const uint8_t g_blob_garbage[16]; /* 16 нулей — та же приманка, что qp_arm_step в quicprobe.c */
+/* =========================================================================
+ * ПРИМАНКА — ВЫВЕДЕННАЯ ИЗ ЗАМЕРА. Контракт в d2k_quicprobe.h.
+ *
+ * Здесь стоял каталог заготовок и снятых дампов, перебираемый по очереди.
+ * Он снят целиком: перебор набора — это блокчек, а не замер, и длина набора
+ * влияла и на цену подбора, и на бюджет, чего быть не должно.
+ * ========================================================================= */
 
-/* D2K_QUIC_ARM_BLOB_SHAPED строится ОДИН РАЗ (лениво, при первом обращении) —
- * не на стеке КАЖДОГО вызова d2k_quic_pick_arm: 1200 байт незачем копировать
- * заново на каждую попытку разведки (их до 257 за один подбор), а сама
- * заготовка от вызова к вызову не меняется. Не на пакетном горячем пути
- * (см. общие ограничения проекта про "на пакетном пути память не
- * выделяется") — это измерительный код, не путь пакета датапата. */
-static uint8_t g_blob_shaped[1200];
-static int g_blob_shaped_ready;
-
-static void build_shaped_blob(void) {
-    /* Валидный ПО ФОРМЕ длинный заголовок QUIC v1 Initial (RFC 9000 §17.2),
-       дополненный до 1200 байт (RFC 9000 §14.1 — см. её же обоснование у
-       qp_build_vn_trigger в quicprobe.c, тот же порог и та же причина).
-       Токен и SCID пустые, DCID — 8 произвольных байт (эта приманка не
-       пытается расшифроваться, см. doc-комментарий в заголовке). */
-    size_t off = 0;
-    g_blob_shaped[off++] = 0xC0; /* long header, fixed bit, type=Initial(v1) */
-    g_blob_shaped[off++] = 0x00;
-    g_blob_shaped[off++] = 0x00;
-    g_blob_shaped[off++] = 0x00;
-    g_blob_shaped[off++] = 0x01; /* version = 1 */
-    g_blob_shaped[off++] = 0x08; /* dcid_len */
-    for (int i = 0; i < 8; i++) {
-        g_blob_shaped[off++] = (uint8_t)(0xE0 + i);
+int d2k_quic_decoy_from_trigger(d2k_hello trigger, const char *decoy_sni,
+                                uint8_t *out, size_t cap, size_t *out_len) {
+    if (!trigger.bytes || trigger.len == 0 || !decoy_sni || !decoy_sni[0] ||
+        !out || cap == 0 || !out_len) {
+        return -1;
     }
-    g_blob_shaped[off++] = 0x00; /* scid_len = 0 */
-    g_blob_shaped[off++] = 0x00; /* token varint (1 байт, значение 0) */
-    /* length varint (2 байта, RFC 9000 §16): верхние 2 бита формы = 01,
-       значение — сколько байт (packet number + тело) идёт после этого поля,
-       чтобы итог был ровно 1200: 1200 - off(16) - 2(это поле) = 1182. */
-    size_t remaining = 1200 - off - 2;
-    g_blob_shaped[off++] = (uint8_t)(0x40 | ((remaining >> 8) & 0x3F));
-    g_blob_shaped[off++] = (uint8_t)(remaining & 0xFF);
-    for (size_t i = 0; i < remaining; i++) {
-        g_blob_shaped[off + i] = (uint8_t)(0xA0 + (i & 0x3F));
-    }
-    off += remaining;
-    /* off обязан быть ровно 1200 — если арифметика выше когда-нибудь разъедется
-       (например, remaining пересчитают неверно), тест test_quic_arms.c поймает
-       это через d2k_quic_is_initial и/или прямую проверку длины. */
-    g_blob_shaped_ready = 1;
-}
-
-const uint8_t *d2k_quic_arm_blob(size_t idx, size_t *len_out) {
-    if (idx == D2K_QUIC_ARM_BLOB_GARBAGE) {
-        if (len_out) {
-            *len_out = sizeof g_blob_garbage;
-        }
-        return g_blob_garbage;
-    }
-    if (idx == D2K_QUIC_ARM_BLOB_SHAPED) {
-        if (!g_blob_shaped_ready) {
-            build_shaped_blob();
-        }
-        if (len_out) {
-            *len_out = sizeof g_blob_shaped;
-        }
-        return g_blob_shaped;
-    }
-    if (len_out) {
-        *len_out = 0;
-    }
-    return NULL;
+    /* Ровно та же пересборка, которой собирается контрольный зонд: одна
+       реализация на обе надобности (§2.5). Свежие идентификаторы соединения
+       она ставит сама — новому соединению они и положены (RFC 9000 §7.2). */
+    return d2k_quic_hello_rename(trigger.bytes, trigger.len, decoy_sni,
+                                 out, cap, out_len);
 }
 
 /* =========================================================================
@@ -489,7 +445,8 @@ static int qa_budget_left(const struct timespec *start) {
 
 static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_pool, size_t *next_fresh,
                                 uint16_t port, d2k_hello trigger, uint32_t mark, int *probes,
-                                d2k_quic_arm_kind kind, size_t blob_id, int ttl, int copies) {
+                                d2k_quic_arm_kind kind, const uint8_t *bytes, size_t blen,
+                                int ttl, int copies) {
     d2k_quic_arm a;
     memset(&a, 0, sizeof a);
     if (*next_fresh >= n_pool) {
@@ -501,8 +458,6 @@ static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_po
         return a;
     }
     const char *fresh = pool[(*next_fresh)++];
-    size_t blen;
-    const uint8_t *bytes = d2k_quic_arm_blob(blob_id, &blen);
     int sent = 0;
     d2k_tally t;
     if (ttl > 0) {
@@ -525,7 +480,6 @@ static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_po
                  t.err, D2K_QUIC_REPEATS);
     } else if (t.pass == D2K_QUIC_REPEATS) {
         a.kind = kind;
-        a.blob_id = blob_id;
         a.ttl = ttl;
         a.copies = copies;
         snprintf(a.reason, sizeof a.reason, "подтверждено на свежем адресе %s: %d/%d", fresh, t.pass,
@@ -589,8 +543,8 @@ static d2k_quic_arm qa_confirm_frag(const char pool[][D2K_QUIC_ADDR_LEN], size_t
  * Дерево плеч — см. полный контракт в d2k_quicprobe.h.
  * ========================================================================= */
 
-d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d2k_hello trigger,
-                                uint32_t mark) {
+d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni,
+                                const char *decoy_sni, d2k_hello trigger, uint32_t mark) {
     d2k_quic_arm a;
     memset(&a, 0, sizeof a);
 
@@ -602,11 +556,25 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
         struct in_addr probe;
         ip_ok = (inet_pton(AF_INET, ip, &probe) == 1);
     }
-    if (!ip_ok || !sni || !trigger.bytes || trigger.len == 0) {
+    if (!ip_ok || !sni || !decoy_sni || !decoy_sni[0] || !trigger.bytes || trigger.len == 0) {
         a.kind = D2K_QA_FLAKY;
         snprintf(a.reason, sizeof a.reason,
                  "вход структурно непригоден: адрес не разбирается как IPv4, имя или снимок триггера "
                  "отсутствуют — подбирать плечо не на чем");
+        return a;
+    }
+
+    /* ПРИМАНКА ВЫВОДИТСЯ ЗДЕСЬ И ОДИН РАЗ — из снятого приветствия этой цели,
+       с подменённым именем. Это единственный её источник: не вывелась —
+       подбирать нечем, и это честный отрицательный результат, а не повод
+       подставить заготовку (см. d2k_quic_decoy_from_trigger). */
+    uint8_t decoy[2048];
+    size_t decoy_len = 0;
+    if (d2k_quic_decoy_from_trigger(trigger, decoy_sni, decoy, sizeof decoy, &decoy_len) != 0) {
+        a.kind = D2K_QA_NOT_FOUND;
+        snprintf(a.reason, sizeof a.reason,
+                 "приманку не из чего вывести: снятое приветствие не пересобирается с другим "
+                 "именем — подбирать плечо нечем");
         return a;
     }
 
@@ -624,60 +592,48 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
         return a;
     }
 
-    /* ===== Ступень 1 (самая дешёвая): одиночная фальшивка, перебор блобов ===== */
-    int chosen_blob = -1;
-    for (size_t i = 0; i < D2K_QUIC_ARM_N_BLOBS && chosen_blob < 0; i++) {
-        if (!qa_budget_left(&start)) {
-            a.kind = D2K_QA_NOT_FOUND;
-            snprintf(a.reason, sizeof a.reason, "бюджет исчерпан на переборе блобов (успели %zu из %u)", i,
-                      D2K_QUIC_ARM_N_BLOBS);
-            a.probes = probes;
-            return a;
-        }
-        size_t blen;
-        const uint8_t *bytes = d2k_quic_arm_blob(i, &blen);
+    /* ===== Ступень 1 (самая дешёвая): одиночная приманка ===== */
+    if (!qa_budget_left(&start)) {
+        a.kind = D2K_QA_NOT_FOUND;
+        snprintf(a.reason, sizeof a.reason, "бюджет исчерпан до одиночной приманки");
+        a.probes = probes;
+        return a;
+    }
+    {
         int sent = 0;
-        d2k_tally t = d2k_quic_ask_hook(pool[0], port, bytes, blen, trigger, d2k_quic_wait_ms, mark, 1,
-                                          NULL, NULL, &sent);
+        d2k_tally t = d2k_quic_ask_hook(pool[0], port, decoy, decoy_len, trigger,
+                                        d2k_quic_wait_ms, mark, 1, NULL, NULL, &sent);
         probes += sent;
         if (t.pass == 1) {
-            chosen_blob = (int)i;
+            return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes,
+                              D2K_QA_BLOB, decoy, decoy_len, 0, 1);
         }
-    }
-    if (chosen_blob >= 0) {
-        return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes, D2K_QA_BLOB,
-                           (size_t)chosen_blob, 0, 1);
     }
 
     /* ===== Ступень 1б: ЧИСЛО КОПИЙ ПРИМАНКИ — отдельная ось =====
        Одиночная копия могла потеряться, а могла и не хватить коробке. Донор
        разводит эти два случая отдельной осью и пробует две точки, 6 и 11
-       (arms.go:140); замер 12.09 показал, что instagram берётся ТОЛЬКО
-       одиннадцатью копиями, а одиночные копии всех блобов дают 0/3. Ось
-       идёт до TTL-развёртки: она дешевле — две точки против двухсот
-       пятидесяти пяти. */
+       (arms.go:140); замер 12.09.2026 показал, что instagram берётся ТОЛЬКО
+       одиннадцатью копиями. Приманка при этом ТА ЖЕ: меняется число копий,
+       а не тело — иначе это были бы две оси сразу, и по результату нельзя
+       было бы сказать, что именно помогло. */
     {
         static const int ladder[] = { D2K_QUIC_COPIES_A, D2K_QUIC_COPIES_B };
         for (size_t li = 0; li < sizeof ladder / sizeof ladder[0]; li++) {
-            for (size_t i = 0; i < D2K_QUIC_ARM_N_BLOBS; i++) {
-                if (!qa_budget_left(&start)) {
-                    a.kind = D2K_QA_NOT_FOUND;
-                    snprintf(a.reason, sizeof a.reason,
-                             "бюджет исчерпан на числе копий приманки");
-                    a.probes = probes;
-                    return a;
-                }
-                size_t blen;
-                const uint8_t *bytes = d2k_quic_arm_blob(i, &blen);
-                int sent = 0;
-                d2k_tally t = d2k_quic_ask_copies_hook(pool[0], port, bytes, blen, ladder[li],
-                                                       trigger, d2k_quic_wait_ms, mark, 1, &sent);
-                probes += sent;
-                if (t.pass == 1) {
-                    d2k_quic_arm c = qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark,
-                                                &probes, D2K_QA_COPIES, i, 0, ladder[li]);
-                    return c;
-                }
+            if (!qa_budget_left(&start)) {
+                a.kind = D2K_QA_NOT_FOUND;
+                snprintf(a.reason, sizeof a.reason,
+                         "бюджет исчерпан на числе копий приманки");
+                a.probes = probes;
+                return a;
+            }
+            int sent = 0;
+            d2k_tally t = d2k_quic_ask_copies_hook(pool[0], port, decoy, decoy_len, ladder[li],
+                                                   trigger, d2k_quic_wait_ms, mark, 1, &sent);
+            probes += sent;
+            if (t.pass == 1) {
+                return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes,
+                                  D2K_QA_COPIES, decoy, decoy_len, 0, ladder[li]);
             }
         }
     }
@@ -691,8 +647,19 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
        791 §3.1 — 8 бит, 255), останов на первом успехе: сама лестница держит
        стоимость минимальной, изобретённый потолок ниже 255 не нужен —
        бюджет §7 обрежет её раньше, если потребуется. */
-    size_t shaped_len;
-    const uint8_t *shaped = d2k_quic_arm_blob(D2K_QUIC_ARM_BLOB_SHAPED, &shaped_len);
+    /* ПРИМАНКА ДЛЯ РАЗВЁРТКИ — СНЯТАЯ, а не синтетическая заготовка.
+     *
+     * Развёртка проверяет ОДНУ ось: на каком расстоянии стоит коробка. Бить по
+     * ней приманкой, про которую отдельно известно, что коробка ей не верит,
+     * значит проверять не ось, а негодность приманки: сколько бы шагов ни
+     * прошло, ответ будет один и тот же. На живой линии 13.09.2026 так и
+     * вышло — `плечо(мусор)=0/3`, а следом «бюджет исчерпан на развёртке TTL
+     * (успели до 34)»: тридцать четыре шага впустую. */
+    /* Развёртка идёт ТОЙ ЖЕ выведенной приманкой: ось проверяет расстояние до
+       коробки, и менять вместе с ним ещё и тело значило бы мерить две вещи
+       сразу. Заготовкой её бить нельзя тем более — на живой линии 13.09.2026
+       так и вышло: `плечо(мусор)=0/3`, а следом тридцать четыре шага
+       развёртки впустую, потому что ответ не зависел от расстояния вовсе. */
     int chosen_ttl = -1;
     for (int ttl = 1; ttl <= 255 && chosen_ttl < 0; ttl++) {
         if (!qa_budget_left(&start)) {
@@ -702,7 +669,7 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
             return a;
         }
         int sent = 0;
-        d2k_tally t = d2k_quic_ask_ttl_hook(pool[0], port, shaped, shaped_len, ttl, trigger,
+        d2k_tally t = d2k_quic_ask_ttl_hook(pool[0], port, decoy, decoy_len, ttl, trigger,
                                               d2k_quic_wait_ms, mark, 1, &sent);
         probes += sent;
         if (t.pass == 1) {
@@ -711,7 +678,7 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni, d
     }
     if (chosen_ttl >= 0) {
         return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes, D2K_QA_TTL,
-                           D2K_QUIC_ARM_BLOB_SHAPED, chosen_ttl, 1);
+                           decoy, decoy_len, chosen_ttl, 1);
     }
 
     /* ===== Ступень 3 (самая дорогая): IP-фрагментация ===== */

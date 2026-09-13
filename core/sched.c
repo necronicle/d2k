@@ -214,8 +214,8 @@ static d2k_ver_result verify_default(const char *ip, uint16_t port, uint8_t tran
  * прочие оракулы: подбор ходит в сеть десятками опытов, и модульный тест
  * обязан утверждать поведение планировщика, не выходя наружу. */
 static d2k_quic_arm pick_arm_default(const char *ip, uint16_t port, const char *sni,
-                                     d2k_hello trigger, uint32_t mark) {
-    return d2k_quic_pick_arm(ip, port, sni, trigger, mark);
+                                     const char *decoy_sni, d2k_hello trigger, uint32_t mark) {
+    return d2k_quic_pick_arm(ip, port, sni, decoy_sni, trigger, mark);
 }
 
 d2k_sched_arm_fn  d2k_sched_arm_hook  = pick_arm_default;
@@ -881,7 +881,7 @@ static void *worker_run(void *vp) {
            десятки опытов было бы тратой чужого канала. */
         if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX ||
             r.verdict == D2K_V_WHOLE) {
-            t->arm = d2k_sched_arm_hook(t->ip, t->port, t->name, trig, s->mark);
+            t->arm = d2k_sched_arm_hook(t->ip, t->port, t->name, SCHED_DECOY, trig, s->mark);
             t->arm_ready = 1;
         }
     } else {
@@ -1614,11 +1614,18 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
                 t->name, t->arm.reason);
             return;
         }
+        /* Тело приманки выводится ТЕМ ЖЕ вызовом из ТОГО ЖЕ снимка, что и при
+           подборе: индекс чужого каталога не носится, потому что каталога
+           нет (d2k_quic_decoy_from_trigger). Свежие идентификаторы соединения
+           пересборка ставит сама — новому соединению они и положены. */
+        uint8_t decoy[2048];
         size_t blen = 0;
-        const uint8_t *blob = d2k_quic_arm_blob(t->arm.blob_id, &blen);
+        d2k_hello trg; trg.bytes = t->trig; trg.len = t->trig_len;
+        int have_decoy = (d2k_quic_decoy_from_trigger(trg, SCHED_DECOY, decoy,
+                                                      sizeof decoy, &blen) == 0);
         char text[sizeof t->plans[0]];
-        if (blob && blen > 0 &&
-            d2k_quic_arm_plan(&t->arm, blob, blen, text, sizeof text) == 0) {
+        if (have_decoy && blen > 0 &&
+            d2k_quic_arm_plan(&t->arm, decoy, blen, text, sizeof text) == 0) {
             if (t->n_plans < cap) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;
@@ -2958,6 +2965,32 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->researched = 1;
                     t->box_id[0] = '\0';
                     t->state = T_ASKING;
+                    /* ПРИВЕТСТВИЯ ПОДБИРАЮТСЯ ЗАНОВО, А НЕ БЕРУТСЯ КАКИЕ ЕСТЬ.
+                     *
+                     * Сюда задача приходит двумя дорогами. Прежняя — через
+                     * успешный fill_hellos, и тогда оба приветствия на месте.
+                     * Новая (QUIC, коробка узнана, снимка ещё не было) входит
+                     * в T_PLANNING БЕЗ приветствий вовсе: испытать готовый
+                     * план ими не нужно, зонд QUIC ведёт рукопожатие сам.
+                     * Но ЗАМЕР без них невозможен, и на живой линии 13.09.2026
+                     * это вышло ровно так: по scontent-arn2-1.cdninstagram.com
+                     * снимок приехал через секунду после входа в T_PLANNING, а
+                     * замер стартовал со старым пустым контролем и закончился
+                     * «вердикта нет (нет контрольного имени — базовая живость
+                     * не проверена)» — то есть вопрос коробке не задавался
+                     * вовсе, а восемь кандидатов ушли в никуда.
+                     *
+                     * Повторный вызов дешёв и идемпотентен: заполняются только
+                     * пустые поля (см. fill_hellos). Отказ означает, что
+                     * мерить по-прежнему нечем, и честнее сказать это, чем
+                     * задать вопрос пустотой. */
+                    if (fill_hellos(s, t) != 0) {
+                        say(s, "по %s готовые планы не помогли, а мерить нечем: "
+                               "приветствия для этой цели так и нет", t->name);
+                        task_fail(s, t, now_ms);
+                        moved++;
+                        continue;
+                    }
                     if (start_worker(s, t, JOB_CLASSIFY) == 0) {
                         say(s, "по %s готовые планы не помогли — начинаю новый замер", t->name);
                         moved++;

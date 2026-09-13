@@ -37,6 +37,14 @@
 #include "d2k_compose.h"
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
+/* d2k_quic_is_initial — им проверяется, что снятые приманки доехали в бинарник
+   именно приветствиями, а не чем попало (см. test_blob_catalogue_is_captured). */
+#include "d2k_quic.h"
+/* Настоящий Initial из RFC 9001, приложение A.2 — тот же вектор, что у
+   test_quichello/test_sched. Нужен затем, что приманка теперь ВЫВОДИТСЯ из
+   снятого приветствия: выдуманные двадцать байт не пересобираются, и подбор
+   честно отказал бы ещё до первого опыта. */
+#include "test_quic_vector.h"
 
 static int fails;
 #define CHECK(cond, msg)                          \
@@ -61,19 +69,24 @@ static d2k_quic_resolve_fn real_resolve_hook;
 static int g_ask_calls;
 static char g_ask_last_addr[D2K_QUIC_ADDR_LEN];
 static int g_ask_repeats_log[8];
+/* Повторы ПОСЛЕДНЕГО обращения. Отдельно от лога на восемь ячеек: каталог
+   приманок вырос, и подтверждение давно уезжает за его пределы — лог ловил
+   бы чужую ячейку и молчал об этом. */
+static int g_ask_last_repeats;
 static uint32_t g_ask_mark_seen;
-static int g_ask_pass_blob = -1; /* -1 — ни один блоб не проходит одиночно */
+static int g_ask_pass_single;    /* 1 — одиночная приманка проходит */
 static int g_ask_confirm_ok = 1; /* единогласие на подтверждении (repeats>1) */
 
-static int blob_index_of(const uint8_t *prefix, size_t prefix_len) {
-    for (size_t i = 0; i < D2K_QUIC_ARM_N_BLOBS; i++) {
-        size_t blen;
-        const uint8_t *b = d2k_quic_arm_blob(i, &blen);
-        if (b && blen == prefix_len && (prefix_len == 0 || memcmp(b, prefix, prefix_len) == 0)) {
-            return (int)i;
-        }
-    }
-    return -1;
+/* Приманка у подбора одна и ВЫВЕДЕННАЯ. Мок не сверяет её с каталогом —
+   каталога нет, — а проверяет, что ему дали именно выведенную: настоящий
+   Initial, в котором стоит имя приманки, а не имя цели. */
+#define TEST_DECOY_SNI "disk.rzd.ru"
+static int decoy_is_derived(const uint8_t *prefix, size_t prefix_len) {
+    char sni[256];
+    if (!prefix || prefix_len == 0) { return 0; }
+    if (!d2k_quic_is_initial(prefix, prefix_len)) { return 0; }
+    if (d2k_quic_sni(prefix, prefix_len, sni, sizeof sni) != 0) { return 0; }
+    return strcmp(sni, TEST_DECOY_SNI) == 0;
 }
 
 static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
@@ -86,6 +99,7 @@ static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix
     if (addr) {
         strncpy(g_ask_last_addr, addr, sizeof g_ask_last_addr - 1);
     }
+    g_ask_last_repeats = repeats;
     if (g_ask_calls < 8) {
         g_ask_repeats_log[g_ask_calls] = repeats;
     }
@@ -99,8 +113,7 @@ static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
-    int blob = blob_index_of(prefix, prefix_len);
-    if (blob == g_ask_pass_blob) {
+    if (g_ask_pass_single && decoy_is_derived(prefix, prefix_len)) {
         if (repeats <= 1) {
             t.pass = 1;
         } else {
@@ -119,7 +132,6 @@ static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix
 /* -- мок d2k_quic_ask_copies_hook (несколько копий приманки) -- */
 static int g_cop_calls;
 static int g_cop_pass_at = -1;   /* число копий, при котором коробка поддаётся; -1 — никогда */
-static int g_cop_pass_blob;      /* какой блоб при этом нужен */
 static int g_cop_log[8];
 
 static d2k_tally mock_ask_copies(const char *addr, uint16_t port, const uint8_t *prefix,
@@ -131,8 +143,7 @@ static d2k_tally mock_ask_copies(const char *addr, uint16_t port, const uint8_t 
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
-    int blob = blob_index_of(prefix, prefix_len);
-    if (copies == g_cop_pass_at && blob == g_cop_pass_blob) {
+    if (copies == g_cop_pass_at && decoy_is_derived(prefix, prefix_len)) {
         t.pass = repeats <= 1 ? 1 : repeats;
     } else {
         t.fail = repeats <= 1 ? 1 : repeats;
@@ -232,15 +243,15 @@ static size_t mock_resolve(const char *sni, char out[][D2K_QUIC_ADDR_LEN], size_
 
 static void mocks_reset(void) {
     g_ask_calls = 0;
+    g_ask_last_repeats = 0;
     memset(g_ask_last_addr, 0, sizeof g_ask_last_addr);
     memset(g_ask_repeats_log, 0, sizeof g_ask_repeats_log);
     g_ask_mark_seen = 0;
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     g_ask_confirm_ok = 1;
     g_cop_calls = 0;
     memset(g_cop_log, 0, sizeof g_cop_log);
     g_cop_pass_at = -1;
-    g_cop_pass_blob = -1;
     g_ttl_calls = 0;
     memset(g_ttl_log, 0, sizeof g_ttl_log);
     g_ttl_pass_at = -1;
@@ -252,22 +263,23 @@ static void mocks_reset(void) {
     d2k_quic_budget_s = 120;
 }
 
-static const uint8_t g_trig_bytes[20] = {0xC0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0xAA, 0xAA, 0xAA, 0xAA};
+/* Триггер — настоящий Initial: из него выводится приманка. */
+#define g_trig_bytes d2k_test_v1_initial
 
 static void test_ladder_blob_wins(void) {
     mocks_reset();
-    g_ask_pass_blob = (int)D2K_QUIC_ARM_BLOB_SHAPED;
+    g_ask_pass_single = 1;
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 7);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 7);
 
-    CHECK(a.kind == D2K_QA_BLOB, "блоб-плечо должно победить, когда одиночная фальшивка проходит");
-    CHECK(a.blob_id == D2K_QUIC_ARM_BLOB_SHAPED, "выбран именно прошедший блоб, не первый по счёту");
+    CHECK(a.kind == D2K_QA_BLOB, "плечо приманки должно победить, когда одиночная приманка проходит");
     CHECK(g_ttl_calls == 0, "TTL дороже блоба — не должен спрашиваться, если блоб уже победил");
     CHECK(g_frag_calls == 0, "фрагментация дороже всех — не должна спрашиваться, если блоб победил");
-    /* Ровно два одиночных зонда (по одному на блоб, второй сразу проходит) плюс
-       одно подтверждение единогласием — три обращения к d2k_quic_ask_hook. */
-    CHECK(g_ask_calls == 3, "ожидались 2 одиночных попытки блобов + 1 подтверждение");
-    CHECK(g_ask_repeats_log[2] == D2K_QUIC_REPEATS, "подтверждение обязано идти повторами, не одиночно");
+    /* Приманка ОДНА: один разведочный опыт плюс одно подтверждение
+       единогласием — два обращения, и никакого перебора. */
+    CHECK(g_ask_calls == 2, "ожидались одна одиночная попытка и одно подтверждение");
+    CHECK(g_ask_last_repeats == D2K_QUIC_REPEATS,
+          "подтверждение обязано идти повторами, не одиночно");
     CHECK(strcmp(g_ask_last_addr, "1.2.3.4") != 0,
           "подтверждение обязано уйти на СВЕЖИЙ адрес, а не на тот, где велась разведка");
     CHECK(g_ask_mark_seen == 7, "метка обязана дойти до оракула без изменений");
@@ -275,14 +287,14 @@ static void test_ladder_blob_wins(void) {
 
 static void test_ladder_ttl_wins_when_no_blob_helps(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     g_ttl_pass_at = 5;
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_TTL, "если ни один блоб без TTL не помог, а TTL=5 помогает — плечо TTL");
     CHECK(a.ttl == 5, "выбранный TTL обязан быть измеренным значением развёртки, не любым другим");
-    CHECK(g_ask_calls == (int)D2K_QUIC_ARM_N_BLOBS, "все блобы должны быть перепробованы дёшево, прежде чем перейти к TTL");
+    CHECK(g_ask_calls == 1, "до развёртки TTL обязана быть ровно одна одиночная попытка приманкой");
     /* 5 разведочных шагов развёртки (1,2,3,4,5, останов на первом успехе) +
        1 подтверждение повторами на найденном TTL=5. */
     CHECK(g_ttl_calls == 6, "развёртка обязана идти С НАЧАЛА (1,2,3,4,5) и остановиться на первом успехе, плюс одно подтверждение");
@@ -301,18 +313,18 @@ static void test_ladder_ttl_wins_when_no_blob_helps(void) {
    одиночные копии всех блобов дают 0/3. */
 static void test_ladder_copies_before_ttl(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;          /* одиночной копией не берётся ни один блоб */
+    g_ask_pass_single = 0;          /* одиночной копией не берётся ни один блоб */
     g_ttl_pass_at = 5;             /* TTL помог бы, но до него дойти не должно */
     g_cop_pass_at = D2K_QUIC_COPIES_A;
-    g_cop_pass_blob = 0;
+    
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_COPIES,
           "плечо с числом копий не названо своим видом — воздействие выдано за одиночную приманку");
     CHECK(a.copies == D2K_QUIC_COPIES_A,
           "число копий в результате не то, которым коробка поддалась");
-    CHECK(a.blob_id == 0, "номер блоба потерян");
+
     CHECK(g_cop_log[0] == D2K_QUIC_COPIES_A,
           "лестница копий обязана начинаться с меньшей точки");
     CHECK(g_ttl_calls == 0,
@@ -322,25 +334,25 @@ static void test_ladder_copies_before_ttl(void) {
 /* Вторая точка лестницы достигается, если первой не хватило. */
 static void test_ladder_copies_second_point(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     g_ttl_pass_at = -1;
     g_cop_pass_at = D2K_QUIC_COPIES_B;
-    g_cop_pass_blob = 1;
+    
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_COPIES, "вторая точка лестницы не сработала");
     CHECK(a.copies == D2K_QUIC_COPIES_B, "число копий не совпало со второй точкой");
-    CHECK(a.blob_id == 1, "номер блоба второй точки потерян");
+
 }
 
 static void test_ladder_frag_is_last_resort(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     g_ttl_pass_at = -1; /* ни один TTL до потолка протокола (255) не помогает */
     g_frag_works = 1;
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_FRAG, "если ни блоб, ни TTL не помогли — последнее и самое дорогое средство: фрагментация");
     CHECK(g_ttl_calls == 255, "развёртка обязана дойти до предела поля TTL (RFC 791 §3.1, 8 бит), не остановиться раньше без причины");
@@ -349,11 +361,11 @@ static void test_ladder_frag_is_last_resort(void) {
 
 static void test_nothing_works_is_honest_not_found(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     g_ttl_pass_at = -1;
     g_frag_works = 0;
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_NOT_FOUND, "если весь каталог исчерпан без единого прохода — честный отрицательный результат");
     CHECK(a.probes > 0, "отрицательный результат обязан отчитаться, сколько опытов он стоил");
@@ -361,10 +373,10 @@ static void test_nothing_works_is_honest_not_found(void) {
 
 static void test_confirm_disagreement_is_flaky_not_escalation(void) {
     mocks_reset();
-    g_ask_pass_blob = (int)D2K_QUIC_ARM_BLOB_GARBAGE;
+    g_ask_pass_single = 1;
     g_ask_confirm_ok = 0; /* одиночная попытка прошла, повторы разошлись */
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_FLAKY, "расхождение на подтверждении — FLAKY, а не округление в удобную сторону");
     CHECK(g_ttl_calls == 0, "разошедшееся подтверждение НЕ повод пробовать более дорогое плечо вместо честного FLAKY");
@@ -373,19 +385,18 @@ static void test_confirm_disagreement_is_flaky_not_escalation(void) {
 
 static void test_confirm_needs_fresh_address_honestly(void) {
     mocks_reset();
-    g_ask_pass_blob = (int)D2K_QUIC_ARM_BLOB_GARBAGE;
+    g_ask_pass_single = 1;
     g_resolve_n = 0; /* пул исчерпан — кроме исходного ip, свежих адресов нет */
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_NOT_FOUND,
           "разведка нашла блоб, но подтвердить не на чем (пул адресов пуст) — незадан, а не удача");
-    /* D2K_QUIC_ARM_BLOB_GARBAGE стоит первым в каталоге и сразу проходит —
-       разведка останавливается на одной попытке; ВАЖНО здесь другое: сколько
-       бы их ни было, подтверждения СРЕДИ НИХ быть не должно (см. следующую
+    /* Разведка останавливается на прошедшем блобе; ВАЖНО здесь другое: сколько
+       бы попыток ни было, подтверждения СРЕДИ НИХ быть не должно (см. следующую
        проверку) — тратить опыт на заведомо провальное подтверждение (пул
        пуст) незачем. */
-    CHECK(g_ask_calls == 1, "разведка обязана остановиться на первом прошедшем блобе");
+    CHECK(g_ask_calls == 1, "разведка обязана уложиться в одну попытку: приманка одна");
     CHECK(g_ask_repeats_log[0] == 1,
           "подтверждение НЕ ДОЛЖНО тайком уйти на разведанный (потенциально уже отравленный) адрес — "
           "единственный вызов обязан остаться одиночной разведкой (repeats=1), не превратиться в "
@@ -394,10 +405,10 @@ static void test_confirm_needs_fresh_address_honestly(void) {
 
 static void test_budget_exhausted_is_honest(void) {
     mocks_reset();
-    g_ask_pass_blob = -1;
+    g_ask_pass_single = 0;
     d2k_quic_budget_s = 0; /* исчерпан ДО первого же опыта */
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
-    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", trig, 0);
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
 
     CHECK(a.kind == D2K_QA_NOT_FOUND, "бюджет 0 — честный отказ, не притворство, что что-то измерили");
     CHECK(g_ask_calls == 0, "при нулевом бюджете не должно уйти ни одного опыта");
@@ -410,16 +421,16 @@ static void test_structural_guard_rejects_bad_input(void) {
     d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
     d2k_hello empty = {NULL, 0};
 
-    d2k_quic_arm a1 = d2k_quic_pick_arm("999.999.999.999", 443, "example.com", trig, 0);
+    d2k_quic_arm a1 = d2k_quic_pick_arm("999.999.999.999", 443, "example.com", TEST_DECOY_SNI, trig, 0);
     CHECK(a1.kind == D2K_QA_FLAKY, "адрес, не разбирающийся как IPv4, — структурно непригодный вход");
     CHECK(g_ask_calls == 0, "структурно непригодный вход не тратит ни одного опыта");
 
     mocks_reset();
-    d2k_quic_arm a2 = d2k_quic_pick_arm("1.2.3.4", 443, NULL, trig, 0);
+    d2k_quic_arm a2 = d2k_quic_pick_arm("1.2.3.4", 443, NULL, TEST_DECOY_SNI, trig, 0);
     CHECK(a2.kind == D2K_QA_FLAKY, "отсутствие имени — тоже структурно непригодный вход");
 
     mocks_reset();
-    d2k_quic_arm a3 = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", empty, 0);
+    d2k_quic_arm a3 = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, empty, 0);
     CHECK(a3.kind == D2K_QA_FLAKY, "отсутствие снимка триггера — измерять нечем");
     CHECK(g_ask_calls == 0, "без снимка триггера не отправляется ни один опыт");
 }
@@ -635,9 +646,13 @@ static void test_real_ttl_hook_on_wire(void) {
  */
 static void test_arm_to_plan(void) {
     char plan[8192], err[200], hex[2 * D2K_PLAN_TLV_MAX + 1];
+    /* Тело приманки — выведенное, как и в бою: то же, что подбор и увидит. */
+    static uint8_t decoy[2048];
     size_t blen = 0;
-    const uint8_t *blob = d2k_quic_arm_blob(D2K_QUIC_ARM_BLOB_SHAPED, &blen);
-    CHECK(blob != NULL && blen > 0, "блоб-приманка не достался");
+    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes};
+    CHECK(d2k_quic_decoy_from_trigger(trg, TEST_DECOY_SNI, decoy, sizeof decoy, &blen) == 0,
+          "приманка не вывелась из снятого приветствия");
+    const uint8_t *blob = decoy;
 
     struct { d2k_quic_arm_kind kind; int copies; int ttl; int ok; const char *what; } c[] = {
         { D2K_QA_BLOB,      0,  0, 1, "одиночная приманка" },
@@ -651,7 +666,6 @@ static void test_arm_to_plan(void) {
         d2k_quic_arm a;
         memset(&a, 0, sizeof a);
         a.kind = c[i].kind;
-        a.blob_id = D2K_QUIC_ARM_BLOB_SHAPED;
         a.copies = c[i].copies;
         a.ttl = c[i].ttl;
         int rc = d2k_quic_arm_plan(&a, blob, blen, plan, sizeof plan);
@@ -675,6 +689,54 @@ static void test_arm_to_plan(void) {
     }
 }
 
+
+/* --- ПРИМАНКА ВЫВОДИТСЯ ИЗ ЗАМЕРА, А НЕ ВЫБИРАЕТСЯ ИЗ НАБОРА ---------------
+ *
+ * Здесь стоял каталог из девяти заготовок и снятых дампов, перебираемый по
+ * очереди. Перебор набора — это блокчек, а не замер: длина набора влияла и на
+ * цену подбора, и на бюджет, чего быть не должно.
+ *
+ * Приманка обязана выглядеть для коробки настоящим приветствием ЭТОГО
+ * соединения. Ничего более похожего на него, чем оно само, не существует —
+ * значит берётся оно, с подменённым именем. */
+static void test_decoy_is_derived(void) {
+    d2k_hello trg = {g_trig_bytes, sizeof g_trig_bytes};
+    uint8_t out[2048];
+    size_t olen = 0;
+    char sni[256];
+
+    CHECK(d2k_quic_decoy_from_trigger(trg, TEST_DECOY_SNI, out, sizeof out, &olen) == 0,
+          "приманка не вывелась из снятого приветствия");
+    CHECK(olen > 0 && d2k_quic_is_initial(out, olen),
+          "выведенная приманка не Initial — коробка такому не поверит");
+    CHECK(d2k_quic_sni(out, olen, sni, sizeof sni) == 0 && strcmp(sni, TEST_DECOY_SNI) == 0,
+          "в выведенной приманке стоит не имя приманки");
+    /* Имя ПОДМЕНЕНО, а не оставлено: приманка с именем цели ничего не
+       отвлекает — коробка прочтёт ровно то, что и собиралась. */
+    {
+        char orig[256];
+        if (d2k_quic_sni(g_trig_bytes, sizeof g_trig_bytes, orig, sizeof orig) == 0) {
+            CHECK(strcmp(orig, sni) != 0, "приманка несёт имя цели — отвлекать нечем");
+        }
+    }
+    /* Длина сохранена: длина — часть формы, по которой коробка отличает
+       приветствие от чего угодно другого (см. d2k_quichello.h). */
+    CHECK(olen == sizeof g_trig_bytes,
+          "длина приманки разошлась с длиной снятого приветствия");
+
+    /* Вывести не из чего — честный отказ, а не подстановка заготовки. */
+    {
+        d2k_hello empty = {NULL, 0};
+        size_t n = 1;
+        CHECK(d2k_quic_decoy_from_trigger(empty, TEST_DECOY_SNI, out, sizeof out, &n) != 0,
+              "приманка «вывелась» из пустого снимка");
+    }
+
+    /* Цена лестницы не зависит ни от какой длины набора: набора нет. */
+    CHECK(D2K_QUIC_ARM_LADDER_PROBES == 1u + 2u + D2K_QUIC_ARM_TTL_WINDOW_HI + 3u,
+          "цена лестницы посчитана не по её ступеням");
+}
+
 int main(void) {
     /* Сохраняем боевые крючки — они же используются другими тестами при
        линковке в один процесс (см. Makefile: test_quic_arms собирает
@@ -695,6 +757,7 @@ int main(void) {
     test_ladder_blob_wins();
     test_ladder_ttl_wins_when_no_blob_helps();
     test_ladder_copies_before_ttl();
+    test_decoy_is_derived();
     test_ladder_copies_second_point();
     test_ladder_frag_is_last_resort();
     test_nothing_works_is_honest_not_found();
