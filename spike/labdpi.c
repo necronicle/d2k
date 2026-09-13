@@ -121,6 +121,27 @@ static void place(flow *f, uint32_t seq, const uint8_t *p, size_t len, int last_
     if (off + n > f->high) { f->high = off + n; }
 }
 
+/* Имя внутри ОДНОГО пакета, без всякой сборки потока.
+ *
+ * Это игрушечный цензор в его самой простой форме — ровно то, что делает
+ * `iptables -m string`: строка встретилась в этом пакете — пакет снят. Такая
+ * коробка честно обходится разрезом, и именно её обход d2k показывает в
+ * lab-censor.sh.
+ *
+ * Зачем она здесь, рядом с собирающей: собирающая коробка разрезом НЕ
+ * обходится, и обход на неё — открытый вопрос (см. lab-censor.sh, режим
+ * D2K_LAB_REASM). Стенду, который проверяет ДРУГОЕ утверждение — что
+ * найденный обход доходит до клиента за NAT, — нужна коробка, обход которой
+ * уже доказан: иначе красный результат ничего не говорит о транзите. */
+static int packet_has_name(const uint8_t *p, size_t len, const char *name) {
+    size_t nl = strlen(name);
+    if (len < nl) { return 0; }
+    for (size_t i = 0; i + nl <= len; i++) {
+        if (memcmp(p + i, name, nl) == 0) { return 1; }
+    }
+    return 0;
+}
+
 static int found_name(const flow *f, const char *name) {
     size_t nl = strlen(name);
     if (f->high < nl) { return 0; }
@@ -184,21 +205,32 @@ static void on_stop(int s) { (void)s; stop_now = 1; }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first]\n");
+        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first] [--naive]\n");
         return 2;
     }
     uint16_t queue = (uint16_t)atoi(argv[1]);
     const char *name = argv[2];
     int hops = atoi(argv[3]);
-    int last_wins = 0, quic_mode = 0, first_only = 0;
+    int last_wins = 0, quic_mode = 0, first_only = 0, naive = 0;
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--last") == 0) { last_wins = 1; }
         if (strcmp(argv[i], "--quic") == 0) { quic_mode = 1; }
         if (strcmp(argv[i], "--first") == 0) { first_only = 1; }
+        if (strcmp(argv[i], "--naive") == 0) { naive = 1; }
     }
 
-    signal(SIGINT, on_stop);
-    signal(SIGTERM, on_stop);
+    /* sigaction, а НЕ signal: glibc ставит обработчик с SA_RESTART, и тогда
+       recv из очереди после сигнала просто перезапускается — цензор не
+       выходит и итоговую строку со счётчиками не печатает. Стенд, который
+       читает эту строку как доказательство «резали по-настоящему», получал
+       ноль и объявлял провал на ровном месте (13.09.2026). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_stop;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     d2k_nfq_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -209,8 +241,10 @@ int main(int argc, char **argv) {
     char err[200];
     d2k_nfq *q = d2k_nfq_open(&cfg, err, sizeof err);
     if (!q) { fprintf(stderr, "labdpi: очередь не открылась: %s\n", err); return 1; }
-    printf("labdpi: очередь %u, имя \"%s\", коробка в %d хопах, перекрытие: %s\n",
-           (unsigned)queue, name, hops, last_wins ? "последний" : "первый");
+    printf("labdpi: очередь %u, имя \"%s\", коробка в %d хопах, %s\n",
+           (unsigned)queue, name, hops,
+           naive ? "без сборки потока (имя ищется в одном пакете)"
+                 : (last_wins ? "перекрытие: последний" : "перекрытие: первый"));
     fflush(stdout);
 
     static uint8_t buf[65536];
@@ -297,13 +331,22 @@ int main(int argc, char **argv) {
                             f->base_seq = seq + 1;
                             f->have_base = 1;
                         }
-                        if (f && plen > 0) {
-                            place(f, seq, tcp + doff, plen, last_wins);
-                            if (!f->blocked && found_name(f, name)) {
-                                f->blocked = 1;
+                        int hit = 0;
+                        if (naive) {
+                            /* Ни памяти о потоке, ни сборки: решение целиком
+                               в этом пакете, как у `-m string`. */
+                            hit = plen > 0 &&
+                                  packet_has_name(tcp + doff, plen, name);
+                        } else {
+                            if (f && plen > 0) {
+                                place(f, seq, tcp + doff, plen, last_wins);
+                                if (!f->blocked && found_name(f, name)) {
+                                    f->blocked = 1;
+                                }
                             }
+                            hit = f && f->blocked;
                         }
-                        if (f && f->blocked) {
+                        if (hit) {
                             verdict = NF_DROP;
                             n_dropped_name++;
                         } else if (ip[8] <= (uint8_t)hops) {

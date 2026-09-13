@@ -104,6 +104,7 @@ sh scripts/check.sh          # всё: формат, vet, тесты C и Go, с
 make -C datapath d2kd-linux-arm64   # служба датапата под роутер
 sh scripts/build.sh             # панель под девять арок + d2kc/d2kd под роутер
 sh scripts/lab-install.sh       # установка целиком, в контейнере (нужен Docker)
+sh scripts/lab-transit.sh       # клиент ЗА NAT: обход обязан дойти до него
 ```
 
 `scripts/check.sh` — единственный вход в проверку. Звать его надо через `&&`:
