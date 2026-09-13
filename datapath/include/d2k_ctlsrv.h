@@ -67,7 +67,11 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t send_limits, uint32_t send_maxlen,
  * Зовётся СРАЗУ после d2k_ctl_accept и до любых других событий: контроллер,
  * не получивший версии или получивший чужую, обязан отказаться работать, а не
  * мерить пустоту смешанной парой (см. D2K_CTL_PROTO_VERSION в d2k_ctl.h). */
-void d2k_ctlsrv_greet(d2k_ctl *ctl);
+/* send_maxlen — предел длины посылки, который объявляет ЭТОТ датапат
+ * (d2k_raw_maxlen); 0 — предела нет (стенд без сырого сокета). Едет
+ * контроллеру вместе с версией: без него тот собирает планы, не зная, что
+ * унесёт канал (см. D2K_EV_PROTO в d2k_ctl.h). */
+void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen);
 
 /* Обработчик для d2k_ctl_poll. ctx — d2k_ctlsrv *. */
 void d2k_ctlsrv_command(void *ctx, uint16_t type, const uint8_t *body, size_t len);

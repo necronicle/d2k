@@ -407,6 +407,10 @@ struct d2k_sched {
        уликой нельзя (см. on_applied). */
     uint32_t     dropped_seen;
 
+    /* Предел длины посылки, объявленный датапатом (D2K_EV_PROTO). Ноль — не
+       объявлен: сборка планов тогда ведёт себя как раньше. */
+    uint32_t     send_cap;
+
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
        какого времени идёт поиск» (внутри всё на монотонных). */
@@ -457,6 +461,11 @@ static void say(d2k_sched *s, const char *fmt, ...) {
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
     s->say_fn(s->say_ctx, line);
+}
+
+void d2k_sched_set_send_cap(d2k_sched *s, uint32_t cap) {
+    if (!s) { return; }
+    s->send_cap = cap;
 }
 
 void d2k_sched_set_say(d2k_sched *s, d2k_sched_say_fn fn, void *ctx) {
@@ -1165,13 +1174,14 @@ static void task_done(task *t) {
    готовых планов и синтеза.
 
    Возвращает число долитых планов. */
-static size_t refill_from_fallback(task *t) {
+static size_t refill_from_fallback(const d2k_sched *s, task *t) {
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     size_t added = 0;
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     while (added < cap) {
         char text[sizeof t->plans[0]];
-        if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, text, sizeof text) != 0) {
+        if (d2k_fallback_plan(t->fb_next, sh, SCHED_DECOY, s->send_cap,
+                              text, sizeof text) != 0) {
             t->fb_next++;
             if (t->fb_next > D2K_FALLBACK_MAX) { break; }
             continue;   /* плечо не выразимо — пробел реализации, идём дальше */
@@ -1350,7 +1360,7 @@ static int install_next(d2k_sched *s, task *t) {
         /* Очередь исчерпана. Раньше здесь был отказ — задача уходила в
            отдых. Теперь пробуем ТРЕТИЙ источник: запасной перебор донора.
            Ничего не долилось — значит список кончился, и отказ честен. */
-        if (refill_from_fallback(t) == 0) { return -1; }
+        if (refill_from_fallback(s, t) == 0) { return -1; }
     }
 }
 

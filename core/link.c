@@ -321,6 +321,13 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
         if (rlen >= 2) {
             out->num = (uint32_t)rest[0] << 8 | rest[1];
         }
+        /* Предел отправки — четыре байта следом. Его может не быть: старый
+           датапат слал только версию, и терять из-за этого разбор события
+           нельзя. Нет байтов — ноль, то есть «предел не объявлен». */
+        if (rlen >= 6) {
+            out->send_maxlen = (uint32_t)rest[2] << 24 | (uint32_t)rest[3] << 16 |
+                               (uint32_t)rest[4] << 8 | rest[5];
+        }
         break;
     case D2K_EV_REFUSED:
         /* КОД ПРИЧИНЫ, если он приехал. Байт необязателен по длине по той же

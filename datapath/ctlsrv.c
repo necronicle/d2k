@@ -90,7 +90,7 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     }
 }
 
-void d2k_ctlsrv_greet(d2k_ctl *ctl) {
+void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
     if (!ctl) { return; }
     /* ПЕРВОЕ, ЧТО СЛЫШИТ КОНТРОЛЛЕР — ВЕРСИЯ ПРОВОДА.
        До неё он не знает, с кем разговаривает, а провод менялся несовместимо
@@ -98,10 +98,14 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl) {
        ругается: она молча не даёт подтверждений, и полдня измерений уходит в
        никуда. Событие лосси, как и все прочие, — не дошло, значит контроллер
        версии не увидел и обязан считать это несовпадением. */
-    uint8_t body[D2K_KEY_WIRE_LEN + 2];
+    uint8_t body[D2K_KEY_WIRE_LEN + 6];
     memset(body, 0, sizeof body);
     body[D2K_KEY_WIRE_LEN]     = (uint8_t)(D2K_CTL_PROTO_VERSION >> 8);
     body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)D2K_CTL_PROTO_VERSION;
+    body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(send_maxlen >> 24);
+    body[D2K_KEY_WIRE_LEN + 3] = (uint8_t)(send_maxlen >> 16);
+    body[D2K_KEY_WIRE_LEN + 4] = (uint8_t)(send_maxlen >> 8);
+    body[D2K_KEY_WIRE_LEN + 5] = (uint8_t)send_maxlen;
     d2k_ctl_event(ctl, D2K_EV_PROTO, body, sizeof body);
 }
 

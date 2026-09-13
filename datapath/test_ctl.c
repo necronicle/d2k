@@ -283,7 +283,7 @@ static void check_proto_greeting(void) {
     int cli = dial();
     CHECK(cli >= 0, "клиент для проверки версии не подключился");
     d2k_ctl_accept(c);
-    d2k_ctlsrv_greet(c);
+    d2k_ctlsrv_greet(c, 1500u);
     d2k_ctl_flush(c);
 
     uint16_t type = 0;
@@ -291,11 +291,19 @@ static void check_proto_greeting(void) {
     ssize_t n = read_event(cli, &type, ev, sizeof ev);
     CHECK(n > 0, "версия протокола не приехала вовсе");
     CHECK(type == D2K_EV_PROTO, "первым событием пришла не версия протокола");
-    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 2), "тело версии не «ключ + два байта»");
-    if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 2)) {
+    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 6),
+          "тело версии не «ключ + два байта версии + четыре байта предела»");
+    if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 6)) {
         unsigned v = (unsigned)ev[D2K_KEY_WIRE_LEN] << 8 | ev[D2K_KEY_WIRE_LEN + 1];
         CHECK(v == (unsigned)D2K_CTL_PROTO_VERSION,
               "объявлена не та версия протокола, что собрана");
+        /* Предел отправки едет ТЕМ ЖЕ событием: без него контроллер собирает
+           планы, не зная, что унесёт канал (см. D2K_EV_PROTO в d2k_ctl.h). */
+        unsigned long lim = (unsigned long)ev[D2K_KEY_WIRE_LEN + 2] << 24 |
+                            (unsigned long)ev[D2K_KEY_WIRE_LEN + 3] << 16 |
+                            (unsigned long)ev[D2K_KEY_WIRE_LEN + 4] << 8 |
+                            ev[D2K_KEY_WIRE_LEN + 5];
+        CHECK(lim == 1500ul, "предел отправки доехал не тем числом, каким объявлен");
     }
     close(cli);
     d2k_ctl_close(c);

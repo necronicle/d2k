@@ -288,7 +288,7 @@ int main(int argc, char **argv) {
         if (p[1].revents & POLLIN) {
             d2k_ctl_accept(ctl);
             /* Версия провода — первым делом, до любых других событий. */
-            d2k_ctlsrv_greet(ctl);
+            d2k_ctlsrv_greet(ctl, 0u);   /* стенд без сырого сокета: предела нет */
         }
         if (ip != (nfds_t)-1 && (p[ip].revents & (POLLIN | POLLHUP))) {
             /* Тот же счётчик, что метит симулированные пакеты ниже: единые
