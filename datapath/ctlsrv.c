@@ -116,13 +116,22 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
 
     switch (type) {
     case D2K_CMD_SET_NAME:
+    case D2K_CMD_SET_NAME_PROBE:
     case D2K_CMD_SET_ADDR: {
         /* SET_NAME: [длина имени][имя][ФОРМА][план]. Форма байтом перед
            планом, а не после: длина плана в теле не объявлена, план это «всё,
            что осталось», и поле после него было бы съедено как его часть.
            Формат сменился 12.09.2026 вместе с кодом APPLIED — d2kd и d2kc
            обновляются согласованно (d2k_ctl.h, d2k_link.h). */
-        size_t hdr = (type == D2K_CMD_SET_NAME) ? (len ? 2u + b[0] : 2u) : 4u;
+        /* У пробной команды после формы идёт ещё местный порт (u16). */
+        size_t hdr;
+        if (type == D2K_CMD_SET_ADDR) {
+            hdr = 4u;
+        } else if (type == D2K_CMD_SET_NAME_PROBE) {
+            hdr = len ? 4u + b[0] : 4u;
+        } else {
+            hdr = len ? 2u + b[0] : 2u;
+        }
         if (len < hdr) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
@@ -140,9 +149,13 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             return;
         }
         int rc;
-        if (type == D2K_CMD_SET_NAME) {
-            rc = d2k_plantab_set_name_shaped(tab, b + 1, b[0], cx->now_ns, p,
-                                             b[1u + b[0]]);
+        if (type == D2K_CMD_SET_NAME || type == D2K_CMD_SET_NAME_PROBE) {
+            uint16_t sport_be = 0;
+            if (type == D2K_CMD_SET_NAME_PROBE) {
+                memcpy(&sport_be, b + 2u + b[0], 2);
+            }
+            rc = d2k_plantab_set_name_probe(tab, b + 1, b[0], cx->now_ns, p,
+                                            b[1u + b[0]], sport_be);
         } else {
             uint32_t addr;
             memcpy(&addr, b, 4);

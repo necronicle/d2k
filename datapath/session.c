@@ -670,9 +670,15 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        миграция — задача каталога, а не мгновенного отказа здесь. Совместимы
        они по ФОРМЕ; транспорт проверяется отдельно и ниже — он объявлен в
        самом плане, и догадываться о нём не нужно (plan_fits_transport). */
-    const d2k_plan *use = d2k_plantab_find(s->plans, (const uint8_t *)name,
-                                           name_len, dst_be, now_ns,
-                                           D2K_PLAN_SHAPE_QUIC);
+    /* МЕСТНЫЙ ПОРТ — чтобы пробная запись досталась только потоку зонда и
+       никому больше (d2k_plans.h про d2k_plantab_set_name_probe). Берётся из
+       заголовка как есть, в сетевом порядке: таблица сравнивает его с тем,
+       что назвал контроллер, и переворачивать по дороге нечего. */
+    uint16_t sport_be;
+    memcpy(&sport_be, u + 0, 2);
+    const d2k_plan *use = d2k_plantab_find_sport(s->plans, (const uint8_t *)name,
+                                                 name_len, dst_be, now_ns,
+                                                 D2K_PLAN_SHAPE_QUIC, sport_be);
     if (!use) {
         use = s->plan;
     }
@@ -1280,10 +1286,13 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             /* Признака нет, блок оборван — «ещё не всё пришло». Формы не
                объявляем: LEGACY здесь был бы выдуманным замером. */
         }
-        use = d2k_plantab_find(s->plans,
-                               tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
-                               tls.have_sni ? tls.sni_len : 0,
-                               dst_be, now_ns, seen_shape);
+        /* Местный порт — см. ту же оговорку в ветке UDP выше. */
+        uint16_t sport_be;
+        memcpy(&sport_be, t + 0, 2);
+        use = d2k_plantab_find_sport(s->plans,
+                                     tls.have_sni ? pkt + payload_off + tls.sni_off : NULL,
+                                     tls.have_sni ? tls.sni_len : 0,
+                                     dst_be, now_ns, seen_shape, sport_be);
         if (!use) {
             use = s->plan;
         }

@@ -291,6 +291,57 @@ int main(void) {
         d2k_plantab_free(t);
     }
 
+    /* --- ПРОБНАЯ ЗАПИСЬ ДОСТАЁТСЯ ТОЛЬКО СВОЕМУ ПОТОКУ --------------------
+     *
+     * Испытывает кандидата зонд, а платил за испытание пользователь: план
+     * вставал по ИМЕНИ и доставался всем, кто шёл к этой цели. На роутере
+     * владельца 13.09.2026 поиск по i.ytimg.com шёл двадцать одну минуту, и
+     * всё это время цель работала через раз. */
+    {
+        d2k_plantab *t = d2k_plantab_new(8);
+        CHECK(t != NULL, "таблица не создалась");
+        if (t) {
+            d2k_plan *probe_plan = mkplan();
+            d2k_plan *common = mkplan();
+            const uint8_t nm[] = "i.ytimg.com";
+            const size_t nl = sizeof nm - 1;
+            const uint16_t sport = 0x3412;   /* сетевой порядок, значение неважно */
+
+            CHECK(d2k_plantab_set_name_probe(t, nm, nl, 1, probe_plan,
+                                             D2K_PLAN_SHAPE_MODERN, sport) == 0,
+                  "пробная запись не встала");
+
+            /* Свой поток — получает. */
+            CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 2, D2K_PLAN_SHAPE_MODERN, sport)
+                      == probe_plan,
+                  "поток зонда не получил пробный план");
+            /* Чужой поток — НЕ получает: для него этой записи нет вовсе. */
+            CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 3, D2K_PLAN_SHAPE_MODERN, 0x9988)
+                      == NULL,
+                  "чужой поток получил пробный план — испытание за счёт пользователя");
+            /* И тот, кто про порты не знает, тоже не получает. */
+            CHECK(d2k_plantab_find(t, nm, nl, 0, 4, D2K_PLAN_SHAPE_MODERN) == NULL,
+                  "пробная запись досталась вызову без порта");
+
+            /* Подтверждённый план ставится БЕЗ порта и достаётся всем,
+               пробная запись при этом ему не мешает. */
+            CHECK(d2k_plantab_set_name_shaped(t, nm, nl, 5, common,
+                                              D2K_PLAN_SHAPE_MODERN) == 0,
+                  "подтверждённый план не встал рядом с пробным");
+            CHECK(d2k_plantab_find(t, nm, nl, 0, 6, D2K_PLAN_SHAPE_MODERN) == common,
+                  "подтверждённый план не достался общему потоку");
+            CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 7, D2K_PLAN_SHAPE_MODERN, 0x9988)
+                      == common,
+                  "чужой поток не получил подтверждённый план");
+            /* А поток зонда всё ещё судит испытуемый: иначе испытание мерило
+               бы не то, что поставили. */
+            CHECK(d2k_plantab_find_sport(t, nm, nl, 0, 8, D2K_PLAN_SHAPE_MODERN, sport)
+                      == probe_plan,
+                  "поток зонда перестал получать испытуемый план");
+            d2k_plantab_free(t);
+        }
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

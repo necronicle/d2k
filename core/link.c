@@ -357,6 +357,15 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
 
 int d2k_link_set_name(int fd, const char *name, uint8_t transport,
                       const char *plan_text, uint8_t shape, char *err, size_t errcap) {
+    return d2k_link_set_name_probe(fd, name, transport, plan_text, shape, 0, err, errcap);
+}
+
+/* Ноль в sport_be означает «всем» и шлёт обычный SET_NAME — старый формат
+   тела, старое поведение. Ненулевой порт превращает команду в пробную
+   (D2K_CMD_SET_NAME_PROBE): такой план достанется ровно одному потоку. */
+int d2k_link_set_name_probe(int fd, const char *name, uint8_t transport,
+                            const char *plan_text, uint8_t shape,
+                            uint16_t sport_be, char *err, size_t errcap) {
     if (fd < 0) {
         say(err, errcap, "сокет не открыт");
         return -1;
@@ -385,7 +394,8 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
         say(err, errcap, "план не hex: нечётное число символов (%zu)", hexlen);
         return -1;
     }
-    size_t plan_cap = sizeof g_scratch - HDR - 2 - nl;   /* 1 длина имени + 1 форма */
+    size_t extra = sport_be ? 2u : 0u;                  /* местный порт, если пробный */
+    size_t plan_cap = sizeof g_scratch - HDR - 2 - nl - extra;
     if (hexlen / 2 > plan_cap) {
         say(err, errcap, "план длиннее предела кадра");
         return -1;
@@ -399,6 +409,10 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
        Длина плана в теле не объявлена: план это «всё, что осталось». Поле
        после него было бы съедено как часть плана. */
     g_scratch[o++] = shape;
+    if (sport_be) {
+        memcpy(g_scratch + o, &sport_be, 2);
+        o += 2;
+    }
     long planlen = hex_decode(plan_text, g_scratch + o, sizeof g_scratch - o);
     if (planlen < 0) {
         say(err, errcap, "план не hex: недопустимый символ");
@@ -419,8 +433,9 @@ int d2k_link_set_name(int fd, const char *name, uint8_t transport,
     g_scratch[1] = (uint8_t)(plen >> 16);
     g_scratch[2] = (uint8_t)(plen >> 8);
     g_scratch[3] = (uint8_t)plen;
-    g_scratch[4] = (uint8_t)(D2K_CMD_SET_NAME >> 8);
-    g_scratch[5] = (uint8_t)D2K_CMD_SET_NAME;
+    uint16_t cmd = sport_be ? D2K_CMD_SET_NAME_PROBE : D2K_CMD_SET_NAME;
+    g_scratch[4] = (uint8_t)(cmd >> 8);
+    g_scratch[5] = (uint8_t)cmd;
 
     if (write_all(fd, g_scratch, o) != 0) {
         say(err, errcap, "команда SET_NAME не отправилась: %s", strerror(errno));

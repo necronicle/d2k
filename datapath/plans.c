@@ -22,6 +22,11 @@ typedef struct {
        успех собственного зонда на TLS 1.3 ничего не говорит про браузер с
        TLS 1.2 (docs/decisions/0009 U5). */
     uint8_t  shape;
+    /* Местный порт потока, которому одному эта запись и предназначена
+       (сетевой порядок). Ноль — «любому»: так стоят подтверждённые планы.
+       Ненулевой ставит только испытание кандидата (см.
+       d2k_plantab_set_name_probe в d2k_plans.h). */
+    uint16_t only_sport;
     d2k_plan *plan;
 } entry;
 
@@ -111,9 +116,13 @@ static int name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
 }
 
 /* used, не cap — см. инвариант уплотнения в шапке файла. */
+/* Запись имени БЕЗ ПРИВЯЗКИ К ПОТОКУ. Пробные записи (only_sport != 0) сюда
+   не попадают намеренно: они существуют только для одного местного порта, и
+   для всех прочих вопросов их как будто нет. Пропусти это — и пробный план
+   утёк бы к пользователю через ветку «имя знаем, формы такой нет». */
 static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len) {
     for (size_t i = 0; i < t->used; i++) {
-        if (t->v[i].kind == KEY_NAME &&
+        if (t->v[i].kind == KEY_NAME && t->v[i].only_sport == 0 &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
@@ -133,15 +142,21 @@ static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len) {
  * TCP-план, и QUIC-план; после синхронизации в таблице оставался последний, и
  * клиент за роутером не проходил ни по одному транспорту — при том, что
  * собственный зонд на обоих отвечал 200. */
-static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
-                              uint8_t shape) {
+static entry *find_name_shape_port(d2k_plantab *t, const uint8_t *name, size_t len,
+                                   uint8_t shape, uint16_t sport_be) {
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_NAME && t->v[i].shape == shape &&
+            t->v[i].only_sport == sport_be &&
             name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
             return &t->v[i];
         }
     }
     return NULL;
+}
+
+static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
+                              uint8_t shape) {
+    return find_name_shape_port(t, name, len, shape, 0);
 }
 
 static entry *find_addr(d2k_plantab *t, uint32_t addr_be) {
@@ -222,6 +237,12 @@ static entry *take_free_or_evict(d2k_plantab *t) {
 
 int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
                                 uint64_t now_ns, d2k_plan *p, uint8_t shape) {
+    return d2k_plantab_set_name_probe(t, name, len, now_ns, p, shape, 0);
+}
+
+int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
+                               uint64_t now_ns, d2k_plan *p, uint8_t shape,
+                               uint16_t sport_be) {
     if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX) {
         d2k_plan_free(p);
         return -2;
@@ -236,17 +257,17 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
        его никто не подтверждал. Вместо этого обновляется план у измеренной
        записи — ровно прежнее поведение «форму не понижаем». */
     entry *e = NULL;
-    if (shape == D2K_PLAN_SHAPE_GRANDFATHER) {
+    if (shape == D2K_PLAN_SHAPE_GRANDFATHER && sport_be == 0) {
         e = find_name(t, name, len);
-        if (e && e->shape != D2K_PLAN_SHAPE_GRANDFATHER) {
+        if (e && e->only_sport == 0 && e->shape != D2K_PLAN_SHAPE_GRANDFATHER) {
             e->last_used_ns = now_ns;
             d2k_plan_free(e->plan);
             e->plan = p;
             return 0;
         }
     }
-    if (!e || e->shape != shape) {
-        e = find_name_shape(t, name, len, shape);
+    if (!e || e->shape != shape || e->only_sport != sport_be) {
+        e = find_name_shape_port(t, name, len, shape, sport_be);
     }
     if (!e) {
         e = take_free_or_evict(t);
@@ -259,6 +280,7 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
         e->name_len = (uint8_t)len;
         memcpy(e->name, name, len);
         e->shape = shape;
+        e->only_sport = sport_be;
     }
     e->last_used_ns = now_ns;
     /* Прежний план освобождается здесь, а не у вызывающего: иначе замена
@@ -378,12 +400,37 @@ size_t d2k_plantab_shape_misses(const d2k_plantab *t) {
 const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
                                  size_t len, uint32_t addr_be, uint64_t now_ns,
                                  uint8_t seen_shape) {
+    return d2k_plantab_find_sport(t, name, len, addr_be, now_ns, seen_shape, 0);
+}
+
+const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
+                                       size_t len, uint32_t addr_be, uint64_t now_ns,
+                                       uint8_t seen_shape, uint16_t sport_be) {
     if (!t) {
         return NULL;
     }
     if (name && len) {
+        /* ПРОБНАЯ ЗАПИСЬ ЭТОГО ПОТОКА — ПЕРВОЙ. Она поставлена под один
+           конкретный местный порт (испытание кандидата), и если поток тот
+           самый, судить его обязан именно испытуемый план. Для всех
+           остальных потоков её как будто нет вовсе. */
+        entry *e = NULL;
+        if (sport_be != 0) {
+            e = find_name_shape_port(t, name, len, seen_shape, sport_be);
+            if (!e) {
+                e = find_name_shape_port(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER, sport_be);
+            }
+            if (e) {
+                e->last_used_ns = now_ns;
+                if (shape_fits(e->shape, seen_shape)) {
+                    return e->plan;
+                }
+                t->shape_misses++;
+                return NULL;
+            }
+        }
         /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
-        entry *e = find_name_shape(t, name, len, seen_shape);
+        e = find_name_shape(t, name, len, seen_shape);
         if (!e) {
             /* Дедушкино право — отдельная запись, и она подходит любой
                форме (см. shape_fits). Ищем её только когда своей нет. */

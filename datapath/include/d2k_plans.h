@@ -140,6 +140,26 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
 int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
                          d2k_plan *p);
 
+/* ПРОБНЫЙ ПЛАН — ТОЛЬКО ДЛЯ ОДНОГО ПОТОКА, а не для всех, кто пойдёт к этой
+ * цели.
+ *
+ * Испытывает кандидата зонд, а платил за испытание пользователь: план встаёт
+ * по ИМЕНИ, и его получают ВСЕ соединения к этой цели, пока идёт перебор. На
+ * роутере владельца 13.09.2026 поиск по i.ytimg.com шёл двадцать одну минуту,
+ * и всё это время цель у человека работала через раз — часть кандидатов её
+ * пробивала, часть рвала.
+ *
+ * Есть и вторая, худшая беда: пока пробный план висит на имени, «цель молчит»
+ * означает сразу две несовместимые вещи — «коробка режет» и «наш же кандидат
+ * сломал». Отличить их нечем, и поиск меряет собственную тень.
+ *
+ * sport_be — местный порт зонда В СЕТЕВОМ ПОРЯДКЕ; зонд занимает его заранее
+ * (bind до connect), потому и может назвать. Ноль означает «любой поток» —
+ * так ставятся ПОДТВЕРЖДЁННЫЕ планы, им скрывать нечего. */
+int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
+                               uint64_t now_ns, d2k_plan *p, uint8_t shape,
+                               uint16_t sport_be);
+
 /* Убирает план цели. Возвращает 1, если что-то убрано. */
 int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len);
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be);
@@ -158,6 +178,15 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be);
 const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
                                  size_t len, uint32_t addr_be, uint64_t now_ns,
                                  uint8_t seen_shape);
+
+/* То же, но с МЕСТНЫМ ПОРТОМ потока (сетевой порядок). Запись, поставленная
+ * под конкретный порт (d2k_plantab_set_name_probe), достаётся только потоку с
+ * этим портом; запись без порта — любому. Вариант без порта выше зовёт этот с
+ * нулём, то есть видит только записи без порта: так и надо всем, кто про
+ * пробные планы не знает. */
+const d2k_plan *d2k_plantab_find_sport(d2k_plantab *t, const uint8_t *name,
+                                       size_t len, uint32_t addr_be, uint64_t now_ns,
+                                       uint8_t seen_shape, uint16_t sport_be);
 
 /* Сколько раз запись нашлась по цели, но НЕ ПОДОШЛА по форме приветствия.
  * Отдельно от «плана нет»: тот счёт растёт и на каждом не-приветствии, и по
