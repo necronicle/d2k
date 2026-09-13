@@ -121,6 +121,29 @@ static entry *find_name(d2k_plantab *t, const uint8_t *name, size_t len) {
     return NULL;
 }
 
+/* ЗАПИСЬ ИЩЕТСЯ ПО ИМЕНИ И ФОРМЕ, а не по одному имени.
+ *
+ * У одного имени бывает НЕСКОЛЬКО планов: TCP и QUIC — это разные
+ * приветствия, разные коробки в общем случае и заведомо разные воздействия
+ * (датаграмму нельзя резать, поток нельзя размножить приманками). Пока
+ * запись была одна на имя, вторая привязка ЗАТИРАЛА первую, и какой из двух
+ * обходов работает, зависело от порядка синхронизации каталога.
+ *
+ * Замерено на роутере Марка 13.09.2026: у www.facebook.com подтверждены и
+ * TCP-план, и QUIC-план; после синхронизации в таблице оставался последний, и
+ * клиент за роутером не проходил ни по одному транспорту — при том, что
+ * собственный зонд на обоих отвечал 200. */
+static entry *find_name_shape(d2k_plantab *t, const uint8_t *name, size_t len,
+                              uint8_t shape) {
+    for (size_t i = 0; i < t->used; i++) {
+        if (t->v[i].kind == KEY_NAME && t->v[i].shape == shape &&
+            name_eq(t->v[i].name, t->v[i].name_len, name, len)) {
+            return &t->v[i];
+        }
+    }
+    return NULL;
+}
+
 static entry *find_addr(d2k_plantab *t, uint32_t addr_be) {
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_ADDR && t->v[i].addr_be == addr_be) {
@@ -203,7 +226,28 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
         d2k_plan_free(p);
         return -2;
     }
-    entry *e = find_name(t, name, len);
+    /* Своя запись на КАЖДУЮ ИЗМЕРЕННУЮ форму этого имени — см.
+       find_name_shape выше. Прежде запись была одна на имя, и вторая
+       привязка (например, QUIC) затирала первую (TCP).
+
+       ДЕДУШКИНО ПРАВО СВОЕЙ ЗАПИСИ НЕ ЗАВОДИТ, если у имени уже есть
+       измеренная: оно подходит любому приветствию (shape_fits), и такая
+       запись рядом с измеренной молча расширила бы план на формы, на которых
+       его никто не подтверждал. Вместо этого обновляется план у измеренной
+       записи — ровно прежнее поведение «форму не понижаем». */
+    entry *e = NULL;
+    if (shape == D2K_PLAN_SHAPE_GRANDFATHER) {
+        e = find_name(t, name, len);
+        if (e && e->shape != D2K_PLAN_SHAPE_GRANDFATHER) {
+            e->last_used_ns = now_ns;
+            d2k_plan_free(e->plan);
+            e->plan = p;
+            return 0;
+        }
+    }
+    if (!e || e->shape != shape) {
+        e = find_name_shape(t, name, len, shape);
+    }
     if (!e) {
         e = take_free_or_evict(t);
         if (!e) {
@@ -214,19 +258,9 @@ int d2k_plantab_set_name_shaped(d2k_plantab *t, const uint8_t *name, size_t len,
         e->kind = KEY_NAME;
         e->name_len = (uint8_t)len;
         memcpy(e->name, name, len);
+        e->shape = shape;
     }
     e->last_used_ns = now_ns;
-    /* ФОРМУ НЕ ПОНИЖАЕМ. Запись, уже помеченную измеренной формой, нельзя
-       молча расширить до дедушкиного права: порядок команд не наш (сначала
-       испытание, потом синхронизация каталога — или наоборот), и от него не
-       должно зависеть, к каким приветствиям применяется план. */
-    if (e->shape != D2K_PLAN_SHAPE_MODERN && e->shape != D2K_PLAN_SHAPE_LEGACY &&
-        e->shape != D2K_PLAN_SHAPE_QUIC) {
-        e->shape = shape;
-    } else if (shape == D2K_PLAN_SHAPE_MODERN || shape == D2K_PLAN_SHAPE_LEGACY ||
-               shape == D2K_PLAN_SHAPE_QUIC) {
-        e->shape = shape;
-    }
     /* Прежний план освобождается здесь, а не у вызывающего: иначе замена
        плана цели молча текла бы. */
     d2k_plan_free(e->plan);
@@ -292,7 +326,20 @@ int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
     if (!t || !name || len == 0) {
         return 0;
     }
-    return drop(t, find_name(t, name, len));
+    /* Снимаем ВСЕ записи этого имени, а не первую попавшуюся: у имени их
+       теперь столько, сколько измеренных форм приветствия (см.
+       find_name_shape). «Сними план с этой цели» означает снять его целиком;
+       оставленная вторая форма продолжала бы применяться, и человек видел бы
+       обход там, где его выключили. */
+    int n = 0;
+    for (;;) {
+        entry *e = find_name(t, name, len);
+        if (!e || drop(t, e) == 0) {
+            break;
+        }
+        n++;
+    }
+    return n > 0;
 }
 
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
@@ -335,7 +382,18 @@ const d2k_plan *d2k_plantab_find(d2k_plantab *t, const uint8_t *name,
         return NULL;
     }
     if (name && len) {
-        entry *e = find_name(t, name, len);
+        /* Сперва запись СВОЕЙ формы: у имени их может быть несколько. */
+        entry *e = find_name_shape(t, name, len, seen_shape);
+        if (!e) {
+            /* Дедушкино право — отдельная запись, и она подходит любой
+               форме (см. shape_fits). Ищем её только когда своей нет. */
+            e = find_name_shape(t, name, len, D2K_PLAN_SHAPE_GRANDFATHER);
+        }
+        if (!e) {
+            /* Имя знаем, а формы такой у него нет — это отдельный факт, см.
+               счётчик ниже. */
+            e = find_name(t, name, len);
+        }
         if (e) {
             /* Обращение продлевает жизнь записи — см. d2k_plans.h про то,
                почему рабочая цель не должна вытесняться наравне с забытой.
