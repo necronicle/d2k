@@ -290,15 +290,24 @@ static const char *proto_name(uint8_t proto) {
     }
 }
 
+/* Все виды записей названы вслух. Пропущенный вид печатался «?», и в
+   диагностике лаборатории 13.09 судьба посылок выглядела как «?план
+   доисполнен» — читатель видел знак вопроса там, где всё сошлось. */
 static const char *jrn_kind(uint8_t k) {
     switch (k) {
     case D2K_JRN_HELLO_SNI:     return "приветствие";
     case D2K_JRN_HELLO_NONAME:  return "приветствие без имени";
     case D2K_JRN_PLAN_APPLIED:  return "план применён";
     case D2K_JRN_PLAN_REFUSED:  return "план не применён";
-    case D2K_JRN_SUSPECT:       return "подозрение:";
+    case D2K_JRN_SUSPECT:       return "подозрение";
     case D2K_JRN_EXCHANGE:      return "обмен пошёл";
-    default:                    return "?";
+    case D2K_JRN_SHAPE:         return "снята форма приветствия";
+    /* У этой записи всё сказано в пояснении («план доисполнен»), и вид
+       печатать нечем: «план: план доисполнен» — не строка для человека. */
+    case D2K_JRN_PLAN_DONE:     return "";
+    case D2K_JRN_PLAN_UNSENT:   return "посылка не ушла";
+    case D2K_JRN_PLAN_DAMAGED:  return "поток испорчен";
+    default:                    return "запись неизвестного вида";
     }
 }
 
@@ -323,13 +332,18 @@ static void print_journal(const d2k_session *s, uint64_t start) {
            о направлении. */
         const uint8_t *la = (const uint8_t *)&e->key.low_ip;
         const uint8_t *ha = (const uint8_t *)&e->key.high_ip;
-        printf("  %6" PRIu64 " мс  %s %u.%u.%u.%u:%u - %u.%u.%u.%u:%u  %s%s%s%s\n",
+        printf("  %6" PRIu64 " мс  %s %u.%u.%u.%u:%u - %u.%u.%u.%u:%u  %s%s%s%s%s\n",
                (e->at_ns - start) / NS_PER_MS,
                proto_name(e->key.proto),
                la[0], la[1], la[2], la[3], port_of(&e->key.low_port),
                ha[0], ha[1], ha[2], ha[3], port_of(&e->key.high_port),
                jrn_kind(e->kind),
                e->name_len ? " " : "", e->name_len ? e->name : "",
+               /* Пояснение отделяется двоеточием: без него «план не
+                  применён» и «плана для этой цели нет» слипались в одно
+                  слово. И только там, где есть ЧТО отделять: у записи о
+                  судьбе посылок вид пустой, и строка начиналась бы с него. */
+               (e->note && jrn_kind(e->kind)[0]) ? ": " : "",
                e->note ? e->note : "");
     }
     fflush(stdout);

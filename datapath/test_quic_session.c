@@ -720,6 +720,116 @@ int main(void) {
         d2k_session_free(s);
     }
 
+    /* --- «ШЛЁМ, А МОЛЧАТ»: молчание сервера по QUIC ----------------------
+     *
+     * Лаборатория lab-quic.sh 13.09.2026: цензор снимал датаграммы по имени,
+     * датапат узнавал приветствия (4 из 4 с именем) — и не подозревал НИЧЕГО,
+     * поиск не начинался вовсе. Причина была в учёте: датаграмма сервера
+     * уходила отказом «не клиентский Initial» до всякого счёта, обратная
+     * сторона у QUIC-потока навсегда оставалась нулём, и наблюдение «ответа
+     * не было» по UDP не могло родиться ни при каких обстоятельствах.
+     *
+     * Критерий здесь СВОЙ, не унаследованный от TCP, и каждая его часть
+     * закрепляется отдельной проверкой — иначе завтра любая из них уйдёт
+     * молча, а подозрение останется. */
+    {
+        const uint64_t s_ns = 1000000000ull;
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        const uint8_t any[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+
+        /* 1. Все части на месте: обратная сторона видна, приветствие было,
+           клиент повторил, срок вышел. */
+        {
+            d2k_session *s1 = d2k_session_new(64, 64);
+            /* Ответ сервера на ЧУЖОМ потоке — единственная улика того, что
+               правило на обратное направление вообще поставлено. */
+            size_t n = build_udp_rev_pkt(pkt, 50100, any, sizeof any);
+            d2k_session_packet(s1, pkt, n, 1 * s_ns, buf, sizeof buf, &r);
+
+            n = build_udp_pkt(pkt, 50101, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s1, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_hellos(s1) == 1, "QUIC-приветствие не узнано");
+            CHECK(d2k_session_suspects(s1) == 0, "подозрение сразу после приветствия");
+
+            /* Повтор Initial по таймеру PTO — тот же поток, те же байты. */
+            d2k_session_packet(s1, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+
+            CHECK(d2k_session_sweep(s1, 3 * s_ns + 900000000ull) == 0,
+                  "неполные две секунды молчания по QUIC объявлены блокировкой");
+            CHECK(d2k_session_sweep(s1, 4 * s_ns + 100000000ull) == 1,
+                  "молчание по QUIC не замечено после срока");
+            CHECK(d2k_session_suspects(s1) == 1, "подозрение о молчании по QUIC не отмечено");
+            CHECK(d2k_session_sweep(s1, 20 * s_ns) == 0, "подозрение по QUIC продублировано");
+            d2k_session_free(s1);
+        }
+
+        /* 2. Клиент не повторял — это не «сервер молчит», а «больше не
+           спрашивали». У QUIC ждущий клиент ВСЕГДА повторяет Initial (RFC
+           9002 §6.2), и закрытая вкладка отличается от блокировки ровно
+           этим. */
+        {
+            d2k_session *s2 = d2k_session_new(64, 64);
+            size_t n = build_udp_rev_pkt(pkt, 50200, any, sizeof any);
+            d2k_session_packet(s2, pkt, n, 1 * s_ns, buf, sizeof buf, &r);
+            n = build_udp_pkt(pkt, 50201, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s2, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s2, 30 * s_ns) == 0,
+                  "приветствие без единого повтора объявлено молчанием сервера");
+            d2k_session_free(s2);
+        }
+
+        /* 3. Обратная сторона не видна вовсе: правило на неё не поставлено,
+           оттуда не приходит ничего и никогда. Объявить это молчанием значит
+           подменить «не смотрели» на «нет ответа» (§2.4). */
+        {
+            d2k_session *s3 = d2k_session_new(64, 64);
+            size_t n = build_udp_pkt(pkt, 50301, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s3, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            d2k_session_packet(s3, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s3, 30 * s_ns) == 0,
+                  "невидимая обратная сторона QUIC объявлена молчащей");
+            /* И забвение потока не должно обойти ту же оговорку с чёрного
+               хода. */
+            d2k_session_expire(s3, 300 * s_ns, 50 * s_ns);
+            CHECK(d2k_session_suspects(s3) == 0,
+                  "забвение UDP-потока объявило молчанием невидимую обратную сторону");
+            d2k_session_free(s3);
+        }
+
+        /* 4. Сервер ответил на ЭТОТ поток — молчания нет, сколько ни ждать.
+           У UDP пустых пакетов не бывает, поэтому ответом считается любая
+           датаграмма оттуда, а не только несущая нагрузку. */
+        {
+            d2k_session *s4 = d2k_session_new(64, 64);
+            size_t n = build_udp_pkt(pkt, 50401, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s4, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            d2k_session_packet(s4, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+            n = build_udp_rev_pkt(pkt, 50401, any, sizeof any);
+            d2k_session_packet(s4, pkt, n, 3 * s_ns + 100000000ull, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s4, 30 * s_ns) == 0,
+                  "ответивший по QUIC сервер объявлен молчащим");
+            d2k_session_free(s4);
+        }
+
+        /* 5. Обе стороны на порту 443 — направление неизвестно, и ни
+           видимости обратной стороны, ни приветствия из такой датаграммы не
+           следует. */
+        {
+            d2k_session *s5 = d2k_session_new(64, 64);
+            size_t n = build_udp_pkt(pkt, 443, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s5, pkt, n, 1 * s_ns, buf, sizeof buf, &r);
+            CHECK(r.skipped != NULL && strstr(r.skipped, "неизвестно") != NULL,
+                  "датаграмма 443->443 не объяснена как неизвестное направление");
+            n = build_udp_pkt(pkt, 50501, 443, v1_initial, sizeof v1_initial);
+            d2k_session_packet(s5, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+            d2k_session_packet(s5, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+            CHECK(d2k_session_sweep(s5, 30 * s_ns) == 0,
+                  "443->443 сошла за видимость обратной стороны");
+            d2k_session_free(s5);
+        }
+    }
+
     /* --- таблица UDP-потоков чистится по молчанию, как и таблица TCP ------- */
     {
         d2k_session *s = d2k_session_new(64, 32);
