@@ -175,7 +175,7 @@ int main(void) {
         d2k_props pr;
         memset(&pr, 0, sizeof pr);
         char plans[8][4096];
-        size_t n = d2k_compose(&pr, D2K_SHAPE_MODERN, "disk.rzd.ru", plans, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_MODERN, "disk.rzd.ru", 0, plans, 8);
         CHECK(n == 1, "пустой вектор обязан дать ровно один запасной план");
         if (n >= 1) {
             uint8_t tlv[D2K_PLAN_TLV_MAX];

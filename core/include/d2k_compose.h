@@ -276,7 +276,10 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
  * двух профилей) как безопасный запасной вариант, а не как угаданное «нет»:
  * это выбор ФОРМЫ ПРИМАНКИ, не записываемое свойство коробки, тройственная
  * логика d2k_props этим не затрагивается. */
+/* send_cap — предел длины посылки, объявленный датапатом (D2K_EV_PROTO);
+ * 0 — не объявлен. Тело фальшивки урезается по нему: оно обязано и покрывать
+ * то, что должно покрыть, и помещаться в канал. */
 size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *decoy,
-                   char out[][4096], size_t cap);
+                   size_t send_cap, char out[][4096], size_t cap);
 
 #endif /* D2K_COMPOSE_H */

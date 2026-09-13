@@ -904,7 +904,7 @@ int main(int argc, char **argv) {
     }
 
     static char plans[8][4096];
-    size_t n = d2k_compose(&pr, target_shape, decoy, plans, 8);
+    size_t n = d2k_compose(&pr, target_shape, decoy, 0, plans, 8);
     print_plans(plans, n, decoy, no_decoy_reason);
 
     d2k_link_close(fd);

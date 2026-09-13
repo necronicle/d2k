@@ -670,7 +670,7 @@ int main(void) {
      * См. большой комментарий в шапке файла про расхождение с брифом. */
     {
         d2k_props pr = {0};
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "полностью неизмеренный вектор обязан дать ровно один "
                        "запасной план (everythingPlan), а не ноль и не больше");
         CHECK(strstr(out[0], "seqovl") != NULL, "запасной план без перекрытия");
@@ -689,13 +689,13 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], "seqovl") != NULL, "плечо перекрытия не собрано");
         CHECK(strstr(out[0], "payload 1 0f") != NULL, "приставка перекрытия не та");
 
         pr.tolerates_left_overlap = D2K_P_YES;
-        n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "коробка держит перекрытие: свой план не должен выводиться, "
                        "но вектор пуст и обязан дать everythingPlan, а не 0 и не 2");
         CHECK(strstr(out[0], "seqovl") != NULL && strstr(out[0], "order reverse") != NULL,
@@ -706,7 +706,7 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.tolerates_reorder = D2K_P_NO;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], "sni_middle") != NULL,
               "рез не по имени: замер донора 07.09 показал, что середина приветствия не работает");
@@ -720,7 +720,7 @@ int main(void) {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
         pr.validates_checksum = D2K_P_UNKNOWN;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "неизмеренная сумма всё равно породила своё плечо");
         CHECK(strstr(out[0], CHECKSUM_FILLER_MARK) == NULL,
               "неизмеренное свойство породило checksum-плечо");
@@ -730,7 +730,7 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.counts_duplicates = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], "fake payload=1 poison=1 repeats=2 gap_us=20000 place=before") != NULL,
               "план дубликатов: не та форма fake");
@@ -743,7 +743,7 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.parses_l7 = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], "fake payload=1 poison=1 repeats=1 gap_us=0 place=before") != NULL,
               "план разбора протокола: не та форма fake (repeats/gap перепутаны с дубликатами)");
@@ -763,18 +763,18 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.parses_l7 = D2K_P_YES;
-        CHECK(d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8) == 1, "LEGACY: не одно плечо");
+        CHECK(d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8) == 1, "LEGACY: не одно плечо");
         size_t legacy_hex = hexrun_after(out[0], "payload 1 ");
         CHECK(legacy_hex > 100 && legacy_hex < 1000,
               "длина hex LEGACY-приманки вне ожидаемых границ (~420 симв. для LEGACY)");
 
-        CHECK(d2k_compose(&pr, D2K_SHAPE_MODERN, decoy, out, 8) == 1, "MODERN: не одно плечо");
+        CHECK(d2k_compose(&pr, D2K_SHAPE_MODERN, decoy, 0, out, 8) == 1, "MODERN: не одно плечо");
         size_t modern_hex = hexrun_after(out[0], "payload 1 ");
         CHECK(modern_hex > legacy_hex * 2,
               "вид цели MODERN не выбрал MODERN-приманку — hex не заметно длиннее LEGACY");
         CHECK(strlen(out[0]) < 4096, "MODERN-план не поместился бы в старый буфер out[][2048]" );
 
-        CHECK(d2k_compose(&pr, D2K_SHAPE_UNKNOWN, decoy, out, 8) == 1, "UNKNOWN: не одно плечо");
+        CHECK(d2k_compose(&pr, D2K_SHAPE_UNKNOWN, decoy, 0, out, 8) == 1, "UNKNOWN: не одно плечо");
         size_t unknown_hex = hexrun_after(out[0], "payload 1 ");
         CHECK(unknown_hex == legacy_hex,
               "вид цели UNKNOWN не упал на безопасный запасной LEGACY, дал другую длину");
@@ -784,7 +784,7 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.validates_checksum = D2K_P_NO;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "ожидалось ровно одно плечо");
         CHECK(strstr(out[0], CHECKSUM_FILLER_MARK) != NULL,
               "план суммы не содержит набивку 0x0f — приманка не та");
@@ -800,7 +800,7 @@ int main(void) {
         d2k_props pr = {0};
         pr.validates_checksum = D2K_P_NO;
         pr.parses_l7 = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 1, "сумма=NO вместе с разбором=YES дала не одно плечо — "
                        "ловушка донора наоборот не подавлена");
         CHECK(strstr(out[0], CHECKSUM_FILLER_MARK) == NULL,
@@ -812,7 +812,7 @@ int main(void) {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
         pr.counts_duplicates = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out, 8);
         CHECK(n == 2, "два независимых свойства обязаны дать два плеча");
         CHECK(strstr(out[0], "seqovl") != NULL,
               "порядок плеч расходится с Go Compose: перекрытие обязано идти первым");
@@ -826,7 +826,7 @@ int main(void) {
         pr.tolerates_left_overlap = D2K_P_NO;
         pr.counts_duplicates = D2K_P_YES;
         char out1[1][4096];
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out1, 1);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out1, 1);
         CHECK(n == 1, "cap=1 не ограничил число записанных плеч");
         CHECK(strstr(out1[0], "seqovl") != NULL,
               "при cap=1 записано не первое по порядку плечо");
@@ -834,7 +834,7 @@ int main(void) {
     {
         d2k_props pr = {0};
         char out0[1][4096];
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, out0, 0);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, out0, 0);
         CHECK(n == 0, "cap=0 обязан дать 0 независимо от вектора");
     }
 
@@ -842,13 +842,13 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, 0, out, 8);
         CHECK(n == 1, "план перекрытия обязан собираться и без decoy");
     }
     {
         d2k_props pr = {0};
         pr.tolerates_reorder = D2K_P_NO;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, 0, out, 8);
         CHECK(n == 1, "план порядка обязан собираться и без decoy — якорь вычисляется датапатом");
     }
 
@@ -856,14 +856,14 @@ int main(void) {
     {
         d2k_props pr = {0};
         pr.counts_duplicates = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, NULL, 0, out, 8);
         CHECK(n == 0, "без decoy план дубликатов обязан быть пропущен, а не выдуман; "
                        "запасной план тоже нуждается в decoy и падает по той же причине");
     }
     {
         d2k_props pr = {0};
         pr.counts_duplicates = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, "", out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_LEGACY, "", 0, out, 8);
         CHECK(n == 0, "пустая строка decoy обязана трактоваться как «имени нет», а не как имя");
     }
 
@@ -874,18 +874,18 @@ int main(void) {
         long_decoy[sizeof long_decoy - 1] = '\0';
         d2k_props pr = {0};
         pr.parses_l7 = D2K_P_YES;
-        size_t n = d2k_compose(&pr, D2K_SHAPE_MODERN, long_decoy, out, 8);
+        size_t n = d2k_compose(&pr, D2K_SHAPE_MODERN, long_decoy, 0, out, 8);
         CHECK(n == 0, "слишком длинный decoy обязан дать пропуск плеча, а не переполнение/усечение");
     }
 
     /* --- нулевые/негодные аргументы d2k_compose не падают и не пишут ------- */
     {
-        CHECK(d2k_compose(NULL, D2K_SHAPE_LEGACY, decoy, out, 8) == 0, "pr==NULL обязан дать 0, а не падение");
+        CHECK(d2k_compose(NULL, D2K_SHAPE_LEGACY, decoy, 0, out, 8) == 0, "pr==NULL обязан дать 0, а не падение");
     }
     {
         d2k_props pr = {0};
         pr.tolerates_left_overlap = D2K_P_NO;
-        CHECK(d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, NULL, 8) == 0, "out==NULL обязан дать 0, а не падение");
+        CHECK(d2k_compose(&pr, D2K_SHAPE_LEGACY, decoy, 0, NULL, 8) == 0, "out==NULL обязан дать 0, а не падение");
     }
 
     /* ======================================================================
@@ -1642,13 +1642,12 @@ int main(void) {
                 }
             }
         }
-        CHECK(longest[0] == 64,
-              "без объявленного предела длина набивки изменилась — проверить её нечем");
-        CHECK(longest[2] > 64,
-              "при канале в полтора килобайта набивка осталась прежней: "
-              "остаток имени она перекроет только случайно");
-        CHECK(longest[1] < longest[2],
-              "узкий канал не укоротил тело фальшивки");
+        CHECK(longest[0] > 0, "без объявленного предела плечи перестали собираться");
+        /* Широкий канал НЕ РАСТИТ тело: предел — условие необходимое, но не
+           достаточное (с посылкой едет ещё кусок настоящей нагрузки, и его
+           длину знает пакет). Достаточное считает датапат. */
+        CHECK(longest[2] == longest[0],
+              "объявленный широкий канал изменил тело фальшивки");
     }
 
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }

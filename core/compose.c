@@ -1148,6 +1148,22 @@ static int duplicates_plan_text(d2k_shape shape, const char *decoy, char *buf, s
     return badsum_fake_plan_text(hello, hello_len, 2, 20000, buf, cap);
 }
 
+/* Сколько байт тела может унести посылка при объявленном пределе.
+ *
+ * Вычитаются МАКСИМАЛЬНЫЕ заголовки, а не типичные: поле длины заголовка и в
+ * IPv4, и в TCP занимает четыре бита с шагом в четыре байта, то есть каждый
+ * из них не длиннее шестидесяти (RFC 791 §3.1, RFC 793 §3.1). Оценка снизу
+ * здесь и нужна: ошибка в эту сторону делает фальшивку короче, чем можно, а в
+ * другую — отказ отправки посреди исполнения, где чистого выхода нет.
+ *
+ * Ноль означает «предел не объявлен» и отдаёт ноль же: вызывающий обязан
+ * вести себя как раньше, а не считать, что можно сколько угодно. */
+static size_t body_room(size_t send_cap) {
+    const size_t heads = 60 + 60;
+    if (send_cap <= heads) { return 0; }
+    return send_cap - heads;
+}
+
 /* --------------------------------------------------------------------
  * everythingPlan (properties.go:369-394) — единственный честный кандидат при
  * ПОЛНОСТЬЮ неизмеренном векторе: перекрытие слева, разнесённая пара дублей
@@ -1155,10 +1171,16 @@ static int duplicates_plan_text(d2k_shape shape, const char *decoy, char *buf, s
  * sni_middle}, что и у reorder_plan_text (задача reorder-cut, ревью
  * 2026-09-06) — НЕ AnchorHelloMiddle, той же забракованной замером формы.
  * -------------------------------------------------------------------- */
-static int everything_plan_text(d2k_shape shape, const char *decoy, char *buf, size_t cap) {
+static int everything_plan_text(d2k_shape shape, const char *decoy, size_t send_cap,
+                                char *buf, size_t cap) {
     uint8_t hello[D2K_COMPOSE_HELLO_MAX];
     size_t hello_len;
     if (build_decoy_hello(shape, decoy, hello, sizeof hello, &hello_len) != 0) { return -1; }
+    /* Тело фальшивки урезается по каналу — та же причина и та же оговорка, что
+       у запасного перебора (см. body_room ниже): приманка в 1534 байта при
+       канале в 1500 даёт отказ отправки, и плечо не исполняется вовсе. */
+    size_t room = body_room(send_cap);
+    if (room > 0 && hello_len > room) { hello_len = room; }
 
     size_t pos = 0;
     if (emit_header(buf, cap, &pos) != 0) { return -1; }
@@ -1293,22 +1315,6 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
     return -1;
 }
 
-/* Сколько байт тела может унести посылка при объявленном пределе.
- *
- * Вычитаются МАКСИМАЛЬНЫЕ заголовки, а не типичные: поле длины заголовка и в
- * IPv4, и в TCP занимает четыре бита с шагом в четыре байта, то есть каждый
- * из них не длиннее шестидесяти (RFC 791 §3.1, RFC 793 §3.1). Оценка снизу
- * здесь и нужна: ошибка в эту сторону делает фальшивку короче, чем можно, а в
- * другую — отказ отправки посреди исполнения, где чистого выхода нет.
- *
- * Ноль означает «предел не объявлен» и отдаёт ноль же: вызывающий обязан
- * вести себя как раньше, а не считать, что можно сколько угодно. */
-static size_t body_room(size_t send_cap) {
-    const size_t heads = 60 + 60;
-    if (send_cap <= heads) { return 0; }
-    return send_cap - heads;
-}
-
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap, char *buf, size_t cap) {
     fb_arm a;
@@ -1368,11 +1374,21 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                Поэтому берётся МЕНЬШЕЕ из двух: сколько нужно (приманка) и
                сколько унесёт канал (body_room). Предел не объявлен — остаётся
                прежнее поведение: не выдумывать длину, которой не проверить. */
+            /* ПОЧЕМУ НАБИВКА НЕ РАСТЁТ ДО ДЛИНЫ ПРИМАНКИ, ХОТЯ КАНАЛ ИЗВЕСТЕН.
+               Потому что посылка несёт не одно тело: при `place=between` с ней
+               едет кусок настоящей нагрузки, и сколько его — знает ПАКЕТ, а не
+               сборка. Измерено 13.09.2026: набивка, поднятая до предела канала
+               минус максимальные заголовки, всё равно давала «посылка 1574 при
+               пределе 1500», и кандидаты уходили в «опыт невозможен» один за
+               другим. Предел канала здесь — условие НЕОБХОДИМОЕ, но не
+               достаточное, и притворяться обратным нельзя.
+
+               Поэтому набивка остаётся прежней, а предел используется только
+               на урезание: там, где тело заведомо не влезет одно (приманка в
+               теле, ниже). Достаточное условие считает датапат, и правильное
+               место для него — там же, где считаются настоящие длины. */
+            size_t fill = hello_len ? 64 : 64;
             size_t room = body_room(send_cap);
-            /* Предел не объявлен — остаётся ПРЕЖНЕЕ число. Длина приманки без
-               урезания измеренно ломает всю семью фальшивок (посылка 1574 при
-               канале 1500), а проверить её здесь нечем: канал неизвестен. */
-            size_t fill = room > 0 ? (hello_len ? hello_len : 64) : 64;
             if (room > 0 && fill > room) { fill = room; }
             for (size_t i = 0; i < fill; i++) {
                 if (append_fmt(buf, cap, &pos, "%02x", (unsigned)D2K_OVERLAP_FILLER) != 0) {
@@ -1445,7 +1461,7 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
  * ровно как nil не совпадал ни с *b==true, ни с *b==false.
  * -------------------------------------------------------------------- */
 size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *decoy,
-                   char out[][4096], size_t cap) {
+                   size_t send_cap, char out[][4096], size_t cap) {
     if (!pr || !out || cap == 0) { return 0; }
     size_t n = 0;
     size_t buflen = sizeof(out[0]); /* не литерал: буфер вызывающего меняет размер вместе с сигнатурой, не порознь */
@@ -1477,7 +1493,7 @@ size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *deco
            doc-комментарий cap в d2k_compose.h): единственный честный
            кандидат — «всё сразу» (everythingPlan, properties.go:214-221),
            а не «плечей нет». */
-        if (everything_plan_text(target_shape, decoy, out[0], buflen) == 0) { n = 1; }
+        if (everything_plan_text(target_shape, decoy, send_cap, out[0], buflen) == 0) { n = 1; }
     }
     return n;
 }

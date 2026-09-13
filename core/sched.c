@@ -1447,7 +1447,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     if (t->n_plans < cap) {
-        t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY,
+        t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY, s->send_cap,
                                   t->plans + t->n_plans, cap - t->n_plans);
     }
 }

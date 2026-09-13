@@ -747,8 +747,8 @@ int main(void) {
             memset(&none, 0, sizeof none);
             memset(&answered, 0, sizeof answered);
             d2k_props_question_passed(2, &answered);
-            size_t n_empty = d2k_compose(&none, D2K_SHAPE_MODERN, "disk.rzd.ru", empty_plan, 8);
-            size_t n_answ = d2k_compose(&answered, D2K_SHAPE_MODERN, "disk.rzd.ru", answered_plan, 8);
+            size_t n_empty = d2k_compose(&none, D2K_SHAPE_MODERN, "disk.rzd.ru", 0, empty_plan, 8);
+            size_t n_answ = d2k_compose(&answered, D2K_SHAPE_MODERN, "disk.rzd.ru", 0, answered_plan, 8);
             CHECK(n_empty >= 1 && n_answ >= 1, "d2k_compose не собрал план ни там, ни там");
             CHECK(n_empty >= 1 && n_answ >= 1 && strcmp(empty_plan[0], answered_plan[0]) != 0,
                   "план по отвеченному вектору совпал с запасным — ответ коробки ничего не изменил");
