@@ -133,6 +133,7 @@
 #include <unistd.h>
 
 #include "d2k_quic.h"       /* d2k_quic_is_initial — канонический разбор заголовка Task 2 */
+#include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
 
@@ -842,9 +843,43 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     struct timespec sent_at[D2K_QUIC_MAX_ADDRS];
     int pending = 0;
 
+    /* КАЖДАЯ ПАРАЛЛЕЛЬНАЯ ПОПЫТКА — СВОЁ СОЕДИНЕНИЕ.
+     *
+     * Здесь стоял открытый вопрос (см. шапку файла): отбивает ли сервер три
+     * дословно одинаковые датаграммы как повтор одного пакета. Замер сделан
+     * 13.09.2026 в lab-quic.sh на www.google.com: контрольное имя давало
+     * ровно 1/3 — первая попытка засчитывалась, две другие пропадали молча.
+     * Единогласие 3/3 при этом недостижимо ни на одном вопросе, и дерево
+     * честно объявляло «измерению верить нельзя» ВСЕГДА.
+     *
+     * Ответ — не ослабить порог, а перестать слать один и тот же пакет
+     * одного и того же соединения: идентификатор назначения RFC 9000 §7.2
+     * велит выбирать заново на КАЖДОЕ соединение, и три попытки — это три
+     * соединения. Содержимое приветствия при этом не меняется ни на байт
+     * (d2k_quic_hello_recid): форма — то, что коробка сличает, и трогать её
+     * нельзя.
+     *
+     * Не вышло пересобрать (не Initial, чужая версия — так выглядит зонд
+     * согласования версий, склеенная датаграмма) — шлём снимок как есть.
+     * Это ровно прежнее поведение, и там оно верно: у тех вопросов
+     * состояния соединения на сервере не заводится. */
+    static const size_t COPY_CAP = D2K_QW_MAX_DGRAM;
+    uint8_t copies[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
+    d2k_hello sent[D2K_QUIC_MAX_ADDRS];
+    for (int i = 0; i < repeats; i++) {
+        size_t clen = 0;
+        if (msg.bytes && msg.len &&
+            d2k_quic_hello_recid(msg.bytes, msg.len, copies[i], COPY_CAP, &clen) == 0) {
+            sent[i].bytes = copies[i];
+            sent[i].len = clen;
+        } else {
+            sent[i] = msg;
+        }
+    }
+
     for (int i = 0; i < repeats; i++) {
         fds[i] = qp_send_one(addr, port, prefix, prefix_len, prefix_ttl, prefix_copies,
-                              msg, mark, &marked[i]);
+                              sent[i], mark, &marked[i]);
         if (!marked[i]) {
             t.marked = 0;
         }
@@ -902,7 +937,10 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             uint8_t buf[2048];
             ssize_t n = recv(fds[i], buf, sizeof buf, 0);
             if (n > 0) {
-                if (verify(buf, (size_t)n, msg) == 0) {
+                /* Проверять ответ надо ключами ТОЙ копии, что ушла с этого
+                   сокета: у каждой свой идентификатор, а из него выводятся
+                   ключи сервера. */
+                if (verify(buf, (size_t)n, sent[i]) == 0) {
                     result[i] = 1;
                     if (rtt_ms_out) {
                         struct timespec arrived;
