@@ -101,7 +101,10 @@ extern d2k_sched_arm_fn  d2k_sched_arm_hook;
  * hello_wire — длина приветствия, снятого С КЛИЕНТА этой цели: зонд добивает
  * своё до неё, иначе измерение идёт в другом контексте, чем работа человека
  * (седьмая находка лаборатории 13.09.2026). */
-typedef d2k_ver_result (*d2k_sched_ver_fn)(const char *ip, uint16_t port,
+/* use_fd — УЖЕ ЗАНЯТЫЙ сокет зонда, под чей местный порт поставлен пробный
+ * план (d2k_props_bind + d2k_link_set_name_probe). Меньше нуля — сокета нет,
+ * зонд заводит свой; владение сокетом переходит вызываемому. */
+typedef d2k_ver_result (*d2k_sched_ver_fn)(int use_fd, const char *ip, uint16_t port,
                                            uint8_t transport, const char *sni,
                                            int deadline_ms, size_t hello_wire);
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;

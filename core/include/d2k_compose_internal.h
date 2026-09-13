@@ -90,4 +90,25 @@ void d2k_props_question_passed(int q, d2k_props *pr);
 int  d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
                        uint8_t *local_ip4, uint16_t *local_port, int *out_fd);
 
+/* ЗАНЯТЬ МЕСТНЫЙ ПОРТ ЗАРАНЕЕ, до всякого подключения.
+ *
+ * Нужно ровно для одного: испытание кандидата обязано действовать только на
+ * поток зонда, а чтобы назвать этот поток датапату, его местный порт нужно
+ * знать ДО того, как зонд пойдёт на цель (d2k_link_set_name_probe). После
+ * connect знать поздно — план уже не поставить.
+ *
+ * Порт занимается настоящим bind, а не угадыванием свободного: угаданный
+ * может оказаться занятым между выбором и подключением, и зонд ушёл бы с
+ * другого порта, а план остался бы висеть на чужом.
+ *
+ * Сокет отдаётся ОТКРЫТЫМ и непомеченным: его дальше передают в
+ * d2k_props_contact как готовый. Закрывает вызывающий. */
+int  d2k_props_bind(int *out_fd, uint16_t *sport_be);
+
+/* Как d2k_props_contact, но на УЖЕ ЗАНЯТОМ сокете (d2k_props_bind). use_fd
+ * меньше нуля означает «создать свой» — тогда это в точности
+ * d2k_props_contact. */
+int  d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
+                          uint8_t *local_ip4, uint16_t *local_port, int *out_fd);
+
 #endif /* D2K_COMPOSE_INTERNAL_H */

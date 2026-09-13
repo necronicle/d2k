@@ -84,6 +84,14 @@ static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
 
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
                                 int deadline_ms, size_t hello_wire) {
+    return d2k_verify_probe_on(-1, ip, port, sni, deadline_ms, hello_wire);
+}
+
+/* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind), чей местный порт вызывающий
+   назвал датапату заранее, чтобы пробный план достался только этому потоку.
+   Меньше нуля — создать свой, тогда это в точности d2k_verify_probe. */
+d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, const char *sni,
+                                   int deadline_ms, size_t hello_wire) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -106,7 +114,7 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
     d2k_hello none;
     none.bytes = NULL;
     none.len = 0;
-    if (d2k_props_contact(ip, port, none, r.local_ip4, &r.local_port, &r.fd) != 0) {
+    if (d2k_props_contact_on(use_fd, ip, port, none, r.local_ip4, &r.local_port, &r.fd) != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TCP");
         return r;
     }

@@ -101,6 +101,13 @@ typedef struct {
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
                                 int deadline_ms, size_t hello_wire);
 
+/* То же, но на УЖЕ ЗАНЯТОМ сокете. Нужно испытанию кандидата: его план
+ * ставится только для местного порта зонда, а порт обязан быть известен ДО
+ * подключения (d2k_props_bind, d2k_link_set_name_probe). Меньше нуля —
+ * создать свой сокет, тогда это в точности d2k_verify_probe. */
+d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
+                                   const char *sni, int deadline_ms, size_t hello_wire);
+
 /* ТО ЖЕ САМОЕ, НО ПО QUIC. Уровни и их смысл не меняются ни на йоту:
  * TRANSPORT — датаграммы уходят, ответа нет; HANDSHAKE — рукопожатие
  * завершено, приложение молчит; APPLICATION — пришёл код ответа HTTP/3.

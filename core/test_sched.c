@@ -147,8 +147,14 @@ static int ver_name_ok = -1;
    всегда), единица — «не про кандидата, а про транспорт». */
 static int ver_unsupported;
 
-static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
+/* Сокет зонда приходит УЖЕ ЗАНЯТЫМ (под его порт поставлен пробный план).
+   Подменённый зонд в сеть не ходит, но владение обязан взять: иначе каждый
+   опыт течёт дескриптором, и тест упрётся в их предел. */
+static int ver_last_fd = -2;
+static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire) {
+    ver_last_fd = use_fd;
+    if (use_fd >= 0) { close(use_fd); }
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
     ver_last_wire = hello_wire;
     ver_calls++;
@@ -837,6 +843,40 @@ int main(void) {
             }
         }
         d2k_catalog_free(&cR);
+    }
+
+    /* --- ПРОБНЫЙ ПЛАН СТАВИТСЯ ПОД ПОРТ ЗОНДА, А НЕ ВСЕМ ------------------
+     *
+     * Испытывает кандидата зонд, а платил за испытание пользователь: план
+     * вставал по имени и доставался всем, кто шёл к этой цели. На роутере
+     * владельца 13.09.2026 поиск по i.ytimg.com шёл двадцать одну минуту, и
+     * всё это время цель работала через раз.
+     *
+     * Проверяем, что зонду достаётся УЖЕ ЗАНЯТЫЙ сокет: значит порт известен
+     * заранее и план поставлен именно под него. */
+    {
+        d2k_catalog cP;
+        memset(&cP, 0, sizeof cP);
+        d2k_sched *s = d2k_sched_new(&cP, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_last_fd = -2;
+        ver_answer_port = 40301;
+        d2k_ev h = ev_hello(6, 40301, "испытание.под.портом");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40301);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls >= 1, "зонд не пошёл вовсе");
+        CHECK(ver_last_fd >= 0,
+              "зонду достался пустой сокет — порт не занят заранее, значит пробный "
+              "план встал ВСЕМ, а не одному потоку");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cP);
     }
 
     /* --- подозрение без предшествующего приветствия: имени нет, искать

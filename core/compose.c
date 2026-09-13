@@ -475,10 +475,33 @@ static int wait_for_event(int fd, uint16_t want, int code_filter,
    Читать из сокета по-прежнему не нужно (судит датапат по проводу, см. шапку
    файла): держать открытым и читать — разные вещи, и здесь нужно первое.
    Закрывает вызывающий, ПОСЛЕ ожидания обмена. */
+int d2k_props_bind(int *out_fd, uint16_t *sport_be) {
+    if (out_fd) { *out_fd = -1; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { return -1; }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = 0;                 /* порт выбирает ядро — и сразу отдаёт */
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    struct sockaddr_in got;
+    socklen_t gl = sizeof got;
+    if (getsockname(fd, (struct sockaddr *)&got, &gl) != 0) { close(fd); return -1; }
+    if (sport_be) { *sport_be = got.sin_port; }   /* сетевой порядок, как есть */
+    if (out_fd) { *out_fd = fd; } else { close(fd); return -1; }
+    return 0;
+}
+
 int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
                       uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
+    return d2k_props_contact_on(-1, ip, port, h, local_ip4, local_port, out_fd);
+}
+
+int d2k_props_contact_on(int use_fd, const char *ip, uint16_t port, d2k_hello h,
+                         uint8_t *local_ip4, uint16_t *local_port, int *out_fd) {
     if (out_fd) { *out_fd = -1; }
-    if (!ip) { return -1; }
+    if (!ip) { if (use_fd >= 0) { close(use_fd); } return -1; }
     /* Пустое приветствие законно, и это не послабление контракта, а второй
        его законный вход: зонд подтверждения (core/verify.c) ведёт СВОЁ
        рукопожатие TLS 1.3 своим ключом и чужих байт в начало потока не
@@ -487,9 +510,9 @@ int d2k_props_contact(const char *ip, uint16_t port, d2k_hello h,
        завести второе обращение к цели рядом, а расходятся такие копии молча
        (см. шапку d2k_compose_internal.h). Указатель без длины — по-прежнему
        нарушение: это не «нечего слать», это испорченный вызов. */
-    if (h.len > 0 && !h.bytes) { return -1; }
+    if (h.len > 0 && !h.bytes) { if (use_fd >= 0) { close(use_fd); } return -1; }
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = use_fd >= 0 ? use_fd : socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { return -1; }
     int one = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);

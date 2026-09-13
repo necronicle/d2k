@@ -189,16 +189,20 @@ static int refuse_is_damage(uint8_t code) {
  * Initial, а не доводить обмен приложения до конца), и честный ответ про
  * QUIC — «не измерено» (§2.4): кандидат ставится, но в каталог не попадает.
  * Когда такой зонд появится, он встанет сюда же. */
-static d2k_ver_result verify_default(const char *ip, uint16_t port, uint8_t transport,
-                                     const char *sni, int deadline_ms,
-                                     size_t hello_wire) {
+static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
+                                     uint8_t transport, const char *sni,
+                                     int deadline_ms, size_t hello_wire) {
     if (transport == 17) {
+        /* У QUIC свой сокет внутри рукопожатия (quicconn.c): занятый TCP-порт
+           ему не годится, и отдавать его некуда — закрываем, чтобы не течь. */
+        if (use_fd >= 0) { close(use_fd); }
         /* Зонд QUIC появился: доводит рукопожатие до прикладных ключей и
            берёт код ответа HTTP/3. Порог доказательства тот же, что у TCP, —
            прикладной обмен, а не «сервер что-то прислал» (§4.2). */
         return d2k_verify_probe_quic(ip, port, sni, deadline_ms, hello_wire);
     }
     if (transport != 6) {
+        if (use_fd >= 0) { close(use_fd); }
         d2k_ver_result r;
         memset(&r, 0, sizeof r);
         r.fd = -1;
@@ -376,6 +380,12 @@ typedef struct {
     size_t     n_known;
     int        researched;     /* expensive measurement is a fallback, not recognition */
     int        trial_installed;
+    /* СОКЕТ ЗОНДА, ЗАНЯТЫЙ ЗАРАНЕЕ. Пробный план ставится только для его
+       местного порта, поэтому порт обязан быть известен ДО подключения:
+       после connect ставить поздно. Минус один — порт занять не удалось, и
+       тогда план ставится по-старому, всем (об этом говорится вслух). */
+    int        probe_fd;
+    uint16_t   probe_sport_be;
 
     /* Вопросы о свойствах коробки (§2.4, d2k_compose.h). Задаются ТОЛЬКО на
        вердикт «решает содержимое»: разрез такую коробку не берёт, берёт её
@@ -806,7 +816,13 @@ static void *worker_run(void *vp) {
            снимка ещё нет; и то и другое — приветствие настоящего клиента, а
            не наше минимальное. Без этого испытание идёт в ДРУГОМ контексте,
            чем работа человека, и «подтверждено» достаётся зонду. */
-        d2k_ver_result vr = d2k_sched_ver_hook(t->ip, t->port, t->transport,
+        /* Сокет зонда занят заранее (install_next), и план поставлен именно
+           под его порт: зонд обязан пойти С НЕГО, иначе испытание пройдёт
+           мимо собственного плана. Владение отдаётся вниз — закроет тот, кто
+           им распорядится. */
+        int use_fd = t->probe_fd;
+        t->probe_fd = -1;
+        d2k_ver_result vr = d2k_sched_ver_hook(use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
                                                t->trig_len);
         pthread_mutex_lock(&s->mu);
@@ -1153,9 +1169,15 @@ static void ver_close(task *t) {
    поле, чей «пусто» не ноль (см. prop_close выше), и разложить это по всем
    точкам сброса значило бы завести столько же мест, где про него забудут. */
 static void task_reset(task *t) {
+    /* СТРОГО БОЛЬШЕ НУЛЯ. Задачи живут в занулённом массиве, и при самом
+       первом сбросе здесь лежит ноль — не «сокет номер ноль», а «поля ещё не
+       трогали». Закрыть его значит закрыть стандартный ввод процесса: тест
+       ловил это немедленной смертью по SIGPIPE. */
+    if (t->probe_fd > 0) { close(t->probe_fd); }
     memset(t, 0, sizeof *t);
     t->prop_fd = -1;
     t->prop_q = -1;
+    t->probe_fd = -1;   /* та же ловушка нуля, что у prop_fd */
     t->ver.fd = -1; /* та же ловушка нуля, что у prop_fd, — см. prop_close */
 }
 
@@ -1475,12 +1497,32 @@ static int install_next(d2k_sched *s, task *t) {
         if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0) {
             continue; /* кандидат не переводится — не наше наблюдение о коробке */
         }
-        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
-                              probe_shape(t),
-                              err, sizeof err) == 0) {
+        /* ПОРТ ЗОНДА ЗАНИМАЕТСЯ ЗДЕСЬ, в главном потоке, и до установки
+           плана. Не в рабочем: управляющий сокет принадлежит главному циклу,
+           и писать в него из потока зонда значило бы гонку на канале.
+           Транспорт пока только TCP — у QUIC свой сокет внутри рукопожатия
+           (quicconn.c), и его порт этой дорогой не занять; там испытание
+           по-прежнему действует на всех, и это названо, а не скрыто. */
+        if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
+        t->probe_sport_be = 0;
+        if (t->transport == 6) {
+            int pfd = -1;
+            uint16_t psport = 0;
+            if (d2k_props_bind(&pfd, &psport) == 0) {
+                t->probe_fd = pfd;
+                t->probe_sport_be = psport;
+            } else {
+                say(s, "по %s порт для зонда не занялся — пробный план встанет "
+                       "всем, а не только зонду", t->name);
+            }
+        }
+        if (d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
+                                    probe_shape(t), t->probe_sport_be,
+                                    err, sizeof err) == 0) {
             t->trial_installed = 1;
             return 0;
         }
+        if (t->probe_fd >= 0) { close(t->probe_fd); t->probe_fd = -1; }
     }
         /* Очередь исчерпана. Раньше здесь был отказ — задача уходила в
            отдых. Теперь пробуем ТРЕТИЙ источник: запасной перебор донора.
