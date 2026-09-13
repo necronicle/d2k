@@ -133,6 +133,7 @@
 #include <unistd.h>
 
 #include "d2k_quic.h"       /* d2k_quic_is_initial — канонический разбор заголовка Task 2 */
+#include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
 
 /* ---------------------------------------------------------------------
@@ -376,15 +377,6 @@ static int qp_dcid_of(const uint8_t *p, size_t n, uint32_t *version, size_t *off
 #define QP_VERSION_V1 0x00000001u
 #define QP_VERSION_V2 0x6b3343cfu
 
-static const uint8_t qp_salt_v1[20] = {
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-};
-static const uint8_t qp_salt_v2[20] = {
-    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93,
-    0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
-};
-
 /* ---------------------------------------------------------------------
  * Внутри РАСШИФРОВАННОГО серверного Initial: хотя бы один кадр CRYPTO?
  * (правка ревью 2026-09-06 круг 2, находка 5). §8 спецификации требует
@@ -525,82 +517,41 @@ static int qp_verify_server_response(const uint8_t *p, size_t n,
         return -1; /* отвечает не той версией, которой спросили, — не наш ответ */
     }
 
-    uint8_t initial_secret[32], server_secret[32], key[16], iv[12], hp[16];
-    const uint8_t *salt = (version == QP_VERSION_V2) ? qp_salt_v2 : qp_salt_v1;
-    d2k_hkdf_extract(salt, sizeof qp_salt_v1, dcid, dcid_len, initial_secret);
-
-    const char *lk = (version == QP_VERSION_V2) ? "quicv2 key" : "quic key";
-    const char *li = (version == QP_VERSION_V2) ? "quicv2 iv" : "quic iv";
-    const char *lh = (version == QP_VERSION_V2) ? "quicv2 hp" : "quic hp";
-    if (d2k_hkdf_expand_label(initial_secret, "server in", server_secret, sizeof server_secret) != 0) {
+    /* КЛЮЧИ И СНЯТИЕ ЗАЩИТЫ — ОБЩИЕ (core/quicwire.c). Здесь была копия
+       того же кода, что в quic.c: две соли, четыре метки, маска защиты
+       заголовка, сборка AAD и вектора. Копии успели разойтись — одна
+       восстанавливала номер пакета дополнением нулями, другая тоже, но
+       обе молча, — и третья копия (зонд подтверждения) спецификацией
+       запрещена (§2.5). Осталось то, что знает ЭТОТ путь: сторона
+       серверная, а наибольшего принятого у одиночного зонда нет. */
+    uint8_t server_secret[32];
+    if (d2k_qw_initial_secret(version, dcid, dcid_len, D2K_QW_SERVER, server_secret) != 0) {
         return -1;
     }
-    if (d2k_hkdf_expand_label(server_secret, lk, key, sizeof key) != 0) {
+    d2k_qw_keys k;
+    if (d2k_qw_keys_from_secret(version, server_secret, &k) != 0) {
         return -1;
     }
-    if (d2k_hkdf_expand_label(server_secret, li, iv, sizeof iv) != 0) {
-        return -1;
-    }
-    if (d2k_hkdf_expand_label(server_secret, lh, hp, sizeof hp) != 0) {
-        return -1;
-    }
+    d2k_qw_hdr qh;
+    memset(&qh, 0, sizeof qh);
+    qh.long_hdr = 1;
+    qh.version = h.version;
+    qh.type = D2K_QW_LT_INITIAL;
+    qh.dcid_off = h.dcid_off;
+    qh.dcid_len = h.dcid_len;
+    qh.pn_offset = h.pn_offset;
+    qh.length_claimed = h.length_claimed;
+    qh.packet_len = h.pn_offset + h.length_claimed;
 
-    size_t sample_off = h.pn_offset + 4;
-    uint8_t mask[16];
-    d2k_aes128_ecb(hp, p + sample_off, mask);
-
-    uint8_t byte0 = (uint8_t)(p[0] ^ (mask[0] & 0x0f));
-    size_t pn_len = (size_t)(byte0 & 0x03) + 1;
-    uint8_t pn_bytes[4];
-    for (size_t i = 0; i < pn_len; i++) {
-        pn_bytes[i] = (uint8_t)(p[h.pn_offset + i] ^ mask[1 + i]);
-    }
-
-    if (h.length_claimed < pn_len) {
-        return -1;
-    }
-    size_t ct_len = h.length_claimed - pn_len;
-    if (ct_len < 16) {
-        return -1;
-    }
-
-    size_t aad_len = h.pn_offset + pn_len;
-    uint8_t aad[2048];
-    if (aad_len > sizeof aad) {
-        return -1; /* заведомо больше любой правдоподобной Initial-датаграммы — не наш случай */
-    }
-    memcpy(aad, p, aad_len);
-    aad[0] = byte0;
-    memcpy(aad + h.pn_offset, pn_bytes, pn_len);
-
-    uint32_t pn = 0;
-    for (size_t i = 0; i < pn_len; i++) {
-        pn = (pn << 8) | pn_bytes[i];
-    }
-    uint8_t nonce[12];
-    memcpy(nonce, iv, sizeof nonce);
-    for (size_t i = 0; i < 4; i++) {
-        nonce[sizeof nonce - 1 - i] ^= (uint8_t)(pn >> (8 * i));
-    }
-
-    if (ct_len > 2048) {
-        return -1;
-    }
     uint8_t plain[2048];
-    const uint8_t *ct = p + h.pn_offset + pn_len;
-    if (d2k_aes128_gcm_decrypt(key, nonce, aad, aad_len, ct, ct_len, plain) != 0) {
-        return -1; /* тег не сошёлся: похоже на ответ, но не доказательство — см. шапку файла */
+    size_t plain_len = 0;
+    if (h.length_claimed > sizeof plain) {
+        return -1; /* заведомо больше любой правдоподобной Initial-датаграммы */
+    }
+    if (d2k_qw_open(&k, &qh, p, 0, plain, &plain_len, NULL) != 0) {
+        return -1; /* тег не сошёлся: похоже на ответ, но не доказательство */
     }
 
-    /* Резервные биты после снятия ОБЕИХ защит обязаны быть нулём (RFC 9000
-       §17.2); проверять это можно только сейчас — byte0 аутентифицирован
-       только после совпавшего тега (он часть AAD). Тот же порядок, что и в
-       quic.c decrypt_initial, и по той же причине. */
-    if ((byte0 & 0x0c) != 0) {
-        return -1;
-    }
-
-    size_t plain_len = ct_len - 16;
     if (!qp_progressed(plain, plain_len)) {
         return -1; /* аутентичный, но без кадра CRYPTO — вежливый отказ, не прогресс */
     }

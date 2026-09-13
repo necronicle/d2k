@@ -30,7 +30,7 @@ TEST_LDFLAGS = $(LDFLAGS) -lpthread
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
-SRC     = meas.c verdict.c crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c verify.c
+SRC     = meas.c verdict.c crypto.c quicwire.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c plantlv.c x25519.c tls13.c volume.c sched.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
@@ -64,7 +64,7 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_meas test_verdict test_crypto test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
+TESTS   = test_meas test_verdict test_crypto test_quicwire test_quic test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-aarch64 test-meas test-verdict test-crypto test-quic test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
@@ -233,14 +233,17 @@ test_verdict: test_verdict.c meas.o verdict.o hello.o $(HDR) $(TESTHDR)
 test_crypto: test_crypto.c crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_crypto.c crypto.o $(TEST_LDFLAGS)
 
-test_quic: test_quic.c quic.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o crypto.o $(TEST_LDFLAGS)
+test_quicwire: test_quicwire.c quicwire.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicwire.c quicwire.o crypto.o $(TEST_LDFLAGS)
 
-test_quicprobe: test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
+test_quic: test_quic.c quic.o quicwire.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic.c quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
 
-test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(TEST_LDFLAGS)
+test_quicprobe: test_quicprobe.c quicprobe.o quic.o quicwire.o crypto.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quicprobe.c quicprobe.o quic.o quicwire.o crypto.o meas.o $(TEST_LDFLAGS)
+
+test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o quicwire.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(TEST_LDFLAGS)
 
 test_hello: test_hello.c hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_hello.c hello.o $(TEST_LDFLAGS)
@@ -400,19 +403,19 @@ cross: hello_profiles.inc
 		test_crypto.c crypto.c -lpthread || exit 1
 	@echo "== test_quic целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic-a64 \
-		test_quic.c quic.c crypto.c -lpthread || exit 1
+		test_quic.c quic.c quicwire.c crypto.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic-mipsel \
-		test_quic.c quic.c crypto.c -lpthread || exit 1
+		test_quic.c quic.c quicwire.c crypto.c -lpthread || exit 1
 	@echo "== test_quicprobe целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-a64 \
-		test_quicprobe.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+		test_quicprobe.c quicprobe.c quic.c quicwire.c crypto.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quicprobe-mipsel \
-		test_quicprobe.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+		test_quicprobe.c quicprobe.c quic.c quicwire.c crypto.c meas.c -lpthread || exit 1
 	@echo "== test_quic_arms целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
-		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
-		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quic.c quicwire.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
 	@echo "== test_hello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
 		test_hello.c hello.c -lpthread || exit 1
@@ -445,11 +448,11 @@ cross: hello_profiles.inc
 		test_plantlv.c plantlv.c compose.c hello.c meas.c link.c -lpthread || exit 1
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
-		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
 		verify.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
-		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		test_sched.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
 		verify.c -lpthread || exit 1
 	@echo "== d2kask целиком =="
@@ -466,11 +469,11 @@ cross: hello_profiles.inc
 		-lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kc-a64 \
-		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
 		verify.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kc-mipsel \
-		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicprobe.c \
+		d2kc.c sched.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c x25519.c \
 		verify.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
@@ -494,7 +497,7 @@ d2kc-aarch64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
 		-o $(BUILDDIR)/d2kc-aarch64 d2kc.c sched.c plantlv.c verdict.c meas.c \
-		crypto.c quic.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
+		crypto.c quic.c quicwire.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
 		volume.c tls13.c x25519.c verify.c -lpthread
 	@ls -l $(BUILDDIR)/d2kc-aarch64
 
@@ -519,9 +522,9 @@ test-sched: test_sched sched.o plantlv.o verify.o
 # verify.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
-test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+test_sched: test_sched.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
             hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
 		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(TEST_LDFLAGS)
 
 # Стенд test_verify.c — СВОЙ (не общий test_stand.h): он единственный умеет
@@ -537,9 +540,9 @@ test-verify: test_verify
 	./test_verify
 
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
-d2kc: d2kc.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+d2kc: d2kc.c sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
       hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicprobe.o props.o \
+	$(CC) $(CFLAGS) -o $@ $< sched.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
 		hello.o catalog.o match.o compose.o link.o volume.o tls13.o x25519.o verify.o $(TEST_LDFLAGS)
 
 clean:

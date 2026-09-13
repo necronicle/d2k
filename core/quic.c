@@ -56,6 +56,7 @@
 #include <string.h>
 
 #include "d2k_quic.h"
+#include "d2k_quicwire.h"
 
 /* ---------------------------------------------------------------------
  * Константы протокола. Каждая — из текста RFC, а не «на вкус».
@@ -68,20 +69,6 @@
  * длину), поэтому один именованный размер на обе — decrypt_initial ниже
  * передаёт его в d2k_hkdf_extract независимо от того, какая соль выбрана. */
 #define D2K_QUIC_SALT_LEN 20
-
-/* RFC 9001 §5.2, приложение A.1: соль версии 1. Тот же массив уже проверен
- * байтовым вектором в test_crypto.c (initial_salt) — здесь копия неизбежна,
- * т.к. crypto.c не выводит вспомогательных данных наружу, только примитивы. */
-static const uint8_t salt_v1[D2K_QUIC_SALT_LEN] = {
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
-};
-/* RFC 9369 §3.3.1: первые 20 байт sha256("QUICv2 salt"), сверено напрямую по
- * тексту RFC (rfc-editor.org/rfc/rfc9369.txt) при разработке этого файла. */
-static const uint8_t salt_v2[D2K_QUIC_SALT_LEN] = {
-    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93,
-    0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
-};
 
 /* RFC 9000 §17.2: длина DCID/SCID в длинном заголовке — 8-битное число, но
  * "MUST NOT exceed 20 bytes... Endpoints that receive a ... value larger than
@@ -122,9 +109,6 @@ static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
 }
 
-static uint32_t rd32(const uint8_t *p) {
-    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
-}
 
 /* Переменная длина QUIC (RFC 9000 §16): два старших бита ПЕРВОГО байта задают
  * ширину поля (1/2/4/8 байт) — а значит ширину можно узнать только прочитав
@@ -160,22 +144,6 @@ static int read_varint(const uint8_t *p, size_t avail, uint64_t *val, size_t *wi
  * наблюдения и задача другого модуля (core/quicprobe.c, ещё не написан).
  * --------------------------------------------------------------------- */
 
-static const uint8_t *initial_salt_for(uint32_t version) {
-    return version == D2K_QUIC_V2 ? salt_v2 : salt_v1;
-}
-
-static const char *label_quic_key(uint32_t version) {
-    return version == D2K_QUIC_V2 ? "quicv2 key" : "quic key";
-}
-
-static const char *label_quic_iv(uint32_t version) {
-    return version == D2K_QUIC_V2 ? "quicv2 iv" : "quic iv";
-}
-
-static const char *label_quic_hp(uint32_t version) {
-    return version == D2K_QUIC_V2 ? "quicv2 hp" : "quic hp";
-}
-
 /* ---------------------------------------------------------------------
  * Разбор заголовка Initial — общий для d2k_quic_is_initial и d2k_quic_sni,
  * чтобы у них не было шанса разойтись в том, что считать Initial. НЕ трогает
@@ -191,95 +159,34 @@ typedef struct {
 
 static int parse_initial_header(const uint8_t *p, size_t n, quic_hdr *h) {
     if (!p) {
-        return -1; /* проверяется здесь один раз, а не в каждом из двух публичных входов по отдельности */
+        return -1; /* проверяется здесь один раз, а не в каждом из двух публичных входов */
     }
     if (n > D2K_QUIC_MAX_DGRAM) {
         return -1; /* см. комментарий у константы: за этим пределом разбор сознательно не пытается */
     }
-    if (n < 5) {
-        return -1; /* не хватает даже на первый байт и версию — обрывок */
-    }
-    if ((p[0] & 0x80) == 0) {
-        return -1; /* короткий заголовок — до него в Initial-пространстве дело не доходит (RFC 9000 §17.2) */
-    }
-
-    uint32_t version = rd32(p + 1);
-    uint8_t type_bits = (uint8_t)((p[0] & 0x30) >> 4); /* НЕ закрыты защитой заголовка — см. шапку файла */
-    uint8_t want_type;
-    if (version == D2K_QUIC_V1) {
-        want_type = 0x00; /* RFC 9000 §17.2 Table 5 */
-    } else if (version == D2K_QUIC_V2) {
-        want_type = 0x01; /* RFC 9369 §3.2 — перенумеровано нарочно */
-    } else {
-        return -1; /* неизвестная версия, включая 0 (Version Negotiation) — это честно не наш Initial */
-    }
-    if (type_bits != want_type) {
-        return -1; /* тот же длинный заголовок, но 0-RTT/Handshake/Retry — не Initial */
-    }
-
-    size_t off = 5;
-    if (off + 1 > n) {
+    /* РАЗБОР — ОБЩИЙ (core/quicwire.c), а не свой. Копия этого кода уже жила
+       здесь и в quicprobe.c, и копии успели разойтись: одна знала версию 2,
+       другая нет. Здесь остаются только требования, которые предъявляет
+       ИМЕННО ЭТОТ путь — пакетный, где нас интересует ровно клиентский
+       Initial известной версии. */
+    d2k_qw_hdr qh;
+    if (d2k_qw_hdr_parse(p, n, 0, &qh) != 0) {
         return -1;
     }
-    size_t dcid_len = p[off];
-    off += 1;
-    if (dcid_len > D2K_QUIC_CID_MAX) {
-        return -1; /* RFC 9000 §17.2: длиннее 20 — MUST drop, это противоречие стандарту, а не наш обрывок */
+    if (!qh.long_hdr) {
+        return -1; /* короткий заголовок — до него в Initial-пространстве дело не доходит */
     }
-    if (off + dcid_len > n) {
-        return -1;
+    if (qh.version != D2K_QW_V1 && qh.version != D2K_QW_V2) {
+        return -1; /* неизвестная версия — честно не наш Initial */
     }
-    size_t dcid_off = off;
-    off += dcid_len;
-
-    if (off + 1 > n) {
-        return -1;
+    if (qh.type != D2K_QW_LT_INITIAL) {
+        return -1; /* тот же длинный заголовок, но 0-RTT/Handshake/Retry */
     }
-    size_t scid_len = p[off];
-    off += 1;
-    if (scid_len > D2K_QUIC_CID_MAX) {
-        return -1;
-    }
-    if (off + scid_len > n) {
-        return -1;
-    }
-    off += scid_len;
-
-    uint64_t token_len;
-    size_t w;
-    if (read_varint(p + off, n - off, &token_len, &w) != 0) {
-        return -1;
-    }
-    off += w;
-    if (token_len > (uint64_t)(n - off)) {
-        return -1; /* сравнение в uint64_t — токен теоретически до 2^62-1, size_t на mipsel 32-битный */
-    }
-    off += (size_t)token_len;
-
-    uint64_t length_claimed;
-    if (read_varint(p + off, n - off, &length_claimed, &w) != 0) {
-        return -1;
-    }
-    off += w;
-
-    size_t pn_offset = off;
-    if (length_claimed > (uint64_t)(n - pn_offset)) {
-        return -1; /* заявленный остаток пакета не помещается в то, что реально пришло — обрывок */
-    }
-    /* RFC 9001 §5.4.2: сэмпл для снятия защиты заголовка ВСЕГДА берётся через
-     * 4 байта после начала номера пакета (реальная длина номера ещё
-     * неизвестна и намеренно не участвует в этой арифметике), и это 16 байт.
-     * "An endpoint MUST discard packets that are not long enough to contain
-     * a complete sample" — здесь это тот случай. */
-    if (pn_offset + 4 + 16 > n) {
-        return -1;
-    }
-
-    h->version = version;
-    h->dcid_off = dcid_off;
-    h->dcid_len = dcid_len;
-    h->pn_offset = pn_offset;
-    h->length_claimed = (size_t)length_claimed;
+    h->version = qh.version;
+    h->dcid_off = qh.dcid_off;
+    h->dcid_len = qh.dcid_len;
+    h->pn_offset = qh.pn_offset;
+    h->length_claimed = qh.length_claimed;
     return 0;
 }
 
@@ -293,96 +200,30 @@ int d2k_quic_is_initial(const uint8_t *p, size_t n) {
  * --------------------------------------------------------------------- */
 
 static int decrypt_initial(const uint8_t *p, const quic_hdr *h, uint8_t *plain, size_t *plain_len) {
-    uint8_t initial_secret[32], client_secret[32], key[16], iv[12], hp[16];
-
-    d2k_hkdf_extract(initial_salt_for(h->version), D2K_QUIC_SALT_LEN,
-                      p + h->dcid_off, h->dcid_len, initial_secret);
-    /* Метки — наши же литералы (максимум "server in"/"client in", девять
-     * байт), D2K_HKDF_LABEL_MAX это заведомо пропускает; возврат всё равно
-     * проверяется — того требует D2K_WARN_UNUSED в d2k_crypto.h, и это тот
-     * самый случай, ради которого проверка вообще введена: подать сюда
-     * что-то длиннее лимита физически нельзя, но КОД, который не смотрит на
-     * возврат, был бы неотличим от кода, который проверяет. */
-    if (d2k_hkdf_expand_label(initial_secret, "client in", client_secret, sizeof client_secret) != 0) {
+    /* Ключи и снятие защиты — ОБЩИЕ (core/quicwire.c). Здесь остаётся только
+       то, что знает этот путь: сторона клиентская, а номер пакета в начале
+       соединения мал, и наибольшего принятого у пакетного разбора нет —
+       состояния между вызовами у него не бывает по устройству. */
+    uint8_t secret[32];
+    if (d2k_qw_initial_secret(h->version, p + h->dcid_off, h->dcid_len,
+                              D2K_QW_CLIENT, secret) != 0) {
         return -1;
     }
-    if (d2k_hkdf_expand_label(client_secret, label_quic_key(h->version), key, sizeof key) != 0) {
+    d2k_qw_keys k;
+    if (d2k_qw_keys_from_secret(h->version, secret, &k) != 0) {
         return -1;
     }
-    if (d2k_hkdf_expand_label(client_secret, label_quic_iv(h->version), iv, sizeof iv) != 0) {
-        return -1;
-    }
-    if (d2k_hkdf_expand_label(client_secret, label_quic_hp(h->version), hp, sizeof hp) != 0) {
-        return -1;
-    }
-
-    /* Сэмпл и маска (RFC 9001 §5.4.1/5.4.2). Доступность этих байт уже
-     * проверена в parse_initial_header. */
-    size_t sample_off = h->pn_offset + 4;
-    uint8_t mask[16];
-    d2k_aes128_ecb(hp, p + sample_off, mask);
-
-    uint8_t byte0 = (uint8_t)(p[0] ^ (mask[0] & 0x0f)); /* длинный заголовок — младшие 4 бита */
-    size_t pn_len = (size_t)(byte0 & 0x03) + 1;
-    uint8_t pn_bytes[4];
-    for (size_t i = 0; i < pn_len; i++) {
-        pn_bytes[i] = (uint8_t)(p[h->pn_offset + i] ^ mask[1 + i]);
-    }
-
-    if (h->length_claimed < pn_len) {
-        return -1; /* заявленный остаток короче самого номера пакета — противоречие в заголовке */
-    }
-    size_t ct_len = h->length_claimed - pn_len;
-    if (ct_len < 16) {
-        return -1; /* короче тега AEAD не бывает, см. d2k_aes128_gcm_decrypt */
-    }
-
-    /* AAD — весь незащищённый заголовок вплоть до номера пакета включительно
-     * (RFC 9001 §5.3), с первым байтом и номером пакета уже РАСКРЫТЫМИ:
-     * остальное на проводе защите не подвергалось, копируем как есть и
-     * правим только те два места, что были протёрты маской. */
-    size_t aad_len = h->pn_offset + pn_len;
-    uint8_t aad[D2K_QUIC_MAX_DGRAM];
-    memcpy(aad, p, aad_len); /* aad_len <= n <= D2K_QUIC_MAX_DGRAM — проверено в parse_initial_header */
-    aad[0] = byte0;
-    memcpy(aad + h->pn_offset, pn_bytes, pn_len);
-
-    /* Реконструкция номера пакета здесь — простое дополнение нулями старших
-     * байт, а НЕ полный алгоритм "ближайшее к ожидаемому" из RFC 9000 §17.1.
-     * Это осознанное упрощение, а не недосмотр: Initial — самое начало
-     * соединения, и настоящий номер пакета там всегда мал (0, 1, 2, ...) и
-     * укладывается в переданные pn_len байт без обрезания; полный алгоритм
-     * нужен только когда отправитель начинает укорачивать номер относительно
-     * УЖЕ подтверждённого older-пакета — а у этого разбора нет состояния
-     * между вызовами, чтобы такое "older" вообще знать. */
-    uint32_t pn = 0;
-    for (size_t i = 0; i < pn_len; i++) {
-        pn = (pn << 8) | pn_bytes[i];
-    }
-    uint8_t nonce[12];
-    memcpy(nonce, iv, sizeof nonce);
-    for (size_t i = 0; i < 4; i++) {
-        nonce[sizeof nonce - 1 - i] ^= (uint8_t)(pn >> (8 * i));
-    }
-
-    const uint8_t *ct = p + h->pn_offset + pn_len;
-    int rc = d2k_aes128_gcm_decrypt(key, nonce, aad, aad_len, ct, ct_len, plain);
-    if (rc != 0) {
-        return -1; /* тег не сошёлся: похоже на Initial, но не расшифровалось — не наше, см. шапку файла */
-    }
-
-    /* RFC 9000 §17.2: резервные биты (маска 0x0c первого байта) обязаны быть
-     * нулём, и проверять это можно ТОЛЬКО после снятия ОБЕИХ защит — "Discarding
-     * such a packet after only removing header protection can expose the
-     * endpoint to attacks" (там же). До этой строки byte0 не был
-     * аутентифицирован ничем; после успешного d2k_aes128_gcm_decrypt — был,
-     * потому что byte0 входит в AAD, а AAD целиком под тегом. */
-    if ((byte0 & 0x0c) != 0) {
-        return -1;
-    }
-
-    *plain_len = ct_len - 16;
-    return 0;
+    d2k_qw_hdr qh;
+    memset(&qh, 0, sizeof qh);
+    qh.long_hdr = 1;
+    qh.version = h->version;
+    qh.type = D2K_QW_LT_INITIAL;
+    qh.dcid_off = h->dcid_off;
+    qh.dcid_len = h->dcid_len;
+    qh.pn_offset = h->pn_offset;
+    qh.length_claimed = h->length_claimed;
+    qh.packet_len = h->pn_offset + h->length_claimed;
+    return d2k_qw_open(&k, &qh, p, 0, plain, plain_len, NULL);
 }
 
 /* ---------------------------------------------------------------------
