@@ -39,6 +39,7 @@
 
 #include "d2k_nfq.h"
 #include "d2k_nl.h"
+#include "d2k_quic.h"
 
 #define NF_DROP   0u
 #define NF_ACCEPT 1u
@@ -129,18 +130,72 @@ static int found_name(const flow *f, const char *name) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------
+ * КОРОБКА, СМОТРЯЩАЯ ТОЛЬКО ПЕРВУЮ ДАТАГРАММУ ПОТОКА (--first).
+ *
+ * Это не поблажка нам, а ВТОРАЯ настоящая конструкция, и ради неё в каталоге
+ * плеч вообще есть приманки: коробка, которая заводит состояние на пятёрку и
+ * разбирает ПЕРВУЮ датаграмму, обманывается мусором, посланным перед
+ * приветствием. Коробка без состояния (умолчание здесь) разбирает каждую
+ * датаграмму и мусором не обманывается вовсе.
+ *
+ * Обе существуют в природе, и лаборатория обязана уметь показать обе: на
+ * одной вертикаль ДОЛЖНА найти обход, на другой — честно сказать, что не
+ * нашла. Один и тот же ответ на оба стенда означал бы, что стенд не
+ * различает коробки.
+ * --------------------------------------------------------------------- */
+#define UFLOWS 256
+
+typedef struct {
+    int      used;
+    uint32_t sip, dip;
+    uint16_t sport, dport;
+    int      decided;   /* первая датаграмма уже разобрана */
+    int      blocked;   /* и разобрана как «наше имя» — поток закрыт целиком */
+} uflow;
+
+static uflow g_uflows[UFLOWS];
+
+static uflow *uflow_of(uint32_t sip, uint16_t sport, uint32_t dip, uint16_t dport) {
+    uflow *free_slot = NULL;
+    for (size_t i = 0; i < UFLOWS; i++) {
+        uflow *f = &g_uflows[i];
+        if (!f->used) { if (!free_slot) { free_slot = f; } continue; }
+        if (f->sip == sip && f->dip == dip && f->sport == sport && f->dport == dport) {
+            return f;
+        }
+    }
+    if (!free_slot) { return NULL; }   /* таблица полна — коробка просто смотрит всё */
+    free_slot->used = 1;
+    free_slot->sip = sip; free_slot->dip = dip;
+    free_slot->sport = sport; free_slot->dport = dport;
+    free_slot->decided = 0;
+    free_slot->blocked = 0;
+    return free_slot;
+}
+
+static uint32_t rd32be(const uint8_t *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static uint16_t rd16be(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 | p[1]); }
+
 static volatile sig_atomic_t stop_now;
 static void on_stop(int s) { (void)s; stop_now = 1; }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last]\n");
+        fprintf(stderr, "использование: labdpi <очередь> <имя> <хопов> [--last] [--quic] [--first]\n");
         return 2;
     }
     uint16_t queue = (uint16_t)atoi(argv[1]);
     const char *name = argv[2];
     int hops = atoi(argv[3]);
-    int last_wins = (argc > 4 && strcmp(argv[4], "--last") == 0);
+    int last_wins = 0, quic_mode = 0, first_only = 0;
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "--last") == 0) { last_wins = 1; }
+        if (strcmp(argv[i], "--quic") == 0) { quic_mode = 1; }
+        if (strcmp(argv[i], "--first") == 0) { first_only = 1; }
+    }
 
     signal(SIGINT, on_stop);
     signal(SIGTERM, on_stop);
@@ -170,6 +225,58 @@ int main(int argc, char **argv) {
             d2k_nl_pkt p;
             if (d2k_nl_packet(&m, &p) != 0 || !p.have_hdr) { continue; }
             uint32_t verdict = NF_ACCEPT;
+            /* QUIC: имя лежит в ЗАШИФРОВАННОМ Initial, и настоящая коробка
+               достаёт его ровно так же, как мы — ключами, выведенными из
+               идентификатора соединения, который лежит открытым текстом
+               (RFC 9001 §5.2). Никакой сборки потока здесь не нужно: у
+               датаграммы её нет, и весь смысл плеча QUIC в том, чтобы имя
+               в собранном коробкой Initial оказалось не тем. */
+            if (quic_mode && p.have_payload && !p.truncated && p.payload_len >= 28 &&
+                (p.payload[0] >> 4) == 4 && p.payload[9] == 17) {
+                const uint8_t *ip = p.payload;
+                size_t ihl = (size_t)(ip[0] & 0x0F) * 4;
+                if (ihl >= 20 && p.payload_len > ihl + 8) {
+                    const uint8_t *udp = ip + ihl;
+                    size_t plen = p.payload_len - ihl - 8;
+                    n_seen++;
+                    int look = 1;
+                    uflow *f = NULL;
+                    if (first_only) {
+                        f = uflow_of(rd32be(ip + 12), rd16be(udp + 0),
+                                     rd32be(ip + 16), rd16be(udp + 2));
+                        if (f) { look = !f->decided; }
+                    }
+                    char sni[256];
+                    int matched = look &&
+                                  d2k_quic_is_initial(udp + 8, plen) &&
+                                  d2k_quic_sni(udp + 8, plen, sni, sizeof sni) == 0 &&
+                                  strcmp(sni, name) == 0;
+                    if (f) {
+                        /* ОСТАТОЧНАЯ БЛОКИРОВКА. Коробка, решившая «это наше
+                           имя», закрывает ПОТОК, а не одну датаграмму: иначе
+                           повтор Initial по таймеру PTO прошёл бы следом, и
+                           блокировка не была бы блокировкой. Решение
+                           «не наше» закрывает вопрос навсегда в другую
+                           сторону — на это и рассчитана приманка. */
+                        if (!f->decided) { f->decided = 1; f->blocked = matched; }
+                        matched = f->blocked;
+                    }
+                    if (matched) {
+                        verdict = NF_DROP;
+                        n_dropped_name++;
+                    } else if (ip[8] <= (uint8_t)hops) {
+                        /* Смерть по TTL — это СЕТЬ, а не решение коробки, и
+                           она случается независимо от того, смотрела коробка
+                           эту датаграмму или уже приняла решение по потоку. */
+                        verdict = NF_DROP;
+                        n_dropped_ttl++;
+                    } else {
+                        n_pass++;
+                    }
+                }
+                (void)d2k_nfq_verdict(q, p.id, verdict, err, sizeof err);
+                continue;
+            }
             if (p.have_payload && !p.truncated && p.payload_len >= 40 &&
                 (p.payload[0] >> 4) == 4 && p.payload[9] == 6) {
                 const uint8_t *ip = p.payload;
