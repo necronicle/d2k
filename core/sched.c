@@ -316,8 +316,8 @@ typedef struct {
        несколько планов, и «не поместился» относится к одному из них.
        Сбрасывается вместе с кандидатом (install_next) — как и ранние
        отказы. */
-    uint8_t    unfit_plan_id[D2K_PLAN_ID_LEN];
-    int        unfit_seen;
+    uint8_t    unfit_plan_id[8][D2K_PLAN_ID_LEN];
+    size_t     unfit_seen;
     /* Идентификатор плана ЗАДАННОГО ВОПРОСА — с ним вопрос ушёл на провод.
        По нему сверяется «применён», как у кандидата по ver_plan_id: одного
        ключа потока мало, на нём мог примениться другой план. */
@@ -1272,10 +1272,12 @@ static int install_next(d2k_sched *s, task *t) {
     t->unsent_tries = 0;
     t->unsent_code = 0;
     /* Накопленные ранние отказы принадлежали ПРЕЖНЕМУ кандидату: у нового
-       свой идентификатор плана, и старые улики к нему не относятся. То же и
-       про отказ на чужом потоке — он назван идентификатором. */
+       свой идентификатор плана, и старые улики к нему не относятся. А вот
+       набор НЕПЕРЕНОСИМЫХ планов не сбрасывается: он про ЦЕЛЬ, а не про
+       кандидата — каждый его член назван своим идентификатором, и если тот же
+       план вернётся из другого источника, отказ клиента про него остаётся
+       правдой. */
     t->ver_unsent_seen = 0;
-    t->unfit_seen = 0;
     for (;;) {
     while (t->next_plan < t->n_plans) {
         if (t->probes >= SCHED_MAX_PROBES) { return -1; }
@@ -1917,13 +1919,16 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         t->state = T_PLANNING;
         return;
     }
-    if (t->unfit_seen && memcmp(t->unfit_plan_id, wire_id, sizeof wire_id) == 0) {
+    int unfit_here = 0;
+    for (size_t k = 0; k < t->unfit_seen; k++) {
+        if (memcmp(t->unfit_plan_id[k], wire_id, D2K_PLAN_ID_LEN) == 0) { unfit_here = 1; break; }
+    }
+    if (unfit_here) {
         say(s, "по %s план %s зонду исполнился, а потоку клиента — нет "
                "(не помещается в посылку). Подтверждать не буду: обход, "
                "который не достаётся человеку, обходом не является. "
                "Беру следующего кандидата",
             t->name, plan_id);
-        t->unfit_seen = 0;
         ver_close(t);
         t->state = T_PLANNING;
         return;
@@ -2135,8 +2140,15 @@ static void on_refused_foreign(d2k_sched *s, const d2k_ev *ev) {
            не пишется — приписать его кандидату нечем, а приписать наугад
            значило бы отменить чужой годный опыт. В счёт он при этом уже
            попал: непереносимость случилась, просто неизвестно чья. */
-        memcpy(t->unfit_plan_id, ev->plan_id, sizeof t->unfit_plan_id);
-        t->unfit_seen = 1;
+        size_t cap = sizeof t->unfit_plan_id / sizeof t->unfit_plan_id[0];
+        size_t k = 0;
+        for (; k < t->unfit_seen; k++) {
+            if (memcmp(t->unfit_plan_id[k], ev->plan_id, D2K_PLAN_ID_LEN) == 0) { break; }
+        }
+        if (k == t->unfit_seen && t->unfit_seen < cap) {
+            memcpy(t->unfit_plan_id[t->unfit_seen], ev->plan_id, D2K_PLAN_ID_LEN);
+            t->unfit_seen++;
+        }
     }
 
     for (size_t i = 0; i < sizeof s->unfit_names / sizeof s->unfit_names[0]; i++) {
