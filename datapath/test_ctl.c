@@ -20,6 +20,7 @@
 
 #include "d2k_ctl.h"
 #include "d2k_ctlsrv.h"
+#include "d2k_plan.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -1064,6 +1065,93 @@ int main(void) {
 
         close(cli);
         d2k_session_free(sess);
+    }
+
+    /* ГРАНИЦА ДЛИНЫ: предел−1, предел, предел+1 (приёмка U3).
+     *
+     * Сравнение в ctlsrv.c строгое: посылка РОВНО в предел проходит. Перепутай
+     * его с «больше либо равно» — и отвергался бы полный кадр, который уедет;
+     * перепутай в другую сторону — и план встал бы, чтобы упереться в ядро уже
+     * на отправке, где чистого выхода нет. Обе ошибки различает только опыт на
+     * самой границе, а не «сильно больше», который был здесь до сих пор.
+     *
+     * Само число берётся у d2k_plan_max_emit, а не считается в тесте заново:
+     * вторая реализация правила разошлась бы с первой молча, и тест проверял
+     * бы себя (§2.5). */
+    {
+        static uint8_t bp[512];
+        size_t bo = 0, bpl = 200;
+        memcpy(bp, "D2KP", 4); bo = 4;
+        bp[bo++] = 0; bp[bo++] = 1;            /* версия */
+        bp[bo++] = 0; bp[bo++] = 1;            /* записей */
+        bp[bo++] = 0; bp[bo++] = 0;            /* REC_PAYLOAD... */
+        bp[bo++] = 0; bp[bo++] = 2;
+        bp[bo++] = 0x00; bp[bo++] = 0x10;
+        bp[bo++] = (uint8_t)((2 + bpl) >> 8); bp[bo++] = (uint8_t)(2 + bpl);
+        bp[bo++] = 0x00; bp[bo++] = 0x01;      /* id приманки */
+        memset(bp + bo, 0xAA, bpl); bo += bpl;
+        bp[bo++] = 0x01; bp[bo++] = 0x01;      /* REC_FAKE */
+        bp[bo++] = 0x00; bp[bo++] = 0x0A;
+        bp[bo++] = 0x00; bp[bo++] = 0x01;      /* payload id */
+        bp[bo++] = 0x00; bp[bo++] = 0x00;      /* poison id */
+        bp[bo++] = 0x01; bp[bo++] = 0x00;      /* repeats, placement */
+        bp[bo++] = 0; bp[bo++] = 0; bp[bo++] = 0; bp[bo++] = 0;  /* gap_us */
+
+        d2k_plan *probe = NULL;
+        char perr[160];
+        CHECK(d2k_plan_load(bp, bo, &probe, perr, sizeof perr) == 0,
+              "пробный план для границы длины не разобрался");
+        size_t need = probe ? d2k_plan_max_emit(probe) : 0;
+        d2k_plan_free(probe);
+        CHECK(need > 0, "самая длинная посылка плана нулевая — граница не определена");
+
+        struct { size_t limit; int accept; const char *what; } cases[] = {
+            { need - 1, 0, "предел−1" },
+            { need,     1, "предел"   },
+            { need + 1, 1, "предел+1" },
+        };
+        for (size_t ci = 0; ci < sizeof cases / sizeof cases[0]; ci++) {
+            d2k_session *sess = d2k_session_new(2, 16);
+            CHECK(sess != NULL, "сессия для границы длины не создалась");
+            d2k_ctlsrv cb;
+            memset(&cb, 0, sizeof cb);
+            cb.sess = sess;
+            cb.ctl = c;
+            cb.send_limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
+            cb.send_maxlen = (uint32_t)cases[ci].limit;
+
+            d2k_ctl_poll(c, on_cmd, NULL);
+            cli = dial();
+            CHECK(cli >= 0, "клиент для границы длины не подключился");
+            d2k_ctl_accept(c);
+            struct timeval tvb;
+            tvb.tv_sec = 2; tvb.tv_usec = 0;
+            (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tvb, sizeof tvb);
+
+            static uint8_t body[4096], f[4200];
+            size_t blen = set_name_body(body, "granica.example", bp, bo);
+            frame(f, D2K_CMD_SET_NAME, body, blen);
+            CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
+                  "команда границы длины не отправилась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cb, 1) == 1,
+                  "команда границы длины не разобралась");
+            d2k_ctl_flush(c);
+            uint16_t cmd = 0; int ok = 1; uint8_t reason = 0;
+            CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на границе длины не пришёл");
+            if (cases[ci].accept) {
+                CHECK(ok == 1, "план, ровно помещающийся в предел, отвергнут");
+                CHECK(d2k_session_plan_count(sess) == 1,
+                      "принятый на границе план не встал в таблицу");
+            } else {
+                CHECK(ok == 0, "план на байт длиннее предела принят");
+                CHECK(reason == D2K_ACK_BAD_PLAN,
+                      "отказ на границе назван не негодностью плана");
+                CHECK(d2k_session_plan_count(sess) == 0,
+                      "отвергнутый на границе план всё-таки встал в таблицу");
+            }
+            close(cli);
+            d2k_session_free(sess);
+        }
     }
 
     d2k_ctl_close(c);

@@ -23,12 +23,28 @@
 
 #include "d2k_raw.h"
 
+/* Сколько маршрутов помним. Шестнадцать — не «разумное число», а следствие
+ * того, что здесь кэшируется: предел ОДНОГО направления, и направлений у
+ * домашнего роутера ровно столько, сколько провайдеров и туннелей, то есть
+ * единицы. Кольцо вытесняет старое, потому что промах стоит трёх системных
+ * вызовов без единого пакета, а переполнение не должно отказывать. */
+#define ROUTE_CACHE 16
+
+typedef struct {
+    uint8_t ip[4];
+    size_t  mtu;    /* 0 — ячейка пуста */
+} route_entry;
+
 struct d2k_raw {
     int      fd;
     uint32_t limits;
     size_t   maxlen;
     uint64_t sent;
     uint64_t errors;
+    uint32_t mark;
+    int      maxlen_declared;  /* предел назван оператором (--iface), а не угадан */
+    route_entry route[ROUTE_CACHE];
+    size_t   route_next;
 };
 
 /* MTU одного интерфейса по имени. 0 — не узнали.
@@ -91,6 +107,58 @@ static size_t pick_maxlen(const char *ifname) {
     return best ? (size_t)best : (size_t)D2K_RAW_MTU_FALLBACK;
 }
 
+/* MTU МАРШРУТА к адресу, а не интерфейса. 0 — не узнали.
+ *
+ * Почему это вообще нужно. Наименьший MTU среди поднятых интерфейсов —
+ * оценка ЗАНИЖЕННАЯ и общая на все направления сразу: поднявшийся туннель с
+ * MTU 1280 опустит предел для трафика, который через него не идёт, а маршрут
+ * с PMTU меньше любого локального интерфейса не опустит его вовсе — и
+ * упрётся в ядро уже на отправке (EMSGSIZE), то есть ПОСРЕДИ исполнения
+ * плана.
+ *
+ * Почему это не противоречит прежнему решению (шапка d2k_raw.h). Там
+ * отвергнут запрос маршрута НА ПАКЕТНОМ ПУТИ — ради числа, меняющегося раз в
+ * жизни соединения. Здесь запрос идёт РАЗ НА НАПРАВЛЕНИЕ и кладётся в кольцо;
+ * на пакетном пути остаётся сравнение чисел.
+ *
+ * Пакетов не отправляется ни одного: connect на UDP — местный поиск маршрута,
+ * а IP_MTU отдаёт то, что ядро о нём знает, включая свежий PMTU. Метка
+ * ставится та же, что и на исходящих: сокет ничего не шлёт, но правило
+ * firewall может смотреть и на создание — пусть видит своё.
+ *
+ * Порт 443 не значит ничего: у UDP connect не спрашивает согласия адресата, а
+ * маршрут от порта не зависит. Ноль там был бы отвергнут ядром как
+ * недопустимый адресат. */
+static size_t route_mtu(uint32_t mark, const uint8_t dst[4]) {
+#ifdef IP_MTU
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { return 0; }
+#ifdef SO_MARK
+    if (mark) { (void)setsockopt(s, SOL_SOCKET, SO_MARK, &mark, sizeof mark); }
+#else
+    (void)mark;
+#endif
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_port = htons(443);
+    memcpy(&to.sin_addr.s_addr, dst, 4);
+    size_t got = 0;
+    if (connect(s, (struct sockaddr *)&to, sizeof to) == 0) {
+        int mtu = 0;
+        socklen_t sl = sizeof mtu;
+        if (getsockopt(s, IPPROTO_IP, IP_MTU, &mtu, &sl) == 0 && mtu > 0) {
+            got = (size_t)mtu;
+        }
+    }
+    close(s);
+    return got;
+#else
+    (void)mark; (void)dst;
+    return 0;   /* нет IP_MTU — нет и ответа; врать нечем */
+#endif
+}
+
 static void say(char *err, size_t cap, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
@@ -115,6 +183,15 @@ d2k_raw *d2k_raw_open(uint32_t mark, const char *ifname, char *err, size_t errca
     r->limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
     /* Один раз при старте — см. шапку в d2k_raw.h про цену этого выбора. */
     r->maxlen = pick_maxlen(ifname);
+    r->mark = mark;
+    /* НАЗВАННЫЙ предел и УГАДАННЫЙ — разные вещи, и маршрут разрешено
+       противопоставлять только второму. Оператор, указавший интерфейс,
+       ОБЪЯВИЛ предел; перепрыгнуть его ответом маршрута значило бы сделать
+       флаг рекомендацией. Наименьший MTU среди поднятых — не объявление, а
+       оценка: она ошибается в обе стороны (туннель к другой цели опускает
+       предел всем; маршрут с меньшим PMTU не опускает никому), и уточнять её
+       маршрутом не только можно, но и нужно. */
+    r->maxlen_declared = (ifname && *ifname) ? 1 : 0;
 
     r->fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (r->fd < 0) {
@@ -177,6 +254,34 @@ size_t d2k_raw_maxlen(const d2k_raw *r) {
     return (r && r->maxlen) ? r->maxlen : (size_t)D2K_RAW_MTU_FALLBACK;
 }
 
+/* Ответ маршрута против общего предела: см. maxlen_declared выше. */
+static size_t blend(const d2k_raw *r, size_t route, size_t cap_all) {
+    if (r->maxlen_declared) { return route < cap_all ? route : cap_all; }
+    return route;
+}
+
+size_t d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]) {
+    size_t cap_all = d2k_raw_maxlen(r);
+    if (!r || !dst) { return cap_all; }
+    for (size_t i = 0; i < ROUTE_CACHE; i++) {
+        if (r->route[i].mtu && memcmp(r->route[i].ip, dst, 4) == 0) {
+            return blend(r, r->route[i].mtu, cap_all);
+        }
+    }
+    size_t m = route_mtu(r->mark, dst);
+    if (m < (size_t)D2K_RAW_MTU_FLOOR) {
+        /* Ответа нет или он бессмысленно мал. Запоминать такое нельзя: пустая
+           ячейка честнее выдуманного числа, а ниже минимума IPv4 маршрутов не
+           бывает. Общий предел остаётся в силе. */
+        return cap_all;
+    }
+    route_entry *e = &r->route[r->route_next % ROUTE_CACHE];
+    r->route_next++;
+    memcpy(e->ip, dst, 4);
+    e->mtu = m;
+    return blend(r, m, cap_all);
+}
+
 int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                  char *err, size_t errcap) {
     if (!r || !pkt || len < 20) {
@@ -226,6 +331,15 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                спускаться некуда. Обратно предел сам не растёт — для этого
                нужен новый замер, а не оптимизм. */
             size_t lowered = len - 1;
+            /* Ячейка маршрута опускается ВСЕГДА, даже если cap_all предел уже
+               ниже: ядро сказало про ЭТО направление, и следующий план к нему
+               обязан считаться с ответом, а не с общей оценкой. */
+            for (size_t i = 0; i < ROUTE_CACHE; i++) {
+                if (r->route[i].mtu && memcmp(r->route[i].ip, pkt + 16, 4) == 0) {
+                    if (lowered < r->route[i].mtu) { r->route[i].mtu = lowered; }
+                    break;
+                }
+            }
             if (lowered < r->maxlen) {
                 r->maxlen = lowered;
                 say(err, errcap,

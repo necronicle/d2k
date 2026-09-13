@@ -742,10 +742,27 @@ int main(int argc, char **argv) {
                      * отправка такого выхода уже не даёт, поэтому проверяем
                      * ВСЕ посылки разом, а не по одной на ходу. */
                     if (mode == MODE_APPLY && raw && res.applied) {
+                        /* Предел КАЖДОЙ ПОСЫЛКИ по ЕЁ направлению, а не один
+                           общий на план: общий не знает ни про туннель,
+                           поднятый к другой цели, ни про PMTU этого маршрута.
+                           Адрес берётся из самого пакета (байты 16..19
+                           заголовка IPv4), а не из ключа потока: ключ
+                           канонический — в нём «низкий» и «высокий» конец, а
+                           не источник и назначение. Маршрут спрашивается раз на
+                           направление (d2k_raw_route_maxlen), дальше —
+                           сравнение чисел. */
                         size_t cap = d2k_raw_maxlen(raw);
                         size_t too_long = 0;
                         for (size_t k = 0; k < res.n_out; k++) {
-                            if (res.out[k].len > cap) { too_long = res.out[k].len; break; }
+                            const uint8_t *ip = obuf + res.out[k].off;
+                            size_t here = res.out[k].len >= 20
+                                              ? d2k_raw_route_maxlen(raw, ip + 16)
+                                              : cap;
+                            if (res.out[k].len > here) {
+                                too_long = res.out[k].len;
+                                cap = here;
+                                break;
+                            }
                         }
                         if (too_long) {
                             fprintf(stderr,
