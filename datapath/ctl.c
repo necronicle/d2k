@@ -17,16 +17,38 @@
 
 #define HDR 6u
 
+/* Кольцо исходящих — обоснование размера у поля out в struct d2k_ctl. */
+#define D2K_CTL_OUT_RING 65536u
+
 struct d2k_ctl {
     int      lfd;
     int      pfd;
     char     path[108];
 
-    /* Хвост одного недописанного кадра. Больше одного не бывает: пока хвост
-       не ушёл, новые события теряются. Предел памяти отсюда известен. */
-    uint8_t  out[D2K_CTL_FRAME_MAX + HDR];
-    size_t   out_len;
-    size_t   out_off;
+    /* КОЛЬЦО ИСХОДЯЩИХ КАДРОВ, а не место под один.
+     *
+     * Здесь был буфер ровно на один недописанный кадр: пока хвост не ушёл,
+     * каждое новое событие терялось. Оправдание было «очередь значит память
+     * без предела» — оно неверно: у кольца фиксированного размера предел
+     * ничуть не хуже, просто больше.
+     *
+     * Цена той экономии, замерено на роутере владельца 13.09.2026: датапат
+     * потерял 173 уведомления за одно окно сводки, и ровно из-за этого
+     * контроллер 269 раз сказал «зонд прошёл, а применения этого плана к его
+     * потоку не было — не засчитано». То есть двести шестьдесят девять раз
+     * НАЙДЕННЫЙ рабочий обход выбрасывался, потому что доказательство его
+     * применения не доехало по каналу.
+     *
+     * Размер выведен из этого же замера: всплеск в 173 кадра при обменном
+     * кадре в 26 байт, приветствии с именем до 280 и снимке формы до двух
+     * килобайт даёт от 4,5 до 48 КиБ. 64 КиБ покрывают наблюдённый всплеск
+     * целиком; на роутере это +3 % к RSS датапата (2,1 МиБ).
+     *
+     * Кадр кладётся ЦЕЛИКОМ или не кладётся вовсе: половина кадра в потоке
+     * рассинхронизировала бы разбор у контроллера навсегда. */
+    uint8_t  out[D2K_CTL_OUT_RING];
+    size_t   out_head;   /* куда писать следующий байт */
+    size_t   out_used;   /* сколько байт ждут отправки */
 
     /* Приёмный буфер: команда может прийти по кускам. */
     uint8_t  in[D2K_CTL_FRAME_MAX + HDR];
@@ -138,7 +160,7 @@ void d2k_ctl_accept(d2k_ctl *c) {
         return;
     }
     c->pfd = fd;
-    c->out_len = c->out_off = 0;
+    c->out_head = c->out_used = 0;
     c->in_len = 0;
     /* Версию протокола объявляет d2k_ctlsrv_greet, а не этот файл: раскладка
        тела события (ключ потока впереди) — знание ПРОТОКОЛА команд, а
@@ -151,23 +173,25 @@ static void drop_peer(d2k_ctl *c) {
         close(c->pfd);
         c->pfd = -1;
     }
-    c->out_len = c->out_off = 0;
+    c->out_head = c->out_used = 0;
     c->in_len = 0;
 }
 
 void d2k_ctl_flush(d2k_ctl *c) {
-    if (!c || c->pfd < 0 || c->out_off >= c->out_len) {
+    if (!c || c->pfd < 0 || c->out_used == 0) {
         return;
     }
-    for (;;) {
-        ssize_t n = write(c->pfd, c->out + c->out_off, c->out_len - c->out_off);
+    while (c->out_used > 0) {
+        size_t tail = (c->out_head + D2K_CTL_OUT_RING - c->out_used) % D2K_CTL_OUT_RING;
+        /* За один write уходит только СПЛОШНОЙ кусок: кольцо переносится
+           через край, а write об этом не знает. Остаток допишется следующим
+           оборотом цикла либо следующим вызовом. */
+        size_t run = D2K_CTL_OUT_RING - tail;
+        if (run > c->out_used) { run = c->out_used; }
+        ssize_t n = write(c->pfd, c->out + tail, run);
         if (n > 0) {
-            c->out_off += (size_t)n;
-            if (c->out_off >= c->out_len) {
-                c->out_len = c->out_off = 0;
-                c->sent++;
-            }
-            return;
+            c->out_used -= (size_t)n;
+            continue;
         }
         if (n < 0 && errno == EINTR) {
             continue;
@@ -187,26 +211,36 @@ void d2k_ctl_event(d2k_ctl *c, uint16_t type, const uint8_t *body, size_t len) {
         }
         return;
     }
-    /* Хвост прошлого кадра ещё не ушёл — это событие теряется. Ставить его в
-       очередь значит заводить память без предела. */
+    /* Сперва освобождаем место тем, что уже можно дописать. */
     d2k_ctl_flush(c);
-    if (c->out_off < c->out_len) {
+
+    size_t plen = 2 + len;
+    size_t need = HDR + len;
+    if (need > D2K_CTL_OUT_RING - c->out_used) {
+        /* Места нет даже после дописывания — кадр теряется ЦЕЛИКОМ и
+           считается. Половина кадра сломала бы разбор у контроллера. */
         c->dropped++;
         return;
     }
 
-    size_t plen = 2 + len;
-    c->out[0] = (uint8_t)(plen >> 24);
-    c->out[1] = (uint8_t)(plen >> 16);
-    c->out[2] = (uint8_t)(plen >> 8);
-    c->out[3] = (uint8_t)plen;
-    c->out[4] = (uint8_t)(type >> 8);
-    c->out[5] = (uint8_t)type;
-    if (len) {
-        memcpy(c->out + HDR, body, len);
+    uint8_t hdr[HDR];
+    hdr[0] = (uint8_t)(plen >> 24);
+    hdr[1] = (uint8_t)(plen >> 16);
+    hdr[2] = (uint8_t)(plen >> 8);
+    hdr[3] = (uint8_t)plen;
+    hdr[4] = (uint8_t)(type >> 8);
+    hdr[5] = (uint8_t)type;
+
+    for (size_t i = 0; i < HDR; i++) {
+        c->out[c->out_head] = hdr[i];
+        c->out_head = (c->out_head + 1) % D2K_CTL_OUT_RING;
     }
-    c->out_len = HDR + len;
-    c->out_off = 0;
+    for (size_t i = 0; i < len; i++) {
+        c->out[c->out_head] = body[i];
+        c->out_head = (c->out_head + 1) % D2K_CTL_OUT_RING;
+    }
+    c->out_used += need;
+    c->sent++;
     d2k_ctl_flush(c);
 }
 
