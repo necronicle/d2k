@@ -114,9 +114,12 @@ static uint8_t ver_last_transport;
 static d2k_ver_level ver_answer = D2K_VER_APPLICATION;
 static uint16_t ver_answer_port;
 
+static size_t ver_last_wire;
+
 static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
-                               const char *sni, int deadline_ms) {
+                               const char *sni, int deadline_ms, size_t hello_wire) {
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
+    ver_last_wire = hello_wire;
     ver_calls++;
     ver_last_transport = transport;
     d2k_ver_result r;
@@ -375,7 +378,7 @@ static d2k_shape probe_hello_shape(void) {
     d2k_tls *t = NULL;
     char e[200];
     /* Потолок маленький: ждать здесь нечего, а тест платит за это временем. */
-    (void)d2k_tls_connect(p[0], "пример.цель", 50, &t, e, sizeof e);
+    (void)d2k_tls_connect(p[0], "пример.цель", 50, 0, &t, e, sizeof e);
     d2k_tls_free(t);
     uint8_t buf[2048];
     ssize_t n = read(p[1], buf, sizeof buf);
@@ -1537,6 +1540,93 @@ int main(void) {
         d2k_catalog_free(&cB);
     }
 
+    /* СЕДЬМАЯ НАХОДКА ЛАБОРАТОРИИ: подтверждение на зонде ≠ работа у клиента.
+       Кандидат стоит на ЦЕЛИ, и по нему одновременно с зондом ходит браузер.
+       Приветствие браузера длиннее зондового, и бывает так: зонду план
+       исполняется и доходит до приложения, а потоку клиента — нет, отказом по
+       длине. Записать такое подтверждённым значит выдать человеку каталог с
+       «подтверждено» и отсутствием обхода. */
+    {
+        d2k_catalog cuf;
+        memset(&cuf, 0, sizeof cuf);
+        d2k_sched *s = d2k_sched_new(&cuf, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;   /* зонду план исполнился до конца */
+        ver_fail_first = 0;
+        ver_answer_port = 40160;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40160, "непереносимая.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40160);
+        d2k_sched_event(s, &su);
+        settle(s);
+        spin_until_installed(s);
+
+        /* Второй поток к ТОЙ ЖЕ цели — его открыл клиент, а не зонд. Имя за
+           ним планировщик знает из приветствия, как и на живой линии. */
+        d2k_ev hc = ev_hello(6, 40161, "непереносимая.цель");
+        d2k_sched_event(s, &hc);
+        d2k_ev big = ev_refused(6, 40161, D2K_REFUSE_TOO_LONG, 1);
+        CHECK(big.plan_id[0] != 0,
+              "кандидат ушёл на провод без идентификатора — приписать отказ нечему");
+        d2k_sched_event(s, &big);
+
+        /* А зонду тот же план исполнился: полное доказательство на руках. */
+        d2k_ev ap = ev_applied(6, 40160);
+        d2k_sched_event(s, &ap);
+        run_out(s);
+
+        CHECK(said("потоку клиента"),
+              "план не исполнился клиенту, а планировщик об этом промолчал");
+        CHECK(binding_of(&cuf, "непереносимая.цель", 6) == NULL,
+              "план, не исполнимый потоку клиента, записан подтверждённым — "
+              "в каталоге «подтверждено», у человека обхода нет");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cuf);
+    }
+
+    /* Тот же ход, но отказ у клиента ВРЕМЕННЫЙ: очередь переполнилась, к
+       переносимости это отношения не имеет, и подтверждение обязано пройти. */
+    {
+        d2k_catalog ctq;
+        memset(&ctq, 0, sizeof ctq);
+        d2k_sched *s = d2k_sched_new(&ctq, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40162;
+        ver_calls = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40162, "временная.цель");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40162);
+        d2k_sched_event(s, &su);
+        settle(s);
+        spin_until_installed(s);
+
+        d2k_ev hc = ev_hello(6, 40163, "временная.цель");
+        d2k_sched_event(s, &hc);
+        d2k_ev tmp = ev_refused(6, 40163, D2K_REFUSE_QUEUE, 1);
+        d2k_sched_event(s, &tmp);
+
+        d2k_ev ap = ev_applied(6, 40162);
+        d2k_sched_event(s, &ap);
+        run_out(s);
+
+        CHECK(binding_of(&ctq, "временная.цель", 6) != NULL,
+              "временный отказ у клиента отменил состоявшееся подтверждение — "
+              "всплеск очереди объявлен непереносимостью");
+        d2k_sched_free(s);
+        d2k_catalog_free(&ctq);
+    }
+
     /* Ранние APPLIED: два клиента вправе иметь одинаковый местный порт.
        События подаются до следующего tick: результат worker ещё не принят. */
     for (int with_own = 0; with_own < 2; with_own++) {
@@ -1764,6 +1854,60 @@ int main(void) {
               "наблюдение завело привязку — заводить её может только подтверждение");
         d2k_sched_free(s);
         d2k_catalog_free(&cE);
+    }
+
+    /* --- зонд ходит ДЛИНОЙ КЛИЕНТА, а не своей ------------------------- */
+    {
+        /* Приветствие зонда вчетверо короче браузерного (замерено: curl шлёт
+           1581 байт), и на этой разнице ломается переносимость: план, чьи
+           куски помещаются в посылку на коротком приветствии, на длинном не
+           помещается вовсе. Поэтому длина снятого с клиента приветствия
+           обязана доехать до зонда — проверяем, что доезжает именно она, а не
+           ноль и не своя. */
+        d2k_catalog cW;
+        memset(&cW, 0, sizeof cW);
+        d2k_sched *s = d2k_sched_new(&cW, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_answer_port = 40170;
+        ver_calls = 0;
+        ver_last_wire = 0;
+        forget_sent();
+
+        d2k_ev h = ev_hello(6, 40170, "длина.клиента");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40170);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls >= 1, "зонд не позван — длину проверять не на чем");
+        CHECK(ver_last_wire > 0,
+              "зонду досталась нулевая длина — он пойдёт СВОИМ коротким приветствием, "
+              "и подтверждение достанется ему, а не человеку");
+
+        /* Теперь датапат прислал снимок приветствия ЖИВОГО клиента. Со
+           следующего испытания зонд обязан ходить ЕГО длиной. */
+        d2k_ev sh;
+        memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE;
+        sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "длина.клиента",
+                                     sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+              "приветствие клиента не собралось — проверять нечем");
+        d2k_sched_event(s, &sh);
+        CHECK(said("поймана форма приветствия"), "снимок не дошёл до задачи");
+
+        size_t want = sh.shape_len;
+        ver_last_wire = 0;
+        ver_answer_port = 40171;
+        run_out(s);
+        CHECK(ver_last_wire == want,
+              "зонд пошёл НЕ длиной снятого с клиента приветствия — испытание идёт "
+              "в другом контексте, чем работа человека");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cW);
     }
 
     /* --- живой обмен не ВЫДУМЫВАЕТ форму клиента ------------------------ */

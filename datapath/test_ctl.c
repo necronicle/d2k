@@ -49,6 +49,30 @@ static int dial(void) {
 static struct { uint16_t type; size_t len; uint8_t body[64]; } got[8];
 static size_t n_got;
 
+/* Ждёт, пока из потока соберётся заданное число ЦЕЛЫХ кадров.
+ *
+ * d2k_ctl_poll делает РОВНО ОДНО чтение за вызов и возвращает столько кадров,
+ * сколько собралось из накопленного; датапат зовёт его в цикле. Кадр в
+ * полторы тысячи байт ядро вправе отдать по кускам, и проверка «poll() == 1»
+ * тогда проходит или падает в зависимости от нарезки потока, а не от
+ * поведения кода. Поймано полным гейтом 13.09.2026: отдельным запуском тест
+ * проходил сорок раз подряд, внутри гейта упал.
+ *
+ * Предел кругов нужен затем, чтобы сломанный разбор не превратился в вечный
+ * цикл: сокет неблокирующий, и при пустом чтении poll возвращает ноль сразу.
+ * Отрицательный ответ (разрыв) отдаётся как есть — он проверяется отдельно. */
+static int poll_frames(d2k_ctl *c,
+                       void (*cb)(void *ctx, uint16_t type, const uint8_t *body, size_t len),
+                       void *ctx, int want) {
+    int got_n = 0;
+    for (int i = 0; i < 1000 && got_n < want; i++) {
+        int n = d2k_ctl_poll(c, cb, ctx);
+        if (n < 0) { return n; }
+        got_n += n;
+    }
+    return got_n;
+}
+
 static void on_cmd(void *ctx, uint16_t type, const uint8_t *body, size_t len) {
     (void)ctx;
     if (n_got >= 8) {
@@ -459,7 +483,7 @@ int main(void) {
             size_t blen = set_name_body(body, "ok.example", tiny, sizeof tiny);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "годная команда не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "годная команда не разобралась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "годная команда не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на годную команду не пришёл");
@@ -478,7 +502,7 @@ int main(void) {
             size_t blen = set_name_body(body, "bad.example", garbage, sizeof garbage);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "негодный план не отправился");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "негодный план не разобрался");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "негодный план не разобрался");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на негодный план не пришёл");
@@ -496,7 +520,7 @@ int main(void) {
             size_t blen = 2 + sizeof tiny;
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "команда с пустым именем не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "команда с пустым именем не разобралась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "команда с пустым именем не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на пустое имя не пришёл");
@@ -536,7 +560,7 @@ int main(void) {
                 size_t blen = set_name_body(body, nm, tiny, sizeof tiny);
                 frame(f, D2K_CMD_SET_NAME, body, blen);
                 CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель-наполнитель не отправилась");
-                CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель-наполнитель не разобралась");
+                CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "цель-наполнитель не разобралась");
                 d2k_ctl_flush(c);
                 uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
                 CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на наполнитель не пришёл");
@@ -552,7 +576,7 @@ int main(void) {
             size_t blen = set_name_body(body, "overflow.example", tiny, sizeof tiny);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель после заполнения не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель после заполнения не разобралась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "цель после заполнения не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1, "ack на цель после заполнения не пришёл");
@@ -617,7 +641,7 @@ int main(void) {
             size_t blen = set_name_body(body, "fresh.example", tiny, sizeof tiny);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "первая цель давности не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "первая цель давности не разобралась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "первая цель давности не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
@@ -635,7 +659,7 @@ int main(void) {
             size_t blen = set_name_body(body, nm, tiny, sizeof tiny);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "наполнитель давности не отправился");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "наполнитель давности не разобрался");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "наполнитель давности не разобрался");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
@@ -653,7 +677,7 @@ int main(void) {
             size_t blen = set_name_body(body, "overflow2.example", tiny, sizeof tiny);
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen), "цель поверх давности не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1, "цель поверх давности не разобралась");
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1, "цель поверх давности не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
@@ -726,7 +750,7 @@ int main(void) {
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
                   "команда с планом-носителем идентификатора не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "команда с планом-носителем идентификатора не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
@@ -827,7 +851,7 @@ int main(void) {
             frame(f, D2K_CMD_SET_NAME, body, blen);
             CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
                   "команда с планом для проверки отказа не отправилась");
-            CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+            CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
                   "команда с планом для проверки отказа не разобралась");
             d2k_ctl_flush(c);
             uint16_t cmd = 0; int ok = 0; uint8_t reason = 0;
@@ -1028,7 +1052,7 @@ int main(void) {
         frame(f, D2K_CMD_SET_NAME, body, blen);
         CHECK(write(cli, f, 6 + blen) == (ssize_t)(6 + blen),
               "команда с длинной посылкой не отправилась");
-        CHECK(d2k_ctl_poll(c, d2k_ctlsrv_command, &cx) == 1,
+        CHECK(poll_frames(c, d2k_ctlsrv_command, &cx, 1) == 1,
               "команда с длинной посылкой не разобралась");
         d2k_ctl_flush(c);
         uint16_t cmd = 0; int ok = 1; uint8_t reason = 0;

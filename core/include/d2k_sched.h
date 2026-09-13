@@ -88,10 +88,14 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
  * transport (6 TCP, 17 UDP) передаётся зонду, потому что доказательство
  * принадлежит транспорту: подтвердить план QUIC обращением по TCP значило бы
  * записать успех ДРУГОГО транспорта. Умолчание (verify_default, sched.c) на
- * не-TCP честно отвечает «не измерено»: своего зонда для QUIC сегодня нет. */
+ * не-TCP честно отвечает «не измерено»: своего зонда для QUIC сегодня нет.
+ *
+ * hello_wire — длина приветствия, снятого С КЛИЕНТА этой цели: зонд добивает
+ * своё до неё, иначе измерение идёт в другом контексте, чем работа человека
+ * (седьмая находка лаборатории 13.09.2026). */
 typedef d2k_ver_result (*d2k_sched_ver_fn)(const char *ip, uint16_t port,
                                            uint8_t transport, const char *sni,
-                                           int deadline_ms);
+                                           int deadline_ms, size_t hello_wire);
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;

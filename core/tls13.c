@@ -156,7 +156,8 @@ static uint16_t get16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] << 8 
    договориться, а не обмануть коробку (обманывает план в датапате, и этот
    зонд ходит НЕПОМЕЧЕННЫМ именно затем, чтобы план к нему применился). */
 static size_t build_client_hello(uint8_t *out, size_t cap, const char *sni,
-                                 const uint8_t pub[32], const uint8_t rnd[32]) {
+                                 const uint8_t pub[32], const uint8_t rnd[32],
+                                 size_t want_wire) {
     if (cap < 512) { return 0; }
     size_t sni_len = sni ? strlen(sni) : 0;
     size_t p = 0;
@@ -224,6 +225,36 @@ static size_t build_client_hello(uint8_t *out, size_t cap, const char *sni,
     put16(out + p, 38); p += 2; put16(out + p, 36); p += 2;
     put16(out + p, 0x001d); p += 2; put16(out + p, 32); p += 2;
     memcpy(out + p, pub, 32); p += 32;
+
+    /* ДОБИВКА ДО ДЛИНЫ ПРИВЕТСТВИЯ КЛИЕНТА (RFC 7685).
+       Зонд подтверждения ходит СВОИМ приветствием — чужое сюда не годится,
+       закрытого ключа к чужому key_share у нас нет. Но своё приветствие
+       вчетверо короче браузерного, и на этом ломается переносимость: план,
+       чьи куски помещаются в посылку на коротком приветствии зонда, на
+       длинном приветствии браузера не помещается вовсе. В каталоге
+       «подтверждено», у человека обхода нет (лаборатория 13.09.2026, седьмая
+       находка).
+
+       Поэтому длина выравнивается по приветствию, которое датапат СНЯЛ С
+       КЛИЕНТА. Расширение padding выбрано не за отсутствием идей: это
+       единственный штатный способ добрать длину, ничего не сообщив о себе
+       (RFC 7685), и браузеры пользуются им ровно за этим же. Нули внутри
+       значения не несут.
+
+       Добивается ПРОВОДНАЯ длина: пять байт заголовка записи плюс тело.
+       Четыре байта — заголовок самого расширения; если до цели меньше,
+       добивать нечем и незачем, разница в четыре байта ни на какой предел
+       отправки не влияет. */
+    if (want_wire > 0) {
+        size_t have = p + 5;
+        if (want_wire > have + 4 && want_wire - have - 4 <= 0xFFFF &&
+            p + 4 + (want_wire - have - 4) <= cap) {
+            size_t pad = want_wire - have - 4;
+            put16(out + p, 0x0015); p += 2;
+            put16(out + p, (uint16_t)pad); p += 2;
+            memset(out + p, 0, pad); p += pad;
+        }
+    }
 
     put16(out + ext_at, (uint16_t)(p - ext_at - 2));
     size_t body = p - len_at - 3;
@@ -333,7 +364,7 @@ static int traffic_keys(const uint8_t secret[32], uint8_t key[16], uint8_t iv[12
     return d2k_hkdf_expand_label(secret, "iv", iv, 12);
 }
 
-int d2k_tls_connect(int fd, const char *sni, int deadline_ms,
+int d2k_tls_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                     d2k_tls **out, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
     if (fd < 0 || !out) { say(err, errcap, "нечем поднимать сессию"); return -1; }
@@ -357,11 +388,14 @@ int d2k_tls_connect(int fd, const char *sni, int deadline_ms,
     uint8_t *tr = t->transcript;
     size_t tr_len = 0;
 
-    uint8_t ch[1024];
-    size_t ch_len = build_client_hello(ch, sizeof ch, sni, pub, rnd);
+    /* Две с половиной тысячи, а не тысяча: приветствие теперь добивается до
+       длины клиентского, а снимок приветствия с провода бывает до 2048 байт
+       (d2k_ev.shape). */
+    uint8_t ch[2560];
+    size_t ch_len = build_client_hello(ch, sizeof ch, sni, pub, rnd, want_wire);
     if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); free(t); return -1; }
 
-    uint8_t rec[5 + 1024];
+    uint8_t rec[5 + sizeof ch];
     rec[0] = REC_HANDSHAKE;
     put16(rec + 1, 0x0301);                        /* legacy_record_version */
     put16(rec + 3, (uint16_t)ch_len);

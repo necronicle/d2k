@@ -272,6 +272,10 @@ static int parse_client_hello(const uint8_t *ch, size_t len,
    прикладные ключи в обе стороны. Сертификата стенд не шлёт вовсе — клиент
    его не проверяет и не будет (шапка d2k_tls13.h называет это прямо), а
    лишний сертификат означал бы держать в тесте ещё и X.509. */
+/* Длина последнего приветствия, ДОШЕДШЕГО до мишени. Пишется из потока
+   стенда, читается тестом после join — гонки нет. */
+static size_t stand_ch_wire;
+
 static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     uint8_t tr[REC_MAX * 2];
     size_t tr_len = 0;
@@ -287,6 +291,10 @@ static int stand_handshake(int c, struct dir *rd, struct dir *wr) {
     const uint8_t *sid = NULL, *peer_pub = NULL;
     size_t sid_len = 0;
     if (parse_client_hello(ch, ch_len, &sid, &sid_len, &peer_pub) != 0) { return -1; }
+    /* Проводная длина приветствия, какой её увидела МИШЕНЬ: пять байт
+       заголовка записи плюс тело. Своё представление о ней сверять не с чем —
+       ровно та же причина, по которой местный порт берётся у мишени. */
+    stand_ch_wire = ch_len + 5;
     memcpy(tr, ch, ch_len);
     tr_len = ch_len;
 
@@ -479,7 +487,7 @@ static void stand_stop(struct stand *s) {
 struct probe_job { uint16_t port; d2k_ver_result result; };
 static void *parallel_probe(void *arg) {
     struct probe_job *j = arg;
-    j->result = d2k_verify_probe("127.0.0.1", j->port, "parallel.example", 3000);
+    j->result = d2k_verify_probe("127.0.0.1", j->port, "parallel.example", 3000, 0);
     d2k_verify_close(&j->result);
     return NULL;
 }
@@ -522,7 +530,7 @@ int main(void) {
     {
         uint16_t port = closed_port();
         CHECK(port != 0, "свободный порт не нашёлся");
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 2000);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 2000, 0);
         CHECK(r.level == D2K_VER_NOT_MEASURED,
               "отказ транспорта засчитан выше уровня «не измерено»");
         CHECK(r.status == 0, "кода состояния взяться неоткуда, а он не ноль");
@@ -538,7 +546,7 @@ int main(void) {
         CHECK(port != 0, "стенд ROLE_PLAIN не поднялся");
 
         mark_calls = 0;
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 2000);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 2000, 0);
         CHECK(r.level == D2K_VER_TRANSPORT,
               "не-TLS ответ засчитан выше уровня транспорта");
         CHECK(r.status == 0, "кода состояния взяться неоткуда, а он не ноль");
@@ -571,7 +579,7 @@ int main(void) {
         uint16_t port = stand_start(&s, ROLE_SILENT);
         CHECK(port != 0, "стенд ROLE_SILENT не поднялся");
 
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 1200);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 1200, 0);
         CHECK(r.level == D2K_VER_HANDSHAKE,
               "молчание после рукопожатия засчитано за ответ приложения");
         CHECK(r.status == 0, "приложение молчало, а код состояния появился");
@@ -585,7 +593,7 @@ int main(void) {
         uint16_t port = stand_start(&s, ROLE_APP);
         CHECK(port != 0, "стенд ROLE_APP не поднялся");
 
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 3000);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 3000, 0);
         CHECK(r.level == D2K_VER_APPLICATION,
               "разобранный ответ приложения не поднял уровень до прикладного");
         CHECK(r.status == 200, "код состояния разобран неверно");
@@ -594,13 +602,57 @@ int main(void) {
         stand_stop(&s);
     }
 
+    /* --- ДОБИВКА ДО ДЛИНЫ ПРИВЕТСТВИЯ КЛИЕНТА ---------------------------
+       Зонд ходит своим приветствием, вчетверо короче браузерного (замерено в
+       лаборатории 13.09.2026: curl шлёт 1581 байт, наше — около четырёхсот).
+       На этой разнице ломается переносимость: план, чьи куски помещаются в
+       посылку на коротком приветствии, на длинном не помещается вовсе, и
+       подтверждение достаётся зонду, а не человеку.
+
+       Проверяется ДВА утверждения, и оба обязательны:
+         - на проводе оказалось РОВНО столько байт, сколько просили (иначе
+           добивка есть, а контекст всё равно чужой);
+         - рукопожатие при этом дошло до приложения (иначе мы научились
+           добивать, но сломали зонд). */
+    for (size_t i = 0; i < 2; i++) {
+        size_t want = i == 0 ? (size_t)900 : (size_t)1581;
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_APP);
+        CHECK(port != 0, "стенд ROLE_APP для добивки не поднялся");
+        stand_ch_wire = 0;
+
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 3000, want);
+        CHECK(r.level == D2K_VER_APPLICATION,
+              "добитое приветствие не довело зонд до приложения");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(stand_ch_wire == want,
+              "до мишени дошло приветствие НЕ той длины — измерение идёт в чужом контексте");
+    }
+
+    /* Просьба короче собственного приветствия не укорачивает его и ничего не
+       ломает: добивать назад нечем, и притворяться, что получилось, нельзя. */
+    {
+        struct stand s;
+        uint16_t port = stand_start(&s, ROLE_APP);
+        CHECK(port != 0, "стенд ROLE_APP для короткой просьбы не поднялся");
+        stand_ch_wire = 0;
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "стенд.пример", 3000, 50);
+        CHECK(r.level == D2K_VER_APPLICATION,
+              "невыполнимая просьба о длине сломала зонд");
+        d2k_verify_close(&r);
+        stand_stop(&s);
+        CHECK(stand_ch_wire > 50,
+              "приветствие внезапно укоротилось до невозможного");
+    }
+
     /* Ни обрыв строки, ни промежуточный 1xx не заменяют окончательный ответ.
        Валидный ответ, разделённый между TLS-записями, не теряется. */
     for (size_t i = 1; i < sizeof replies / sizeof replies[0]; i++) {
         struct stand s;
         uint16_t port = stand_start(&s, ROLE_APP + (int)i);
         CHECK(port != 0, "HTTP-стенд не поднялся");
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 600);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 600, 0);
         CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
         CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
               "фрагмент или промежуточный ответ засчитан как окончательный HTTP");
@@ -608,7 +660,7 @@ int main(void) {
         stand_stop(&s);
     }
     {
-        d2k_ver_result r = d2k_verify_probe("127.0.0.1", 1, "a\r\nInjected: yes", 100);
+        d2k_ver_result r = d2k_verify_probe("127.0.0.1", 1, "a\r\nInjected: yes", 100, 0);
         CHECK(r.level == D2K_VER_NOT_MEASURED && r.fd < 0,
               "управляющие символы имени дошли до сети");
     }

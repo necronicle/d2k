@@ -81,7 +81,7 @@ static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
 }
 
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
-                                int deadline_ms) {
+                                int deadline_ms, size_t hello_wire) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
@@ -113,7 +113,7 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
     char err[160];
     err[0] = '\0';
     d2k_tls *t = NULL;
-    if (d2k_tls_connect(r.fd, sni, deadline_ms, &t, err, sizeof err) != 0) {
+    if (d2k_tls_connect(r.fd, sni, deadline_ms, hello_wire, &t, err, sizeof err) != 0) {
         snprintf(r.reason, sizeof r.reason, "нет TLS: %.150s", err);
         return r;
     }

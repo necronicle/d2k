@@ -216,7 +216,7 @@ d2k_vol_result d2k_volume_probe(const char *ip, uint16_t port, const char *sni,
     d2k_tls *tls = NULL;
     if (!plain) {
         char err[160];
-        if (d2k_tls_connect(fd, (sni && sni[0]) ? sni : NULL, HANDSHAKE_MS,
+        if (d2k_tls_connect(fd, (sni && sni[0]) ? sni : NULL, HANDSHAKE_MS, 0,
                             &tls, err, sizeof err) != 0) {
             /* Причина обрезается по месту, а не тянет за собой размер буфера:
                «нет TLS: » плюс хвост — читателю нужна суть, а не полный текст

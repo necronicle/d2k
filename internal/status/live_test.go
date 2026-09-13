@@ -34,7 +34,8 @@ func TestЖивойВидЧитаетсяПолеВПоле(t *testing.T) {
   ],
   "targets": 1,
   "confirms": 1,
-  "probes_used": 8
+  "probes_used": 8,
+  "client_unfit": 2
 }`
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -54,6 +55,12 @@ func TestЖивойВидЧитаетсяПолеВПоле(t *testing.T) {
 	}
 	if k.Targets != 1 || k.Confirms != 1 || k.ProbesUsed != 8 {
 		t.Fatalf("счётчики не прочитались: %d %d %d", k.Targets, k.Confirms, k.ProbesUsed)
+	}
+	// Непереносимость читается наравне с подтверждениями: без неё панель
+	// показала бы «подтверждено 1» там, где плану дважды не хватило места на
+	// потоке клиента.
+	if k.ClientUnfit != 2 {
+		t.Fatalf("непереносимость не прочиталась: %d", k.ClientUnfit)
 	}
 }
 
