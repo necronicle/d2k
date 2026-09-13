@@ -44,7 +44,10 @@
 #include <unistd.h>
 
 #include "d2k_compose_internal.h"
+#include "d2k_quichello.h"
 #include "d2k_sched.h"
+#include "d2k_quic.h"
+#include "test_quic_vector.h"
 #include "d2k_tls13.h"
 
 /* Что планировщик говорил о себе. Нужен не для красоты: узнавание коробки
@@ -170,11 +173,27 @@ static d2k_ver_result stub_ver(const char *ip, uint16_t port, uint8_t transport,
     return r;
 }
 
+static char quic_last_trig[256];
+static char quic_last_ctl[256];
+
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
                           d2k_hello trigger, d2k_hello control, uint32_t mark) {
-    (void)ip; (void)port; (void)trigger; (void)control; (void)mark;
+    (void)ip; (void)port; (void)mark;
     quic_calls++;
     snprintf(quic_last_sni, sizeof quic_last_sni, "%s", sni ? sni : "");
+    /* Чем именно позвали мерить — разбираем ТЕМ ЖЕ разбором, что и коробка.
+       Без этого «вопросник вызван» ничего не значит: ему могли подсунуть
+       TLS-приветствие, и стенд не заметил бы. */
+    quic_last_trig[0] = '\0';
+    quic_last_ctl[0] = '\0';
+    if (trigger.bytes && trigger.len &&
+        d2k_quic_sni(trigger.bytes, trigger.len, quic_last_trig, sizeof quic_last_trig) != 0) {
+        snprintf(quic_last_trig, sizeof quic_last_trig, "<не QUIC>");
+    }
+    if (control.bytes && control.len &&
+        d2k_quic_sni(control.bytes, control.len, quic_last_ctl, sizeof quic_last_ctl) != 0) {
+        snprintf(quic_last_ctl, sizeof quic_last_ctl, "<не QUIC>");
+    }
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = quic_answer;
@@ -216,6 +235,22 @@ static d2k_ev ev_suspect(uint8_t transport, uint16_t cport) {
     e.tos = 0x88;
     e.ipid = 54321;
     return e;
+}
+
+/* СНИМОК ПРИВЕТСТВИЯ QUIC для имени. У TLS ту же роль в этом файле играет
+   d2k_hello_from_profile; для QUIC профиля нет и быть не может (см.
+   d2k_quichello.h), поэтому снимок делается ровно тем же способом, каким его
+   делает продукт: из настоящего снятого Initial с подставленным именем.
+
+   Нужен он теперь КАЖДОМУ поиску по QUIC: без снимка планировщик больше не
+   меряет вовсе (T_SHAPE_WAIT) — прежде он подставлял TLS-приветствие, то есть
+   байты другого протокола, и «цель молчит» говорило про нашу ошибку. */
+static int quic_shape(d2k_ev *sh, const char *name) {
+    memset(sh, 0, sizeof *sh);
+    sh->kind = D2K_EV_SHAPE;
+    sh->transport = 17;
+    return d2k_quic_hello_rename(d2k_test_v1_initial, sizeof d2k_test_v1_initial,
+                                 name, sh->shape, sizeof sh->shape, &sh->shape_len);
 }
 
 /* Обмен с ВНЕШНИМ типом записи 23 в маске встреченных типов
@@ -559,12 +594,62 @@ int main(void) {
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, 40002);
         CHECK(d2k_sched_event(s, &su) == 1, "поиск по QUIC не начат");
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "instagram.com") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
         settle(s);
         CHECK(quic_calls == 1, "вопросник QUIC не вызван");
         CHECK(tcp_calls == 0, "по UDP-подозрению позвано дерево вердиктов TCP");
         CHECK(strcmp(quic_last_sni, "instagram.com") == 0,
               "вопроснику QUIC досталось не имя цели");
         d2k_sched_free(s);
+    }
+
+    /* --- БЕЗ СНИМКА ПО QUIC НЕ МЕРЯЕМ ВОВСЕ ---------------------------
+     *
+     * Лаборатория lab-quic.sh 13.09.2026: поиск начинался немедленно и уходил
+     * мерить ПРОФИЛЕМ TLS — байтами другого протокола. Сервер на них не
+     * отвечает никогда, и вердикт выходил «контрольное имя молчит», то есть
+     * измерение рассказывало про нашу ошибку. Профиля холодного старта для
+     * QUIC нет и быть не может (d2k_quichello.h), поэтому правильный ответ —
+     * подождать форму, а не подставить похожее. */
+    {
+        tcp_calls = quic_calls = 0;
+        d2k_catalog cW;
+        memset(&cW, 0, sizeof cW);
+        d2k_sched *s = d2k_sched_new(&cW, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(17, 40004, "ждём.форму");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40004);
+        CHECK(d2k_sched_event(s, &su) == 1, "подозрение по QUIC не завело задачу");
+        settle(s);
+        CHECK(quic_calls == 0,
+              "по QUIC пошли мерить без снимка — профилем TLS, байтами другого протокола");
+        CHECK(said("жду форму приветствия"), "ожидание формы не названо вслух");
+        CHECK(d2k_sched_active(s) == 1, "задача, ждущая форму, не считается занятой");
+
+        /* Форма пришла — поиск обязан пойти дальше сам, без нового
+           подозрения: подозрение уже было, и второго может не случиться. */
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "ждём.форму") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        settle(s);
+        CHECK(quic_calls == 1, "после прихода формы поиск не начался");
+        CHECK(strcmp(quic_last_trig, "ждём.форму") == 0,
+              "мерить пошли не снятым приветствием цели");
+        /* КОНТРОЛЬ — тоже QUIC, и с именем приманки: он собирается из того же
+           снимка (core/quichello.c). Прежде сюда уезжало TLS-приветствие, и
+           базовая живость не подтверждалась никогда. */
+        CHECK(strcmp(quic_last_ctl, "disk.rzd.ru") == 0,
+              "контроль по QUIC не собран из снимка с именем приманки");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cW);
     }
 
     /* --- подозрение без предшествующего приветствия: имени нет, искать
@@ -610,6 +695,11 @@ int main(void) {
         d2k_sched_event(s, &h2);
         d2k_ev s2 = ev_suspect(17, 40011);
         d2k_sched_event(s, &s2);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "instagram.com") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
         settle(s);
         CHECK(ver_last_transport == 17,
               "зонду не сказали транспорт — умолчание не смогло бы отказать QUIC");
@@ -2058,6 +2148,11 @@ int main(void) {
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, 40220);
         d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "квик.обход") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
         settle(s);
         CHECK(arm_calls == 1, "плечо QUIC не подбиралось вовсе");
         CHECK(said("плечо подобрано"), "подбор плеча не назван вслух");
@@ -2103,16 +2198,64 @@ int main(void) {
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, 40221);
         d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "фрагмент.квик") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
         run_out(s);
 
         CHECK(said("не выразимо"),
               "невыразимое плечо не названо пробелом реализации");
+        CHECK(!said("не нашлось"),
+              "невыразимое плечо выдано за ненайденное — это разные факты");
         CHECK(binding_of(&cF2, "фрагмент.квик", 17) == NULL,
               "по невыразимому плечу появилась привязка");
         arm_kind = D2K_QA_BLOB;
         quic_answer = D2K_V_CLEAR;
         d2k_sched_free(s);
         d2k_catalog_free(&cF2);
+    }
+
+    /* --- «не нашлось» и «не выразимо» — РАЗНЫЕ ответы --------------------
+     *
+     * Первое про коробку и бюджет: перебор кончился, воздействия нет.
+     * Второе про нас: воздействие есть, языка плана на него нет. Лаборатория
+     * 13.09 на коробке без состояния получила «не выразимо» там, где на деле
+     * кончился бюджет развёртки TTL, — то есть отчиталась нашим пробелом
+     * вместо свойства сети. */
+    {
+        d2k_catalog cNF;
+        memset(&cNF, 0, sizeof cNF);
+        d2k_sched *s = d2k_sched_new(&cNF, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        quic_answer = D2K_V_OPAQUE;
+        ver_answer_port = 40222;
+        arm_kind = D2K_QA_NOT_FOUND;
+        forget_sent();
+
+        d2k_ev h = ev_hello(17, 40222, "нечем.квик");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(17, 40222);
+        d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "нечем.квик") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
+        run_out(s);
+
+        CHECK(said("плечо не нашлось"),
+              "исчерпанный перебор не назван своим именем");
+        CHECK(!said("не выразимо"),
+              "ненайденное плечо выдано за пробел реализации");
+        CHECK(binding_of(&cNF, "нечем.квик", 17) == NULL,
+              "по ненайденному плечу появилась привязка");
+        arm_kind = D2K_QA_BLOB;
+        quic_answer = D2K_V_CLEAR;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cNF);
     }
 
     /* --- подтверждать нечем: перебор кандидатов не начинается ---------- */
@@ -2137,6 +2280,11 @@ int main(void) {
         d2k_sched_event(s, &h);
         d2k_ev su = ev_suspect(17, 40190);
         d2k_sched_event(s, &su);
+        {
+            d2k_ev sh;
+            CHECK(quic_shape(&sh, "квик.цель") == 0, "снимок QUIC не собрался");
+            d2k_sched_event(s, &sh);
+        }
         run_out(s);
 
         CHECK(said("подтверждать нечем"),

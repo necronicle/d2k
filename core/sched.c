@@ -57,6 +57,7 @@
 #include "d2k_compose_internal.h"
 #include "d2k_hello.h"
 #include "d2k_quic.h"
+#include "d2k_quichello.h"
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
@@ -230,6 +231,19 @@ d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 typedef enum {
     T_FREE = 0,
     T_ASKING,        /* сетевой оракул работает в потоке */
+    /* Снимок приветствия заказан, поиск ЖДЁТ его. Состояние заведено ради
+       QUIC и существует только для него: у TLS есть профиль холодного старта
+       (d2k_hello_from_profile), у QUIC профиля нет и быть не может —
+       приветствие едет внутри зашифрованного Initial, и «профиль» пришлось
+       бы хранить вместе с ключами чужой сессии. Мерить QUIC TLS-байтами
+       нельзя: это не «хуже, чем снимок», это другой протокол.
+
+       Ждать приходится потому, что снимок приезжает СОБЫТИЕМ: датапат
+       отвечает на заказ немедленно, когда подходящее приветствие у него уже
+       лежит, но кадр всё равно читается следующим кругом цикла. Раньше
+       поиск стартовал тут же, а снимок дописывался в t->trig уже на ходу —
+       рабочий поток читал байты, которые в это же время переписывались. */
+    T_SHAPE_WAIT,
     T_PROPS_CONTACT, /* план-вопрос отправлен, обращение к цели работает в потоке */
     T_PROPS_WAIT,    /* обращение состоялось, ждём обмена по своему потоку */
     T_PLANNING,      /* вектор собран, ставим планы */
@@ -677,6 +691,35 @@ static task *task_watching_slot(d2k_sched *s) {
  * -------------------------------------------------------------------- */
 
 static int fill_hellos(task *t) {
+    if (t->transport == 17) {
+        /* У QUIC ДВА отличия, и оба следуют из одного: приветствие едет
+           внутри зашифрованного пакета.
+
+           Первое — профиля холодного старта нет. Подставить сюда
+           TLS-приветствие (как делает ветка ниже) значит послать байты
+           другого протокола: сервер их не поймёт, и «цель молчит» сказало бы
+           про нашу ошибку, а не про коробку. Снимка нет — мерить нечем, и
+           это честный отказ, а не повод придумать байты.
+
+           Второе — контроль собирается ИЗ СНИМКА, а не из профиля:
+           приветствие расшифровывается своими же ключами и пересобирается с
+           другим именем (core/quichello.c). Получается контроль той же формы,
+           что и вопрос, — отличающийся ровно именем, ради чего он и нужен. */
+        if (t->trig_len == 0) {
+            return -1;
+        }
+        if (t->ctrl_len == 0 && strcmp(t->name, SCHED_DECOY) != 0) {
+            if (d2k_quic_hello_rename(t->trig, t->trig_len, SCHED_DECOY,
+                                      t->ctrl, sizeof t->ctrl, &t->ctrl_len) != 0) {
+                /* Контроль — законно пустой: дерево вопросов честно скажет
+                   «базовая живость не проверена», а не выдаст молчание за
+                   ответ. Так бывает на приветствии, не поместившемся в одну
+                   датаграмму (см. d2k_quichello.h). */
+                t->ctrl_len = 0;
+            }
+        }
+        return 0;
+    }
     if (t->trig_len == 0) {
         /* Холодный старт: снимка ещё нет. Профиль — это заведомо НЕ те байты,
            что шлёт настоящий клиент (§4), и вердикт на нём слабее; но
@@ -1471,6 +1514,21 @@ static void props_text(const d2k_props *p, char *out, size_t cap) {
              v[p->parses_l7 % 3]);
 }
 
+/* «опыт», «опыта», «опытов» — по числу. Русский счёт не выводится из
+   форматной строки, а «за 41 опытов» читается как машинный перевод: это
+   текст, который читает человек в журнале контроллера. */
+static const char *probes_word(int n) {
+    int t = n % 100;
+    if (t >= 11 && t <= 14) { return "опытов"; }
+    switch (n % 10) {
+    case 1:  return "опыт";
+    case 2:
+    case 3:
+    case 4:  return "опыта";
+    default: return "опытов";
+    }
+}
+
 static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     (void)s;
     t->next_plan = 0;
@@ -1501,6 +1559,24 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
                 t->name);
             return;
         }
+        /* ТРИ РАЗНЫХ ИСХОДА, И ИХ НЕЛЬЗЯ СЛИВАТЬ В ОДИН.
+           «Не нашлось» — это про коробку и бюджет: перебор дошёл до конца и
+           не нашёл, чем её взять. «Верить нельзя» — про измерение: повторы
+           разошлись. «Не выразимо» — про НАС: воздействие найдено, а языка
+           плана на него нет (0007 п.3). Прежде все три печатались как
+           «не выразимо», и лаборатория 13.09 на коробке без состояния
+           отчиталась пробелом реализации там, где на деле кончился бюджет
+           развёртки TTL. */
+        if (t->arm.kind == D2K_QA_NOT_FOUND) {
+            say(s, "по %s (QUIC) плечо не нашлось за %d %s: %s",
+                t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
+            return;
+        }
+        if (t->arm.kind == D2K_QA_FLAKY) {
+            say(s, "по %s (QUIC) подбору плеча верить нельзя: %s",
+                t->name, t->arm.reason);
+            return;
+        }
         size_t blen = 0;
         const uint8_t *blob = d2k_quic_arm_blob(t->arm.blob_id, &blen);
         char text[sizeof t->plans[0]];
@@ -1510,12 +1586,13 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;
             }
-            say(s, "по %s (QUIC) плечо подобрано за %d опытов: %s",
-                t->name, t->arm.probes, t->arm.reason);
+            say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
+                t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
         } else {
-            /* Плечо есть, а выразить его языком Plan нечем (например,
-               фрагментация) — это пробел РЕАЛИЗАЦИИ, а не свойство коробки
-               (0007 п.3), и подменять его похожим запрещено. */
+            /* Сюда доходят только НАЙДЕННЫЕ плечи: фрагментация (языка нет
+               вовсе) и приманка, чей блоб не отдался. Это пробел
+               РЕАЛИЗАЦИИ, а не свойство коробки (0007 п.3), и подменять его
+               похожим запрещено. */
             say(s, "по %s (QUIC) плечо не выразимо сегодняшним языком плана: %s",
                 t->name, t->arm.reason);
         }
@@ -1625,6 +1702,7 @@ static void signal_human(const d2k_cat_signal *sig, char *out, size_t cap) {
    «ищем новое», и сливать их в одно нельзя. */
 static const char *task_phase(const task *t) {
     switch (t->state) {
+    case T_SHAPE_WAIT:    return "ждём форму приветствия";
     case T_ASKING:        return "распознаём поведение";
     case T_PROPS_CONTACT:
     case T_PROPS_WAIT:    return "спрашиваем коробку о свойствах";
@@ -1753,8 +1831,8 @@ size_t d2k_sched_active(const d2k_sched *s) {
     size_t n = 0;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task_state st = s->tasks[i].state;
-        if (st == T_ASKING || st == T_PLANNING || st == T_VERIFY ||
-            st == T_VERIFY_WAIT || st == T_WATCHING) { n++; }
+        if (st == T_SHAPE_WAIT || st == T_ASKING || st == T_PLANNING ||
+            st == T_VERIFY || st == T_VERIFY_WAIT || st == T_WATCHING) { n++; }
     }
     return n;
 }
@@ -1881,6 +1959,43 @@ int d2k_sched_sync_step(d2k_sched *s) {
     return 1;
 }
 
+/* Заводит поиск на подготовленной задаче: приветствия, готовые планы
+   узнанной коробки, иначе замер. Отдельно от on_suspect потому, что тот же
+   запуск нужен ПОЗЖЕ — когда задача ждала форму приветствия и дождалась
+   (on_shape ниже). Возвращает 1, если задача занята делом. */
+static int start_search(d2k_sched *s, task *t) {
+    if (fill_hellos(t) != 0) {
+        if (t->transport == 17 && t->shape_armed) {
+            /* Единственный случай, когда отсутствие приветствия — не отказ:
+               снимок заказан и приедет событием (см. T_SHAPE_WAIT). */
+            t->state = T_SHAPE_WAIT;
+            say(s, "по %s (QUIC) жду форму приветствия: профиля для QUIC нет, "
+                   "мерить до снимка нечем", t->name);
+            return 1;
+        }
+        task_reset(t);
+        return 0;
+    }
+    t->n_known = known_plans(s, t);
+    t->n_plans = t->n_known;
+    if (t->n_known > 0) {
+        t->state = T_PLANNING;
+        say(s, "по %s проверяю %zu готовых планов узнанной коробки / совместимых моделей ДО нового замера",
+            t->name, t->n_known);
+        return 1;
+    }
+    t->researched = 1;
+    t->state = T_ASKING;
+    if (start_worker(s, t, JOB_CLASSIFY) != 0) {
+        task_reset(t);
+        return 0;
+    }
+    say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
+        t->name, t->transport == 17 ? "QUIC" : "TCP", t->ip, (unsigned)t->port,
+        t->trig_len, t->shape_armed ? ", снимок заказан" : "");
+    return 1;
+}
+
 static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     /* Имя копируется СРАЗУ, а не держится указателем в кольцо имён: и потому
        что кольцо переживает вытеснение (следующее приветствие может занять
@@ -1939,34 +2054,15 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     server_of(ev, t->ip, sizeof t->ip, &t->port);
     t->started_ms = 0;
-    if (fill_hellos(t) != 0) {
-        task_reset(t);
-        return 0;
-    }
+    /* Снимок заказывается ДО подбора приветствий, а не после: для QUIC он не
+       «уточнение», а единственный источник байт, и порядок здесь несущий. */
     if (!t->shape_armed) {
         char err[128];
         if (d2k_link_arm_shape(s->link_fd, t->name, t->transport, err, sizeof err) == 0) {
             t->shape_armed = 1;
         }
     }
-    t->n_known = known_plans(s, t);
-    t->n_plans = t->n_known;
-    if (t->n_known > 0) {
-        t->state = T_PLANNING;
-        say(s, "по %s проверяю %zu готовых планов узнанной коробки / совместимых моделей ДО нового замера",
-            t->name, t->n_known);
-        return 1;
-    }
-    t->researched = 1;
-    t->state = T_ASKING;
-    if (start_worker(s, t, JOB_CLASSIFY) != 0) {
-        task_reset(t);
-        return 0;
-    }
-    say(s, "по %s (%s) начинаю поиск: %s:%u, приветствие %zu байт%s",
-        t->name, t->transport == 17 ? "QUIC" : "TCP", t->ip, (unsigned)t->port,
-        t->trig_len, t->shape_armed ? ", снимок заказан" : "");
-    return 1;
+    return start_search(s, t);
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
@@ -1998,6 +2094,11 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
             t->trig_snapped = 1;
             say(s, "по %s (%s) поймана форма приветствия: %zu байт",
                 t->name, t->transport == 17 ? "QUIC" : "TCP", ev->shape_len);
+            if (t->state == T_SHAPE_WAIT) {
+                /* Ждали ровно этого. Контроль соберётся из этих же байт, и
+                   поиск пойдёт дальше как обычно. */
+                (void)start_search(s, t);
+            }
         }
     }
 }
@@ -2480,7 +2581,15 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
         if (t->started_ms == 0) { t->started_ms = now_ms; }
         if (now_ms - t->started_ms > SCHED_TASK_LIFE_MS) {
-            if (t->state == T_WATCHING) {
+            if (t->state == T_SHAPE_WAIT) {
+                /* Формы так и не дождались: человек ушёл со страницы, и
+                   повторять приветствие некому. Это НЕ неудача плана —
+                   планов не было вовсе; освобождаем место молча по сути, но
+                   вслух по журналу. */
+                say(s, "по %s (QUIC) формы приветствия так и не пришло — мерить нечем",
+                    t->name);
+                task_done(t);
+            } else if (t->state == T_WATCHING) {
                 /* Наблюдение за живым трафиком кончилось ничем — и это НЕ
                    неудача: план уже подтверждён зондом и записан, снимать его
                    (task_fail) не за что. Просто освобождаем место. */
