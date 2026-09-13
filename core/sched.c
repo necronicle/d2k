@@ -56,6 +56,7 @@
 #include "d2k_compose.h"
 #include "d2k_compose_internal.h"
 #include "d2k_hello.h"
+#include "d2k_quic.h"
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
@@ -958,6 +959,13 @@ static int is_hex_digit(char c) {
    план-кандидат не применится ни к чему, включая собственный зонд. План при
    этом временный и снимается по итогам испытания. */
 static uint8_t probe_shape(const task *t) {
+    /* У QUIC форма своя и известна ЗАРАНЕЕ, из транспорта: перечисление
+       d2k_shape знает только формы TLS, и вывести по нему тройку неоткуда.
+       Пока этого не было, план QUIC-задачи уезжал формой MODERN, а таблица
+       планов датапата на UDP отдаёт план только форме QUIC (или дедушкиному
+       праву) — собственный кандидат был невидим для тех самых датаграмм,
+       ради которых ставился. */
+    if (t->transport == 17) { return (uint8_t)D2K_LINK_SHAPE_QUIC; }
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
     return (sh == D2K_SHAPE_UNKNOWN) ? (uint8_t)D2K_LINK_SHAPE_GRANDFATHER
                                      : (uint8_t)sh;
@@ -1868,7 +1876,7 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     if (!t->shape_armed) {
         char err[128];
-        if (d2k_link_arm_shape(s->link_fd, t->name, err, sizeof err) == 0) {
+        if (d2k_link_arm_shape(s->link_fd, t->name, t->transport, err, sizeof err) == 0) {
             t->shape_armed = 1;
         }
     }
@@ -1894,20 +1902,33 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0].trig) { return; }
-    size_t off = 0, len = 0;
-    if (d2k_hello_sni(ev->shape, ev->shape_len, &off, &len) != 0 || len == 0) { return; }
+    /* ИМЯ ДОСТАЁТСЯ ТЕМ РАЗБОРОМ, КОТОРОМУ ПРИНАДЛЕЖАТ БАЙТЫ.
+       Снимок приходит с транспортом в ключе (датапат кладёт его туда, см.
+       ARM_SHAPE в ctlsrv.c), и приветствие QUIC — это Initial, а не запись
+       TLS: разбор TLS на нём возвращает отказ, и снимок молча пропадал. */
     char name[256];
-    if (len >= sizeof name) { return; }
-    memcpy(name, ev->shape + off, len);
-    name[len] = '\0';
-    /* Снимок кладём ВСЕМ задачам этого имени: транспортов два, а имя одно. */
+    if (ev->transport == 17) {
+        if (d2k_quic_sni(ev->shape, ev->shape_len, name, sizeof name) != 0) { return; }
+    } else {
+        size_t off = 0, len = 0;
+        if (d2k_hello_sni(ev->shape, ev->shape_len, &off, &len) != 0 || len == 0) { return; }
+        if (len >= sizeof name) { return; }
+        memcpy(name, ev->shape + off, len);
+        name[len] = '\0';
+    }
+    if (name[0] == '\0') { return; }
+    /* Кладём ТОЛЬКО задачам своего транспорта: у TCP и QUIC приветствия
+       разные, и снимок одного для другого — не «лучше, чем ничего», а чужие
+       байты, которыми задача пойдёт мерить. */
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
-        if (t->state != T_FREE && strcmp(t->name, name) == 0) {
+        if (t->state != T_FREE && t->transport == ev->transport &&
+            strcmp(t->name, name) == 0) {
             memcpy(t->trig, ev->shape, ev->shape_len);
             t->trig_len = ev->shape_len;
             t->trig_snapped = 1;
-            say(s, "по %s поймана форма приветствия: %zu байт", t->name, ev->shape_len);
+            say(s, "по %s (%s) поймана форма приветствия: %zu байт",
+                t->name, t->transport == 17 ? "QUIC" : "TCP", ev->shape_len);
         }
     }
 }
@@ -1994,7 +2015,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
                          t->name, t->transport,
-                         (uint8_t)SCHED_PROBE_SHAPE, D2K_VERBY_PROBE,
+                         t->transport == 17 ? (uint8_t)D2K_LINK_SHAPE_QUIC
+                                            : (uint8_t)SCHED_PROBE_SHAPE,
+                         D2K_VERBY_PROBE,
                          wall_s(s, now_ms), &t->fp);
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);

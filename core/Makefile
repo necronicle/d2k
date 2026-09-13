@@ -239,8 +239,8 @@ test_quic: test_quic.c quic.o crypto.o $(HDR)
 test_quicprobe: test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_quicprobe.c quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
 
-test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o $(TEST_LDFLAGS)
+test_quic_arms: test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_arms.c props.o quicprobe.o quic.o crypto.o meas.o compose.o hello.o plantlv.o link.o $(TEST_LDFLAGS)
 
 test_hello: test_hello.c hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_hello.c hello.o $(TEST_LDFLAGS)
@@ -410,9 +410,9 @@ cross: hello_profiles.inc
 		test_quicprobe.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
 	@echo "== test_quic_arms целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-a64 \
-		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quic_arms-mipsel \
-		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c -lpthread || exit 1
+		test_quic_arms.c props.c quicprobe.c quic.c crypto.c meas.c compose.c hello.c plantlv.c link.c -lpthread || exit 1
 	@echo "== test_hello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_hello-a64 \
 		test_hello.c hello.c -lpthread || exit 1

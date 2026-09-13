@@ -396,7 +396,7 @@ int main(int argc, char **argv) {
                        r.verdict == D2K_VERDICT_DROP ? "снять" : "пропустить");
             } else if (strcmp(line, "shape") == 0) {
                 size_t sl = 0;
-                const uint8_t *sh = d2k_session_shape(sess, &sl);
+                const uint8_t *sh = d2k_session_shape(sess, 6, &sl);
                 printf("shape: %zu байт\n", sh ? sl : (size_t)0);
             } else if (strcmp(line, "plans") == 0) {
                 printf("planов %zu, команд принято %llu, отвергнуто %llu\n",

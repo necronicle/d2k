@@ -96,6 +96,7 @@
 #include "d2k_compose_internal.h" /* прототипы четырёх сборщиков TLV ниже — не наложением, а для planlab, см. её шапку */
 #include "d2k_hello.h"
 #include "d2k_link.h"
+#include "d2k_quicprobe.h" /* d2k_quic_arm: перевод подобранного плеча в текст плана */
 #include "d2k_plan.h" /* datapath/include — D2K_POISON_BADSUM, тот же публичный контракт, что уже читает d2k_link.h через d2k_ctl.h */
 
 /* --------------------------------------------------------------------
@@ -999,12 +1000,16 @@ static int append_fmt(char *buf, size_t cap, size_t *pos, const char *fmt, ...) 
  * заполняет поле ID, каталожный идентификатор ("plan-XXXXXXXX") считается
  * ПОЗЖЕ и ОТДЕЛЬНО хэшем текста (planID(text) в properties.go), а не хранится
  * в самом тексте плана. */
-static int emit_header(char *buf, size_t cap, size_t *pos) {
+static int emit_header_proto(char *buf, size_t cap, size_t *pos, const char *proto) {
     static const char zero32[] = "00000000000000000000000000000000000000";
     if (append_fmt(buf, cap, pos, "d2k-plan 1 1\n") != 0) { return -1; }
     if (append_fmt(buf, cap, pos, "id %.32s\n", zero32) != 0) { return -1; }
-    if (append_fmt(buf, cap, pos, "proto tcp tls\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, pos, "proto %s\n", proto) != 0) { return -1; }
     return 0;
+}
+
+static int emit_header(char *buf, size_t cap, size_t *pos) {
+    return emit_header_proto(buf, cap, pos, "tcp tls");
 }
 
 static int append_hex(char *buf, size_t cap, size_t *pos,
@@ -1313,6 +1318,82 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
         return 0;
     }
     return -1;
+}
+
+/* --------------------------------------------------------------------
+ * ПЛАН ИЗ ПОДОБРАННОГО ПЛЕЧА QUIC.
+ *
+ * Плечо подбирает d2k_quic_pick_arm (core/props.c): перебор блобов-приманок,
+ * затем ось числа копий, затем развёртка TTL — донорский порядок. До сих пор
+ * подобранное плечо НЕКУДА было девать: планировщик его не звал, а если бы
+ * позвал — переводить результат в текст плана было нечем, и вертикаль QUIC
+ * обрывалась на месте.
+ *
+ * Что из плеча выразимо сегодня, и почему именно это. Датаграмма атомарна:
+ * резать её нельзя (datapath/session.c: «план режет датаграмму на части — для
+ * UDP это порча, не разрез»), якоря имени на UDP не определены намеренно
+ * (have_sni=0), а d2k_wire_build_udp честно отказывается собирать посылку с
+ * приставкой перекрытия, сдвигом номера, tcp_ts и битой суммой — полей TCP у
+ * UDP нет. Остаётся ровно то, из чего плечо QUIC и состоит: приманка
+ * отдельными датаграммами ПЕРЕД правдой, число копий и TTL приманки.
+ *
+ * D2K_QA_FRAG не выражается: IP-фрагментации язык Plan не знает. Возвращается
+ * -1 — пробел РЕАЛИЗАЦИИ, а не отрицательное свойство коробки (0007 п.3), и
+ * подменять его похожим запрещено (§2.5). Так же -1 на NOT_FOUND и FLAKY:
+ * там нечего ставить.
+ * -------------------------------------------------------------------- */
+int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
+                      char *buf, size_t cap) {
+    if (!arm || !buf || cap == 0) { return -1; }
+    unsigned repeats = 1;
+    int ttl = 0;
+    size_t blob_id = 0;
+    switch (arm->kind) {
+    case D2K_QA_BLOB:   blob_id = arm->blob_id; break;
+    case D2K_QA_COPIES:
+        blob_id = arm->blob_id;
+        if (arm->copies <= 0 || arm->copies > 255) { return -1; }
+        repeats = (unsigned)arm->copies;
+        break;
+    case D2K_QA_TTL:
+        blob_id = arm->blob_id;
+        if (arm->ttl <= 0 || arm->ttl > 255) { return -1; }
+        ttl = arm->ttl;
+        break;
+    default:
+        return -1;   /* FRAG не выразим; NOT_FOUND и FLAKY ставить нечего */
+    }
+
+    /* Байты приманки приходят ОТ ВЫЗЫВАЮЩЕГО, а не берутся здесь: каталог
+       блобов принадлежит подбору плеч (d2k_quic_arm_blob), и тащить его в
+       сборку планов значило бы связать её с сетевым модулем ради одной
+       таблицы. blob_id проверяется тем, что вызывающий по нему блоб и достал. */
+    (void)blob_id;
+    if (!blob || blen == 0) { return -1; }
+
+    size_t pos = 0;
+    if (emit_header_proto(buf, cap, &pos, "udp quic") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
+    if (append_hex(buf, cap, &pos, blob, blen) != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
+    if (ttl) {
+        if (append_fmt(buf, cap, &pos, "poison 1 ttl=%d\n", ttl) != 0) { return -1; }
+    } else {
+        if (append_fmt(buf, cap, &pos, "poison 1\n") != 0) { return -1; }
+    }
+    /* place=before и никакого «между»: между чем? Кусков у датаграммы нет.
+       gap_us нулевой — паузы МЕЖДУ копиями донор не задаёт, а выдержку перед
+       правдой задаёт pace, и это то же число, что у TCP-плеч с фальшивкой. */
+    if (append_fmt(buf, cap, &pos,
+                   "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
+                   repeats) != 0) {
+        return -1;
+    }
+    if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,

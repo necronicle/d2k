@@ -165,19 +165,28 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, rc == 0, reason);
         return;
     }
-    case D2K_CMD_ARM_SHAPE:
-        if (len < 1 || len < 1u + b[0]) {
+    case D2K_CMD_ARM_SHAPE: {
+        /* Тело: длина имени, имя, затем ТРАНСПОРТ одним байтом. Транспорт
+           обязателен: снимок приветствия хранится отдельно на транспорт, и без
+           него датапат отдал бы QUIC-задаче байты TLS. Старое тело (без
+           последнего байта) отвергается — смешанная пара ловится сверкой
+           версии провода, а не молча. */
+        if (len < 2 || len < 2u + b[0]) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        if (d2k_session_want_shape(cx->sess, b + 1, b[0])) {
+        uint8_t want_tr = b[1u + b[0]];
+        if (d2k_session_want_shape(cx->sess, b + 1, b[0], want_tr)) {
             /* Готово прямо сейчас — отдаём, не дожидаясь следующего
                приветствия. */
             size_t slen = 0;
-            const uint8_t *sh = d2k_session_shape(cx->sess, &slen);
+            const uint8_t *sh = d2k_session_shape(cx->sess, want_tr, &slen);
             if (sh && slen > 0 && cx->ctl) {
                 uint8_t body[D2K_KEY_WIRE_LEN + 2048];
                 memset(body, 0, D2K_KEY_WIRE_LEN);
+                /* Транспорт кладётся в ключ, а не рядом: место под него на
+                   проводе уже есть, и контроллер разбирает его общим путём. */
+                body[D2K_KEY_WIRE_LEN - 1] = want_tr;
                 if (slen <= sizeof body - D2K_KEY_WIRE_LEN) {
                     memcpy(body + D2K_KEY_WIRE_LEN, sh, slen);
                     d2k_ctl_event(cx->ctl, D2K_EV_SHAPE, body, D2K_KEY_WIRE_LEN + slen);
@@ -186,6 +195,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         }
         ack(cx, type, 1, D2K_ACK_OK);
         return;
+    }
     case D2K_CMD_DEL_NAME:
         if (len < 1 || len < 1u + b[0]) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
@@ -312,7 +322,9 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             /* Байты приветствия лежат не в журнале, а в ловушке сессии:
                запись журнала ограничена, а приветствие бывает в килобайт. */
             size_t slen = 0;
-            const uint8_t *sh = d2k_session_shape(s, &slen);
+            /* Транспорт берётся из ключа записи журнала: ловушка взводится на
+               транспорт, и снимок лежит в его слоте. */
+            const uint8_t *sh = d2k_session_shape(s, e->key.proto, &slen);
             if (!sh || slen == 0 || n + slen > sizeof body) {
                 continue;
             }

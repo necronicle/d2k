@@ -518,8 +518,40 @@ int d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
     return 0;
 }
 
-int d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap) {
-    return send_name_only(fd, D2K_CMD_ARM_SHAPE, "ARM_SHAPE", name, err, errcap);
+int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
+                       char *err, size_t errcap) {
+    /* Своё тело, а не send_name_only: за именем едет ТРАНСПОРТ. Снимок
+       приветствия датапат хранит отдельно на транспорт, и без этого байта он
+       отдал бы QUIC-задаче байты TLS (d2k_session_want_shape). */
+    if (fd < 0) {
+        say(err, errcap, "сокет не открыт");
+        return -1;
+    }
+    if (!name) { name = ""; }
+    size_t nl = strlen(name);
+    if (nl > 255) {
+        say(err, errcap, "имя цели длиной %zu байт длиннее 255", nl);
+        return -1;
+    }
+    size_t o = HDR;
+    g_scratch[o++] = (uint8_t)nl;
+    memcpy(g_scratch + o, name, nl);
+    o += nl;
+    g_scratch[o++] = transport;
+
+    size_t body_len = o - HDR;
+    uint32_t plen = (uint32_t)(2 + body_len);
+    g_scratch[0] = (uint8_t)(plen >> 24);
+    g_scratch[1] = (uint8_t)(plen >> 16);
+    g_scratch[2] = (uint8_t)(plen >> 8);
+    g_scratch[3] = (uint8_t)plen;
+    g_scratch[4] = (uint8_t)(D2K_CMD_ARM_SHAPE >> 8);
+    g_scratch[5] = (uint8_t)D2K_CMD_ARM_SHAPE;
+    if (write_all(fd, g_scratch, o) != 0) {
+        say(err, errcap, "команда ARM_SHAPE не отправилась: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {

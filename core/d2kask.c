@@ -779,7 +779,7 @@ int main(int argc, char **argv) {
     } else {
         trig_how = "--arm-wait-ms";
         snprintf(trig_detail, sizeof trig_detail, "имя=%s, потолок=%ld мс", a.sni, a.arm_wait_ms);
-        if (d2k_link_arm_shape(fd, a.sni, err, sizeof err) != 0) {
+        if (d2k_link_arm_shape(fd, a.sni, 6, err, sizeof err) != 0) {
             fprintf(stderr, "d2kask: ARM_SHAPE(%s) не отправился: %s\n", a.sni, err);
             d2k_link_close(fd);
             return 1;
@@ -803,7 +803,7 @@ int main(int argc, char **argv) {
     } else if (a.control_sni) {
         ctrl_how = "--arm-wait-ms";
         snprintf(ctrl_detail, sizeof ctrl_detail, "имя=%s, потолок=%ld мс", a.control_sni, a.arm_wait_ms);
-        if (d2k_link_arm_shape(fd, a.control_sni, err, sizeof err) != 0) {
+        if (d2k_link_arm_shape(fd, a.control_sni, 6, err, sizeof err) != 0) {
             fprintf(stderr, "d2kask: ARM_SHAPE(%s) не отправился: %s\n", a.control_sni, err);
             d2k_link_close(fd);
             return 1;

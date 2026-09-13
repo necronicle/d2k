@@ -36,7 +36,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "d2k_hello.h" /* d2k_shape */
+#include "d2k_hello.h"
 #include "d2k_meas.h"  /* d2k_hello */
 
 /* Тройственная логика: не измерено / да / нет. Ноль означает «не измерено»,

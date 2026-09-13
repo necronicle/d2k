@@ -262,10 +262,15 @@ void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);
  * состояние (§5.3), и зонд для неё тоже нужен.
  *
  * Возвращает 1, если сохранённое подошло и уже готово; 0 — ловушка взведена. */
-int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len);
+/* transport — 6 или 17: снимок приветствия хранится ОТДЕЛЬНО НА ТРАНСПОРТ.
+ * TLS-приветствие поверх TCP и Initial поверх UDP — разные байты разной формы,
+ * и отдать одно вместо другого значит отправить контроллера мерить тем, чем
+ * клиент не ходит. */
+int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,
+                           uint8_t transport);
 
 /* Приветствие, готовое к выдаче. NULL — не готово. */
-const uint8_t *d2k_session_shape(const d2k_session *s, size_t *len);
+const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len);
 
 const d2k_journal *d2k_session_journal(const d2k_session *s);
 

@@ -1893,6 +1893,53 @@ int main(void) {
         d2k_catalog_free(&cE);
     }
 
+    /* --- снимок приветствия не уходит на ЧУЖОЙ транспорт --------------- */
+    {
+        /* Приветствие TLS поверх TCP и Initial поверх UDP — разные байты
+           разной формы. Пока снимок раздавался всем задачам имени, QUIC-задача
+           уходила мерить TLS-приветствием, и первый же разбор его отвергал. */
+        d2k_catalog cS;
+        memset(&cS, 0, sizeof cS);
+        d2k_sched *s = d2k_sched_new(&cS, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        quic_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_HANDSHAKE;
+        ver_fail_first = 0;
+        ver_answer_port = 40210;
+        forget_sent();
+
+        /* Две задачи одного имени: по TCP и по QUIC. */
+        d2k_ev h1 = ev_hello(6, 40210, "оба.транспорта");
+        d2k_sched_event(s, &h1);
+        d2k_ev s1 = ev_suspect(6, 40210);
+        d2k_sched_event(s, &s1);
+        d2k_ev h2 = ev_hello(17, 40211, "оба.транспорта");
+        d2k_sched_event(s, &h2);
+        d2k_ev s2 = ev_suspect(17, 40211);
+        d2k_sched_event(s, &s2);
+        settle(s);
+
+        /* Снимок приходит с транспортом TCP. */
+        d2k_ev sh;
+        memset(&sh, 0, sizeof sh);
+        sh.kind = D2K_EV_SHAPE;
+        sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "оба.транспорта",
+                                     sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+              "приветствие для снимка не собралось");
+        saidbuf[0] = '\0';
+        d2k_sched_event(s, &sh);
+
+        CHECK(said("(TCP) поймана форма приветствия"),
+              "снимок не дошёл до задачи своего транспорта");
+        CHECK(!said("(QUIC) поймана форма приветствия"),
+              "снимок TCP положили QUIC-задаче — она пойдёт мерить чужими байтами");
+        d2k_sched_free(s);
+        d2k_catalog_free(&cS);
+    }
+
     /* --- неудачный ВТОРОЙ поиск не уносит подтверждённый план ---------- */
     {
         /* Второй поиск по уже подтверждённой цели — обычное дело: новое

@@ -229,6 +229,18 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * управляющего протокола. */
 #define D2K_LINK_SHAPE_GRANDFATHER 4
 
+/* Форма приветствия QUIC на проводе — то же число, что D2K_PLAN_SHAPE_QUIC в
+ * datapath/d2k_plans.h, и объявлено здесь по той же причине, что и дедушкино
+ * право выше.
+ *
+ * Нужно затем, что перечисление d2k_shape (d2k_hello.h) знает только формы
+ * TLS: 0 «не разобрано», 1 MODERN, 2 LEGACY. Значения 3 в нём нет, и пока
+ * контроллер выводил форму только из него, план QUIC-задачи уезжал с формой
+ * MODERN — а таблица планов датапата на UDP отдаёт план только форме QUIC или
+ * дедушкиному праву. Собственный кандидат QUIC-задачи был НЕВИДИМ для
+ * датаграмм, ради которых он и ставился, и молча увеличивал shape_misses. */
+#define D2K_LINK_SHAPE_QUIC 3
+
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
                        const char *plan_text, uint8_t shape,
                        char *err, size_t errcap);
@@ -239,7 +251,8 @@ int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
  * НЕМЕДЛЕННО, если она уже поймана (см. d2k_ctlsrv_command в ctlsrv.c), и это
  * событие придёт РАНЬШЕ ack на саму команду ARM_SHAPE — забирать его должен
  * вызывающий через d2k_link_next, а не эта функция впустую. */
-int  d2k_link_arm_shape(int fd, const char *name, char *err, size_t errcap);
+int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
+                        char *err, size_t errcap);
 
 /* Снимает план с имени цели: команда D2K_CMD_DEL_NAME. Тело на проводе такое
  * же, как у ARM_SHAPE (длина имени u8, имя — d2k_ctl.h), поэтому и код тот

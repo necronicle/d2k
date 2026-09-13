@@ -34,6 +34,8 @@
 
 #include "d2k_crypto.h"
 #include "d2k_meas.h"
+#include "d2k_compose.h"
+#include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 
 static int fails;
@@ -621,6 +623,58 @@ static void test_real_ttl_hook_on_wire(void) {
     close(fd);
 }
 
+/* ПОДОБРАННОЕ ПЛЕЧО ПЕРЕВОДИТСЯ В ПЛАН, И ПЛАН ЭТОТ ИСПОЛНИМ.
+ *
+ * До сих пор подбор плеча был вещью в себе: результат некуда было девать.
+ * Проверяется три утверждения, и все три обязательны:
+ *   - текст плана объявляет UDP и QUIC, а не унаследованные tcp/tls;
+ *   - грамматика его принимает (d2k_plan_text_to_hex собирает TLV) — иначе
+ *     «план» это строка, которую датапат отвергнет;
+ *   - плечи, которые сегодня не выразимы, честно дают отказ, а не подменяются
+ *     похожими (§2.5).
+ */
+static void test_arm_to_plan(void) {
+    char plan[8192], err[200], hex[2 * D2K_PLAN_TLV_MAX + 1];
+    size_t blen = 0;
+    const uint8_t *blob = d2k_quic_arm_blob(D2K_QUIC_ARM_BLOB_SHAPED, &blen);
+    CHECK(blob != NULL && blen > 0, "блоб-приманка не достался");
+
+    struct { d2k_quic_arm_kind kind; int copies; int ttl; int ok; const char *what; } c[] = {
+        { D2K_QA_BLOB,      0,  0, 1, "одиночная приманка" },
+        { D2K_QA_COPIES,   11,  0, 1, "одиннадцать копий" },
+        { D2K_QA_TTL,       0,  3, 1, "приманка с укороченным TTL" },
+        { D2K_QA_FRAG,      0,  0, 0, "фрагментация — не выразима" },
+        { D2K_QA_NOT_FOUND, 0,  0, 0, "плечо не найдено — ставить нечего" },
+        { D2K_QA_FLAKY,     0,  0, 0, "измерению верить нельзя" },
+    };
+    for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
+        d2k_quic_arm a;
+        memset(&a, 0, sizeof a);
+        a.kind = c[i].kind;
+        a.blob_id = D2K_QUIC_ARM_BLOB_SHAPED;
+        a.copies = c[i].copies;
+        a.ttl = c[i].ttl;
+        int rc = d2k_quic_arm_plan(&a, blob, blen, plan, sizeof plan);
+        if (!c[i].ok) {
+            CHECK(rc != 0, "невыразимое плечо всё-таки дало план");
+            continue;
+        }
+        CHECK(rc == 0, "выразимое плечо не дало плана");
+        CHECK(strstr(plan, "proto udp quic") != NULL,
+              "план плеча QUIC объявил не тот транспорт или протокол");
+        CHECK(strstr(plan, "place=before") != NULL,
+              "приманка поставлена не перед правдой — между чем её ставить у датаграммы?");
+        CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
+              "грамматика не приняла план плеча QUIC");
+        if (c[i].kind == D2K_QA_COPIES) {
+            CHECK(strstr(plan, "repeats=11") != NULL, "число копий не доехало в план");
+        }
+        if (c[i].kind == D2K_QA_TTL) {
+            CHECK(strstr(plan, "ttl=3") != NULL, "TTL приманки не доехал в план");
+        }
+    }
+}
+
 int main(void) {
     /* Сохраняем боевые крючки — они же используются другими тестами при
        линковке в один процесс (см. Makefile: test_quic_arms собирает
@@ -656,6 +710,8 @@ int main(void) {
 
     test_frag_builder_correctness();
     test_real_ttl_hook_on_wire();
+
+    test_arm_to_plan();
 
     if (fails == 0) {
         printf("плечи QUIC: все проверки прошли\n");

@@ -807,7 +807,7 @@ int main(void) {
         (void)probe_say(&p, "hello shape.example");
 
         char e1[200] = {0};
-        CHECK(d2k_link_arm_shape(fd, "shape.example", e1, sizeof e1) == 0, "ARM_SHAPE не отправилась");
+        CHECK(d2k_link_arm_shape(fd, "shape.example", 6, e1, sizeof e1) == 0, "ARM_SHAPE не отправилась");
 
         d2k_ev ev;
         int found_shape = 0;

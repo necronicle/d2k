@@ -89,17 +89,28 @@ struct d2k_session {
      *
      * last_* — последнее увиденное приветствие, копится всегда.
      * ready_* — то, что готово к выдаче по запросу. */
-    uint8_t  last_hello[2048];
-    size_t   last_hello_len;
-    uint8_t  last_name[256];
-    size_t   last_name_len;
+    /* Снимок приветствия храним ОТДЕЛЬНО НА ТРАНСПОРТ.
+       Один слот на оба был дырой: приветствие TLS поверх TCP и Initial поверх
+       UDP — разные байты, разной формы, и контроллеру они нужны РАЗНЫЕ.
+       Общий слот отдавал QUIC-задаче то, что снято с TCP, и наоборот; задача
+       QUIC шла мерить, держа в руках TLS-приветствие, и первый же разбор его
+       отвергал. Индекс 0 — TCP, 1 — UDP (см. slot_of). */
+    uint8_t  last_hello[2][2048];
+    size_t   last_hello_len[2];
+    uint8_t  last_name[2][256];
+    size_t   last_name_len[2];
 
-    int      shape_armed;
-    uint8_t  shape_name[256];
-    size_t   shape_name_len;
-    uint8_t  shape[2048];
-    size_t   shape_len;
+    int      shape_armed[2];
+    uint8_t  shape_name[2][256];
+    size_t   shape_name_len[2];
+    uint8_t  shape[2][2048];
+    size_t   shape_len[2];
 };
+
+/* Номер слота снимка по транспорту. Всё, кроме UDP, живёт в слоте TCP: других
+   транспортов у нас нет, а заводить третий слот под несуществующее значило бы
+   завести неизмеренную сущность. */
+static size_t slot_of(uint8_t transport) { return transport == 17 ? 1u : 0u; }
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
     d2k_session *s = calloc(1, sizeof *s);
@@ -430,6 +441,37 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     s->with_sni++;
     d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0, NULL,
                     (const uint8_t *)name, name_len, NULL);
+
+    /* СНИМОК ПРИВЕТСТВИЯ QUIC — ровно то же, что делает ветка TCP, и по той
+       же причине: контроллер мерит ТЕМ, чем ходит клиент, а не заготовкой.
+       Без этого QUIC-задача уходила мерить с TLS-приветствием из профиля
+       холодного старта — байтами, которые разбор Initial отвергает первым же
+       шагом, и вертикаль обрывалась, не начавшись.
+
+       Слот свой (см. slot_of): TLS-приветствие и Initial — разные байты
+       разной формы, и отдавать одно вместо другого нельзя. */
+    {
+        size_t k = slot_of(17);
+        if (payload_len <= sizeof s->last_hello[k]) {
+            memcpy(s->last_hello[k], pkt + payload_off, payload_len);
+            s->last_hello_len[k] = payload_len;
+            s->last_name_len[k] = 0;
+            if (name_len > 0 && name_len <= sizeof s->last_name[k]) {
+                memcpy(s->last_name[k], name, name_len);
+                s->last_name_len[k] = name_len;
+            }
+        }
+        if (s->shape_armed[k] && payload_len <= sizeof s->shape[k] &&
+            (s->shape_name_len[k] == 0 ||
+             name_same((const uint8_t *)name, name_len,
+                       s->shape_name[k], s->shape_name_len[k]))) {
+            memcpy(s->shape[k], pkt + payload_off, payload_len);
+            s->shape_len[k] = payload_len;
+            s->shape_armed[k] = 0;
+            d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
+                            (uint32_t)payload_len, NULL, NULL, 0, NULL);
+        }
+    }
 
     uint32_t dst_be;
     memcpy(&dst_be, pkt + 16, 4);
@@ -928,25 +970,25 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             /* Последнее приветствие копится всегда: подозрение возникнет на
                этом же соединении, и просить форму будет уже поздно. Один
                буфер, объявленный предел. */
-            if (payload_len <= sizeof s->last_hello) {
-                memcpy(s->last_hello, pkt + payload_off, payload_len);
-                s->last_hello_len = payload_len;
-                s->last_name_len = 0;
-                if (tls.have_sni && tls.sni_len <= sizeof s->last_name) {
-                    memcpy(s->last_name, pkt + payload_off + tls.sni_off, tls.sni_len);
-                    s->last_name_len = tls.sni_len;
+            if (payload_len <= sizeof s->last_hello[0]) {
+                memcpy(s->last_hello[0], pkt + payload_off, payload_len);
+                s->last_hello_len[0] = payload_len;
+                s->last_name_len[0] = 0;
+                if (tls.have_sni && tls.sni_len <= sizeof s->last_name[0]) {
+                    memcpy(s->last_name[0], pkt + payload_off + tls.sni_off, tls.sni_len);
+                    s->last_name_len[0] = tls.sni_len;
                 }
             }
             /* Взведённая ловушка — на случай, когда в момент запроса
                подходящего приветствия ещё не было. */
-            if (s->shape_armed && payload_len <= sizeof s->shape &&
-                (s->shape_name_len == 0 ||
+            if (s->shape_armed[0] && payload_len <= sizeof s->shape[0] &&
+                (s->shape_name_len[0] == 0 ||
                  (tls.have_sni &&
                   name_same(pkt + payload_off + tls.sni_off, tls.sni_len,
-                            s->shape_name, s->shape_name_len)))) {
-                memcpy(s->shape, pkt + payload_off, payload_len);
-                s->shape_len = payload_len;
-                s->shape_armed = 0;
+                            s->shape_name[0], s->shape_name_len[0])))) {
+                memcpy(s->shape[0], pkt + payload_off, payload_len);
+                s->shape_len[0] = payload_len;
+                s->shape_armed[0] = 0;
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
                                 (uint32_t)payload_len, NULL, NULL, 0, NULL);
             }
@@ -1198,40 +1240,46 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     return 0;
 }
 
-int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len) {
+int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,
+                           uint8_t transport) {
     if (!s) {
         return 0;
     }
-    if (len > sizeof s->shape_name) {
-        len = sizeof s->shape_name;
+    size_t k = slot_of(transport);
+    if (len > sizeof s->shape_name[k]) {
+        len = sizeof s->shape_name[k];
     }
     /* Сохранённое подходит — отдаём немедленно. Ждать следующего приветствия
        значило бы ждать повтора клиента, а подозрение возникло на том же
        соединении, чьё приветствие только что прошло. */
-    if (s->last_hello_len > 0 &&
-        (len == 0 || name_same(s->last_name, s->last_name_len, name, len))) {
-        memcpy(s->shape, s->last_hello, s->last_hello_len);
-        s->shape_len = s->last_hello_len;
-        s->shape_armed = 0;
+    if (s->last_hello_len[k] > 0 &&
+        (len == 0 || name_same(s->last_name[k], s->last_name_len[k], name, len))) {
+        memcpy(s->shape[k], s->last_hello[k], s->last_hello_len[k]);
+        s->shape_len[k] = s->last_hello_len[k];
+        s->shape_armed[k] = 0;
         return 1;
     }
-    s->shape_armed = 1;
-    s->shape_len = 0;
-    s->shape_name_len = len;
+    s->shape_armed[k] = 1;
+    s->shape_len[k] = 0;
+    s->shape_name_len[k] = len;
     if (len) {
-        memcpy(s->shape_name, name, len);
+        memcpy(s->shape_name[k], name, len);
     }
     return 0;
 }
 
-const uint8_t *d2k_session_shape(const d2k_session *s, size_t *len) {
-    if (!s || s->shape_len == 0) {
+const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len) {
+    if (!s) {
+        return NULL;
+    }
+    size_t k = slot_of(transport);
+    if (s->shape_len[k] == 0) {
         return NULL;
     }
     if (len) {
-        *len = s->shape_len;
+        *len = s->shape_len[k];
     }
-    return s->shape;
+    return s->shape[k];
 }
 
 d2k_plantab *d2k_session_plans(d2k_session *s) {
