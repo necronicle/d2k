@@ -215,6 +215,65 @@ static size_t build_hello(uint8_t *out) {
     return o;
 }
 
+/* То же приветствие, добитое расширением padding (RFC 7685) до want байт на
+   проводе. Нужно затем, что «перекрытие на полном сегменте» — отдельный
+   случай приёмки U3: статическая проверка длины считает только объявленные
+   планом части, а кусок нагрузки приходит ИЗ ПАКЕТА, и на коротком
+   приветствии расхождение не видно. */
+static size_t build_hello_pad(uint8_t *out, size_t want) {
+    size_t base = build_hello(out);
+    if (want <= base + 4) { return base; }
+    size_t pad = want - base - 4;
+    if (pad > 0xFF00) { return base; }
+
+    /* Три длины растут на одну величину: блок расширений, тело рукопожатия и
+       запись. Позиция длины блока расширений считается ПРОХОДОМ по телу —
+       зашитое смещение поменялось бы от любой правки build_hello. */
+    size_t q = 5 + 4 + 2 + 32;                      /* запись, заголовок, версия, random */
+    q += 1 + out[q];                                /* session_id */
+    q += 2 + ((size_t)out[q] << 8 | out[q + 1]);    /* cipher_suites */
+    q += 1 + out[q];                                /* compression */
+    wr16(out + q, (uint16_t)(((size_t)out[q] << 8 | out[q + 1]) + 4 + pad));
+
+    size_t end = base;
+    out[end++] = 0x00; out[end++] = 0x15;           /* padding */
+    wr16(out + end, (uint16_t)pad); end += 2;
+    memset(out + end, 0, pad); end += pad;
+
+    wr16(out + 7, (uint16_t)(((size_t)out[7] << 8 | out[8]) + 4 + pad));
+    wr16(out + 3, (uint16_t)(((size_t)out[3] << 8 | out[4]) + 4 + pad));
+    return end;
+}
+
+/* Пакет с ОПЦИЯМИ TCP: смещение данных растёт, и всё, что собирается из
+   пакета, растёт вместе с ним. Опции — NOP'ы: их содержимое здесь не предмет,
+   предмет — длина. */
+static size_t build_pkt_opt(uint8_t *o, uint16_t sport, uint8_t flags,
+                            const uint8_t *pay, size_t paylen, size_t optlen) {
+    size_t total = 20 + 20 + optlen + paylen;
+    memset(o, 0, 40 + optlen);
+    o[0] = 0x45;
+    wr16(o + 2, (uint16_t)total);
+    wr16(o + 4, 0x1000);
+    o[8] = 64;
+    o[9] = 6;
+    uint8_t s[4] = {192, 168, 1, 67}, d[4] = {1, 2, 3, 4};
+    memcpy(o + 12, s, 4);
+    memcpy(o + 16, d, 4);
+    wr16(o + 20, sport);
+    wr16(o + 22, 443);
+    wr32(o + 24, 1000);
+    wr32(o + 28, 0x11223344);
+    o[32] = (uint8_t)(((20 + optlen) / 4) << 4);
+    o[33] = flags;
+    wr16(o + 34, 64240);
+    memset(o + 40, 0x01, optlen);          /* NOP */
+    if (paylen) {
+        memcpy(o + 40 + optlen, pay, paylen);
+    }
+    return total;
+}
+
 /* Тот же поток, но со стороны сервера: концы поменяны местами. */
 static size_t build_rev_pkt_ttl(uint8_t *o, uint16_t client_port, uint8_t flags,
                                 const uint8_t *pay, size_t paylen, uint8_t ttl);
@@ -746,6 +805,48 @@ int main(void) {
         CHECK(count_kind(g, D2K_JRN_PLAN_UNSENT) == 0,
               "успешная отправка записана недоисполнением");
 
+        d2k_session_free(g);
+    }
+
+    /* --- ДЛИНА ПОСЫЛКИ И ОБЪЯВЛЕННАЯ В НЕЙ ДЛИНА — ОДНО ЧИСЛО -----------
+     *
+     * Приёмка U3 просит опыт на разных опциях TCP и на перекрытии ПОЛНОГО
+     * сегмента. Проверяемое утверждение здесь одно, зато оно держит всю
+     * проверку предела отправки: число, по которому d2kd сверяет посылку с
+     * пределом (out[].len), обязано совпадать с числом, по которому её
+     * нарежет ядро (поле длины в заголовке IPv4). Разойдись они — проверка
+     * предела сверяла бы не то, и EMSGSIZE приходил бы посреди исполнения,
+     * где чистого выхода нет.
+     *
+     * Опции — NOP'ы: их содержимое не предмет опыта, предмет — смещение
+     * данных, от которого зависит всё, что собирается из пакета. Нагрузка —
+     * приветствие, добитое до полутора килобайт: на коротком приветствии
+     * расхождение статической и настоящей длины не видно. */
+    for (size_t oi = 0; oi < 3; oi++) {
+        static const size_t opts[] = { 0, 12, 20 };
+        static const size_t sizes[] = { 0, 700, 1400 };
+        /* Свои буферы: общие на функцию рассчитаны на короткое приветствие, а
+           здесь нагрузка нарочно полноразмерная, и посылок из неё выходит
+           больше её самой. */
+        uint8_t big[2048], bpkt[2048], bbuf[16384];
+        size_t blen = build_hello_pad(big, sizes[oi]);
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &gp,
+                            err, sizeof err) == 0, "план для опыта с опциями");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt_opt(bpkt, (uint16_t)(46200 + oi), 0x18, big, blen, opts[oi]);
+        d2k_session_packet(g, bpkt, n, 1000, bbuf, sizeof bbuf, &r);
+        CHECK(r.applied == 1, "план не применился при опциях TCP");
+        CHECK(r.n_out > 0, "посылок не собралось — сверять нечего");
+        for (size_t k = 0; k < r.n_out; k++) {
+            const uint8_t *e = bbuf + r.out[k].off;
+            CHECK(r.out[k].len >= 20, "посылка короче заголовка IPv4");
+            size_t decl = (size_t)e[2] << 8 | e[3];
+            CHECK(decl == r.out[k].len,
+                  "объявленная длина посылки расходится с её размером — "
+                  "предел отправки сверяется не по тому числу");
+        }
         d2k_session_free(g);
     }
 
