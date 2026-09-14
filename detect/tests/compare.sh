@@ -32,6 +32,12 @@ REPEATS=${REPEATS:-3}
 # modern (1538 байт) фальшивка уходит несколькими сегментами, и там сверяется
 # уже почин­ка, а не эталонный путь.
 HELLO=${HELLO:-modern}
+# Байты контрольного зонда ЭТАЛОНА, снятые mishenью tests/sink.c (см. её шапку).
+# Без них контроль у двух инструментов разный по происхождению, а он входит в
+# замер: гипотезы с приманкой берут длину перекрытия равной его длине. Замер
+# 14.09 на www.youtube.com разошёлся ровно здесь. Пустое значение допустимо —
+# тогда сверка честно скажет, что контроль не общий.
+CONTROL_HEX=${CONTROL_HEX:-/tmp/ref-control.hex}
 OUT=${OUT:-/tmp/d2k-compare}
 
 [ -x "$Z2K" ] || { echo "нет эталона: $Z2K"; exit 1; }
@@ -57,8 +63,19 @@ for target in "$@"; do
 	hex="$OUT/$tag.hex"
 	"$D2K" classify "$target" --hello "$HELLO" --dump-trigger > "$hex"
 
+	ctl=""
+	if [ -s "$CONTROL_HEX" ]; then
+		ctl="--control-raw $(cat "$CONTROL_HEX")"
+	else
+		echo "  ВНИМАНИЕ: $CONTROL_HEX пуст — контроль НЕ общий, расхождения по приманке ожидаемы"
+	fi
+
+	# Строго по очереди: два замера одновременно делят диапазон исходных портов
+	# и правила подавления ядерного RST, и уборщик одного закрывает рот ядру у
+	# другого. Такой прогон врёт молча.
 	"$Z2K" classify -raw "$(cat "$hex")" -repeats "$REPEATS" "$target" > "$OUT/$tag.z2k" 2>&1 || true
-	"$D2K" classify "$target" --raw "$(cat "$hex")" --repeats "$REPEATS" > "$OUT/$tag.d2k" 2>&1 || true
+	# shellcheck disable=SC2086
+	"$D2K" classify "$target" --raw "$(cat "$hex")" $ctl --repeats "$REPEATS" > "$OUT/$tag.d2k" 2>&1 || true
 
 	norm "$OUT/$tag.z2k" > "$OUT/$tag.z2k.n"
 	norm "$OUT/$tag.d2k" > "$OUT/$tag.d2k.n"

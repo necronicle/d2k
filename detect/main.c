@@ -23,6 +23,9 @@ static void usage(void)
         "  --only ИМЯ         прогнать только эту гипотезу (для отладки зондов)\n"
         "  --skip ИМЯ         не пробовать эту гипотезу (можно повторять)\n"
         "  --control-sni ИМЯ  имя для контрольного зонда; сервер обязан его обслуживать\n"
+        "  --control-raw HEX  байты контрольного зонда шестнадцатеричной строкой.\n"
+        "                     Нужен сверке: контроль — такой же ВХОД замера, как триггер,\n"
+        "                     и гипотезы с приманкой берут длину перекрытия равной его длине\n"
         "  --hello modern|legacy   какое приветствие TLS мерить\n"
         "  --no-raw           выключить сырые зонды\n"
         "  --allow-loopback   снять защиту от цели на localhost (для стенда)\n"
@@ -253,7 +256,7 @@ int main(int argc, char **argv)
     d2k_result res;
     char err[256];
     const char *addr = NULL;
-    const char *sni = NULL, *raw = NULL, *ctl_sni = NULL, *hello = "modern";
+    const char *sni = NULL, *raw = NULL, *ctl_sni = NULL, *ctl_raw = NULL, *hello = "modern";
     int as_json = 0;
     int dump_trigger = 0;
     int i;
@@ -283,6 +286,7 @@ int main(int argc, char **argv)
             i++;
         }
         else if (strcmp(a, "--control-sni") == 0 && v)  { ctl_sni = v; i++; }
+        else if (strcmp(a, "--control-raw") == 0 && v)  { ctl_raw = v; i++; }
         else if (strcmp(a, "--hello") == 0 && v)        { hello = v; i++; }
         else if (strcmp(a, "--no-raw") == 0)            { opt.no_raw = 1; }
         else if (strcmp(a, "--allow-loopback") == 0)    { opt.allow_loopback = 1; }
@@ -345,12 +349,29 @@ int main(int argc, char **argv)
     /* Контроль тем же именем, что и триггер, — не контроль вовсе: если имя под
      * блокировкой, молчать будут оба, и вердикт «режут адрес» получится из
      * собственной ошибки ввода. */
+    if (ctl_raw && ctl_sni) {
+        fprintf(stderr, "classify: --control-raw и --control-sni взаимоисключающие\n");
+        return 2;
+    }
     if (ctl_sni && sni && strcmp(ctl_sni, sni) == 0) {
         fprintf(stderr, "classify: --control-sni совпадает с --sni; контролем должно быть ДРУГОЕ "
                         "имя, заведомо не блокируемое\n");
         return 2;
     }
-    if (ctl_sni) {
+    if (ctl_raw) {
+        /* Контроль задан байтами. Поручительства это НЕ даёт: оператор назвал
+         * байты, а не ручался, что сервер обслуживает это имя, — а именно
+         * поручительство превращает молчание контроля в «блок по адресу». */
+        if (d2k_trigger_raw_hex(ctl_raw, &opt.control, err, sizeof(err)) != 0) {
+            fprintf(stderr, "%s\n", err);
+            return 1;
+        }
+        snprintf(opt.control.name, sizeof(opt.control.name), "control");
+        /* Доказательством прохода для контроля служит ЛЮБАЯ запись TLS,
+         * включая алерт: сервер, отвечающий отказом на незнакомое имя, — это
+         * всё равно сервер, до которого дошли. */
+        opt.control.accept = D2K_ACCEPT_TLSRECORD;
+    } else if (ctl_sni) {
         /* Имя названо руками — значит за базу ручается оператор, и молчание
          * контроля можно засчитать как блок по адресу. */
         if (d2k_trigger_tls(ctl_sni, 0, &opt.control, err, sizeof(err)) == 0) {
