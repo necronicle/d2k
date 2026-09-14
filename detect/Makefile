@@ -41,8 +41,14 @@ d2k-detect: main.o $(OBJ) ../core/hello.o
 test_port: test_port.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_port.c $(OBJ) ../core/hello.o $(LDFLAGS)
 
-check: d2k-detect test_port
+# Стенд поднимает поддельную коробку в отдельном потоке; самому измерителю
+# потоки не нужны, поэтому pthread — только у этой линковки.
+test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) ../core/hello.o $(LDFLAGS) -lpthread
+
+check: d2k-detect test_port test_tree
 	./test_port
+	./test_tree
 
 # Кросс-проверка: Linux-ветка сырого слоя на маке не компилируется вовсе,
 # и без неё опечатка там доехала бы до роутера незамеченной.
@@ -75,7 +81,7 @@ cross:
 	fi
 
 clean:
-	rm -f *.o d2k-detect test_port
+	rm -f *.o d2k-detect test_port test_tree
 
 FORCE:
 
