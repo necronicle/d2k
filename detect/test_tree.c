@@ -270,7 +270,7 @@ static void test_prefix_matcher_finds_boundary(void)
     d2k_result res;
     fast_opts(&opt);
     run_on(M_PREFIX, 4, &opt, &res);
-    if (res.verdict != D2K_V_PREFIX) {
+    if (res.verdict != D2K_DV_PREFIX) {
         fail("вердикт = %s (%s), ждали prefix", d2k_verdict_name(res.verdict), res.reason);
         dump_trace(&res);
         return;
@@ -293,7 +293,7 @@ static void test_prefix_boundary_deeper_signature(void)
     d2k_result res;
     fast_opts(&opt);
     run_on(M_PREFIX, 9, &opt, &res);
-    if (res.verdict != D2K_V_PREFIX) {
+    if (res.verdict != D2K_DV_PREFIX) {
         fail("вердикт = %s (%s), ждали prefix", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -308,7 +308,7 @@ static void test_whole_packet_matcher(void)
     d2k_result res;
     fast_opts(&opt);
     run_on(M_WHOLE, 0, &opt, &res);
-    if (res.verdict != D2K_V_WHOLE_PACKET) {
+    if (res.verdict != D2K_DV_WHOLE_PACKET) {
         fail("вердикт = %s (%s), ждали whole_packet", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -323,7 +323,7 @@ static void test_reassembling_box_is_opaque(void)
     d2k_result res;
     fast_opts(&opt);
     run_on(M_REASM, 4, &opt, &res);
-    if (res.verdict != D2K_V_OPAQUE) {
+    if (res.verdict != D2K_DV_OPAQUE) {
         fail("вердикт = %s (%s), ждали opaque", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -339,7 +339,7 @@ static void test_clear_target_stops_early(void)
     d2k_result res;
     fast_opts(&opt);
     run_on(M_CLEAR, 0, &opt, &res);
-    if (res.verdict != D2K_V_CLEAR) {
+    if (res.verdict != D2K_DV_CLEAR) {
         fail("вердикт = %s (%s), ждали clear", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -359,7 +359,7 @@ static void test_unreachable_target(void)
     fast_opts(&opt);
     trig(&t);
     d2k_classify_run("127.0.0.1:1", &t, &opt, &res);
-    if (res.verdict != D2K_V_UNREACHABLE) {
+    if (res.verdict != D2K_DV_UNREACHABLE) {
         fail("вердикт = %s (%s), ждали unreachable", d2k_verdict_name(res.verdict), res.reason);
     }
 }
@@ -372,7 +372,7 @@ static void test_reassembling_box_with_control_stays_opaque(void)
     fast_opts(&opt);
     ctl_trig(&opt.control);
     run_on(M_REASM, 4, &opt, &res);
-    if (res.verdict != D2K_V_OPAQUE) {
+    if (res.verdict != D2K_DV_OPAQUE) {
         fail("вердикт = %s (%s), ждали opaque", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -398,7 +398,7 @@ static void test_address_block_is_not_called_opaque(void)
      * означает блок по адресу, а не «сервер не отдаёт это имя». */
     opt.control_vouched = 1;
     run_on(M_DEAF, 0, &opt, &res);
-    if (res.verdict != D2K_V_ADDRESS) {
+    if (res.verdict != D2K_DV_ADDRESS) {
         fail("вердикт = %s (%s), ждали address", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -418,7 +418,7 @@ static void test_address_needs_vouched_control(void)
     fast_opts(&opt);
     ctl_trig(&opt.control);
     run_on(M_DEAF, 0, &opt, &res);
-    if (res.verdict != D2K_V_INCONCLUSIVE) {
+    if (res.verdict != D2K_DV_INCONCLUSIVE) {
         fail("вердикт = %s (%s), ждали inconclusive", d2k_verdict_name(res.verdict), res.reason);
         return;
     }
@@ -436,7 +436,7 @@ static void test_loopback_guard_rejects_misresolved_target(void)
     opt.repeats = 1;
     trig(&t);
     d2k_classify_run("127.0.0.1:443", &t, &opt, &res);
-    if (res.verdict != D2K_V_FLAKY) {
+    if (res.verdict != D2K_DV_FLAKY) {
         fail("вердикт = %s (%s), ждали flaky", d2k_verdict_name(res.verdict), res.reason);
     }
 }

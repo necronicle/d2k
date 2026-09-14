@@ -31,19 +31,27 @@
 typedef enum { D2K_TRI_UNSET = 0, D2K_TRI_FALSE = 1, D2K_TRI_TRUE = 2 } d2k_tri;
 
 /* Класс блокировки, опознанный по форме отклика. Строковые значения — те же,
- * что в JSON эталона: вердикт читают снаружи. */
+ * что в JSON эталона: вердикт читают снаружи.
+ *
+ * ПРЕФИКС DV, А НЕ V. У прежнего ядра d2k (core/d2k_verdict.h) свой набор
+ * D2K_V_*, и половина имён совпадает при РАЗНОМ составе: там нет ни
+ * poisonable, ни address, ни response, зато есть D2K_V_WHOLE вместо
+ * whole_packet. Переходник между планировщиком и этим измерителем включает оба
+ * заголовка сразу, и молчаливое совпадение имён дало бы там подмену вердикта
+ * без единого предупреждения компилятора. То же и с d2k_dprops против
+ * d2k_dprops из core/d2k_compose.h. */
 typedef enum {
-    D2K_V_NONE = 0,
-    D2K_V_CLEAR,        /* "clear"        триггер проходит как есть */
-    D2K_V_PREFIX,       /* "prefix"       префиксный матчер без пересборки */
-    D2K_V_WHOLE_PACKET, /* "whole_packet" матчер требует пакет целиком */
-    D2K_V_OPAQUE,       /* "opaque"       решает по содержимому, разрез не помогает */
-    D2K_V_INCONCLUSIVE, /* "inconclusive" контроль молчит, отравить не вышло */
-    D2K_V_ADDRESS,      /* "address"      режут адрес */
-    D2K_V_POISONABLE,   /* "poisonable"   буфер пересборки травится */
-    D2K_V_FLAKY,        /* "flaky"        не воспроизводится */
-    D2K_V_UNREACHABLE,  /* "unreachable"  нет даже TCP */
-    D2K_V_RESPONSE      /* "response"     режут ОТВЕТ (TLS 1.2) */
+    D2K_DV_NONE = 0,
+    D2K_DV_CLEAR,        /* "clear"        триггер проходит как есть */
+    D2K_DV_PREFIX,       /* "prefix"       префиксный матчер без пересборки */
+    D2K_DV_WHOLE_PACKET, /* "whole_packet" матчер требует пакет целиком */
+    D2K_DV_OPAQUE,       /* "opaque"       решает по содержимому, разрез не помогает */
+    D2K_DV_INCONCLUSIVE, /* "inconclusive" контроль молчит, отравить не вышло */
+    D2K_DV_ADDRESS,      /* "address"      режут адрес */
+    D2K_DV_POISONABLE,   /* "poisonable"   буфер пересборки травится */
+    D2K_DV_FLAKY,        /* "flaky"        не воспроизводится */
+    D2K_DV_UNREACHABLE,  /* "unreachable"  нет даже TCP */
+    D2K_DV_RESPONSE      /* "response"     режут ОТВЕТ (TLS 1.2) */
 } d2k_verdict_t;
 
 const char *d2k_verdict_name(d2k_verdict_t v);
@@ -109,7 +117,7 @@ typedef struct {
     d2k_tri counts_duplicates;
     d2k_tri inspects_syn;
     int     hop_ttl;
-} d2k_props;
+} d2k_dprops;
 
 /* Один зонд: как писали и что получили. */
 typedef struct {
@@ -165,7 +173,14 @@ typedef struct {
     int             has_response;
     d2k_resp_result response;
 
-    d2k_props props;
+    /* СТРУКТУРНАЯ находка, а не только её текст. Строка стратегии написана в
+     * терминах nfqws2 — она для человека и для донора; датапат d2k принимает
+     * план, и собирать его из разбора собственной же строки значило бы завести
+     * две формы одного знания. Поэтому сработавшая гипотеза отдаётся как есть. */
+    int        has_hit;
+    d2k_poison hit;
+
+    d2k_dprops props;
     /* Каким из трёх путей получен ответ: "свойство", "собрано", "перебор". */
     char path[32];
     int  composed;
@@ -233,15 +248,15 @@ int  d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
 const d2k_poison *d2k_poisons(int *n);
 void d2k_strategy_for_poison(const d2k_poison *p, char *out, size_t cap);
 void d2k_strategy_for(int pos, char *out, size_t cap);
-void d2k_note_props_hit(d2k_props *pr, const d2k_poison *p);
-void d2k_note_props_miss(d2k_props *pr, const d2k_poison *p);
+void d2k_note_props_hit(d2k_dprops *pr, const d2k_poison *p);
+void d2k_note_props_miss(d2k_dprops *pr, const d2k_poison *p);
 
 /* --- свойства (props.c) ------------------------------------------------- */
 
 int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
                        const d2k_trigger *tr, const d2k_opts *opt,
                        d2k_result *res, d2k_poison *hit);
-int d2k_compose_from_props(const d2k_props *pr, const uint8_t *ctl, size_t ctl_len,
+int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_len,
                            d2k_poison *out, int cap);
 
 /* --- триггеры (trigger.c) ----------------------------------------------- */

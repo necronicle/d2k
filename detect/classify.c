@@ -44,16 +44,16 @@
 const char *d2k_verdict_name(d2k_verdict_t v)
 {
     switch (v) {
-    case D2K_V_CLEAR:        return "clear";
-    case D2K_V_PREFIX:       return "prefix";
-    case D2K_V_WHOLE_PACKET: return "whole_packet";
-    case D2K_V_OPAQUE:       return "opaque";
-    case D2K_V_INCONCLUSIVE: return "inconclusive";
-    case D2K_V_ADDRESS:      return "address";
-    case D2K_V_POISONABLE:   return "poisonable";
-    case D2K_V_FLAKY:        return "flaky";
-    case D2K_V_UNREACHABLE:  return "unreachable";
-    case D2K_V_RESPONSE:     return "response";
+    case D2K_DV_CLEAR:        return "clear";
+    case D2K_DV_PREFIX:       return "prefix";
+    case D2K_DV_WHOLE_PACKET: return "whole_packet";
+    case D2K_DV_OPAQUE:       return "opaque";
+    case D2K_DV_INCONCLUSIVE: return "inconclusive";
+    case D2K_DV_ADDRESS:      return "address";
+    case D2K_DV_POISONABLE:   return "poisonable";
+    case D2K_DV_FLAKY:        return "flaky";
+    case D2K_DV_UNREACHABLE:  return "unreachable";
+    case D2K_DV_RESPONSE:     return "response";
     default:                 return "";
     }
 }
@@ -645,12 +645,12 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
      * сообщал бы о блокировке там, где ошибся оператор. Врать так нельзя. */
     colon = strrchr(addr, ':');
     if (!colon || colon == addr || colon[1] == '\0') {
-        res->verdict = D2K_V_FLAKY;
+        res->verdict = D2K_DV_FLAKY;
         snprintf(res->reason, sizeof(res->reason), "адрес не разобран, ожидается host:port");
         goto done;
     }
     if ((size_t)(colon - addr) >= sizeof(host)) {
-        res->verdict = D2K_V_FLAKY;
+        res->verdict = D2K_DV_FLAKY;
         snprintf(res->reason, sizeof(res->reason), "адрес не разобран, ожидается host:port");
         goto done;
     }
@@ -662,7 +662,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         if (!opt->allow_loopback && inet_pton(AF_INET, host, &a) == 1) {
             uint32_t v = ntohl(a.s_addr);
             if ((v >> 24) == 127 || v == 0) {
-                res->verdict = D2K_V_FLAKY;
+                res->verdict = D2K_DV_FLAKY;
                 snprintf(res->reason, sizeof(res->reason),
                          "цель указывает на localhost — мерить нечего, проверь как резолвится имя");
                 goto done;
@@ -670,7 +670,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         }
     }
     if (tr->len < 2) {
-        res->verdict = D2K_V_FLAKY;
+        res->verdict = D2K_DV_FLAKY;
         snprintf(res->reason, sizeof(res->reason), "триггер короче двух байт — резать нечего");
         goto done;
     }
@@ -679,7 +679,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
      * содержимому нет, и всё остальное дерево не имеет смысла. */
     base = measure(host, port, tr, opt, "whole", NULL, 0, opt->write_gap_ms, res);
     if (base.has_err && base.pass == 0) {
-        res->verdict = D2K_V_UNREACHABLE;
+        res->verdict = D2K_DV_UNREACHABLE;
         snprintf(res->reason, sizeof(res->reason), "нет TCP до цели: %s", base.err);
         goto done;
     }
@@ -689,7 +689,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
          * запрос, а убить ОТВЕТ. Замер одного направления объявил бы такой
          * домен чистым, и вердикт был бы противоположен правде. */
         const char *sni;
-        res->verdict = D2K_V_CLEAR;
+        res->verdict = D2K_DV_CLEAR;
         snprintf(res->reason, sizeof(res->reason), "триггер проходит как есть — обходить нечего");
         sni = d2k_trigger_sni(tr);
         if (sni[0] != '\0') {
@@ -697,7 +697,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
             res->has_response = 1;
             res->probes += 2 * opt->repeats;
             if (res->response.verdict == D2K_RESP_BLOCKED) {
-                res->verdict = D2K_V_RESPONSE;
+                res->verdict = D2K_DV_RESPONSE;
                 snprintf(res->reason, sizeof(res->reason), "%s", res->response.reason);
             } else if (res->response.verdict == D2K_RESP_NOT_APPLICABLE ||
                        res->response.verdict == D2K_RESP_FLAKY) {
@@ -711,7 +711,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         goto done;
     }
     if (base.pass > 0) {
-        res->verdict = D2K_V_FLAKY;
+        res->verdict = D2K_DV_FLAKY;
         snprintf(res->reason, sizeof(res->reason),
                  "база не воспроизводится: %d прошло из %d", base.pass, opt->repeats);
         goto done;
@@ -746,8 +746,10 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         memset(&hit, 0, sizeof(hit));
         if (!opt->no_raw && d2k_raw_supported()) {
             if (sweep_poisons(host, port, tr, opt, res, &hit)) {
-                res->verdict = D2K_V_POISONABLE;
+                res->verdict = D2K_DV_POISONABLE;
                 res->boundary = 0;
+                res->hit = hit;
+                res->has_hit = 1;
                 d2k_strategy_for_poison(&hit, res->strategy, sizeof(res->strategy));
                 note_gap_loss(res, &hit);
                 snprintf(res->reason, sizeof(res->reason),
@@ -759,19 +761,19 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         }
         if (!control_ok) {
             if (opt->control_vouched) {
-                res->verdict = D2K_V_ADDRESS;
+                res->verdict = D2K_DV_ADDRESS;
                 snprintf(res->reason, sizeof(res->reason),
                          "молчит и контроль на имени, за которое ручается оператор, и ни одна "
                          "гипотеза не сработала — похоже на блок по адресу");
             } else {
-                res->verdict = D2K_V_INCONCLUSIVE;
+                res->verdict = D2K_DV_INCONCLUSIVE;
                 snprintf(res->reason, sizeof(res->reason),
                          "контроль не ответил и отравить не удалось: базы нет, отличить блок по "
                          "адресу от нехватки гипотез нельзя");
             }
             goto done;
         }
-        res->verdict = D2K_V_OPAQUE;
+        res->verdict = D2K_DV_OPAQUE;
         snprintf(res->reason, sizeof(res->reason),
                  "разрез не помогает, контроль проходит, отравить буфер не удалось — содержимое "
                  "важно, но чем брать, зондами не нашли");
@@ -788,7 +790,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         goto done;
     }
     if (one.pass != opt->repeats) {
-        res->verdict = D2K_V_FLAKY;
+        res->verdict = D2K_DV_FLAKY;
         snprintf(res->reason, sizeof(res->reason),
                  "разрез pos=1 не воспроизводится: %d из %d", one.pass, opt->repeats);
         goto done;
@@ -812,7 +814,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         last = measure(host, port, tr, opt, "split", c, 1, opt->write_gap_ms, res);
     }
     if (last.pass == opt->repeats) {
-        res->verdict = D2K_V_WHOLE_PACKET;
+        res->verdict = D2K_DV_WHOLE_PACKET;
         snprintf(res->reason, sizeof(res->reason),
                  "проходит любой разрез — матчер требует пакет целиком");
         res->split_pos = 1;
@@ -832,14 +834,14 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         } else if (m.pass == 0) {
             hi = mid;
         } else {
-            res->verdict = D2K_V_FLAKY;
+            res->verdict = D2K_DV_FLAKY;
             snprintf(res->reason, sizeof(res->reason),
                      "разрез pos=%d не воспроизводится: %d из %d", mid, m.pass, opt->repeats);
             goto done;
         }
     }
 
-    res->verdict = D2K_V_PREFIX;
+    res->verdict = D2K_DV_PREFIX;
     res->boundary = hi;
     res->split_pos = 1;
     d2k_strategy_for(1, res->strategy, sizeof(res->strategy));

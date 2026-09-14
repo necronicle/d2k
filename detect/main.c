@@ -181,7 +181,7 @@ static const char *tri_word(d2k_tri t)
 
 static void print_human(const d2k_result *r, const d2k_trigger *tr)
 {
-    const d2k_props *pr = &r->props;
+    const d2k_dprops *pr = &r->props;
     int i, j;
 
     printf("Цель:     %s\n", r->target);
@@ -215,7 +215,7 @@ static void print_human(const d2k_result *r, const d2k_trigger *tr)
     for (i = 0; i < r->nnotes; i++) {
         printf("Оговорка:  %s\n", r->notes[i]);
     }
-    if (r->verdict == D2K_V_OPAQUE && !r->raw_usable) {
+    if (r->verdict == D2K_DV_OPAQUE && !r->raw_usable) {
         printf("ВНИМАНИЕ: сырые зонды не отработали — отрицательный вывод про отравление НЕ значим\n");
     }
     if (pr->reassembles != D2K_TRI_UNSET || pr->parses_l7 != D2K_TRI_UNSET ||

@@ -173,7 +173,7 @@ static void test_checksum_verdict_never_inferred_from_silence(void)
     const d2k_poison *ps;
     int n, i;
     d2k_poison badsum;
-    d2k_props pr;
+    d2k_dprops pr;
 
     ps = d2k_poisons(&n);
     for (i = 0; i < n; i++) {
@@ -260,7 +260,7 @@ static void test_raw_trigger_parses_and_rejects_garbage(void)
  * которого он собран: иначе «собрано из вектора» — пустое слово. */
 static void test_compose_follows_the_vector(void)
 {
-    d2k_props pr;
+    d2k_dprops pr;
     d2k_poison out[8];
     int n;
 

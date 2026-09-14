@@ -1291,34 +1291,27 @@ static int everything_plan_text(d2k_shape shape, const char *decoy, size_t send_
  * -------------------------------------------------------------------- */
 
 /* Одно плечо перебора. Поля — ровно те, что читает отправитель донора
-   (probePoison, raw_linux.go): всё остальное было бы выдумкой. */
-typedef struct {
-    const char *name;
-    unsigned    seqovl;      /* длина перекрытия в байтах, 0 — нет */
-    int         seqovl_hello;/* перекрытие длиной в целое приветствие */
-    int         badsum;      /* фальшивка с битой суммой */
-    unsigned    repeats;     /* копий фальшивки */
-    unsigned    gap_ms;      /* пауза между копиями */
-    int         disorder;    /* сбитый порядок сегментов */
-    int         between;     /* фальшивка МЕЖДУ кусками, а не перед ними */
-    unsigned    ttl;         /* TTL фальшивки, 0 — не задан */
-    int         seq_out;     /* номер вне окна */
-    int         decoy_hello; /* телом фальшивки идёт приветствие, не набивка */
-} fb_arm;
+   (probePoison, raw_linux.go): всё остальное было бы выдумкой.
+   Объявление переехало в d2k_compose.h под именем d2k_arm: перенесённый
+   измеритель (detect/) находит плечо САМ и приносит его сюда структурой, а не
+   номером в этом списке — номера у него свои и другие. Второго сборщика плана
+   заводить нельзя (§2.5: две формы одного плана — это записано одно,
+   исполняется другое), поэтому сборщик здесь один, а входов у него два. */
+typedef d2k_arm fb_arm;
 
 /* Голова списка — дословно donor poisons()[0..7], без неподдержанных. */
 static const fb_arm g_fb_head[] = {
-    { "seqovl-1",        1, 0, 0, 0,  0, 0, 0, 0, 0, 0 },
-    { "badsum-x2-g20",   0, 0, 1, 2, 20, 0, 0, 0, 0, 0 },
-    { "badsum-x2-g80",   0, 0, 1, 2, 80, 0, 0, 0, 0, 0 },
-    { "badsum-x7",       0, 0, 1, 7,  0, 0, 0, 0, 0, 0 },
-    { "disorder",        0, 0, 0, 0,  0, 1, 0, 0, 0, 0 },
-    { "badsum",          0, 0, 1, 1,  0, 0, 0, 0, 0, 0 },
-    { "seq-out-of-window", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 },
-    { "fakedsplit",      0, 0, 1, 1,  0, 0, 1, 0, 0, 0 },
-    { "fakedsplit-x7",   0, 0, 1, 7,  0, 0, 1, 0, 0, 0 },
-    { "seqovl-hello",    0, 1, 0, 0,  0, 0, 0, 0, 0, 0 },
-    { "seqovl-hello+disorder", 0, 1, 0, 0, 0, 1, 0, 0, 0, 0 },
+    { "seqovl-1",        1, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 },
+    { "badsum-x2-g20",   0, 0, 1, 2, 20, 0, 0, 0, 0, 0, 0, 0 },
+    { "badsum-x2-g80",   0, 0, 1, 2, 80, 0, 0, 0, 0, 0, 0, 0 },
+    { "badsum-x7",       0, 0, 1, 7,  0, 0, 0, 0, 0, 0, 0, 0 },
+    { "disorder",        0, 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0 },
+    { "badsum",          0, 0, 1, 1,  0, 0, 0, 0, 0, 0, 0, 0 },
+    { "seq-out-of-window", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0 },
+    { "fakedsplit",      0, 0, 1, 1,  0, 0, 1, 0, 0, 0, 0, 0 },
+    { "fakedsplit-x7",   0, 0, 1, 7,  0, 0, 1, 0, 0, 0, 0, 0 },
+    { "seqovl-hello",    0, 1, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0 },
+    { "seqovl-hello+disorder", 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 },
 };
 
 /* Хвост — параметрические семейства донора в его же порядке. */
@@ -1456,6 +1449,14 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap, char *buf, size_t cap) {
     fb_arm a;
     if (!buf || cap == 0 || fb_arm_at(idx, &a) != 0) { return -1; }
+    return d2k_arm_plan(&a, shape, decoy, send_cap, buf, cap);
+}
+
+int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
+                 size_t send_cap, char *buf, size_t cap) {
+    fb_arm a;
+    if (!buf || cap == 0 || !arm) { return -1; }
+    a = *arm;
 
     uint8_t hello[D2K_COMPOSE_HELLO_MAX];
     size_t hello_len = 0;
@@ -1552,6 +1553,14 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
     if (have_fake || a.seq_out) {
         if (append_fmt(buf, cap, &pos, "poison 1") != 0) { return -1; }
         if (a.badsum && append_fmt(buf, cap, &pos, " badsum") != 0) { return -1; }
+        /* Метка времени со сдвигом назад и обнулённый идентификатор — такие же
+           измеренные признаки боевых плеч, как битая сумма, и язык плана их
+           знает. В списке плеч этого файла таких гипотез нет, поэтому до сих
+           пор их никто не печатал; перенесённый измеритель их задаёт
+           (badsum+ts, badsum+ipid), и молча потерять их здесь значило бы
+           поставить план, отличающийся от того, что прошло на замере. */
+        if (a.tcpts && append_fmt(buf, cap, &pos, " tcpts") != 0) { return -1; }
+        if (a.ipidzero && append_fmt(buf, cap, &pos, " ipidzero") != 0) { return -1; }
         if (a.ttl && append_fmt(buf, cap, &pos, " ttl=%u", a.ttl) != 0) { return -1; }
         /* Номер вне окна — донорский seqShift: -66000 (classify.go:597). */
         if (a.seq_out && append_fmt(buf, cap, &pos, " seqshift=-66000") != 0) { return -1; }

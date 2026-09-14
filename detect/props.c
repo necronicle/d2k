@@ -93,7 +93,7 @@ static int prop_probes(prop_probe *out, int cap)
     return k;
 }
 
-static void apply_set(d2k_props *pr, prop_set s, int ok)
+static void apply_set(d2k_dprops *pr, prop_set s, int ok)
 {
     switch (s) {
     case SET_LEFT_OVERLAP:
@@ -183,7 +183,7 @@ static int tri_yes(d2k_tri t) { return t == D2K_TRI_TRUE; }
  * Правила размещения взяты из дампов боевых плеч, а не из головы: фальшивка
  * идёт отдельной посылкой ПЕРЕД перекрытием, приманкой служит целое
  * приветствие, а не огрызок, и число копий имеет порог. */
-int d2k_compose_from_props(const d2k_props *pr, const uint8_t *ctl, size_t ctl_len,
+int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_len,
                            d2k_poison *out, int cap)
 {
     d2k_poison base;

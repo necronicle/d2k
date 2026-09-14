@@ -142,7 +142,7 @@ const d2k_poison *d2k_poisons(int *n)
 /* notePropsHit/notePropsMiss переводят исход зонда в свойство коробки.
  * Именно здесь перебор перестаёт быть перебором: каждая попытка что-то
  * РАССКАЗЫВАЕТ о коробке, даже когда не срабатывает. */
-void d2k_note_props_hit(d2k_props *pr, const d2k_poison *p)
+void d2k_note_props_hit(d2k_dprops *pr, const d2k_poison *p)
 {
     if (p->badsum) {
         pr->validates_checksum = D2K_TRI_FALSE; /* съела битую сумму */
@@ -164,7 +164,7 @@ void d2k_note_props_hit(d2k_props *pr, const d2k_poison *p)
  * ЧЕГО ЗДЕСЬ НЕТ: промах badsum-зонда НЕ пишет ValidatesChecksum = true. Это
  * вывод из тишины, запрещённый нормой пакета, и тот же исход в hit даёт
  * false — один прогон мог выдать оба вывода. */
-void d2k_note_props_miss(d2k_props *pr, const d2k_poison *p)
+void d2k_note_props_miss(d2k_dprops *pr, const d2k_poison *p)
 {
     if (p->disorder) {
         pr->tolerates_reorder = D2K_TRI_TRUE;
