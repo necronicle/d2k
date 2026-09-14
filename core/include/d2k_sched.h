@@ -86,6 +86,16 @@ extern d2k_sched_vol_fn  d2k_sched_vol_hook;
 typedef d2k_quic_arm (*d2k_sched_arm_fn)(const char *ip, uint16_t port,
                                          const char *sni, const char *decoy_sni,
                                          d2k_hello trigger, uint32_t mark);
+
+/* ЗАНЯТЬ ПОРТ ДЛЯ ОПЫТА. Крючок, а не прямой вызов, по той же причине, что и
+ * у сетевых оракулов: отказ bind обязан быть ВОСПРОИЗВОДИМ в тесте. Именно на
+ * этом отказе d2k раньше переходил к общему пробному плану и бил по чужим
+ * соединениям (0010, R1).
+ *
+ * transport — 6 или 17: тип сокета задаётся при создании. 0 — занято,
+ * отрицательное — локальный отказ. */
+typedef int (*d2k_sched_bind_fn)(uint8_t transport, int *out_fd, uint16_t *sport_be);
+extern d2k_sched_bind_fn d2k_sched_bind_hook;
 extern d2k_sched_arm_fn  d2k_sched_arm_hook;
 
 /* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и

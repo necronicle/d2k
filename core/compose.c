@@ -820,13 +820,32 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         uint8_t qshape = (qsh == D2K_SHAPE_UNKNOWN)
                              ? (uint8_t)D2K_LINK_SHAPE_GRANDFATHER
                              : (uint8_t)qsh;
-        if (d2k_link_set_name(link_fd, name, 6, hexbuf, qshape, err, sizeof err) != 0) {
+        /* ПОРТ ВОПРОСА ЗАНИМАЕТСЯ ДО УСТАНОВКИ ПЛАНА (0010, R1). Опросник из
+           командной строки работает на ЖИВОЙ линии владельца, и его вопрос
+           обязан действовать только на собственное обращение — иначе он
+           ломает чужие соединения к той же цели ровно так же, как это делал
+           планировщик. Порт не занялся — вопрос не задаётся: локальный отказ
+           остаётся локальным и не превращается в план для всех. */
+        int qfd = -1;
+        uint16_t qsport = 0;
+        if (d2k_props_bind(&qfd, &qsport) != 0 || qsport == 0) {
+            step_rc(steps, i, D2K_STEP_SEND_FAIL, "порт для вопроса не занялся");
+            continue;
+        }
+        if (d2k_link_set_name_probe(link_fd, name, 6, hexbuf, qshape, qsport,
+                                    err, sizeof err) != 0) {
+            close(qfd);
             step_rc(steps, i, D2K_STEP_SEND_FAIL, err);
             continue; /* план не отправился вовсе — не измерено */
         }
         d2k_ev ack;
-        if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME, NULL,
+        /* Подтверждение ждём по ТОМУ ЖЕ типу команды, каким план и уехал:
+           вопрос теперь ставится изолированной командой, и ожидание старого
+           типа не дождалось бы ничего — каждый вопрос молча становился бы
+           «не измерено». */
+        if (wait_for_event(link_fd, D2K_EV_ACK, D2K_CMD_SET_NAME_PROBE, NULL,
                            D2K_PROPS_ASK_WAIT_MS, &ack, err, sizeof err) != 0) {
+            close(qfd);
             step_rc(steps, i, D2K_STEP_NO_ACK, err);
             continue; /* ack не пришёл в срок — не измерено */
         }
@@ -840,6 +859,7 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
                спросить (см. онAck в controller.go про то, почему причина
                отказа важна: NO_ROOM не по вине плана, но одинаково не даёт
                задать этот вопрос СЕЙЧАС). */
+            close(qfd);
             step_rc(steps, i, D2K_STEP_REFUSED, NULL);
             continue;
         }
@@ -851,7 +871,8 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
         uint8_t local_ip4[4];
         uint16_t local_port = 0;
         int contact_fd = -1;
-        if (d2k_props_contact(ip, port, trigger, local_ip4, &local_port, &contact_fd) != 0) {
+        if (d2k_props_contact_on(qfd, ip, port, trigger, local_ip4, &local_port,
+                                 &contact_fd) != 0) {
             step_rc(steps, i, D2K_STEP_CONTACT_FAIL, strerror(errno));
             continue; /* обращение не состоялось (транспорт) — не измерено */
         }

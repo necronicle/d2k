@@ -45,41 +45,81 @@ static int64_t verify_now_ms(void) {
    Ждём полную строку и конец заголовков окончательного ответа; 1xx сам по
    себе не успех. Ограничены и общий объём заголовков, и время всей сборки.
    Тело ответа, происхождение страницы и сертификат здесь НЕ проверяются. */
+/* Ищет CRLFCRLF в ПАМЯТИ, а не строковыми функциями: ответ содержит нулевые
+   байты, и strstr останавливается на первом из них. */
+static const uint8_t *find_hdr_end(const uint8_t *b, size_t n) {
+    for (size_t i = 0; i + 3 < n; i++) {
+        if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) {
+            return b + i;
+        }
+    }
+    return NULL;
+}
+
+/* Конец ПЕРВОЙ строки (CRLF) в памяти, либо NULL. */
+static const uint8_t *find_eol(const uint8_t *b, size_t n) {
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (b[i] == 13 && b[i + 1] == 10) { return b + i; }
+    }
+    return NULL;
+}
+
+/* Код окончательного ответа HTTP, либо 0 — «полных заголовков нет».
+ *
+ * НОЛЬ В ТЕЛЕ БОЛЬШЕ НИЧЕГО НЕ РЕШАЕТ. Здесь стояло `if (memchr(...0...)) break;`
+ * — разбор бросался, едва во ВХОДЯЩИХ байтах попадался нулевой. Тело ответа
+ * его содержит сплошь и рядом, и зонд выбрасывал полноценный ответ вместе с
+ * кандидатом, который его добыл.
+ *
+ * Замерено на живой линии 14.09.2026: i.ytimg.com отдаёт
+ * «HTTP/1.1 404 Not Found» в первом же чтении (1378 байт, конец заголовков на
+ * месте), нулевой байт лежит на смещении 386 — в ТЕЛЕ. Клиент в ту же секунду
+ * получал 404 за 0,16 с, а зонд докладывал «нет полных заголовков
+ * окончательного HTTP-ответа» и объявлял рабочий план негодным. Так за ночь
+ * терялись найденные обходы (0010, R2: ложный ответ о свойствах DPI).
+ *
+ * Заголовки HTTP нулевого байта содержать не вправе, поэтому проверка на него
+ * осталась — но только ДО конца заголовков, где она и означает «ответ битый».
+ */
 static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
-    char buf[8193];
-    size_t used = 0, total = 0;
+    uint8_t buf[8193];
+    size_t used = 0;
     int64_t until = verify_now_ms() + (wait_ms > 0 ? wait_ms : 8000);
-    while (total < sizeof buf - 1) {
-        int64_t left = until - verify_now_ms();
-        if (left <= 0) { break; }
-        long got = d2k_tls_read(t, (uint8_t *)buf + used,
-                               sizeof buf - 1 - total, (int)left, err, errcap);
-        if (got <= 0) { break; }
-        if (memchr(buf + used, 0, (size_t)got)) { break; }
-        used += (size_t)got;
-        total += (size_t)got;
-        buf[used] = '\0';
-        for (;;) {
-            char *line = strstr(buf, "\r\n");
-            if (!line) { break; }
-            if (line - buf < 13 || memcmp(buf, "HTTP/1.", 7) != 0 ||
+    for (;;) {
+        const uint8_t *end = find_hdr_end(buf, used);
+        if (end) {
+            size_t hdr_len = (size_t)(end - buf);
+            /* Ноль ВНУТРИ заголовков — ответ битый, а не «ещё не всё». */
+            if (memchr(buf, 0, hdr_len)) { return 0; }
+            const uint8_t *eol = find_eol(buf, hdr_len);
+            if (!eol) { return 0; }
+            size_t line_len = (size_t)(eol - buf);
+            if (line_len < 13 || memcmp(buf, "HTTP/1.", 7) != 0 ||
                 (buf[7] != '0' && buf[7] != '1') || buf[8] != ' ' ||
                 buf[9] < '1' || buf[9] > '5' || buf[10] < '0' || buf[10] > '9' ||
-                buf[11] < '0' || buf[11] > '9' || buf[12] != ' ') { return 0; }
-            for (const char *p = buf + 13; p < line; p++) {
-                if (((unsigned char)*p < 32 && *p != '\t') || *p == 127) { return 0; }
+                buf[11] < '0' || buf[11] > '9' || buf[12] != ' ') {
+                return 0;
             }
-            char *end = strstr(line, "\r\n\r\n");
-            if (!end) { break; }
+            for (size_t p = 13; p < line_len; p++) {
+                if ((buf[p] < 32 && buf[p] != '\t') || buf[p] == 127) { return 0; }
+            }
             int code = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + buf[11] - '0';
             if (code >= 200) { return code; }
             if (code == 101) { return 0; } /* upgrade не запрашивали */
-            size_t consumed = (size_t)(end + 4 - buf);
+            /* Промежуточный ответ (1xx) — отбрасываем его вместе с
+               заголовками и ждём окончательного. */
+            size_t consumed = hdr_len + 4;
+            memmove(buf, buf + consumed, used - consumed);
             used -= consumed;
-            memmove(buf, buf + consumed, used + 1);
+            continue;
         }
+        if (used >= sizeof buf - 1) { return 0; }
+        int64_t left = until - verify_now_ms();
+        if (left <= 0) { return 0; }
+        long got = d2k_tls_read(t, buf + used, sizeof buf - 1 - used, (int)left, err, errcap);
+        if (got <= 0) { return 0; }
+        used += (size_t)got;
     }
-    return 0;
 }
 
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,

@@ -240,6 +240,12 @@ static d2k_quic_arm pick_arm_default(const char *ip, uint16_t port, const char *
     return d2k_quic_pick_arm(ip, port, sni, decoy_sni, trigger, mark);
 }
 
+static int bind_default(uint8_t transport, int *out_fd, uint16_t *sport_be) {
+    return (transport == 17) ? d2k_props_bind_udp(out_fd, sport_be)
+                             : d2k_props_bind(out_fd, sport_be);
+}
+
+d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
 d2k_sched_arm_fn  d2k_sched_arm_hook  = pick_arm_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = d2k_classify;
@@ -413,6 +419,13 @@ typedef struct {
     int        props_asked;     /* хоть один вопрос задан — нужно снять план */
     d2k_flowkey prop_flow;      /* чей обмен ждём */
     int        prop_fd;         /* сокет обращения, держится до конца ожидания */
+    /* СОКЕТ ДИАГНОСТИЧЕСКОГО ВОПРОСА, ЗАНЯТЫЙ ЗАРАНЕЕ, и его местный порт.
+       Вопрос ставит план ровно так же, как испытание кандидата, и точно так
+       же обязан действовать ТОЛЬКО на свой поток: до этого он вставал по
+       имени и доставался всем, кто шёл к цели (0010, R1). Минус один — не
+       занят; тогда вопрос не задаётся вовсе, а не задаётся «всем». */
+    int        prop_bound_fd;
+    uint16_t   prop_sport_be;
     int        prop_applied;    /* план вопроса применён к пакетам НАШЕГО зонда */
     int        prop_reply_seen;
     d2k_ev     prop_reply;
@@ -811,12 +824,17 @@ static int fill_hellos(d2k_sched *s, task *t) {
  * Рабочий поток: сетевой оракул.
  * -------------------------------------------------------------------- */
 
-typedef struct { d2k_sched *s; task *t; } worker_arg;
+/* use_fd — сокет, занятый ГЛАВНЫМ потоком до установки плана: владение
+   переходит рабочему потоку вместе с этой структурой. Иначе пришлось бы
+   читать поле задачи из рабочего потока и гадать, успел ли главный его
+   обнулить. */
+typedef struct { d2k_sched *s; task *t; int use_fd; } worker_arg;
 
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
     task *t = a->t;
+    int a_use_fd = a->use_fd;
     free(a);
 
     d2k_hello trig; trig.bytes = t->trig; trig.len = t->trig_len;
@@ -861,7 +879,7 @@ static void *worker_run(void *vp) {
         uint8_t ip4[4];
         uint16_t lport = 0;
         int fd = -1;
-        int rc = d2k_props_contact(t->ip, t->port, trig, ip4, &lport, &fd);
+        int rc = d2k_props_contact_on(a_use_fd, t->ip, t->port, trig, ip4, &lport, &fd);
         pthread_mutex_lock(&s->mu);
         memcpy(t->c_ip, ip4, 4);
         t->c_port = lport;
@@ -942,6 +960,10 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
     if (!a) { return -1; }
     a->s = s; a->t = t;
+    /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
+       очищается сразу: два владельца одного дескриптора — двойное закрытие. */
+    a->use_fd = (job == JOB_CONTACT) ? t->prop_bound_fd : -1;
+    if (job == JOB_CONTACT) { t->prop_bound_fd = -1; }
     t->job = job;
     t->res_ready = 0;
     if (pthread_create(&t->th, NULL, worker_run, a) != 0) {
@@ -1109,6 +1131,25 @@ static int is_hex_digit(char c) {
    разобраться вовсе. Ограничивать нечем — объявляем дедушкино право: иначе
    план-кандидат не применится ни к чему, включая собственный зонд. План при
    этом временный и снимается по итогам испытания. */
+/* ФОРМА ПЛАНА-ВОПРОСА — ИЗ ТЕХ БАЙТ, КОТОРЫЕ ВОПРОС И ПОШЛЁТ.
+ *
+ * Диагностический вопрос воспроизводит приветствие КЛИЕНТА: JOB_CONTACT шлёт
+ * t->trig как есть. Объявить плану форму собственного зонда значит объявить
+ * не ту: план не применится к отправленным байтам, и вопрос вернётся без
+ * измеренного ответа — молча, как «коробка ничего не сделала» (0010, R2).
+ * Ровно это я и сломал 13.09, сведя оба контекста к одной константе.
+ *
+ * Снимок неполный или форма не разобралась — дедушкино право: вопрос живёт
+ * ровно один опыт и снимается сразу, а не применить его вовсе значит не
+ * задать вопрос. Это НЕ «лечение общей совместимостью» подтверждённых
+ * планов: там правило другое и строже (см. verify_confirm). */
+static uint8_t question_shape(const task *t) {
+    if (t->transport == 17) { return (uint8_t)D2K_LINK_SHAPE_QUIC; }
+    d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
+    return (sh == D2K_SHAPE_UNKNOWN) ? (uint8_t)D2K_LINK_SHAPE_GRANDFATHER
+                                     : (uint8_t)sh;
+}
+
 static uint8_t probe_shape(const task *t) {
     /* У QUIC форма своя и известна ЗАРАНЕЕ, из транспорта: перечисление
        d2k_shape знает только формы TLS, и вывести по нему тройку неоткуда.
@@ -1196,6 +1237,7 @@ static void ver_close(task *t) {
    поле, чей «пусто» не ноль (см. prop_close выше), и разложить это по всем
    точкам сброса значило бы завести столько же мест, где про него забудут. */
 static void task_reset(task *t) {
+    if (t->prop_bound_fd > 0) { close(t->prop_bound_fd); }
     /* СТРОГО БОЛЬШЕ НУЛЯ. Задачи живут в занулённом массиве, и при самом
        первом сбросе здесь лежит ноль — не «сокет номер ноль», а «поля ещё не
        трогали». Закрыть его значит закрыть стандартный ввод процесса: тест
@@ -1239,10 +1281,33 @@ static int prop_send_next(d2k_sched *s, task *t, int64_t now_ms) {
         }
         hex[2 * plan_len] = '\0';
         char err[160];
+        /* ПОРТ ВОПРОСА ЗАНИМАЕТСЯ ДО УСТАНОВКИ ПЛАНА, и без него вопрос не
+           задаётся вовсе (0010, R1). Иначе план-вопрос встаёт по имени и
+           достаётся всем клиентским соединениям к этой цели — испытание
+           снова идёт за счёт человека, а «цель молчит» снова означает сразу
+           «коробка режет» и «наш же вопрос сломал».
+
+           Неудача bind — ЛОКАЛЬНЫЙ отказ: вопрос остаётся «не измерен», а не
+           превращается в общий пробный план. */
+        if (t->prop_bound_fd > 0) { close(t->prop_bound_fd); t->prop_bound_fd = -1; }
+        t->prop_sport_be = 0;
+        {
+            int bfd = -1;
+            uint16_t bsp = 0;
+            int bound = d2k_sched_bind_hook(t->transport, &bfd, &bsp);
+            if (bound != 0 || bsp == 0) {
+                continue; /* порт не занят — вопрос не задаём */
+            }
+            t->prop_bound_fd = bfd;
+            t->prop_sport_be = bsp;
+        }
         /* Форма приветствия вопроса — та же, что у снятого триггера. */
-        if (d2k_link_set_name(s->link_fd, t->name, t->transport, hex,
-                              probe_shape(t),
-                              err, sizeof err) != 0) {
+        if (d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
+                                    question_shape(t), t->prop_sport_be,
+                                    err, sizeof err) != 0) {
+            close(t->prop_bound_fd);
+            t->prop_bound_fd = -1;
+            t->prop_sport_be = 0;
             continue; /* план-вопрос не ушёл — не наше наблюдение о коробке */
         }
         t->props_asked = 1;
@@ -1535,14 +1600,20 @@ static int install_next(d2k_sched *s, task *t) {
             /* TCP и UDP занимаются РАЗНЫМИ вызовами: тип сокета задаётся при
                создании, и «тот же bind, только датаграммный» — другой вызов,
                а не другой аргумент. */
-            int bound = (t->transport == 17) ? d2k_props_bind_udp(&pfd, &psport)
-                                             : d2k_props_bind(&pfd, &psport);
+            int bound = d2k_sched_bind_hook(t->transport, &pfd, &psport);
             if (bound == 0) {
                 t->probe_fd = pfd;
                 t->probe_sport_be = psport;
             } else {
-                say(s, "по %s порт для зонда не занялся — пробный план встанет "
-                       "всем, а не только зонду", t->name);
+                /* ПОРТ НЕ ЗАНЯЛСЯ — КАНДИДАТ НЕ СТАВИТСЯ ВОВСЕ (0010, R1).
+                   Раньше здесь план уезжал с нулевым портом, то есть
+                   доставался всем клиентским соединениям к цели: локальная
+                   неудача превращалась в ущерб постороннему трафику и в
+                   двусмысленное «цель молчит». Локальный отказ обязан
+                   остаться локальным. */
+                say(s, "по %s порт для зонда не занялся — кандидат не ставлю: "
+                       "испытание без изоляции било бы по чужим соединениям", t->name);
+                return -2;
             }
         }
         if (d2k_link_set_name_probe(s->link_fd, t->name, t->transport, hex,
@@ -3026,7 +3097,16 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         }
 
         if (t->state == T_PLANNING) {
-            if (install_next(s, t) != 0) {
+            int inst = install_next(s, t);
+            if (inst == -2) {
+                /* ЛОКАЛЬНЫЙ ОТКАЗ, А НЕ «ПЛАНЫ КОНЧИЛИСЬ» (0010, R1). Порт для
+                   изоляции не занялся — это про нашу машину, а не про коробку.
+                   Ни исследование заводить, ни цель хоронить нельзя: очередь
+                   кандидатов цела, пробуем её на следующем круге. */
+                moved++;
+                continue;
+            }
+            if (inst != 0) {
                 if (!t->researched) {
                     /* Exhausted known plans: remove the trial before any
                        baseline measurement. Research happens at most once. */

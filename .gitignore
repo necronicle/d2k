@@ -46,3 +46,11 @@ core/*
 # testdata/catalog-real.json просто не доедет до репозитория, и
 # d2k_catalog_load упадёт на отсутствующем файле, а не на разборе.
 !core/testdata/
+
+# detect/ — тот же белый список и по той же причине, что у датапата выше:
+# забытый исходник заметит сборка, забытый бинарник не заметит никто.
+detect/*
+!detect/*.c
+!detect/Makefile
+!detect/include/
+!detect/tests/

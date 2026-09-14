@@ -122,6 +122,14 @@ static uint16_t ver_answer_port;
 static d2k_quic_arm_kind arm_kind = D2K_QA_BLOB;
 static int arm_calls;
 
+/* Занятие порта всегда неудачно — инъекция отказа для 0010 R1. */
+static int stub_bind_fail(uint8_t transport, int *out_fd, uint16_t *sport_be) {
+    (void)transport;
+    if (out_fd) { *out_fd = -1; }
+    if (sport_be) { *sport_be = 0; }
+    return -1;
+}
+
 static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
                              const char *decoy_sni, d2k_hello trigger, uint32_t mark) {
     (void)ip; (void)port; (void)sni; (void)decoy_sni; (void)trigger; (void)mark;
@@ -956,6 +964,125 @@ int main(void) {
         }
         d2k_sched_free(s);
         d2k_catalog_free(&cS);
+    }
+
+    /* --- ОТКАЗ bind НЕ РАСШИРЯЕТ ПРОБНЫЙ ПЛАН НА ЧУЖИЕ ПОТОКИ ------------
+     *
+     * 0010, R1. Локальная неудача (порт для изоляции не занялся) раньше
+     * превращалась в ущерб постороннему трафику: план уезжал с нулевым
+     * портом и доставался ВСЕМ соединениям к цели. Локальный отказ обязан
+     * остаться локальным.
+     *
+     * Проверяем оба пути сразу — и диагностический вопрос, и кандидата: у
+     * них общий крючок занятия порта. */
+    {
+        d2k_sched_bind_fn saved_bind = d2k_sched_bind_hook;
+        d2k_sched_bind_hook = stub_bind_fail;
+        d2k_catalog cB;
+        memset(&cB, 0, sizeof cB);
+        d2k_sched *s = d2k_sched_new(&cB, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_answer_port = 40401;
+        forget_sent();
+        d2k_ev h = ev_hello(6, 40401, "отказ.порта");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 40401);
+        d2k_sched_event(s, &su);
+        settle(s);
+
+        /* Ни один план не поставлен: ни вопрос, ни кандидат. */
+        CHECK(!said("поставил план"),
+              "кандидат поставлен при неудаче bind — испытание идёт по чужим потокам");
+        /* И причина названа вслух, а не спрятана под «планы исчерпаны». */
+        CHECK(said("порт для зонда не занялся") || !said("выведенные планы исчерпаны"),
+              "локальный отказ выдан за исчерпание планов");
+        /* На проводе нет ни одной команды с планом по этому имени: длина
+           тела команды с планом заведомо больше длины имени с заголовком. */
+        {
+            drain();
+            const char *nm = "отказ.порта";
+            size_t nl = strlen(nm);
+            int plan_cmd = 0;
+            for (size_t i = 0; i + nl + 2 < sent_len; i++) {
+                if (memcmp(sentbuf + i, nm, nl) != 0) { continue; }
+                /* За именем у ARM_SHAPE/DEL_NAME тела нет; у установки плана
+                   идёт форма и сам план. Больше двух байт хвоста — план. */
+                if (sent_len - (i + nl) > 3) { plan_cmd = 1; }
+            }
+            CHECK(!plan_cmd, "команда с планом ушла на провод при неудаче bind");
+        }
+        d2k_sched_free(s);
+        d2k_catalog_free(&cB);
+        d2k_sched_bind_hook = saved_bind;
+    }
+
+    /* --- ПЛАН-ВОПРОС ОБЪЯВЛЯЕТ ФОРМУ ТЕХ БАЙТ, КОТОРЫЕ САМ И ШЛЁТ --------
+     *
+     * 0010, R2. Диагностический вопрос воспроизводит приветствие КЛИЕНТА:
+     * JOB_CONTACT шлёт снятый триггер как есть. Если плану объявить форму
+     * собственного зонда (всегда современную), он не применится к
+     * отправленным байтам старой формы — и вопрос вернётся без измеренного
+     * ответа, молча, как «коробка ничего не сделала». Ровно это я и сломал
+     * 13.09, сведя оба контекста к одной константе.
+     *
+     * Форму читаем ПРЯМО С ПРОВОДА: вторая реализация разбора разошлась бы с
+     * первой молча. */
+    {
+        d2k_catalog cQS;
+        memset(&cQS, 0, sizeof cQS);
+        d2k_sched *s = d2k_sched_new(&cQS, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        ver_calls = 0;
+        ver_answer_port = 40501;
+
+        d2k_ev h = ev_hello(6, 40501, "вопрос.старой.формы");
+        d2k_sched_event(s, &h);
+        /* Снимок живого клиента — СТАРОЙ формы, из того же профиля, что и
+           холодный старт, а не собранный тут руками. */
+        {
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "вопрос.старой.формы",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "приветствие старой формы не собралось — проверять нечем");
+            d2k_sched_event(s, &sh);
+        }
+        forget_sent();
+        d2k_ev su = ev_suspect(6, 40501);
+        d2k_sched_event(s, &su);
+        settle(s);
+        drain();
+
+        {
+            const char *nm = "вопрос.старой.формы";
+            size_t nl = strlen(nm);
+            int seen = 0, legacy_ok = 0, modern_seen = 0;
+            for (size_t i = 0; i + nl + 1 < sent_len; i++) {
+                if (memcmp(sentbuf + i, nm, nl) != 0) { continue; }
+                seen = 1;
+                if (sentbuf[i + nl] == (uint8_t)D2K_SHAPE_LEGACY) { legacy_ok = 1; }
+                if (sentbuf[i + nl] == (uint8_t)D2K_SHAPE_MODERN) { modern_seen = 1; }
+            }
+            CHECK(seen, "имя цели не найдено в отправленном вовсе");
+            CHECK(legacy_ok,
+                  "план-вопрос ушёл НЕ формой своего триггера — к отправленным "
+                  "байтам он не применится, и вопрос вернётся без ответа");
+            CHECK(!modern_seen || legacy_ok,
+                  "вопрос объявил форму собственного зонда вместо формы триггера");
+        }
+        d2k_sched_free(s);
+        d2k_catalog_free(&cQS);
     }
 
     /* --- подозрение без предшествующего приветствия: имени нет, искать
