@@ -157,12 +157,23 @@ int d2k_opts_skipped(const d2k_opts *o, const char *name)
 d2k_obs *d2k_trace_add(d2k_result *res, const char *probe)
 {
     d2k_obs *o;
+    size_t n;
     if (res->ntrace >= D2K_TRACE_MAX) {
         return &res->trace[D2K_TRACE_MAX - 1];
     }
     o = &res->trace[res->ntrace++];
     memset(o, 0, sizeof(*o));
-    snprintf(o->probe, sizeof(o->probe), "%s", probe);
+    /* Копия с явной границей, а не snprintf: имя зонда приходит из разных
+     * мест (гипотеза, свойство, собранный кандидат), длину его ни один
+     * анализатор не выводит, и -Werror=format-truncation на mipsel-gcc
+     * останавливал сборку на ровном месте. Обрезка здесь по построению
+     * невозможна — имена короче поля, — но полагаться на это молча нельзя. */
+    n = strlen(probe);
+    if (n >= sizeof(o->probe)) {
+        n = sizeof(o->probe) - 1;
+    }
+    memcpy(o->probe, probe, n);
+    o->probe[n] = '\0';
     return o;
 }
 

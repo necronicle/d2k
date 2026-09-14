@@ -140,7 +140,7 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
     for (i = 0; i < n; i++) {
         d2k_poison p = pp[i].p;
         d2k_obs *obs;
-        char label[96];
+        char label[160];
         int pass = 0, got;
 
         if (d2k_opts_skipped(opt, p.name)) {

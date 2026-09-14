@@ -46,16 +46,32 @@ check: d2k-detect test_port
 
 # Кросс-проверка: Linux-ветка сырого слоя на маке не компилируется вовсе,
 # и без неё опечатка там доехала бы до роутера незамеченной.
+#
+# Вывод — во ВРЕМЕННЫЙ файл, а не в /dev/null: zig cc при «-c -o /dev/null»
+# всё равно кладёт объектник рядом с исходником и затирает собранный хостом.
+# Ловится это не ошибкой, а «unknown file type» на следующей же линковке —
+# то есть выглядит как поломка совсем в другом месте.
 cross:
 	@if [ -x "$(ZIG)" ]; then \
 	  echo "cross: linux-aarch64"; \
-	  $(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /dev/null raw.c; \
-	  $(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /dev/null classify.c; \
-	  echo "cross: linux-mipsel"; \
-	  $(ZIG) cc -target mipsel-linux-musl $(CFLAGS) -c -o /dev/null raw.c; \
-	  $(ZIG) cc -target mipsel-linux-musl $(CFLAGS) -c -o /dev/null classify.c; \
+	  for f in $(SRC) main.c; do \
+	    $(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-detect-cross.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-detect-cross.o; \
 	else \
-	  echo "cross: zig не найден в $(ZIG) — пропуск"; \
+	  echo "cross: zig не найден в $(ZIG) — aarch64 пропущен"; \
+	fi
+	@# MIPS — настоящим кросс-компилятором, как и в core/: zig для mipsel-musl
+	@# заголовков libc не даёт, а подменять проверку на «собралось где-то ещё»
+	@# значит не проверить ничего.
+	@if command -v $(MIPSEL_CC) >/dev/null 2>&1; then \
+	  echo "cross: linux-mipsel"; \
+	  for f in $(SRC) main.c; do \
+	    $(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-detect-mipsel.o $$f || exit 1; \
+	  done; \
+	  rm -f /tmp/d2k-detect-mipsel.o; \
+	else \
+	  echo "cross: $(MIPSEL_CC) не найден — mipsel пропущен"; \
 	fi
 
 clean:

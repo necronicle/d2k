@@ -113,7 +113,7 @@ typedef struct {
 
 /* Один зонд: как писали и что получили. */
 typedef struct {
-    char probe[96];
+    char probe[160];
     int  cuts[4];
     int  ncuts;
     int  delay_ms;
