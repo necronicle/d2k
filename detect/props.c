@@ -157,7 +157,8 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
         for (j = 0; j < opt->repeats; j++) {
-            int rc = d2k_raw_probe_poison(ip4, port, tr, &p, opt->timeout_ms, err, sizeof(err));
+            int rc = d2k_raw_probe_poison(ip4, port, tr, &p, opt->timeout_ms, opt->mark,
+                                          err, sizeof(err));
             res->probes++;
             if (rc > 0) {
                 pass++;

@@ -604,10 +604,10 @@ static int raw_handshake(raw_conn *c, int timeout_ms, char *err, size_t errcap)
 
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
 static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
-                    int timeout_ms, char *err, size_t errcap)
+                    int timeout_ms, uint32_t mark_val, char *err, size_t errcap)
 {
     int one = 1;
-    int mark = D2K_BYPASS_MARK;
+    int mark = (int)mark_val;
     struct timeval tv;
 
     memset(c, 0, sizeof(*c));
@@ -692,10 +692,10 @@ static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
  * имена, безобидной нагрузки для него не существует, и самопроверка падала не
  * потому, что слой сломан, а потому, что отвечать было не на что. */
 int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
-                            int timeout_ms, char *err, size_t errcap)
+                            int timeout_ms, uint32_t mark, char *err, size_t errcap)
 {
     raw_conn c;
-    if (raw_dial(&c, ip4, port, timeout_ms, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, port, timeout_ms, mark, err, errcap) != 0) {
         return -1;
     }
     raw_close(&c);
@@ -719,7 +719,7 @@ int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
  * фальшивкой и отдать правду — как есть, задом наперёд или внахлёст слева. */
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
-                         int timeout_ms, char *err, size_t errcap)
+                         int timeout_ms, uint32_t mark, char *err, size_t errcap)
 {
     static uint8_t fake[2 * D2K_TRIGGER_MAX];
     static uint8_t seg[D2K_TRIGGER_MAX + 4096];
@@ -732,7 +732,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     size_t n = tr->len;
 
     memset(&none, 0, sizeof(none));
-    if (raw_dial(&c, ip4, port, timeout_ms, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, port, timeout_ms, mark, err, errcap) != 0) {
         return -1;
     }
 
@@ -979,17 +979,17 @@ int d2k_parse_stale_rst_rule(const char *line, int *port);
 
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
-                         int timeout_ms, char *err, size_t errcap)
+                         int timeout_ms, uint32_t mark, char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms;
+    (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
 
 int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
-                            int timeout_ms, char *err, size_t errcap)
+                            int timeout_ms, uint32_t mark, char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)timeout_ms;
+    (void)ip4; (void)port; (void)timeout_ms; (void)mark;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }

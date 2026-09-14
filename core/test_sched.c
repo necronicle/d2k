@@ -1038,7 +1038,13 @@ int main(void) {
         d2k_sched *s = d2k_sched_new(&cQS, sv[0], 0x2d);
         saidbuf[0] = '\0';
         d2k_sched_set_say(s, collect_say, NULL);
-        tcp_answer = D2K_V_PREFIX;
+        /* ИМЕННО OPAQUE, и это не деталь настройки. Вопросы о свойствах
+           задаются ТОЛЬКО на этом вердикте: на остальных ответ уже дан
+           разрезом или его отсутствием (см. ветку в цикле планировщика).
+           С prefix проверка смотрела бы на пробный план — а он по замыслу
+           уезжает формой НАШЕГО зонда, и утверждение про форму клиента к нему
+           не относится вовсе. */
+        tcp_answer = D2K_V_OPAQUE;
         ver_answer = D2K_VER_APPLICATION;
         ver_fail_first = 0;
         ver_calls = 0;

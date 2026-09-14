@@ -28,6 +28,9 @@ static void usage(void)
         "                     и гипотезы с приманкой берут длину перекрытия равной его длине\n"
         "  --hello modern|legacy   какое приветствие TLS мерить\n"
         "  --no-raw           выключить сырые зонды\n"
+        "  --mark HEX         метка SO_MARK для всех зондов (умолчание 0x40000000 — z2k).\n"
+        "                     У d2k метка своя, её задаёт --mark датапату: с чужой зонд\n"
+        "                     пойдёт ЧЕРЕЗ наш обход и замерит его, а не коробку\n"
         "  --allow-loopback   снять защиту от цели на localhost (для стенда)\n"
         "  --json             выдать результат как JSON\n"
         "  --dump-trigger     напечатать байты триггера hex и выйти\n"
@@ -289,6 +292,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--control-raw") == 0 && v)  { ctl_raw = v; i++; }
         else if (strcmp(a, "--hello") == 0 && v)        { hello = v; i++; }
         else if (strcmp(a, "--no-raw") == 0)            { opt.no_raw = 1; }
+        else if (strcmp(a, "--mark") == 0 && v)         { opt.mark = (uint32_t)strtoul(v, NULL, 0); i++; }
         else if (strcmp(a, "--allow-loopback") == 0)    { opt.allow_loopback = 1; }
         else if (strcmp(a, "--json") == 0)              { as_json = 1; }
         else if (strcmp(a, "--dump-trigger") == 0)      { dump_trigger = 1; }

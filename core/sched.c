@@ -515,6 +515,23 @@ struct d2k_sched {
      * прежде, и со следующего обращения мерится уже своим. */
     uint8_t      quic_shape[2048];
     size_t       quic_shape_len;
+    /* ПОСЛЕДНЯЯ СНЯТАЯ ФОРМА TCP — С ИМЕНЕМ, ЧЬЯ ОНА.
+     *
+     * Снимок приходит РАНЬШЕ подозрения: датапат сперва видит приветствие, а
+     * уж потом решает, что цель подозрительна. До сих пор форма клалась
+     * только в УЖЕ существующие задачи, и при обычном порядке событий она
+     * пропадала: задача заводилась без снимка и мерила профилем холодного
+     * старта — современным, даже когда клиент говорит по TLS 1.2. Мерился
+     * при этом не тот клиент, что ходит на самом деле, а план-вопрос уезжал
+     * чужой формой и к отправленным байтам не применялся вовсе (0010, R2).
+     *
+     * Одна ячейка, а не таблица: подозрение по цели идёт следом за её же
+     * приветствием, и между ними чужому снимку взяться почти неоткуда. Имя
+     * сверяется, поэтому чужая форма не подставится молча — в худшем случае
+     * снимка не окажется, и это прежнее поведение. */
+    uint8_t      tcp_shape[2048];
+    size_t       tcp_shape_len;
+    char         tcp_shape_name[256];
 
     /* Для вида панели: сколько подтверждено и сколько зондов потрачено за
        жизнь процесса, и отметка стенных часов, от которой считается «с
@@ -590,6 +607,8 @@ static const char *verdict_name(d2k_verdict v) {
     case D2K_V_INCONCLUSIVE: return "вердикта нет";
     case D2K_V_FLAKY:        return "измерению верить нельзя";
     case D2K_V_UNREACHABLE:  return "до цели нет транспорта";
+    case D2K_V_ADDRESS:      return "режут адрес, а не содержимое";
+    case D2K_V_RESPONSE:     return "режут ответ сервера";
     }
     return "неизвестный вердикт";
 }
@@ -797,6 +816,15 @@ static int fill_hellos(d2k_sched *s, task *t) {
             }
         }
         return 0;
+    }
+    if (t->trig_len == 0 && s->tcp_shape_len > 0 &&
+        strcmp(s->tcp_shape_name, t->name) == 0 &&
+        s->tcp_shape_len <= sizeof t->trig) {
+        /* Снимок ЭТОЙ цели пришёл раньше подозрения. Берём его: это настоящие
+           байты клиента, а профиль холодного старта — заведомо не они. */
+        memcpy(t->trig, s->tcp_shape, s->tcp_shape_len);
+        t->trig_len = s->tcp_shape_len;
+        t->trig_snapped = 1;
     }
     if (t->trig_len == 0) {
         /* Холодный старт: снимка ещё нет. Профиль — это заведомо НЕ те байты,
@@ -1708,8 +1736,14 @@ static const char *probes_word(int n) {
     }
 }
 
-static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
-    (void)s;
+/* Кандидаты из вердикта.
+ *
+ * Принимает ВЕСЬ результат, а не один класс блокировки: измеритель, который
+ * находит конкретное воздействие (перенесённый «Поиск по домену», detect/),
+ * приносит его тут же, в d2k_vres.arm. Раньше здесь стоял только класс, и
+ * найденное плечо было девать некуда. */
+static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
+    d2k_verdict v = r->verdict;
     t->next_plan = 0;
     t->n_known = 0;
     t->n_plans = 0;
@@ -1718,7 +1752,12 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
        plan must not silently enlarge the first vaguely matching model. */
     t->box_id[0] = '\0';
 
-    if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE) {
+    if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE ||
+        v == D2K_V_ADDRESS || v == D2K_V_RESPONSE) {
+        /* Кандидатов НЕТ, и это не бедность перебора. При блоке по адресу
+           десинк не снимает ничего (ответ — туннель), а при блоке ответа
+           резать запрос бессмысленно: он и так проходит. Предлагать сюда
+           планы значило бы жечь бюджет зондов на заведомо ложной гипотезе. */
         return;
     }
     /* Inconclusive/flaky classification limits our diagnosis, not the
@@ -1786,6 +1825,28 @@ static void verdict_to_plans(d2k_sched *s, task *t, d2k_verdict v) {
     }
 
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
+
+    /* НАЙДЕННОЕ ЗАМЕРОМ — ПЕРВЫМ, и это не приоритет «на всякий случай».
+       Плечо здесь не гипотеза: измеритель уже прогнал его по цели столько раз,
+       сколько задано повторами, и засчитал только при единогласии. Ставить
+       перед ним кандидатов, выведенных из вектора свойств, значило бы тратить
+       бюджет зондов на догадки, имея на руках измеренный ответ. */
+    if (r->have_arm && t->n_plans < cap) {
+        char text[sizeof t->plans[0]];
+        if (d2k_arm_plan(&r->arm, sh, SCHED_DECOY, s->send_cap, text, sizeof text) == 0) {
+            memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
+            t->n_plans++;
+            say(s, "по %s приём «%s» НАЙДЕН замером — ставлю его первым кандидатом",
+                t->name, r->arm_name);
+        } else {
+            /* Пробел РЕАЛИЗАЦИИ, а не свойство коробки (0007 п.3): воздействие
+               найдено и на замере сработало, задать его планом мы не умеем.
+               Молчать нельзя — иначе «плана нет» читается как «не взяли». */
+            say(s, "по %s приём «%s» сработал на замере, но сегодняшним языком плана "
+                   "не задаётся", t->name, r->arm_name);
+        }
+    }
+
     if (t->n_plans < cap) {
         t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY, s->send_cap,
                                   t->plans + t->n_plans, cap - t->n_plans);
@@ -2334,6 +2395,15 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         memcpy(s->quic_shape, ev->shape, ev->shape_len);
         s->quic_shape_len = ev->shape_len;
     }
+    /* Форма TCP сохраняется ВМЕСТЕ С ИМЕНЕМ и тоже ДО поиска задач: подозрение
+       приходит следом, и без этой ячейки снимок терялся бы при обычном
+       порядке событий (см. tcp_shape в структуре планировщика). */
+    if (ev->transport == 6 && ev->shape_len <= sizeof s->tcp_shape &&
+        strlen(name) < sizeof s->tcp_shape_name) {
+        memcpy(s->tcp_shape, ev->shape, ev->shape_len);
+        s->tcp_shape_len = ev->shape_len;
+        memcpy(s->tcp_shape_name, name, strlen(name) + 1);
+    }
     /* Кладём ТОЛЬКО задачам своего транспорта: у TCP и QUIC приветствия
        разные, и снимок одного для другого — не «лучше, чем ничего», а чужие
        байты, которыми задача пойдёт мерить. */
@@ -2741,7 +2811,7 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
            шапку compose.c), и второй вопрос той же цели не задаётся. */
         prop_close(t);
         t->prop_q = -1;
-        verdict_to_plans(s, t, t->res.verdict);
+        verdict_to_plans(s, t, &t->res);
         t->state = T_PLANNING;
         return;
     }
@@ -2862,7 +2932,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_unlock(&s->mu);
             if (!ready) { continue; }
             join_worker(t);
-            if (r.verdict == D2K_V_OPAQUE && t->transport == 6) {
+            /* Вопросы о свойствах нужны ТОЛЬКО там, где чем брать — неизвестно.
+               Измеритель, вернувший плечо, на этот вопрос уже ответил своими
+               зондами; спрашивать то же самое ещё раз через датапат значит
+               потратить минуты на повторение готового ответа. */
+            if (r.verdict == D2K_V_OPAQUE && t->transport == 6 && !r.have_arm) {
                 /* «Решает содержимое» — единственный вердикт, на который
                    вопросы о свойствах вообще осмысленны: разрез такую коробку
                    не берёт, берёт её отравление буфера пересборки, а чем
@@ -2882,7 +2956,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 }
                 prop_finish(s, t);
             }
-            verdict_to_plans(s, t, r.verdict);
+            verdict_to_plans(s, t, &r);
             if (t->n_known > 0) {
                 say(s, "по %s вердикт: %s (%s), кандидатов %zu — из них %zu готовых "
                        "планов узнанной коробки %s",
@@ -2918,7 +2992,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 /* Обращение не состоялось (транспорт) — вопрос не измерен. */
                 if (prop_send_next(s, t, now_ms) != 0) {
                     prop_finish(s, t);
-                    verdict_to_plans(s, t, t->res.verdict);
+                    verdict_to_plans(s, t, &t->res);
                     t->state = T_PLANNING;
                 }
                 moved++;
@@ -2960,7 +3034,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             prop_close(t);
             if (prop_send_next(s, t, now_ms) != 0) {
                 prop_finish(s, t);
-                verdict_to_plans(s, t, t->res.verdict);
+                verdict_to_plans(s, t, &t->res);
                 t->state = T_PLANNING;
             }
             moved++;

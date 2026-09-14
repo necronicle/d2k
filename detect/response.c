@@ -99,7 +99,7 @@ static int handshake12(const char *host, const char *port, const char *sni,
         return 0;
     }
     {
-        int mark = D2K_BYPASS_MARK;
+        int mark = (int)(opt->mark ? opt->mark : (uint32_t)D2K_BYPASS_MARK);
         int one = 1;
         struct timeval tv;
         (void)setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));

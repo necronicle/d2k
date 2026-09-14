@@ -9,13 +9,15 @@
 # и на маке компилируется другая ветка файла.
 
 CC      ?= cc
-CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../core/include
+CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../core/include -I../datapath/include
 LDFLAGS ?=
 
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 
 SRC = classify.c poison.c props.c raw.c trigger.c response.c
+# bridge.c — только для сборки в составе d2kc: он тянет заголовки ядра.
+BRIDGE = bridge.c
 OBJ = $(SRC:.c=.o)
 HDR = include/d2k_detect.h ../core/include/d2k_hello.h
 
@@ -46,7 +48,10 @@ test_port: test_port.c $(OBJ) ../core/hello.o $(HDR)
 test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) ../core/hello.o $(LDFLAGS) -lpthread
 
-check: d2k-detect test_port test_tree
+bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+check: d2k-detect test_port test_tree bridge.o
 	./test_port
 	./test_tree
 

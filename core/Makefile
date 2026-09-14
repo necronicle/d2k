@@ -538,12 +538,18 @@ BUILDDIR ?= ../builds
 # ИМЯ ФАЙЛА — то же, что у сборок Go (builds/d2k-linux-arm64): его ищет
 # scripts/install.sh, и расхождение здесь означало бы «скачанного файла нет»
 # на живом роутере.
+# Исходники перенесённого измерителя перечислены здесь по именам, а не
+# подтянуты его Makefile: кросс-сборка идёт ОДНОЙ командой в статический
+# бинарник, и промежуточные объектники host-сборки сюда не годятся.
+DETECT_SRC = ../detect/bridge.c ../detect/classify.c ../detect/poison.c \
+             ../detect/props.c ../detect/raw.c ../detect/trigger.c ../detect/response.c
+
 d2kc-linux-arm64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
-	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -static \
 		-o $(BUILDDIR)/d2kc-linux-arm64 d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicwire.c quicprobe.c props.c hello.c catalog.c match.c compose.c link.c \
-		volume.c tls13.c tls13core.c x25519.c verify.c quicconn.c h3.c -lpthread
+		volume.c tls13.c tls13core.c x25519.c verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread
 	@ls -l $(BUILDDIR)/d2kc-linux-arm64
 
 d2kask-aarch64: hello_profiles.inc
@@ -585,10 +591,21 @@ test-verify: test_verify
 	./test_verify
 
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
+DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
+             ../detect/props.o ../detect/raw.o ../detect/trigger.o ../detect/response.o
+
+# Перенесённый измеритель собирается своим Makefile: у него свои флаги и своя
+# кросс-проверка, и второй рецепт сборки тех же файлов здесь означал бы два
+# источника истины о том, как они собраны.
+$(DETECT_OBJ): FORCE
+	$(MAKE) -C ../detect $(notdir $@)
+
 d2kc: d2kc.c sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-      hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(HDR)
+      hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o \
+      $(DETECT_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< sched.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o props.o \
-		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o $(TEST_LDFLAGS)
+		hello.o catalog.o match.o compose.o link.o volume.o tls13.o tls13core.o x25519.o verify.o quicconn.o h3.o \
+		$(DETECT_OBJ) $(TEST_LDFLAGS)
 
 clean:
 	rm -f *.o $(TESTS) d2kask d2kc hello_profiles.inc

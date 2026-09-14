@@ -133,6 +133,9 @@ void d2k_opts_defaults(d2k_opts *o)
     if (o->long_gap_ms <= 0) {
         o->long_gap_ms = 700;
     }
+    if (o->mark == 0) {
+        o->mark = D2K_BYPASS_MARK;
+    }
 }
 
 int d2k_opts_acceptable(const d2k_opts *o, const d2k_poison *p)
@@ -253,7 +256,7 @@ int d2k_split_offsets(const int *cuts, int ncuts, int n, d2k_span *out, int cap)
  * (целиком, разрез, контроль) обязаны идти мимо десинка ровно так же, иначе
  * половина дерева меряет одно, половина другое. */
 static int dial_marked(const char *host, const char *port, int timeout_ms,
-                       char *err, size_t errcap)
+                       uint32_t mark, char *err, size_t errcap)
 {
     struct addrinfo hints, *ai = NULL, *p;
     int fd = -1, rc;
@@ -267,7 +270,7 @@ static int dial_marked(const char *host, const char *port, int timeout_ms,
         return -1;
     }
     for (p = ai; p; p = p->ai_next) {
-        int mark = D2K_BYPASS_MARK;
+        int mk = (int)mark;
         int one = 1;
         int fl;
         struct pollfd pfd;
@@ -278,7 +281,7 @@ static int dial_marked(const char *host, const char *port, int timeout_ms,
         if (fd < 0) {
             continue;
         }
-        (void)setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+        (void)setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
         /* Без этого ядро склеит наши записи в один сегмент, и весь замер
          * превратится в измерение самого себя. */
         (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -335,7 +338,7 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
     long deadline;
 
     err[0] = '\0';
-    fd = dial_marked(host, port, opt->timeout_ms, err, errcap);
+    fd = dial_marked(host, port, opt->timeout_ms, opt->mark, err, errcap);
     if (fd < 0) {
         return -1;
     }
@@ -487,7 +490,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     {
         d2k_obs *obs = d2k_trace_add(res, "raw-selftest");
         for (i = 0; i < opt->repeats; i++) {
-            int rc = d2k_raw_probe_handshake(ip4, pnum, opt->timeout_ms, err, sizeof(err));
+            int rc = d2k_raw_probe_handshake(ip4, pnum, opt->timeout_ms, opt->mark, err, sizeof(err));
             res->probes++;
             if (rc < 0) {
                 obs->fail++;
@@ -537,7 +540,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             obs->delay_ms = cands[k].gap_ms;
             for (i = 0; i < opt->repeats; i++) {
                 int rc = d2k_raw_probe_poison(ip4, pnum, tr, &cands[k],
-                                              opt->timeout_ms, err, sizeof(err));
+                                              opt->timeout_ms, opt->mark, err, sizeof(err));
                 res->probes++;
                 if (rc > 0) {
                     pass++;
@@ -572,7 +575,8 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         obs->delay_ms = p.gap_ms;
         bind_decoy(&p, opt);
         for (r = 0; r < opt->repeats; r++) {
-            int rc = d2k_raw_probe_poison(ip4, pnum, tr, &p, opt->timeout_ms, err, sizeof(err));
+            int rc = d2k_raw_probe_poison(ip4, pnum, tr, &p, opt->timeout_ms, opt->mark,
+                                          err, sizeof(err));
             res->probes++;
             if (rc < 0) {
                 obs->fail++;
