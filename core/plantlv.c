@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "d2k_plantlv.h"
 
@@ -45,7 +46,10 @@ enum {
     REC_SEQOVL  = 0x0102,
     REC_ORDER   = 0x0103,
     REC_GUARD   = 0x0104,
-    REC_PACE    = 0x0105
+    REC_PACE    = 0x0105,
+    REC_INPUT   = 0x0106,
+    REC_SETTLE  = 0x0107,
+    REC_SEGMENT = 0x0108
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -90,6 +94,7 @@ typedef struct {
     uint8_t    order;
     uint8_t    guards;
     uint32_t   pace_us;   /* 0 — записи нет */
+    uint32_t   input_len, input_sni_off, input_sni_len, settle_us, segment_size;
 } pl_plan;
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
@@ -179,10 +184,11 @@ static int kv_u32(const char *field, const char *key, unsigned long *out) {
    идёт без ключа, и притворяться, что "ключ=значение" тут есть, значило бы
    принимать "pace pace=12000". */
 static int str_u32(const char *sv, unsigned long *out) {
-    if (!sv || !*sv) { return -1; }
+    if (!sv || *sv < '0' || *sv > '9') { return -1; }
     char *end = NULL;
+    errno = 0;
     unsigned long val = strtoul(sv, &end, 10);
-    if (!end || *end != '\0') { return -1; }
+    if (errno == ERANGE || val > UINT32_MAX || !end || *end != '\0') { return -1; }
     *out = val;
     return 0;
 }
@@ -260,6 +266,72 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 goto bad;
             }
             p->n_payloads++;
+        } else if (strcmp(f[0], "payload-pad") == 0) {
+            unsigned long id, len, fill;
+            uint8_t *prefix = NULL;
+            size_t prefix_len = 0;
+            char why[80];
+            if ((nf != 4 && nf != 5) || p->n_payloads >= MAX_PAYLOADS ||
+                str_u32(f[1], &id) || id == 0 || id > 65535 ||
+                str_u32(f[2], &len) || len == 0 || len > 65533 ||
+                str_u32(f[3], &fill) || fill > 255) {
+                say(err, errcap, "строка %zu: payload-pad ждёт id длину байт [hex-префикс]", lineno);
+                goto bad;
+            }
+            if (parse_hex(nf == 5 ? f[4] : "", &prefix, &prefix_len, why, sizeof why)) {
+                say(err, errcap, "строка %zu: payload-pad: %s", lineno, why); goto bad;
+            }
+            if (prefix_len > len) {
+                free(prefix); say(err, errcap, "payload-pad не обрезает префикс"); goto bad;
+            }
+            pl_payload *v = &p->payloads[p->n_payloads];
+            v->bytes = malloc((size_t)len);
+            if (!v->bytes) { free(prefix); say(err, errcap, "нет памяти для payload-pad"); goto bad; }
+            v->id = (uint16_t)id; v->len = (size_t)len;
+            memset(v->bytes, (int)fill, v->len);
+            if (prefix_len) { memcpy(v->bytes, prefix, prefix_len); }
+            free(prefix);
+            p->n_payloads++;
+        } else if (strcmp(f[0], "payload-slice") == 0) {
+            unsigned long id, source, off, len;
+            const pl_payload *src = NULL;
+            if (nf != 5 || p->n_payloads >= MAX_PAYLOADS ||
+                str_u32(f[1], &id) || !id || id > 65535 ||
+                str_u32(f[2], &source) || str_u32(f[3], &off) ||
+                str_u32(f[4], &len) || !len || len > 65533) {
+                say(err, errcap, "payload-slice ждёт id source offset length"); goto bad;
+            }
+            for (size_t j = 0; j < p->n_payloads; j++) {
+                if (p->payloads[j].id == source) { src = &p->payloads[j]; break; }
+            }
+            if (!src || off > src->len || len > src->len - off) {
+                say(err, errcap, "payload-slice выходит за исходные байты"); goto bad;
+            }
+            pl_payload *v = &p->payloads[p->n_payloads];
+            v->bytes = malloc((size_t)len);
+            if (!v->bytes) { say(err, errcap, "нет памяти для payload-slice"); goto bad; }
+            v->id = (uint16_t)id; v->len = (size_t)len;
+            memcpy(v->bytes, src->bytes + off, v->len);
+            p->n_payloads++;
+        } else if (strcmp(f[0], "input") == 0) {
+            unsigned long len, off, snilen;
+            if (nf != 4 || str_u32(f[1], &len) || !len || len > 65535 ||
+                str_u32(f[2], &off) || str_u32(f[3], &snilen) ||
+                off > len || snilen > len - off) {
+                say(err, errcap, "input ждёт длину нагрузки и границы имени"); goto bad;
+            }
+            p->input_len = (uint32_t)len;
+            p->input_sni_off = (uint32_t)off;
+            p->input_sni_len = (uint32_t)snilen;
+        } else if (strcmp(f[0], "settle") == 0 || strcmp(f[0], "segment") == 0) {
+            unsigned long u;
+            if (nf != 2 || str_u32(f[1], &u) || !u) {
+                say(err, errcap, "%s ждёт положительное число", f[0]); goto bad;
+            }
+            if (strcmp(f[0], "segment") == 0) {
+                if (u > 65535) { say(err, errcap, "segment больше 65535"); goto bad; }
+                p->segment_size = (uint32_t)u;
+            } else { p->settle_us = (uint32_t)u; }
         } else if (strcmp(f[0], "poison") == 0) {
             if (nf < 2) { say(err, errcap, "строка %zu: poison без номера", lineno); goto bad; }
             if (p->n_poisons >= MAX_POISONS) { say(err, errcap, "строка %zu: порч больше %d", lineno, MAX_POISONS); goto bad; }
@@ -352,6 +424,9 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         say(err, errcap, "нет заголовка d2k-plan");
         goto bad;
     }
+    if ((p->input_len || p->settle_us || p->segment_size) && p->minexec < 3) {
+        say(err, errcap, "input/settle/segment требуют minexec=3"); goto bad;
+    }
     return 0;
 bad:
     plan_free(p);
@@ -369,6 +444,10 @@ static void put(wbuf *w, const uint8_t *b, size_t n) {
 }
 static void put_u8(wbuf *w, uint8_t v) { put(w, &v, 1); }
 static void put_u16(wbuf *w, uint16_t v) { uint8_t t[2] = { (uint8_t)(v >> 8), (uint8_t)v }; put(w, t, 2); }
+static void put_u32(wbuf *w, uint32_t v) {
+    uint8_t t[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+    put(w, t, sizeof t);
+}
 static void put_rec(wbuf *w, uint16_t typ, const uint8_t *v, size_t n) {
     if (n > 0xFFFFu) { w->bad = 1; return; }
     put_u16(w, typ);
@@ -392,7 +471,8 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     wbuf w = { out, cap, 0, 0 };
     size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
-                       (p.guards ? 1u : 0u);
+                       (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
+                       (p.segment_size ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -462,6 +542,16 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         uint8_t v[4] = { (uint8_t)(p.pace_us >> 24), (uint8_t)(p.pace_us >> 16),
                          (uint8_t)(p.pace_us >> 8),  (uint8_t)p.pace_us };
         put_rec(&w, REC_PACE, v, sizeof v);
+    }
+    if (p.input_len) {
+        put_u16(&w, REC_INPUT); put_u16(&w, 12);
+        put_u32(&w, p.input_len); put_u32(&w, p.input_sni_off); put_u32(&w, p.input_sni_len);
+    }
+    if (p.settle_us) {
+        put_u16(&w, REC_SETTLE); put_u16(&w, 4); put_u32(&w, p.settle_us);
+    }
+    if (p.segment_size) {
+        put_u16(&w, REC_SEGMENT); put_u16(&w, 4); put_u32(&w, p.segment_size);
     }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);

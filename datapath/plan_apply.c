@@ -158,7 +158,9 @@ size_t d2k_plan_max_emit(const d2k_plan *p) {
         }
         const struct d2k_poison *po = p->fakes[i].poison_id
             ? d2k_find_poison(p, p->fakes[i].poison_id) : NULL;
-        size_t n = emit_overhead(p, po) + pl->len;
+        size_t body = pl->len;
+        if (p->segment_size && body > p->segment_size) { body = p->segment_size; }
+        size_t n = emit_overhead(p, po) + body;
         if (n > max) { max = n; }
     }
     for (size_t i = 0; i < p->n_seqovls; i++) {
@@ -171,7 +173,9 @@ size_t d2k_plan_max_emit(const d2k_plan *p) {
         /* Только приставка: кусок нагрузки, к которому она приклеивается,
            приходит из пакета — см. d2k_plan_max_emit в d2k_plan.h про то,
            почему он здесь не считается. */
-        size_t n = emit_overhead(p, po) + pl->len;
+        size_t body = pl->len;
+        if (p->segment_size && body > p->segment_size) { body = p->segment_size; }
+        size_t n = emit_overhead(p, po) + body;
         if (n > max) { max = n; }
     }
     return max;
@@ -186,6 +190,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     memset(out, 0, sizeof *out);
     if (!in->payload || in->payload_len == 0) {
         return -1;
+    }
+    if (p->input_len &&
+        (in->payload_len != p->input_len ||
+         (in->have_sni ? in->sni_len : 0) != p->input_sni_len ||
+         (p->input_sni_len && in->sni_off != p->input_sni_off))) {
+        return -1; /* not the input for which fixed measured bytes were built */
     }
 
     size_t *pts = NULL;
@@ -204,7 +214,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     /* Разнос во времени тоже означает владение нагрузкой: выдержать паузу
        перед правдой можно только тогда, когда правду выпускаем мы сами.
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
-    int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0);
+    int owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) || (p->settle_us > 0);
 
     /* Верхняя оценка числа посылок: копии фальшивок плюс куски. Считаем
        заранее, чтобы выделить память один раз.
@@ -390,7 +400,46 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         }
     }
 
+    if (p->settle_us > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (v[i].kind != D2K_EMIT_PAYLOAD) { continue; }
+            if (i > 0) { v[i].delay_us = p->settle_us; }
+            break;
+        }
+    }
     free(pts);
+    if (p->segment_size) {
+        /* Match raw_send: split the concatenated prefix+body, preserving
+         * bytes, sequence space, fooling and only the first chunk's delay. */
+        size_t count = 0;
+        for (size_t i = 0; i < n; i++) {
+            size_t bytes = v[i].pre_len + v[i].len;
+            size_t chunks = bytes ? (bytes - 1) / p->segment_size + 1 : 1;
+            if (chunks > 65536 || count > 65536 - chunks) { free(v); return -1; }
+            count += chunks;
+        }
+        d2k_emit *split = calloc(count, sizeof *split);
+        if (!split) { free(v); return -1; }
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {
+            size_t total = v[i].pre_len + v[i].len, off = 0;
+            do {
+                d2k_emit *e = &split[k++];
+                *e = v[i];
+                size_t take = total - off;
+                if (take > p->segment_size) { take = p->segment_size; }
+                e->seq += (uint32_t)off;
+                if (off) { e->delay_us = 0; }
+                e->pre_len = off < v[i].pre_len ? v[i].pre_len - off : 0;
+                if (e->pre_len > take) { e->pre_len = take; }
+                e->pre = e->pre_len ? v[i].pre + off : NULL;
+                e->len = take - e->pre_len;
+                e->bytes = e->len ? v[i].bytes + (off > v[i].pre_len ? off - v[i].pre_len : 0) : NULL;
+                off += take;
+            } while (off < total);
+        }
+        free(v); v = split; n = count;
+    }
     out->v = v;
     out->n = n;
     out->fate = owns_payload ? D2K_ORIG_DROP : D2K_ORIG_PASS;

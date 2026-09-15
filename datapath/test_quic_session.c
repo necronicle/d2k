@@ -113,18 +113,12 @@ static const uint8_t plan_badsum[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
-/* План с ОДНОЙ фальшивкой и repeats=20: заголовок "D2KP" + schema=1 +
- * minexec=1 + flags=0 + число записей=2; REC_PAYLOAD (id=1, байт 0xAA) и
- * REC_FAKE (payload_id=1, poison_id=0, repeats=20, placement=PLACE_BEFORE,
- * gap_us=0). repeats — байт TLV без потолка (d2k_plan.h/plan_parse.c), а
- * d2k_result.out[] вмещает 16 посылок (d2k_session.h) — 20 > 16. Нужен ровно
- * для одной проверки (ревью задачи 4, круг 2): план, который просит больше
- * посылок, чем помещается в результат, обязан быть отвергнут ЦЕЛИКОМ, а не
- * тихо обрезан до 16 с "применённым" видом. */
+/* Одна фальшивка, D2K_RESULT_MAX+1 повторов: отказ целиком,
+ * а не тихое обрезание до вместимости результата. */
 static const uint8_t plan_too_many_repeats[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
     0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0xAA,
-    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, D2K_RESULT_MAX + 1, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
@@ -678,17 +672,16 @@ int main(void) {
 
     /* --- план с repeats больше вместимости out[] отвергается целиком -------
        Ревью задачи 4, круг 2: repeats берётся из TLV байтом без потолка (до
-       255), d2k_result.out[] вмещает 16 (d2k_session.h). План с repeats=20
-       раньше "применялся" — n тихо обрезался до 16, на провод уходило 16
-       посылок вместо 20, а plan_done/applied++/PLAN_APPLIED ставились
-       безусловно, как будто ушли все 20. Честный исход — отказ целиком: ни
+       255), d2k_result.out[] ограничен D2K_RESULT_MAX. Раньше лишние
+       посылки тихо обрезались, но plan_done/applied++/PLAN_APPLIED ставились
+       безусловно, как будто ушли все. Честный исход — отказ целиком: ни
        одной посылки, план не считается применённым. */
     {
         d2k_session *s = d2k_session_new(64, 32);
         d2k_plan *p = NULL;
         char err[160];
         CHECK(d2k_plan_load(plan_too_many_repeats, sizeof plan_too_many_repeats, &p, err, sizeof err) == 0,
-              "план с repeats=20 не загрузился");
+              "план с лишним повтором не загрузился");
         d2k_plantab_set_name(d2k_session_plans(s), (const uint8_t *)"example.com", 11, 1, p);
 
         uint8_t pkt[1300], buf[4096];
@@ -696,10 +689,10 @@ int main(void) {
         size_t n = build_udp_pkt(pkt, 56600, 443, v1_initial, sizeof v1_initial);
         d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
 
-        CHECK(r.n_out == 0, "план с repeats=20 отправил хоть одну посылку вместо честного отказа");
+        CHECK(r.n_out == 0, "план с лишним повтором отправил посылку вместо отказа");
         CHECK(r.verdict == D2K_VERDICT_ACCEPT, "ничего не отправив, оригинал обязаны пропустить");
         CHECK(r.skipped != NULL, "отказ по переполнению out[] не объяснён вызывающему");
-        CHECK(d2k_session_applied(s) == 0, "план с repeats=20 засчитан применённым (обрезанным)");
+        CHECK(d2k_session_applied(s) == 0, "план с лишним повтором засчитан применённым");
 
         d2k_session_free(s);
     }

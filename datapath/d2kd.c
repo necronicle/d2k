@@ -38,8 +38,8 @@
 #include "d2k_time.h"
 
 #define RECV_BUF   65536
-#define OUT_BUF    32768
 #define MAX_PKT     1600
+#define OUT_BUF    (D2K_RESULT_MAX * MAX_PKT)
 
 static volatile sig_atomic_t stop_flag;
 static void on_signal(int sig) { (void)sig; stop_flag = 1; }

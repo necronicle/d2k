@@ -31,7 +31,10 @@ enum {
     REC_SEQOVL  = 0x0102,
     REC_ORDER   = 0x0103,
     REC_GUARD   = 0x0104,
-    REC_PACE    = 0x0105
+    REC_PACE    = 0x0105,
+    REC_INPUT   = 0x0106,
+    REC_SETTLE  = 0x0107,
+    REC_SEGMENT = 0x0108
 };
 
 /* Якоря семантических позиций. */
@@ -89,6 +92,9 @@ struct d2k_plan {
     uint8_t  proto;
     uint8_t  order;
     uint8_t  guards;
+    uint32_t input_len, input_sni_off, input_sni_len;
+    uint32_t settle_us;
+    uint32_t segment_size;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

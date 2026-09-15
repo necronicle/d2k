@@ -163,7 +163,7 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     d2k_classify_run(addr, &tr, &opt, &res);
 
     out.verdict = map_verdict(res.verdict);
-    snprintf(out.reason, sizeof(out.reason), "%s", res.reason);
+    snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;
     out.probes = res.probes;
     /* Метку измеритель ставит всегда и на всех сокетах, но ПОДТВЕРЖДЕНИЯ, что
@@ -173,7 +173,20 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     out.marked = 0;
     if (res.has_hit) {
         char why[160];
-        if (d2k_arm_from_poison(&res.hit, &out.arm, why, sizeof(why)) == 0) {
+        int converted = d2k_arm_from_poison(&res.hit, &out.arm, why, sizeof(why));
+        if (converted == 0 && (res.hit.decoy_len > sizeof out.arm_input.decoy ||
+                              (res.hit.decoy_len && !res.hit.decoy))) {
+            snprintf(why, sizeof why, "приманку найденного приёма нельзя сохранить целиком");
+            converted = -1;
+        }
+        if (converted == 0) {
+            out.arm_input.trigger_len = tr.len;
+            out.arm_input.sni_off = (size_t)tr.sni_off;
+            out.arm_input.sni_len = (size_t)tr.sni_len;
+            out.arm_input.decoy_len = res.hit.decoy_len;
+            if (res.hit.decoy_len) {
+                memcpy(out.arm_input.decoy, res.hit.decoy, res.hit.decoy_len);
+            }
             snprintf(out.arm_name, sizeof(out.arm_name), "%s", res.hit.name);
             out.have_arm = 1;
         } else {

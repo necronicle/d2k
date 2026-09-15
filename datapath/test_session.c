@@ -127,18 +127,15 @@ static const uint8_t plan_owns_payload[] = {
     0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x2E, 0xE0
 };
 
-/* План с ОДНОЙ фальшивкой и repeats=20 (ревью задачи 4, круг 2): repeats —
- * байт TLV без потолка (d2k_plan.h/plan_parse.c), а d2k_result.out[] вмещает
- * 16 посылок (d2k_session.h) — 20 > 16. Нужен для проверки, что план,
- * просящий больше посылок, чем помещается в результат, отвергается целиком,
- * а не тихо обрезается до 16 с видом «применён». Заголовок "D2KP" + schema=1
+/* План с числом повторов D2K_RESULT_MAX+1: больше вместимости результата.
+ * Он должен отвергаться целиком, а не тихо обрезаться. Заголовок schema=1
  * + minexec=1 + flags=0 + число записей=2: REC_PAYLOAD (id=1, байт 0xAA) и
- * REC_FAKE (payload_id=1, poison_id=0, repeats=20, placement=PLACE_BEFORE,
+ * REC_FAKE (payload_id=1, poison_id=0, placement=PLACE_BEFORE,
  * gap_us=0). */
 static const uint8_t plan_too_many_repeats[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
     0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0xAA,
-    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00, D2K_RESULT_MAX + 1, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
 /* Порты в ключе потока лежат в СЕТЕВОМ порядке (d2k_key_make, d2k_track.h):
@@ -593,9 +590,48 @@ int main(void) {
         d2k_session_free(g);
     }
 
+    /* Segmented measured fake: 7 * ceil(4096/1400) + truth = 22 packets.
+     * Check the real session output and an all-or-nothing small-buffer refusal. */
+    {
+        uint8_t tlv[4200] = {'D','2','K','P',0,1,0,3,0,0,0,5,0,2,0,2,6,1};
+        size_t z = 18;
+        wr16(tlv + z, 0x0010); wr16(tlv + z + 2, 4098); wr16(tlv + z + 4, 1);
+        memset(tlv + z + 6, 0x0f, 4096); z += 4102;
+        const uint8_t tail[] = {
+            0x01,0x01,0,10, 0,1,0,0,7,0,0,0,0,0,
+            0x01,0x07,0,4, 0,0,0x3a,0x98,
+            0x01,0x08,0,4, 0,0,0x05,0x78
+        };
+        memcpy(tlv + z, tail, sizeof tail); z += sizeof tail;
+        uint8_t bigbuf[D2K_RESULT_MAX * 1600];
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *gp = NULL;
+        CHECK(d2k_plan_load(tlv, z, &gp, err, sizeof err) == 0, "segmented plan rejected");
+        CHECK(d2k_plan_max_emit(gp) == 1440, "MTU check ignores segmentation");
+        d2k_session_set_plan(g, gp);
+        n = build_pkt(pkt, 43098, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && !r.applied && r.verdict == D2K_VERDICT_ACCEPT,
+              "small buffer produced partial measured execution");
+        n = build_pkt(pkt, 43099, 0x18, hello, hlen);
+        d2k_session_packet(g, pkt, n, 2000, bigbuf, sizeof bigbuf, &r);
+        CHECK(r.n_out == 22 && r.applied && r.verdict == D2K_VERDICT_DROP,
+              "long measured fake does not fit real session");
+        if (r.n_out == 22) {
+            for (size_t k = 0; k < 21; k++) {
+                CHECK(r.out[k].len == (k % 3 == 2 ? 1336u : 1440u), "segment length changed");
+                CHECK(r.out[k].delay_us == 0, "segment gained delay");
+            }
+            CHECK(r.out[21].delay_us == 15000, "settle delay lost");
+            CHECK(r.out[21].len == hlen + 40, "truth length changed");
+            CHECK(memcmp(bigbuf + r.out[21].off + 40, hello, hlen) == 0, "truth bytes changed");
+        }
+        d2k_session_free(g);
+    }
+
     /* --- план с repeats больше вместимости out[] отвергается целиком -------
        Ревью задачи 4, круг 2: repeats берётся из TLV байтом без потолка (до
-       255), d2k_result.out[] вмещает 16 (d2k_session.h). Раньше n тихо
+       255), d2k_result.out[] ограничен D2K_RESULT_MAX. Раньше n тихо
        обрезался до 16, на провод уходило меньше посылок, чем описывал план,
        а plan_done/applied++/PLAN_APPLIED ставились как за полное исполнение.
        Честный исход — отказ целиком: ни одной посылки, план не применён. */
@@ -603,14 +639,14 @@ int main(void) {
         d2k_session *g = d2k_session_new(64, 64);
         d2k_plan *gp = NULL;
         CHECK(d2k_plan_load(plan_too_many_repeats, sizeof plan_too_many_repeats, &gp, err, sizeof err) == 0,
-              "план с repeats=20 не загрузился");
+              "план с лишним повтором не загрузился");
         d2k_session_set_plan(g, gp);
         n = build_pkt(pkt, 43100, 0x18, hello, hlen);
         d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
-        CHECK(r.n_out == 0, "план с repeats=20 отправил хоть одну посылку вместо честного отказа");
+        CHECK(r.n_out == 0, "план с лишним повтором отправил посылку вместо отказа");
         CHECK(r.verdict == D2K_VERDICT_ACCEPT, "ничего не отправив, оригинал обязаны пропустить");
         CHECK(r.skipped != NULL, "отказ по переполнению out[] не объяснён вызывающему");
-        CHECK(d2k_session_applied(g) == 0, "план с repeats=20 засчитан применённым (обрезанным)");
+        CHECK(d2k_session_applied(g) == 0, "план с лишним повтором засчитан применённым");
         d2k_session_free(g);
     }
 

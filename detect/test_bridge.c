@@ -59,6 +59,23 @@ int main(void)
     /* d2k_vres is returned and repeatedly copied by value. No pointer into
      * the adapter's dead stack frame may escape with the result. */
     CHECK(r.arm.name == NULL);
+    CHECK(r.arm_input.trigger_len == 2);
+    {
+        uint8_t decoy[] = {0xa1, 0, 0x7f};
+        answer.hit.decoy = decoy;
+        answer.hit.decoy_len = sizeof decoy;
+        r = measure();
+        decoy[0] = 0xff;
+        CHECK(r.arm_input.decoy_len == 3 && r.arm_input.decoy[0] == 0xa1);
+        CHECK(r.arm_input.decoy[1] == 0); /* binary, not a C string */
+        d2k_vres copied = r;
+        memset(&r, 0, sizeof r);
+        CHECK(copied.arm_input.decoy[0] == 0xa1);
+        answer.hit.decoy_len = D2K_ARM_DECOY_MAX + 1;
+        r = measure();
+        CHECK(!r.have_arm); /* fail before dereferencing an oversized prefix */
+        answer.hit.decoy = NULL; answer.hit.decoy_len = 0;
+    }
 
     memset(&p, 0, sizeof p);
     p.ttl = 8;

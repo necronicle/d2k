@@ -38,6 +38,33 @@ int main(void) {
 
     CHECK(loads(good, sizeof good), "правильный план не загрузился");
 
+    /* New measured-context records: validate length, value and minexec. */
+    for (unsigned code = 6; code <= 8; code++) {
+        uint8_t b[34] = {'D','2','K','P',0,1,0,3,0,0,0,2,0,2,0,2,6,1,1,0,0,0};
+        size_t len = code == 6 ? 12 : 4;
+        b[19] = (uint8_t)code; b[21] = (uint8_t)len; b[25] = 100;
+        CHECK(loads(b, 22 + len), "valid measured record rejected");
+        b[16] = 17;
+        CHECK(!loads(b, 22 + len), "TCP operation accepted for UDP");
+        b[16] = 0;
+        CHECK(!loads(b, 22 + len), "TCP operation accepted for unspecified transport");
+        b[16] = 6;
+        b[7] = 2;
+        CHECK(!loads(b, 22 + len), "measured record accepted with minexec=2");
+        b[7] = 3; b[25] = 0;
+        CHECK(!loads(b, 22 + len), "zero measured value accepted");
+        b[25] = 100; b[21]--;
+        CHECK(!loads(b, 21 + len), "short measured record accepted");
+        b[21] = (uint8_t)len;
+        if (code == 6) {
+            b[29] = 99; b[33] = 2;
+            CHECK(!loads(b, sizeof b), "SNI past end accepted");
+        } else if (code == 8) {
+            b[23] = 1;
+            CHECK(!loads(b, 26), "segment over 65535 accepted");
+        }
+    }
+
     /* РАЗНОС ВО ВРЕМЕНИ (REC_PACE 0x0105): ровно 4 байта.
      *
      * Запись новая, и проверка длины у неё отдельная от прочих не случайно:

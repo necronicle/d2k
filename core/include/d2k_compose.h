@@ -130,6 +130,11 @@ typedef struct {
 int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
                  size_t send_cap, char *buf, size_t cap);
 
+/* Exact measured input, not a newly generated profile. Never crops bytes.
+ * The executor's packet-size checks remain mandatory before sending. */
+int d2k_arm_plan_measured(const d2k_arm *arm, const d2k_arm_input *input,
+                          char *buf, size_t cap);
+
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap,
                       char *buf, size_t cap);

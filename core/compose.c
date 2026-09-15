@@ -1452,6 +1452,82 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
     return d2k_arm_plan(&a, shape, decoy, send_cap, buf, cap);
 }
 
+/* Compact text, exact binary payload: keep the measured prefix and the
+ * original sender's 0x0f padding without allocating huge task text buffers. */
+static int measured_payload(char *buf, size_t cap, size_t *pos, unsigned id,
+                             size_t len, const uint8_t *prefix, size_t prefix_len) {
+    if (append_fmt(buf, cap, pos, "payload-pad %u %zu 15", id, len)) { return -1; }
+    if (prefix_len > len) { prefix_len = len; } /* raw sender's memcpy(min(...)) */
+    if (prefix_len) {
+        if (append_fmt(buf, cap, pos, " ") || append_hex(buf, cap, pos, prefix, prefix_len)) { return -1; }
+    }
+    return append_fmt(buf, cap, pos, "\n");
+}
+
+int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
+                          char *buf, size_t cap) {
+    if (!a || !in || !buf || !cap) { return -1; }
+    buf[0] = '\0';
+    if (in->trigger_len < 2 || in->trigger_len > D2K_ARM_DECOY_MAX ||
+        in->decoy_len > sizeof in->decoy || in->sni_off > in->trigger_len ||
+        in->sni_len > in->trigger_len - in->sni_off || a->repeats > 255 ||
+        a->ttl > 255 || a->gap_ms > UINT32_MAX / 1000u) { return -1; }
+    size_t n = in->trigger_len, pos = 0;
+    size_t ov = a->seqovl_hello ? in->decoy_len : a->seqovl;
+    if (ov > D2K_ARM_DECOY_MAX) { return -1; }
+    int between = a->between;
+    int fake = !between && (a->badsum || a->ttl || a->seq_out);
+    int disorder = !between && a->disorder;
+    /* raw.c prioritizes fake_between over disorder/seqovl; it uses SNI
+     * START, not the old Plan builder's two cuts at 1 and SNI middle. */
+    size_t mid = between ? 1 : n / 2;
+    if (in->sni_len > 1 && in->sni_off > 0) {
+        mid = in->sni_off + (between ? 0 : in->sni_len / 2);
+    }
+    if (between) { if (mid >= n) { mid = 1; } ov = 0; }
+    else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
+    if (!fake && !between && !disorder && !ov) { return -1; }
+    if (append_fmt(buf, cap, &pos,
+        "d2k-plan 1 3\nid 00000000000000000000000000000000\nproto tcp tls\n"
+        "input %zu %zu %zu\nsegment %u\n",
+        n, in->sni_off, in->sni_len, (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
+    size_t flen = between ? n - mid : 2 * n;
+    const uint8_t *prefix = in->decoy;
+    size_t prefix_len = in->decoy_len;
+    if (fake || between) {
+        if (measured_payload(buf, cap, &pos, 1, flen,
+                             prefix, between ? 0 : prefix_len)) { return -1; }
+        if (append_fmt(buf, cap, &pos, "poison 1")) { return -1; }
+        if (a->badsum && append_fmt(buf, cap, &pos, " badsum")) { return -1; }
+        if (a->ttl && append_fmt(buf, cap, &pos, " ttl=%u", a->ttl)) { return -1; }
+        if (!between) {
+            if (a->tcpts && append_fmt(buf, cap, &pos, " tcpts")) { return -1; }
+            if (a->ipidzero && append_fmt(buf, cap, &pos, " ipidzero")) { return -1; }
+            if (a->seq_out && append_fmt(buf, cap, &pos, " seqshift=-66000")) { return -1; }
+        }
+        if (append_fmt(buf, cap, &pos, "\n")) { return -1; }
+    }
+    if (ov) {
+        if (fake && ov <= flen) {
+            if (append_fmt(buf, cap, &pos, "payload-slice 2 1 0 %zu\n", ov)) { return -1; }
+        } else if (measured_payload(buf, cap, &pos, 2, ov, prefix, prefix_len)) { return -1; }
+        if (append_fmt(buf, cap, &pos, "seqovl payload=2 poison=0\n")) { return -1; }
+    }
+    if (disorder && append_fmt(buf, cap, &pos, "split payload_start +1\n")) { return -1; }
+    if ((disorder || between) &&
+        append_fmt(buf, cap, &pos, "split payload_start +%zu\n", mid)) { return -1; }
+    if (fake || between) {
+        if (append_fmt(buf, cap, &pos,
+            "fake payload=1 poison=1 repeats=%u gap_us=%u place=%s\n",
+            a->repeats ? a->repeats : 1u, between ? 0u : a->gap_ms * 1000u,
+            between ? "between" : "before")) { return -1; }
+    }
+    if (append_fmt(buf, cap, &pos, "order %s\n", disorder ? "reverse" : "forward")) { return -1; }
+    if ((disorder || between) && append_fmt(buf, cap, &pos, "pace 12000\n")) { return -1; }
+    if (fake && append_fmt(buf, cap, &pos, "settle 15000\n")) { return -1; }
+    return 0;
+}
+
 int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
                  size_t send_cap, char *buf, size_t cap) {
     fb_arm a;

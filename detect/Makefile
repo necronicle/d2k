@@ -20,7 +20,7 @@ SRC = classify.c poison.c props.c raw.c trigger.c response.c
 # bridge.c — только для сборки в составе d2kc: он тянет заголовки ядра.
 BRIDGE = bridge.c
 OBJ = $(SRC:.c=.o)
-HDR = include/d2k_detect.h ../core/include/d2k_hello.h
+HDR = include/d2k_detect.h ../core/include/d2k_hello.h ../core/include/d2k_arm.h
 
 .PHONY: all check cross clean FORCE
 
@@ -78,7 +78,7 @@ check: d2k-detect test_port test_tree test_bridge test_threads test_raw
 cross:
 	@if [ -x "$(ZIG)" ]; then \
 	  echo "cross: linux-aarch64"; \
-	  for f in $(SRC) main.c; do \
+	  for f in $(SRC) $(BRIDGE) main.c; do \
 	    $(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -c -o /tmp/d2k-detect-cross.o $$f || exit 1; \
 	  done; \
 	  rm -f /tmp/d2k-detect-cross.o; \
@@ -90,7 +90,7 @@ cross:
 	@# значит не проверить ничего.
 	@if command -v $(MIPSEL_CC) >/dev/null 2>&1; then \
 	  echo "cross: linux-mipsel"; \
-	  for f in $(SRC) main.c; do \
+	  for f in $(SRC) $(BRIDGE) main.c; do \
 	    $(MIPSEL_CC) $(CFLAGS) -c -o /tmp/d2k-detect-mipsel.o $$f || exit 1; \
 	  done; \
 	  rm -f /tmp/d2k-detect-mipsel.o; \

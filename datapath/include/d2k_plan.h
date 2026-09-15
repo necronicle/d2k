@@ -20,7 +20,9 @@
  * раскладку и всё равно не уметь нужного, поэтому полей два. */
 /* Версия 2 добавила защиту потока (D2K_GUARD_*). План, которому она не нужна,
  * по-прежнему объявляет 1 и исполняется где угодно. */
-#define D2K_EXEC_VERSION 2
+/* Version 3: measured input constraints, a distinct fake→truth delay,
+ * and explicit TCP segmentation without shortening the logical payload. */
+#define D2K_EXEC_VERSION 3
 #define D2K_SCHEMA_MAX   1
 
 /* Ширина идентификатора плана — записи REC_ID в TLV.

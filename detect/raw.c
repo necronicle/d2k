@@ -27,6 +27,7 @@
  * при закрытии. Порт из счётчика, правило узкое.
  */
 #include "d2k_detect.h"
+#include "d2k_arm.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -437,7 +438,7 @@ static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
  * ходит настоящий браузер. То есть в продукте — всегда.
  *
  * 1400 — с запасом под PPPoE (1492) и под опции TCP в нашем же заголовке. */
-#define D2K_SEG_MAX 1400
+#define D2K_SEG_MAX D2K_ARM_SEGMENT_MAX
 
 /* send кладёт нагрузку на провод. Номер последовательности НЕ двигается при
  * отравленной посылке: фальшивка обязана занять ту же область, что займут

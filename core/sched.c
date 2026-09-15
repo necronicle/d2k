@@ -1833,7 +1833,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
        бюджет зондов на догадки, имея на руках измеренный ответ. */
     if (r->have_arm && t->n_plans < cap) {
         char text[sizeof t->plans[0]];
-        if (d2k_arm_plan(&r->arm, sh, SCHED_DECOY, s->send_cap, text, sizeof text) == 0) {
+        if (d2k_arm_plan_measured(&r->arm, &r->arm_input, text, sizeof text) == 0) {
             memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
             t->n_plans++;
             say(s, "по %s приём «%s» НАЙДЕН замером — ставлю его первым кандидатом",

@@ -34,7 +34,7 @@ SRC     = meas.c verdict.c crypto.c quicwire.c tls13core.c quicconn.c h3.c quic.
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicprobe.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
-          include/d2k_verify.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
+          include/d2k_verify.h include/d2k_arm.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
 # test_crypto и test_quic стенда не используют вовсе: криптография и разбор
@@ -64,7 +64,7 @@ TESTHDR = test_stand.h
 # по себе, а настоящий бинарник d2kask, запущенный подпроцессом, плюс
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
-TESTS   = test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify
+TESTS   = test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
@@ -372,7 +372,15 @@ test-link: test_link ../datapath/ctlprobe
 test-d2kask: test_d2kask d2kask ../datapath/ctlprobe
 	./test_d2kask
 
-check: all test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify
+check: all test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify test-measured
+
+test_measured: test_measured.c compose.o plantlv.o hello.o meas.o link.o $(HDR) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/plan_internal.h ../datapath/wire.c ../datapath/include/d2k_session.h
+	$(CC) $(CFLAGS) -o $@ test_measured.c compose.o plantlv.o hello.o meas.o link.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+
+test-measured: test_measured
+	./test_measured
+
+.PHONY: test-measured
 
 # Тот же набор под санитайзерами. «Не упало» и «не читало за буфером» — разные
 # утверждения, а оракул держит в руках чужой сокет и чужой ответ на нём.
@@ -388,8 +396,14 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 # сам d2kask здесь пока обычный — эту половину закрывает отдельный блок
 # ниже (D2KASK_BIN), иначе санитайзер проверял бы только ТЕСТ, а не саму
 # утилиту, которую он должен ловить прежде всего.
-san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask
-	@set -e; for t in $(TESTS); do \
+san-measured: hello_profiles.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-test_measured test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread
+	/tmp/d2k-core-san-test_measured
+
+.PHONY: san-measured
+
+san: hello_profiles.inc ../datapath/ctlprobe ../datapath/planlab d2kask san-measured
+	@set -e; for t in $(filter-out test_measured,$(TESTS)); do \
 		echo "== $$t =="; \
 		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c \
 			$$(echo "$(SRC)" | tr ' ' '\n' | grep -v '^$$') -lpthread ; \
@@ -508,14 +522,19 @@ cross: hello_profiles.inc
 		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c hello.c meas.c link.c tls13.c tls13core.c x25519.c crypto.c \
 		-lpthread || exit 1
 	@echo "== d2kc целиком =="
-	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kc-a64 \
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
 		d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c quicconn.c h3.c -lpthread || exit 1
-	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-d2kc-mipsel \
+		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
 		d2kc.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicwire.c quicprobe.c \
 		props.c hello.c catalog.c match.c compose.c link.c volume.c tls13.c tls13core.c x25519.c \
-		verify.c quicconn.c h3.c -lpthread || exit 1
+		verify.c quicconn.c h3.c $(DETECT_SRC) -lpthread || exit 1
+	@echo "== test_measured целиком =="
+	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
+		test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
+	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_measured-mipsel \
+		test_measured.c compose.c plantlv.c hello.c meas.c link.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_d2kask-a64 \
 		test_d2kask.c hello.c link.c -lpthread || exit 1

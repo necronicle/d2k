@@ -34,4 +34,17 @@ typedef struct {
     int         ipidzero;    /* обнулённый идентификатор IP */
 } d2k_arm;
 
+/* Owned measurement input. No borrowed pointers may cross worker results.
+ * Scheduler captures at most 2048 bytes; larger external inputs are an
+ * explicit unsupported conversion, never silently truncated. */
+#define D2K_ARM_DECOY_MAX 2048
+/* Existing raw sender's segment ceiling, shared rather than copied. */
+#define D2K_ARM_SEGMENT_MAX 1400
+typedef struct {
+    size_t trigger_len;
+    size_t sni_off, sni_len;
+    size_t decoy_len;
+    unsigned char decoy[D2K_ARM_DECOY_MAX];
+} d2k_arm_input;
+
 #endif /* D2K_ARM_H */

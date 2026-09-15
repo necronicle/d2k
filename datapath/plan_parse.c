@@ -61,6 +61,10 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             return -1;
         }
 
+        if ((typ == REC_INPUT || typ == REC_SETTLE || typ == REC_SEGMENT) &&
+            rd16(b + 6) < 3) {
+            fail(err, errlen, "измеренный план требует minexec=3"); return -1;
+        }
         switch (typ) {
         case REC_ID:
             if (ln != D2K_PLAN_ID_LEN) { fail(err, errlen, "id не 16 байт"); return -1; }
@@ -93,6 +97,23 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             break;
         case REC_PACE:
             if (ln != 4) { fail(err, errlen, "разнос во времени не 4 байта"); return -1; }
+            break;
+        case REC_INPUT:
+            if (ln != 12 || rd32(b + off) == 0 ||
+                rd32(b + off + 4) > rd32(b + off) ||
+                rd32(b + off + 8) > rd32(b + off) - rd32(b + off + 4)) {
+                fail(err, errlen, "недопустимый контекст измеренного входа"); return -1;
+            }
+            break;
+        case REC_SETTLE:
+            if (ln != 4 || rd32(b + off) == 0) {
+                fail(err, errlen, "недопустимая пауза перед правдой"); return -1;
+            }
+            break;
+        case REC_SEGMENT:
+            if (ln != 4 || !rd32(b + off) || rd32(b + off) > 65535) {
+                fail(err, errlen, "недопустимый размер сегмента"); return -1;
+            }
             break;
         case REC_GUARD:
             if (ln != 1) { fail(err, errlen, "защита не 1 байт"); return -1; }
@@ -326,6 +347,17 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
                выдумкой. */
             p->pace_us = rd32(v);
             break;
+        case REC_INPUT:
+            p->input_len = rd32(v);
+            p->input_sni_off = rd32(v + 4);
+            p->input_sni_len = rd32(v + 8);
+            break;
+        case REC_SETTLE:
+            p->settle_us = rd32(v);
+            break;
+        case REC_SEGMENT:
+            p->segment_size = rd32(v);
+            break;
         case REC_GUARD:
             p->guards = v[0];
             break;
@@ -341,6 +373,11 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
 
     if (check_refs(p, err, errlen) != 0) {
         d2k_plan_free(p);
+        return -1;
+    }
+    if (p->transport != 6 && (p->input_len || p->settle_us || p->segment_size)) {
+        d2k_plan_free(p);
+        fail(err, errlen, "измеренные TCP-операции требуют явного транспорта TCP");
         return -1;
     }
 

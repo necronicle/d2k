@@ -112,6 +112,7 @@ typedef struct {
      * нечем. */
     int         have_arm;
     d2k_arm     arm;
+    d2k_arm_input arm_input;
     char        arm_name[64]; /* owned display name; adapter leaves arm.name NULL */
 } d2k_vres;
 
