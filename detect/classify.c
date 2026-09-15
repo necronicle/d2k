@@ -332,7 +332,7 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
 {
     d2k_span sp[8];
     int nsp, i, fd;
-    static uint8_t buf[4096];
+    uint8_t buf[4096]; /* private to this measurement, not another worker's reply */
     ssize_t n;
     struct pollfd pfd;
     long deadline;

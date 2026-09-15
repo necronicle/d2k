@@ -78,7 +78,8 @@ static int handshake12(const char *host, const char *port, const char *sni,
     int fd = -1, rc = 0;
     int to = resp_timeout(opt);
     long deadline;
-    static uint8_t buf[65536];
+    enum { RESPONSE_CAP = 65536 };
+    uint8_t *buf; /* heap-owned: each handshake has its own partial records */
     size_t have = 0;
     size_t pos = 0;
 
@@ -121,6 +122,8 @@ static int handshake12(const char *host, const char *port, const char *sni,
         return 0;
     }
 
+    buf = malloc(RESPONSE_CAP);
+    if (!buf) { close(fd); return 0; }
     deadline = d2k_now_ms() + to;
     while (d2k_now_ms() < deadline) {
         struct pollfd pfd;
@@ -133,7 +136,7 @@ static int handshake12(const char *host, const char *port, const char *sni,
         if (poll(&pfd, 1, left < 0 ? 0 : left) <= 0) {
             break;
         }
-        n = recv(fd, buf + have, sizeof(buf) - have, 0);
+        n = recv(fd, buf + have, RESPONSE_CAP - have, 0);
         if (n <= 0) {
             break;
         }
@@ -173,11 +176,12 @@ static int handshake12(const char *host, const char *port, const char *sni,
             }
             pos += 5 + rlen;
         }
-        if (have == sizeof(buf)) {
+        if (have == RESPONSE_CAP) {
             break;
         }
     }
 out:
+    free(buf);
     close(fd);
     return rc;
 }

@@ -91,7 +91,10 @@ static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
             size_t hdr_len = (size_t)(end - buf);
             /* Ноль ВНУТРИ заголовков — ответ битый, а не «ещё не всё». */
             if (memchr(buf, 0, hdr_len)) { return 0; }
-            const uint8_t *eol = find_eol(buf, hdr_len);
+            /* With no header fields, the status line's CRLF is the first
+             * half of CRLFCRLF. Include it in the line search, but keep
+             * the body excluded from the header/NUL validation above. */
+            const uint8_t *eol = find_eol(buf, hdr_len + 2);
             if (!eol) { return 0; }
             size_t line_len = (size_t)(eol - buf);
             if (line_len < 13 || memcmp(buf, "HTTP/1.", 7) != 0 ||

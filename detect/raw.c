@@ -33,10 +33,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(D2K_RAW_UNIT_TEST)
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -57,6 +58,13 @@ enum {
 };
 
 typedef struct {
+    uint8_t recv[65535];
+    uint8_t fake[2 * D2K_TRIGGER_MAX];
+    uint8_t seg[D2K_TRIGGER_MAX + 4096];
+    uint8_t resp[8192];
+} raw_buffers;
+
+typedef struct {
     int      send_fd;
     int      recv_fd;
     uint8_t  src[4];
@@ -66,24 +74,37 @@ typedef struct {
     uint32_t seq; /* наш следующий номер */
     uint32_t ack; /* что подтверждаем */
     int      rule_up;
+    /* raw_recv returns a slice which must survive until the next receive
+     * on THIS connection, without being overwritten by another worker. */
+    raw_buffers *buffers; /* heap-owned: do not grow the router worker stack */
 } raw_conn;
 
 /* rstRuleFailed — хоть раз не удалось закрыть ядру рот. Взводится навсегда:
  * один отказ уже делает отрицательные результаты сырых зондов недостоверными. */
 static int g_rst_rule_failed;
-static int g_swept;
 static uint32_t g_sport_counter;
-static int g_seeded;
+static pthread_once_t g_seed_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_sweep_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_raw_state = PTHREAD_MUTEX_INITIALIZER;
 
-int d2k_raw_rst_rule_failed(void) { return g_rst_rule_failed; }
+int d2k_raw_rst_rule_failed(void)
+{
+    int failed;
+    pthread_mutex_lock(&g_raw_state);
+    failed = g_rst_rule_failed;
+    pthread_mutex_unlock(&g_raw_state);
+    return failed;
+}
+
+static void seed_init(void)
+{
+    srandom((unsigned)(d2k_now_ms() ^ (long)getpid()));
+    g_sport_counter = (uint32_t)(random() % 25000);
+}
 
 static void seed_once(void)
 {
-    if (!g_seeded) {
-        g_seeded = 1;
-        srandom((unsigned)(d2k_now_ms() ^ (long)getpid()));
-        g_sport_counter = (uint32_t)(random() % 25000);
-    }
+    pthread_once(&g_seed_once, seed_init);
 }
 
 /* nextSourcePort выдаёт исходный порт для сырого зонда.
@@ -95,9 +116,13 @@ static void seed_once(void)
  * худший вид замера: ошибку в нём не воспроизвести. */
 static uint16_t next_source_port(void)
 {
+    uint16_t port;
     seed_once();
+    pthread_mutex_lock(&g_raw_state);
     g_sport_counter++;
-    return (uint16_t)(30000 + g_sport_counter % 25000);
+    port = (uint16_t)(30000 + g_sport_counter % 25000);
+    pthread_mutex_unlock(&g_raw_state);
+    return port;
 }
 
 /* parseStaleRSTRule — наше ли это правило и на каком порту.
@@ -162,10 +187,6 @@ static void sweep_stale_rst_rules(void)
     FILE *f;
     char line[512];
 
-    if (g_swept) {
-        return;
-    }
-    g_swept = 1;
     f = popen("iptables -S OUTPUT 2>/dev/null", "r");
     if (!f) {
         return;
@@ -194,14 +215,19 @@ static void sweep_stale_rst_rules(void)
 static int suppress_kernel_rst(uint16_t sport)
 {
     char cmd[192];
+    int rc;
     snprintf(cmd, sizeof(cmd),
              "iptables -I OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
              " >/dev/null 2>&1", (unsigned)sport);
-    if (system(cmd) != 0) {
+    /* Old router iptables cannot be relied on to serialize our commands.
+     * Protect only rule edits, not the network lifetime of the probe. */
+    pthread_mutex_lock(&g_raw_state);
+    rc = system(cmd);
+    if (rc != 0) {
         g_rst_rule_failed = 1;
-        return 0;
     }
-    return 1;
+    pthread_mutex_unlock(&g_raw_state);
+    return rc == 0;
 }
 
 static void release_kernel_rst(uint16_t sport)
@@ -210,7 +236,9 @@ static void release_kernel_rst(uint16_t sport)
     snprintf(cmd, sizeof(cmd),
              "iptables -D OUTPUT -p tcp --sport %u --tcp-flags RST RST -j DROP"
              " >/dev/null 2>&1", (unsigned)sport);
+    pthread_mutex_lock(&g_raw_state);
     (void)system(cmd);
+    pthread_mutex_unlock(&g_raw_state);
 }
 
 /* localAddrFor узнаёт, с какого адреса ядро пошло бы к этой цели. */
@@ -277,19 +305,21 @@ static uint16_t checksum(const uint8_t *b, size_t n)
 static uint16_t tcp_checksum(const uint8_t src[4], const uint8_t dst[4],
                              const uint8_t *t, size_t tlen)
 {
-    static uint8_t ph[12 + 65535];
-    if (tlen > 65535) {
+    uint32_t sum;
+    size_t i;
+    if (tlen < 20 || tlen > 65535) {
         return 0;
     }
-    memset(ph, 0, 12);
-    memcpy(ph, src, 4);
-    memcpy(ph + 4, dst, 4);
-    ph[9] = 6; /* IPPROTO_TCP */
-    wr16(ph + 10, (uint16_t)tlen);
-    memcpy(ph + 12, t, tlen);
-    ph[12 + 16] = 0;
-    ph[12 + 17] = 0;
-    return checksum(ph, 12 + tlen);
+    /* Same pseudo-header checksum, without a shared 64 KiB scratch array
+     * or an equally large stack allocation. Skip TCP's checksum word. */
+    sum = (uint32_t)rd16(src) + rd16(src + 2) + rd16(dst) + rd16(dst + 2)
+          + 6u + (uint32_t)tlen;
+    for (i = 0; i + 1 < tlen; i += 2) {
+        if (i != 16) { sum += rd16(t + i); }
+    }
+    if (tlen & 1u) { sum += (uint32_t)t[tlen - 1] << 8; }
+    while (sum >> 16) { sum = (sum & 0xffffu) + (sum >> 16); }
+    return (uint16_t)~sum;
 }
 
 /* buildIPv4TCP собирает пакет целиком. Контрольные суммы считаем сами: ядро
@@ -426,7 +456,7 @@ static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
 static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
                     uint8_t flags, const d2k_poison *p)
 {
-    static uint8_t pkt[2048];
+    uint8_t pkt[2048];
     uint32_t seq = c->seq;
     size_t off = 0;
 
@@ -466,7 +496,7 @@ static int raw_send_syn(raw_conn *c)
         1,                              /* NOP */
         3, 3, 7                         /* window scale 7 */
     };
-    static uint8_t pkt[256];
+    uint8_t pkt[256];
     d2k_poison none;
     size_t n;
 
@@ -483,9 +513,9 @@ static int raw_send_syn(raw_conn *c)
 static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
                     const uint8_t **payload, size_t *plen)
 {
-    static uint8_t buf[65535];
+    uint8_t *buf = c->buffers->recv;
     for (;;) {
-        ssize_t n = recvfrom(c->recv_fd, buf, sizeof(buf), 0, NULL, NULL);
+        ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0, NULL, NULL);
         size_t ihl, off;
         const uint8_t *t;
         size_t tlen;
@@ -552,14 +582,16 @@ static void raw_close(raw_conn *c)
         release_kernel_rst(c->sport);
         c->rule_up = 0;
     }
-    if (c->send_fd > 0) {
+    if (c->send_fd >= 0) {
         close(c->send_fd);
         c->send_fd = -1;
     }
-    if (c->recv_fd > 0) {
+    if (c->recv_fd >= 0) {
         close(c->recv_fd);
         c->recv_fd = -1;
     }
+    free(c->buffers);
+    c->buffers = NULL;
 }
 
 static int raw_handshake(raw_conn *c, int timeout_ms, char *err, size_t errcap)
@@ -620,10 +652,16 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
         snprintf(err, errcap, "classify: не удалось определить свой адрес");
         return -1;
     }
+    c->buffers = malloc(sizeof(*c->buffers));
+    if (!c->buffers) {
+        snprintf(err, errcap, "classify: нет памяти для буферов сырого зонда");
+        return -1;
+    }
     c->send_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (c->send_fd < 0) {
         snprintf(err, errcap, "classify: сырой сокет на отправку (нужен root): %s",
                  strerror(errno));
+        raw_close(c);
         return -1;
     }
     /* МЕТКА, ОТКЛЮЧАЮЩАЯ НАШ ЖЕ ОБХОД. Замер обязан идти по СЫРОМУ пути,
@@ -647,7 +685,9 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
 
     /* Подметаем один раз за прогон, а не перед каждым зондом: зондов сотни, а
      * разбор таблицы стоит вызова iptables. */
-    sweep_stale_rst_rules();
+    /* Other workers must wait for cleanup to finish before creating rules;
+     * otherwise first-use cleanup can delete a new worker's live rule. */
+    pthread_once(&g_sweep_once, sweep_stale_rst_rules);
     c->sport = next_source_port();
     seed_once();
     c->seq = (uint32_t)random();
@@ -664,7 +704,7 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
  * Сервер по RFC 793 изымает такой байт из потока, коробка — обычно нет. */
 static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
 {
-    static uint8_t pkt[256];
+    uint8_t pkt[256];
     d2k_poison none;
     size_t n;
     uint8_t *t;
@@ -721,9 +761,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, char *err, size_t errcap)
 {
-    static uint8_t fake[2 * D2K_TRIGGER_MAX];
-    static uint8_t seg[D2K_TRIGGER_MAX + 4096];
-    static uint8_t resp[8192];
+    uint8_t *fake, *seg, *resp;
     raw_conn c;
     d2k_poison none;
     uint32_t base;
@@ -735,6 +773,9 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     if (raw_dial(&c, ip4, port, timeout_ms, mark, err, errcap) != 0) {
         return -1;
     }
+    fake = c.buffers->fake;
+    seg = c.buffers->seg;
+    resp = c.buffers->resp;
 
     /* ШАГ 1: фальшивка в ту же область последовательности, что займёт правда.
      *
@@ -752,8 +793,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
         size_t flen = n * 2;
         int reps = p->repeats < 1 ? 1 : p->repeats;
         int i;
-        if (flen > sizeof(fake)) {
-            flen = sizeof(fake);
+        if (flen > sizeof(c.buffers->fake)) {
+            flen = sizeof(c.buffers->fake);
         }
         memset(fake, 0x0f, flen);
         if (p->decoy && p->decoy_len > 0) {
@@ -811,7 +852,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
             goto senderr;
         }
         c.seq = base + (uint32_t)n + 1;
-        if (raw_read_payload(&c, timeout_ms, resp, sizeof(resp), &resp_len) != 0) {
+        if (raw_read_payload(&c, timeout_ms, resp, sizeof(c.buffers->resp), &resp_len) != 0) {
             raw_close(&c);
             return 0;
         }
@@ -837,8 +878,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
             goto senderr;
         }
         flen = n - mid;
-        if (flen > sizeof(fake)) {
-            flen = sizeof(fake);
+        if (flen > sizeof(c.buffers->fake)) {
+            flen = sizeof(c.buffers->fake);
         }
         memset(fake, 0x0f, flen);
         memset(&fp, 0, sizeof(fp));
@@ -882,8 +923,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
             goto senderr;
         }
         d2k_sleep_ms(12);
-        if (ov + 1 > sizeof(seg)) {
-            ov = sizeof(seg) - 1;
+        if (ov + 1 > sizeof(c.buffers->seg)) {
+            ov = sizeof(c.buffers->seg) - 1;
         }
         memset(seg, 0x0f, ov);
         if (p->decoy && p->decoy_len > 0) {
@@ -899,8 +940,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
         /* Внахлёст слева: один сегмент с номером base-N, где первые N байт —
          * приманка. Сервер подрежет левый край окна и возьмёт правду. */
         size_t ov = (size_t)p->seqovl;
-        if (ov + n > sizeof(seg)) {
-            ov = sizeof(seg) - n;
+        if (ov + n > sizeof(c.buffers->seg)) {
+            ov = sizeof(c.buffers->seg) - n;
         }
         memset(seg, 0x0f, ov);
         if (p->decoy && p->decoy_len > 0) {
@@ -953,7 +994,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     }
     c.seq = base + (uint32_t)n;
 
-    if (raw_read_payload(&c, timeout_ms, resp, sizeof(resp), &resp_len) != 0) {
+    if (raw_read_payload(&c, timeout_ms, resp, sizeof(c.buffers->resp), &resp_len) != 0) {
         raw_close(&c);
         return 0;
     }

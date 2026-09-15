@@ -84,6 +84,8 @@ static const struct {
     {"HTTP/1.1 999 Invalid\r\n\r\n", 0, 0},
     {"HTTP/1.0 403 Forbidden\r\n\r\n", 403, 0},
     {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, 0},
+    {"HTTP/1.1 204 No Content\r\n\r\n", 204, 10},
+    {"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", 204, 0},
 };
 
 struct stand {
@@ -724,6 +726,10 @@ int main(void) {
         uint16_t port = stand_start(&s, ROLE_APP + (int)i);
         CHECK(port != 0, "HTTP-стенд не поднялся");
         d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "http.example", 600, 0);
+        if (r.status != replies[i].status) {
+            fprintf(stderr, "HTTP case %zu: expected %d, got %d (level %d): %s\n",
+                    i, replies[i].status, r.status, (int)r.level, r.reason);
+        }
         CHECK(r.status == replies[i].status, "неверный статус HTTP на граничном ответе");
         CHECK((r.level == D2K_VER_APPLICATION) == (replies[i].status != 0),
               "фрагмент или промежуточный ответ засчитан как окончательный HTTP");

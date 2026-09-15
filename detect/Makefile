@@ -11,6 +11,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../core/include -I../datapath/include
 LDFLAGS ?=
+LDLIBS  ?= -lpthread
 
 ZIG        ?= /opt/homebrew/bin/zig
 MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
@@ -38,22 +39,34 @@ main.o: main.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 d2k-detect: main.o $(OBJ) ../core/hello.o
-	$(CC) $(CFLAGS) -o $@ main.o $(OBJ) ../core/hello.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ main.o $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
 
 test_port: test_port.c $(OBJ) ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_port.c $(OBJ) ../core/hello.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ test_port.c $(OBJ) ../core/hello.o $(LDFLAGS) $(LDLIBS)
 
 # Стенд поднимает поддельную коробку в отдельном потоке; самому измерителю
 # потоки не нужны, поэтому pthread — только у этой линковки.
 test_tree: test_tree.c $(OBJ) ../core/hello.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_tree.c $(OBJ) ../core/hello.o $(LDFLAGS) -lpthread
 
+test_bridge: test_bridge.c bridge.o poison.o ../core/hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_bridge.c bridge.o poison.o ../core/hello.o $(LDFLAGS) -lpthread
+
+test_threads: test_threads.c poison.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_threads.c poison.o $(LDFLAGS) -lpthread
+
+test_raw: test_raw.c raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+
 bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-check: d2k-detect test_port test_tree bridge.o
+check: d2k-detect test_port test_tree test_bridge test_threads test_raw
 	./test_port
 	./test_tree
+	./test_bridge
+	./test_threads
+	./test_raw
 
 # Кросс-проверка: Linux-ветка сырого слоя на маке не компилируется вовсе,
 # и без неё опечатка там доехала бы до роутера незамеченной.
@@ -86,7 +99,7 @@ cross:
 	fi
 
 clean:
-	rm -f *.o d2k-detect test_port test_tree
+	rm -f *.o d2k-detect test_port test_tree test_bridge test_threads test_raw
 
 FORCE:
 
@@ -98,5 +111,5 @@ d2k-detect-linux-arm64:
 	$(MAKE) -C ../core hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../core -static \
-		-o $(BUILDDIR)/d2k-detect-linux-arm64 main.c $(SRC) ../core/hello.c
+		-o $(BUILDDIR)/d2k-detect-linux-arm64 main.c $(SRC) ../core/hello.c $(LDLIBS)
 	@ls -l $(BUILDDIR)/d2k-detect-linux-arm64

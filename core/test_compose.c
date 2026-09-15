@@ -412,8 +412,12 @@ static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_p
                                 int *out_c) {
     struct sockaddr_in pa;
     socklen_t pl = sizeof pa;
+    struct pollfd pfd = {s->listen_fd, POLLIN, 0};
+    if (poll(&pfd, 1, 5000) <= 0) { return -1; }
     int c = accept(s->listen_fd, (struct sockaddr *)&pa, &pl);
     if (c < 0) { return -1; }
+    struct timeval tv = {5, 0};
+    (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     memcpy(peer_ip, &pa.sin_addr, 4);
     *peer_port = ntohs(pa.sin_port);
     uint8_t buf[4096];
@@ -449,10 +453,12 @@ static int peer_closed(int c) {
    раскодирует hex перед отправкой (link.c: hex_decode в g_scratch). План
    начинается заголовком 12 байт, следом запись REC_ID: тип(2)+длина(2)+
    16 байт значения. 0 — нашли, -1 — тело короче ожидаемого. */
-static int plan_id_from_setname(const uint8_t *body, size_t len,
+static int plan_id_from_setname(uint16_t kind, const uint8_t *body, size_t len,
                                 uint8_t out[D2K_PLAN_ID_LEN]) {
     if (len < 1) { return -1; }
+    if (kind != D2K_CMD_SET_NAME && kind != D2K_CMD_SET_NAME_PROBE) { return -1; }
     size_t off = (size_t)2 + body[0] + 12 + 4;   /* +1 байт формы приветствия */
+    if (kind == D2K_CMD_SET_NAME_PROBE) { off += 2; } /* reserved probe port */
     if (off + D2K_PLAN_ID_LEN > len) { return -1; }
     memcpy(out, body + off, D2K_PLAN_ID_LEN);
     return 0;
@@ -461,7 +467,8 @@ static int plan_id_from_setname(const uint8_t *body, size_t len,
 /* Как drain_one_command, но СОХРАНЯЕТ тело: поддельному концу связи нужен
    идентификатор плана, чтобы ответить «применён» тем же ID, каким вопрос
    ушёл на провод. Без этого испытание проверяло бы только ключ потока. */
-static int drain_one_command_body(int fd, uint8_t *body, size_t cap, size_t *out_len) {
+static int drain_one_command_body(int fd, uint8_t *body, size_t cap, size_t *out_len,
+                                   uint16_t *kind) {
     uint8_t hdr[6];
     size_t got = 0;
     while (got < sizeof hdr) {
@@ -472,6 +479,7 @@ static int drain_one_command_body(int fd, uint8_t *body, size_t cap, size_t *out
     uint32_t plen = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
                     (uint32_t)hdr[2] << 8 | hdr[3];
     if (plen < 2) { return -1; }
+    *kind = (uint16_t)((uint16_t)hdr[4] << 8 | hdr[5]);
     size_t remaining = (size_t)plen - 2;
     size_t have = 0;
     uint8_t sink[4096];
@@ -594,12 +602,16 @@ typedef struct {
 
 static void *fakeend_run(void *arg) {
     fakeend_args *a = (fakeend_args *)arg;
+    /* A protocol regression must fail a test, not hang pthread_join forever. */
+    struct timeval tv = {5, 0};
+    (void)setsockopt(a->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     for (size_t i = 0; i < a->n; i++) {
         uint8_t cmd[4096]; size_t cmdlen = 0;
         uint8_t qid[D2K_PLAN_ID_LEN];
-        if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen) != 0) { return NULL; }
-        int have_id = (plan_id_from_setname(cmd, cmdlen, qid) == 0);
-        send_ack_ok(a->fd, D2K_CMD_SET_NAME);
+        uint16_t kind;
+        if (drain_one_command_body(a->fd, cmd, sizeof cmd, &cmdlen, &kind) != 0) { return NULL; }
+        int have_id = (plan_id_from_setname(kind, cmd, cmdlen, qid) == 0);
+        send_ack_ok(a->fd, kind);
 
         uint8_t peer_ip[4]; uint16_t peer_port = 0;
         int peer_c = -1;

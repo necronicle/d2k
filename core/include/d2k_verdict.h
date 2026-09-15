@@ -112,7 +112,7 @@ typedef struct {
      * нечем. */
     int         have_arm;
     d2k_arm     arm;
-    char        arm_name[64]; /* имя плеча для журнала; arm.name указывает сюда */
+    char        arm_name[64]; /* owned display name; adapter leaves arm.name NULL */
 } d2k_vres;
 
 /* Задаёт вопросы дерева по порядку и выносит вердикт.

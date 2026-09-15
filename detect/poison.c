@@ -9,6 +9,7 @@
 #include "d2k_detect.h"
 
 #include <stdarg.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,7 @@ int d2k_poison_has_fake(const d2k_poison *p)
 #define POISON_CAP 128
 static d2k_poison g_poisons[POISON_CAP];
 static int g_npoisons;
+static pthread_once_t g_poisons_once = PTHREAD_ONCE_INIT;
 
 static d2k_poison *add(const char *fmt, ...)
 {
@@ -41,7 +43,7 @@ static d2k_poison *add(const char *fmt, ...)
     return p;
 }
 
-const d2k_poison *d2k_poisons(int *n)
+static void init_poisons(void)
 {
     static const int rr[3] = {7, 4, 2};
     static const int ov3[3] = {1, 336, 681};
@@ -52,11 +54,6 @@ const d2k_poison *d2k_poisons(int *n)
     static const int dttls[3] = {62, 58, 50};
     d2k_poison *p;
     int i, j;
-
-    if (g_npoisons > 0) {
-        *n = g_npoisons;
-        return g_poisons;
-    }
 
     /* ПОРЯДОК — ЭТО СТОИМОСТЬ. Перекрытие в один байт (facebook), разнесённые
      * дубликаты (YouTube, googlevideo) и плотная семёрка — первыми. */
@@ -135,6 +132,13 @@ const d2k_poison *d2k_poisons(int *n)
     p = add("badsum+ipid");  p->badsum = 1; p->ip_id_zero = 1;
     p = add("badsum+hello"); p->badsum = 1; p->decoy_hello = 1;
 
+}
+
+const d2k_poison *d2k_poisons(int *n)
+{
+    /* Publish only a complete immutable list. An in-progress count is not
+     * an initialization flag when several scheduler workers enter here. */
+    pthread_once(&g_poisons_once, init_poisons);
     *n = g_npoisons;
     return g_poisons;
 }

@@ -50,9 +50,19 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
         snprintf(why, whycap, "опция TCP-MD5 языком плана не выражается");
         return -1;
     }
-    a->name         = p->name;
+    /* The result crosses worker threads by value. Keep its display name
+     * in d2k_vres.arm_name, not as a pointer into res.hit/the bridge stack. */
+    a->name         = NULL;
+    if (p->seq_shift != 0 && p->seq_shift != -66000) {
+        snprintf(why, whycap, "сдвиг TCP seq %d не выражается флагом seq_out",
+                 (int)p->seq_shift);
+        return -1;
+    }
     a->badsum       = p->badsum;
     a->repeats      = p->repeats > 0 ? (unsigned)p->repeats : 0u;
+    /* In the original, TTL/seq-shift alone also send a fake (one by
+     * default). The Plan builder needs this explicitly to emit its body. */
+    if (a->repeats == 0 && d2k_poison_has_fake(p)) { a->repeats = 1; }
     a->gap_ms       = p->gap_ms > 0 ? (unsigned)p->gap_ms : 0u;
     a->disorder     = p->disorder;
     a->between      = p->fake_between;
@@ -132,10 +142,12 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
         opt.control.len = control.len;
         opt.control.accept = D2K_ACCEPT_TLSRECORD;
         snprintf(opt.control.name, sizeof(opt.control.name), "control");
-        /* Поручительство даёт ВЫЗЫВАЮЩИЙ: он отвечает за то, что это имя
-         * реально обслуживается этим сервером (см. d2k_verdict.h). Только
-         * тогда молчание контроля означает блок по адресу. */
-        opt.control_vouched = 1;
+        /* Scheduler builds this automatically (currently disk.rzd.ru).
+         * Supplying bytes does NOT promise that this target serves that
+         * name. Match the original's automatic ControlTrigger path: a
+         * silent unvouched control cannot prove an address block. The
+         * scheduler hook carries no explicit operator-vouch argument. */
+        opt.control_vouched = 0;
     }
 
     opt.repeats = repeats;
@@ -163,7 +175,6 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
         char why[160];
         if (d2k_arm_from_poison(&res.hit, &out.arm, why, sizeof(why)) == 0) {
             snprintf(out.arm_name, sizeof(out.arm_name), "%s", res.hit.name);
-            out.arm.name = out.arm_name;
             out.have_arm = 1;
         } else {
             /* Молчать об этом нельзя: иначе «плана нет» читается как «коробку
