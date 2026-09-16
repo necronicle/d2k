@@ -98,6 +98,12 @@ typedef struct {
 
 typedef struct d2k_session d2k_session;
 
+uint64_t d2k_session_plan_revision(const d2k_session *s);
+int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);
+/* Accounting/capture for originals released without intervention. Never
+ * applies a plan or emits an APPLIED event. TCP-only hold rollback path. */
+void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_t now);
+
 /* Объявляет поток ИСПОРЧЕННЫМ: часть плана ушла на провод, остаток не ушёл.
  *
  * Отдельно от d2k_session_unsent, потому что это разные факты: там «посылка не

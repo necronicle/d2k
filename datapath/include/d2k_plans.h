@@ -196,4 +196,11 @@ size_t d2k_plantab_shape_misses(const d2k_plantab *t);
 size_t d2k_plantab_count(const d2k_plantab *t);
 size_t d2k_plantab_capacity(const d2k_plantab *t);
 
+uint64_t d2k_plantab_revision(const d2k_plantab *t);
+/* Conservative buffering prefilter, NOT permission to execute. Unknown SNI
+ * may match a name entry; known SNI and probe port never widen their scope.
+ * Full lookup including measured shape remains mandatory after assembly. */
+int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
+                                size_t len, uint32_t addr_be, uint16_t sport_be);
+
 #endif /* D2K_PLANS_H */

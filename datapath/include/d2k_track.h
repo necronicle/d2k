@@ -118,6 +118,8 @@ struct d2k_flow {
     /* Snapshot delivered or rejected; completed flows consume no assembly
        slot and retransmissions cannot publish another snapshot. */
     int      hello_capture_done;
+    uint32_t syn_seq;
+    int      stream_attempted;
 
     /* Признаки для обнаружения подозрений. Это НАБЛЮДЕНИЯ, а не диагноз:
      * §2.4 говорит, что таймаут не доказывает блокировку, а промах не

@@ -435,6 +435,11 @@ uint8_t d2k_plan_transport(const d2k_plan *p) {
     return p ? p->transport : 0;
 }
 
+int d2k_plan_stream_input(const d2k_plan *p) {
+    return p && p->transport == 6 && p->wire_profile == 1 &&
+           (p->input_tls || p->input_len);
+}
+
 const uint8_t *d2k_plan_id(const d2k_plan *p) {
     /* Указатель внутрь плана, а не копия: живёт он ровно столько же, сколько
        сам план, а на пакетном пути копировать шестнадцать байт ради возврата

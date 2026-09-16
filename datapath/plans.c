@@ -57,6 +57,7 @@ typedef struct {
  * не наложение структуры на чужую память (см. d2k_track.h про то, где такое
  * наложение запрещено и почему). */
 struct d2k_plantab {
+    uint64_t revision;
     /* Сколько раз запись НАШЛАСЬ, но не подошла по форме приветствия. */
     size_t   shape_misses;
     entry *v;
@@ -113,6 +114,22 @@ static int name_eq(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
         }
     }
     return 1;
+}
+
+uint64_t d2k_plantab_revision(const d2k_plantab *t) { return t ? t->revision : 0; }
+
+int d2k_plantab_stream_candidate(const d2k_plantab *t, const uint8_t *name,
+                                size_t len, uint32_t addr_be, uint16_t sport_be) {
+    if (!t) { return 0; }
+    for (size_t i = 0; i < t->used; i++) {
+        const entry *e = &t->v[i];
+        if (!d2k_plan_stream_input(e->plan) ||
+            (e->only_sport && e->only_sport != sport_be)) { continue; }
+        if (e->kind == KEY_ADDR && e->addr_be == addr_be) { return 1; }
+        if (e->kind == KEY_NAME &&
+            (!name || !len || name_eq(e->name, e->name_len, name, len))) { return 1; }
+    }
+    return 0;
 }
 
 /* used, не cap — см. инвариант уплотнения в шапке файла. */
@@ -247,6 +264,7 @@ int d2k_plantab_set_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
         d2k_plan_free(p);
         return -2;
     }
+    t->revision++;
     /* Своя запись на КАЖДУЮ ИЗМЕРЕННУЮ форму этого имени — см.
        find_name_shape выше. Прежде запись была одна на имя, и вторая
        привязка (например, QUIC) затирала первую (TCP).
@@ -305,6 +323,7 @@ int d2k_plantab_set_addr(d2k_plantab *t, uint32_t addr_be, uint64_t now_ns,
         d2k_plan_free(p);
         return -2;
     }
+    t->revision++;
     entry *e = find_addr(t, addr_be);
     if (!e) {
         e = take_free_or_evict(t);
@@ -334,6 +353,7 @@ static int drop(d2k_plantab *t, entry *e) {
     if (!e) {
         return 0;
     }
+    t->revision++;
     d2k_plan_free(e->plan);
     entry *last = &t->v[t->used - 1];
     if (e != last) {

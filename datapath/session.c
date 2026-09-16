@@ -18,6 +18,7 @@
 #include "d2k_time.h"
 #include "d2k_tls.h"
 #include "d2k_capture.h"
+#include "d2k_hold.h"
 
 /* Сколько первых пакетов потока имеет смысл разбирать в поисках приветствия.
  * ClientHello приходит первым или почти первым; после этого разбор — чистая
@@ -58,6 +59,7 @@ struct d2k_session {
      * остальные без проверки. Он существует для опытов, где сужение задано
      * снаружи правилом firewall на одну пару адресов. */
     d2k_plan    *plan;
+    uint64_t plan_revision;
     d2k_journal *jrn;
     uint64_t     applied;
     /* Планы, ДОИСПОЛНЕННЫЕ целиком: все посылки ушли и вердикт оригинала
@@ -189,6 +191,7 @@ void d2k_session_set_plan(d2k_session *s, d2k_plan *p) {
     }
     d2k_plan_free(s->plan);
     s->plan = p;
+    s->plan_revision++;
 }
 
 /* Сравнение имени цели без учёта регистра. Своя функция, а не strncasecmp:
@@ -873,9 +876,9 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     d2k_actions_free(&acts);
 }
 
-int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
+static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                        uint64_t now_ns, uint8_t *buf, size_t bufcap,
-                       d2k_result *out) {
+                       d2k_result *out, int observe_only) {
     if (!out) {
         return 0;
     }
@@ -909,7 +912,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
            handle_udp, СВОИМ порогом (8 байт UDP, а не унаследованным TCP-20:
            см. ревью задачи 4 — короткая, но честная UDP-датаграмма получала
            TCP-объяснение «заголовок не помещается» ровно из-за этого). */
-        handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out);
+        if (!observe_only) { handle_udp(s, pkt, len, ihl, now_ns, buf, bufcap, out); }
         return 0;
     }
     if (pkt[9] != 6) {
@@ -1048,6 +1051,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     if (syn && !ack) {
         if (!fl->saw_syn) {
             fl->syn_ns = now_ns;
+            fl->syn_seq = rd32(t + 4);
         }
         fl->saw_syn = 1;
     }
@@ -1270,6 +1274,11 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             fl->hello_capture_done = 1;
             d2k_capture_forget(&s->capture, &key);
         }
+    }
+
+    if (observe_only) {
+        out->skipped = "оригинал отпущен без воздействия";
+        return 0;
     }
 
     /* ПОВРЕЖДЁННЫЙ ПОТОК — РАНЬШЕ ВЫБОРА ПЛАНА И БЕЗ ОГЛЯДКИ НА ПРИВЕТСТВИЕ.
@@ -1507,6 +1516,43 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
 
     d2k_actions_free(&acts);
     return 0;
+}
+
+int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
+                       uint64_t now_ns, uint8_t *buf, size_t bufcap, d2k_result *out) {
+    return session_packet(s, pkt, len, now_ns, buf, bufcap, out, 0);
+}
+
+void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_t now) {
+    d2k_result out;
+    (void)session_packet(s, p, n, now, NULL, 0, &out, 1);
+}
+
+uint64_t d2k_session_plan_revision(const d2k_session *s) {
+    return s ? s->plan_revision + d2k_plantab_revision(s->plans) : 0;
+}
+
+int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
+    d2k_hold_info v;
+    if (!s || !d2k_hold_parse(p, n, &v) || !v.payload || p[v.header] != 22 ||
+        (v.flags & ~0x18) || !(v.flags & 0x10)) { return 0; }
+    if (v.payload >= 5 && 5u + rd16(p + v.header + 3) <= v.payload) { return 0; }
+    d2k_flow *fl = d2k_track_find(s->flows, &v.key);
+    /* Do not retain a tail of an already-passed stream or guess direction.
+       Only a first payload anchored by the observed client SYN qualifies. */
+    if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
+        fl->saw_hello || fl->stream_attempted || fl->damaged ||
+        v.seq != fl->syn_seq + 1) { return 0; }
+    d2k_tls_info tls;
+    d2k_tls_parse(p + v.header, v.payload, &tls);
+    int candidate = d2k_plan_stream_input(s->plan) ||
+        d2k_plantab_stream_candidate(s->plans,
+            tls.have_sni ? p + v.header + tls.sni_off : NULL,
+            tls.have_sni ? tls.sni_len : 0, v.dst_be, v.sport_be);
+    /* Also mark a failed capacity attempt: its head must not be held later
+       after we have already released it unchanged. */
+    if (candidate) { fl->stream_attempted = 1; }
+    return candidate;
 }
 
 int d2k_session_want_shape(d2k_session *s, const uint8_t *name, size_t len,

@@ -36,6 +36,7 @@
 #include "d2k_sched.h"
 #include "d2k_session.h"
 #include "d2k_time.h"
+#include "d2k_hold.h"
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -150,6 +151,25 @@ static struct {
     uint64_t recv_err;
 } st;
 
+typedef struct { d2k_session *sess; d2k_nfq *q; } hold_context;
+static d2k_hold *holding;
+static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
+    hold_context *c = ctx;
+    char err[256];
+    int rc = d2k_nfq_verdict(c->q, id, verdict, err, sizeof err);
+    if (rc != 0) {
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: вердикт оригинала %u: %s\n", id, err);
+    }
+    if (verdict == D2K_NF_DROP) { st.dropped++; } else { st.accepted++; }
+    return rc;
+}
+static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
+    hold_context *c = ctx;
+    d2k_session_observe_tcp(c->sess, p, n, now_ns());
+    (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
+}
+
 static const char *MODE_NAMES[] = {"observe", "apply"};
 enum { MODE_OBSERVE = 0, MODE_APPLY = 1 };
 
@@ -208,6 +228,12 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            secs ? cpu_ms / (secs * 10) : 0,
            secs ? (cpu_ms * 10 / secs) % 100 : 0,
            rss_kb);
+    d2k_hold_stats hs;
+    d2k_hold_get_stats(holding, &hs);
+    printf("составной вход: начато=%" PRIu64 " собрано=%" PRIu64
+           " отпущено=%" PRIu64 " таймаутов=%" PRIu64 " отказов ёмкости=%" PRIu64
+           " ожидающих пакетов=%zu\n", hs.started, hs.ready, hs.released,
+           hs.timed_out, hs.full, hs.pending);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
@@ -589,6 +615,11 @@ int main(int argc, char **argv) {
        провод ничего не пойдёт, и резать по длине нечего. */
     cx.send_maxlen = raw ? (uint32_t)d2k_raw_maxlen(raw) : 0;
     uint64_t events_seen = 0;
+    holding = mode == MODE_APPLY ? d2k_hold_new() : NULL;
+    if (mode == MODE_APPLY && !holding) {
+        fprintf(stderr, "d2kd: нет памяти для составного входа — пакеты не удерживаются\n");
+    }
+    hold_context hc = {sess, q};
 
     static uint8_t rbuf[RECV_BUF];
     static uint8_t obuf[OUT_BUF];
@@ -622,6 +653,8 @@ int main(int argc, char **argv) {
            округлялись бы вверх на его величину. */
         uint64_t wake = t + 200 * NS_PER_MS;      /* потолок ожидания: 200 мс */
         uint64_t due = d2k_sched_next_ns(sched);
+        if (due && due < wake) { wake = due; }
+        due = d2k_hold_next(holding);
         if (due && due < wake) { wake = due; }
         if (next_stats && next_stats < wake) { wake = next_stats; }
         if (next_expire < wake) { wake = next_expire; }
@@ -671,11 +704,16 @@ int main(int argc, char **argv) {
             d2k_ctl_flush(ctl);
         }
 
+        d2k_hold_flush(holding, now_ns(), d2k_session_plan_revision(sess), 0,
+                        release_original, &hc);
         if (pr > 0 && (pfd[iq].revents & POLLIN)) {
             ssize_t n = d2k_nfq_recv(q, rbuf, sizeof rbuf, err, sizeof err);
             if (n == -1) {
                 st.recv_err++;
                 fprintf(stderr, "d2kd: %s\n", err);
+                d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
+            } else if (n == -2) {
+                d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
             } else if (n > 0) {
                 t = now_ns();
                 d2k_nl_iter it;
@@ -704,6 +742,20 @@ int main(int argc, char **argv) {
 
                     st.seen++;
                     st.bytes += np.payload_len;
+
+                    d2k_hold_batch batch;
+                    memset(&batch, 0, sizeof batch);
+                    if (holding && np.have_payload && !np.truncated) {
+                        int hr = d2k_hold_feed(holding, np.id, np.payload, np.payload_len,
+                            t, d2k_session_plan_revision(sess),
+                            d2k_session_hold_candidate(sess, np.payload, np.payload_len),
+                            release_original, &hc, &batch);
+                        if (hr == 1) { continue; } /* ID still held or already released */
+                        if (hr == 2) {
+                            np.payload = batch.packet;
+                            np.payload_len = batch.len;
+                        }
+                    }
 
                     uint32_t verdict = D2K_NF_ACCEPT;
                     d2k_result res;
@@ -868,8 +920,10 @@ int main(int argc, char **argv) {
                         }
                     }
 
-                    if (d2k_nfq_verdict(q, np.id, verdict, err, sizeof err) != 0) {
-                        st.verdict_fail++;
+                    const uint32_t *original_ids = batch.count ? batch.ids : &np.id;
+                    size_t original_count = batch.count ? batch.count : 1;
+                    if (d2k_hold_verdicts(original_ids, original_count, verdict,
+                                           send_original_verdict, &hc) != 0) {
                         if (res.applied && mode == MODE_APPLY) {
                             /* Возврат игнорируется намеренно: вердикт ядру не
                                дошёл, отпускать оригинал уже нечем. */
@@ -879,11 +933,6 @@ int main(int argc, char **argv) {
                         }
                     } else if (res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
-                    }
-                    if (verdict == D2K_NF_DROP) {
-                        st.dropped++;
-                    } else {
-                        st.accepted++;
                     }
                 }
             }
@@ -973,12 +1022,31 @@ int main(int argc, char **argv) {
         }
     }
 
+    d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
+    /* Originals already committed by completed groups cannot be replayed
+       on shutdown. Explicitly fail their remaining queued sends; never let
+       freeing the queue silently leave an execution waiting for DONE. */
+    {
+        size_t slen;
+        d2k_key skey;
+        uint64_t execution;
+        while (d2k_sched_pop_due_serial(sched, UINT64_MAX, sbuf, sizeof sbuf,
+                                        &slen, &skey, &execution)) {
+            if (skey.proto && d2k_session_send_pending(sess, &skey, execution)) {
+                (void)d2k_session_exec_failed(sess, now_ns(), &skey, NULL,
+                    D2K_REFUSE_QUEUE, execution, 0, 1);
+            }
+            st.stale_deferred++;
+        }
+    }
     printf("\n=== итог d2kd[%ld] ===\n", (long)getpid());
     print_stats(sess, sched, q, raw, now_ns() - start);
     print_journal(sess, start);
 
     d2k_ctl_close(ctl);
     d2k_sched_free(sched);
+    d2k_hold_free(holding);
+    holding = NULL;
     d2k_session_free(sess);
     d2k_nfq_close(q);
     d2k_raw_close(raw);
