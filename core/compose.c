@@ -1456,10 +1456,19 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
  * original sender's 0x0f padding without allocating huge task text buffers. */
 static int measured_payload(char *buf, size_t cap, size_t *pos, unsigned id,
                              size_t len, const uint8_t *prefix, size_t prefix_len) {
-    if (append_fmt(buf, cap, pos, "payload-pad %u %zu 15", id, len)) { return -1; }
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (append_fmt(buf, cap, pos, "payload-pad64 %u %zu 15", id, len)) { return -1; }
     if (prefix_len > len) { prefix_len = len; } /* raw sender's memcpy(min(...)) */
     if (prefix_len) {
-        if (append_fmt(buf, cap, pos, " ") || append_hex(buf, cap, pos, prefix, prefix_len)) { return -1; }
+        if (append_fmt(buf, cap, pos, " ")) { return -1; }
+        for (size_t i = 0; i < prefix_len; i += 3) {
+            size_t left = prefix_len - i;
+            uint32_t v = (uint32_t)prefix[i] << 16;
+            if (left > 1) { v |= (uint32_t)prefix[i + 1] << 8; }
+            if (left > 2) { v |= prefix[i + 2]; }
+            if (append_fmt(buf, cap, pos, "%c%c%c%c", b64[v >> 18], b64[(v >> 12) & 63],
+                left > 1 ? b64[(v >> 6) & 63] : '=', left > 2 ? b64[v & 63] : '=')) { return -1; }
+        }
     }
     return append_fmt(buf, cap, pos, "\n");
 }
@@ -1488,7 +1497,7 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
     if (!fake && !between && !disorder && !ov) { return -1; }
     if (append_fmt(buf, cap, &pos,
-        "d2k-plan 1 3\nid 00000000000000000000000000000000\nproto tcp tls\n"
+        "d2k-plan 1 4\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
         n, in->sni_off, in->sni_len, (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
     size_t flen = between ? n - mid : 2 * n;

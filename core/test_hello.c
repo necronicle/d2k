@@ -372,6 +372,21 @@ int main(void) {
         CHECK(d2k_hello_shape(out, n) == D2K_SHAPE_LEGACY, "длинное имя сменило вид приветствия (LEGACY)");
     }
 
+    /* Observing SNI in a prefix does not make it a complete probe input. */
+    CHECK(d2k_hello_complete(modern, sizeof modern), "complete modern rejected");
+    CHECK(d2k_hello_complete(legacy, sizeof legacy), "complete legacy rejected");
+    CHECK(!d2k_hello_complete(NULL, 0), "null complete hello");
+    for (size_t i = 0; i < sizeof modern; i++) {
+        CHECK(!d2k_hello_complete(modern, i), "fragment accepted as complete");
+    }
+    {
+        uint8_t bad[sizeof modern + 1];
+        memcpy(bad, modern, sizeof modern); bad[sizeof modern] = 0;
+        CHECK(!d2k_hello_complete(bad, sizeof bad), "trailing bytes accepted");
+        bad[8]--;
+        CHECK(!d2k_hello_complete(bad, sizeof modern), "short handshake accepted");
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

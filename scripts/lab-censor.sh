@@ -44,7 +44,7 @@ fail() { echo "ПРОВАЛ: $*" >&2; dump; exit 1; }
 control_passes() {
     n=0
     while [ $n -lt 5 ]; do
-        if timeout 5 openssl s_client -connect "127.0.0.1:$PORT" \
+        if timeout 5 openssl s_client -connect "10.203.0.1:$PORT" \
                -servername control.example -tls1_3 </dev/null >/dev/null 2>&1; then
             return 0
         fi
@@ -66,7 +66,7 @@ control_passes() {
 #     различии ломается переносимость (седьмая находка), и здесь оно живое.
 real_client() {
     body=$(timeout 10 curl -sS --cacert /tmp/c.pem \
-        --resolve "$1:$PORT:127.0.0.1" "https://$1:$PORT/" 2>/tmp/curl.err) || return 1
+        --resolve "$1:$PORT:10.203.0.1" "https://$1:$PORT/" 2>/tmp/curl.err) || return 1
     [ "$body" = "ok" ] || return 1
     return 0
 }
@@ -117,6 +117,9 @@ ethtool -K lo gro off tso off gso off >/dev/null 2>&1 || true
 # современный клиент с постквантовым key_share шлёт имя во ВТОРОМ сегменте
 # ровно так же.
 ip link set lo mtu 1500 2>/dev/null || true
+# A real, isolated lab address. The original domain tool correctly refuses
+# 127/8 targets; don't mask that refusal with the old fallback search.
+ip addr add 10.203.0.1/32 dev lo
 
 # Цель: настоящий сервер TLS 1.3, ФОРКАЮЩИЙ.
 #
@@ -174,7 +177,7 @@ cc -std=c99 -O2 -Wall -Wextra -o /tmp/labtls spike/labtls.c -lssl -lcrypto
 /tmp/labtls "$PORT" /tmp/c.pem /tmp/k.pem >/tmp/server.log 2>&1 &
 SRV=$!
 i=0
-while ! (timeout 3 openssl s_client -connect "127.0.0.1:$PORT" </dev/null >/dev/null 2>&1) && [ $i -lt 50 ]; do
+while ! (timeout 3 openssl s_client -connect "10.203.0.1:$PORT" </dev/null >/dev/null 2>&1) && [ $i -lt 50 ]; do
     i=$((i+1)); sleep 0.2
 done
 [ $i -lt 50 ] || fail "сервер цели не поднялся" 
@@ -189,28 +192,23 @@ cat > /tmp/probecheck.c <<'PC'
 #include <stdio.h>
 #include "d2k_verify.h"
 int main(void) {
-    d2k_ver_result r = d2k_verify_probe("127.0.0.1", 4443, "control.example", 4000, 0);
+    d2k_ver_result r = d2k_verify_probe("10.203.0.1", 4443, "control.example", 4000, 0);
     printf("уровень %d, статус %d, причина: %s\n", (int)r.level, r.status, r.reason);
     d2k_verify_close(&r);
     return r.level == D2K_VER_APPLICATION ? 0 : 1;
 }
 PC
 cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
-   core/verify.c core/tls13.c core/x25519.c core/crypto.c core/hello.c core/meas.c 2>/dev/null || \
-cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
-   core/verify.c core/tls13.c core/x25519.c core/crypto.c core/hello.c core/meas.c core/link.c core/compose.c
+   core/verify.c core/tls13.c core/tls13core.c core/x25519.c core/crypto.c \
+   core/hello.c core/meas.c core/link.c core/compose.c core/quicconn.c core/quicwire.c core/h3.c
 if ! /tmp/probecheck; then
     fail "СОБСТВЕННЫЙ ЗОНД не доходит до приложения на ГОЛОЙ линии — опыт бессмыслен: он покажет неудачу на каждом плече, включая рабочие"
 fi
 echo "инструмент исправен: зонд доходит до приложения без цензора"
 
 echo "== сборка =="
-cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
-   -o /tmp/d2kd datapath/d2kd.c datapath/nfq.c datapath/raw.c \
-   datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c \
-   datapath/wire_udp.c datapath/track.c datapath/session.c datapath/nl.c \
-   datapath/sched.c datapath/journal.c datapath/plans.c datapath/ctl.c \
-   datapath/ctlsrv.c core/quic.c core/crypto.c
+make -s -C datapath d2kd
+cp datapath/d2kd /tmp/d2kd
 make -s -C core d2kc >/dev/null
 
 echo "== цензор: режем пакет, в котором встретилось имя =="
@@ -320,7 +318,7 @@ fi
 echo "== цензор работает? =="
 if [ "${D2K_LAB_NOCENSOR:-0}" = "1" ]; then
     echo "пропущено: цензор выключен"
-elif timeout 5 openssl s_client -connect "127.0.0.1:$PORT" -servername "$NAME" \
+elif timeout 5 openssl s_client -connect "10.203.0.1:$PORT" -servername "$NAME" \
        -tls1_3 </dev/null >/dev/null 2>&1; then
     fail "цензор не режет: соединение с заблокированным именем прошло"
 elif ! control_passes; then

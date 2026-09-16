@@ -106,11 +106,14 @@ typedef struct {
      * возвращало вовсе: оно говорило «решает содержимое», а чем брать —
      * выяснял уже планировщик отдельными вопросами через датапат.
      *
-     * have_arm = 0 значит «плечо не найдено», а НЕ «плеча нет»: вердикт от
-     * измерителя без этой способности выглядит ровно так же, и планировщик
-     * обязан в этом случае идти прежним путём, а не считать, что брать
-     * нечем. */
+     * have_arm=0 не различает «не найдено» и «этот поставщик лишь
+     * классифицирует». Это различие хранится в owns_search: только для
+     * старого классификатора допустим старый внешний подбор. */
     int         have_arm;
+    /* This provider owns the whole domain-search workflow, including its
+     * fallback probes. A missing arm is NOT permission for a second search. */
+    int         owns_search;
+    uint32_t    split_gap_us;
     d2k_arm     arm;
     d2k_arm_input arm_input;
     char        arm_name[64]; /* owned display name; adapter leaves arm.name NULL */

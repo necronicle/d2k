@@ -87,6 +87,12 @@ typedef enum {
  * UNKNOWN. */
 d2k_shape d2k_hello_shape(const uint8_t *b, size_t n);
 
+/* Complete single-record ClientHello envelope, suitable for a captured
+ * measurement input. Unlike shape/SNI observation, rejects a TCP fragment,
+ * trailing records and inconsistent record/handshake lengths. This is not
+ * validation of every extension's protocol semantics. */
+int d2k_hello_complete(const uint8_t *b, size_t n);
+
 /* Ищет имя (server_name/host_name) в приветствии и отдаёт его КООРДИНАТЫ.
  *
  * Возвращает 0 и заполняет *off и *len, если имя найдено и целиком помещается

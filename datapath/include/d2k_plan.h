@@ -22,7 +22,10 @@
  * по-прежнему объявляет 1 и исполняется где угодно. */
 /* Version 3: measured input constraints, a distinct fake→truth delay,
  * and explicit TCP segmentation without shortening the logical payload. */
-#define D2K_EXEC_VERSION 3
+/* Version 4 adds explicit detect/raw.c TCP wire semantics. Legacy plans
+ * retain their old header semantics; learned plans are never reinterpreted. */
+#define D2K_EXEC_VERSION 4
+#define D2K_WIRE_DETECT_TCP 1
 #define D2K_SCHEMA_MAX   1
 
 /* Ширина идентификатора плана — записи REC_ID в TLV.
@@ -77,6 +80,7 @@ typedef struct {
     uint8_t  ttl;        /* 0 — как обычно */
     uint8_t  poison;     /* биты D2K_POISON_* */
     int32_t  seq_shift;
+    uint8_t  wire_profile; /* 0 legacy, D2K_WIRE_DETECT_TCP measured raw TCP */
     /* Приставка перед нагрузкой — байты, которых в исходном пакете нет.
      *
      * Нужна перекрытию: сегмент выходит с номером на pre_len МЕНЬШЕ, чем

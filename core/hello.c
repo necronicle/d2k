@@ -269,6 +269,15 @@ static void parse_hello(const uint8_t *b, size_t n, hello_layout *L) {
     }
 }
 
+int d2k_hello_complete(const uint8_t *b, size_t n) {
+    if (!b || n < REC_HDR + HS_HDR ||
+        REC_HDR + (size_t)rd16(b + 3) != n ||
+        REC_HDR + HS_HDR + (size_t)rd24(b + 6) != n) { return 0; }
+    hello_layout L;
+    parse_hello(b, n, &L);
+    return L.parsed && L.complete && !L.exts_truncated;
+}
+
 d2k_shape d2k_hello_shape(const uint8_t *b, size_t n) {
     hello_layout L;
     parse_hello(b, n, &L);

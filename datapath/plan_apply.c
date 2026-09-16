@@ -408,6 +408,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         }
     }
     free(pts);
+    for (size_t i = 0; i < n; i++) { v[i].wire_profile = p->wire_profile; }
     if (p->segment_size) {
         /* Match raw_send: split the concatenated prefix+body, preserving
          * bytes, sequence space, fooling and only the first chunk's delay. */

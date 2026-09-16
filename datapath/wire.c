@@ -6,7 +6,10 @@
  *
  * Плавающей арифметики нет и быть не может: коробки идут без сопроцессора.
  */
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #include <string.h>
+#include <stdlib.h>
 
 #include "d2k_wire.h"
 
@@ -75,6 +78,8 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     if (!c || !e || !out) {
         return 0;
     }
+    if (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP) { return 0; }
+    int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
     size_t opt_len = (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
     const size_t body = e->pre_len + e->len;
     size_t total = IP_HDR + TCP_HDR + opt_len + body;
@@ -91,11 +96,11 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
        Совпадение идентификатора с оригиналом — известная ловушка: сборщик
        фрагментов на той стороне может счесть пакеты частями одной дейтаграммы. */
     wr16(out + 4, (e->poison & D2K_POISON_IPID_ZERO) ? 0
-                                                     : (uint16_t)(c->ip_id + 1));
-    wr16(out + 6, 0x4000);               /* не фрагментировать */
+                      : measured ? (uint16_t)(random() % 65535) : (uint16_t)(c->ip_id + 1));
+    wr16(out + 6, measured ? 0 : 0x4000);
     /* TTL: если порча его задаёт, ставим её значение — пакет умрёт по дороге,
        не дойдя до сервера, но коробку пройдёт. */
-    out[8] = e->ttl ? e->ttl : (c->ttl ? c->ttl : 64);
+    out[8] = e->ttl ? e->ttl : (measured ? 64 : (c->ttl ? c->ttl : 64));
     out[9] = 6;                          /* TCP */
     wr16(out + 10, 0);                   /* сумма считается ниже */
     memcpy(out + 12, &c->src_ip, 4);
@@ -113,7 +118,7 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     wr32(t + 8, c->ack);
     t[12] = (uint8_t)(((TCP_HDR + opt_len) / 4) << 4);
     t[13] = 0x18;                        /* PSH | ACK */
-    wr16(t + 14, c->window);
+    wr16(t + 14, measured ? 65535 : c->window);
     wr16(t + 16, 0);                     /* сумма */
     wr16(t + 18, 0);                     /* указатель срочных данных */
 
@@ -123,7 +128,7 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
         o[2] = 8; o[3] = 10;             /* метка времени, длина 10 */
         /* Значение со сдвигом назад: сервер забракует такую метку как
            устаревшую, а коробка, метки не сверяющая, сегмент возьмёт. */
-        wr32(o + 4, 0);
+        wr32(o + 4, measured ? 1 : 0);
         wr32(o + 8, 0);
     }
 
@@ -139,12 +144,14 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     acc = sum16(out + IP_HDR, tcp_len, acc);
     uint16_t ck = fold(acc);
     if (e->poison & D2K_POISON_BADSUM) {
-        /* Портим предсказуемо, а не случайно: эталонные файлы обязаны
-           сходиться от прогона к прогону. Инверсия гарантированно даёт
-           неверную сумму и никогда не совпадёт с правильной. */
-        ck = (uint16_t)~ck;
-        if (ck == 0) {
-            ck = 0xffff;
+        /* Measured mode reproduces detect/raw.c, including its zero case;
+           legacy plans retain their historical inversion semantics. */
+        if (measured) {
+            ck ^= 0xbeef;
+            if (ck == 0) { ck = 0x1234; }
+        } else {
+            ck = (uint16_t)~ck;
+            if (ck == 0) { ck = 0xffff; }
         }
     }
     wr16(t + 16, ck);

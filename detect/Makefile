@@ -55,8 +55,8 @@ test_bridge: test_bridge.c bridge.o poison.o ../core/hello.o $(HDR)
 test_threads: test_threads.c poison.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_threads.c poison.o $(LDFLAGS) -lpthread
 
-test_raw: test_raw.c raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(LDFLAGS) $(LDLIBS)
+test_raw: test_raw.c raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o $(HDR) ../datapath/wire.c ../datapath/include/d2k_plan.h
+	$(CC) $(CFLAGS) -o $@ test_raw.c $(filter-out raw.o,$(OBJ)) ../core/hello.o ../datapath/wire.c $(LDFLAGS) $(LDLIBS)
 
 bridge.o: bridge.c $(HDR) ../core/include/d2k_arm.h ../core/include/d2k_verdict.h
 	$(CC) $(CFLAGS) -c -o $@ $<

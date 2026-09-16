@@ -7,6 +7,7 @@
 #define recvfrom raw_test_recvfrom
 #include "raw.c"
 #undef recvfrom
+#include "d2k_wire.h"
 
 #define WORKERS 16
 #define PORTS_PER_WORKER 128
@@ -107,11 +108,45 @@ static void test_concurrent_ports_are_unique(void)
     }
 }
 
+/* Compare the TWO real packet encoders. Only the random IP ID and its
+ * dependent IPv4 checksum are normalized; all TCP bytes must match. */
+static void test_datapath_matches_raw_headers(void)
+{
+    uint8_t src[] = {192,0,2,1}, dst[] = {198,51,100,7};
+    uint8_t body[1400], a[1600], b[1600];
+    for (size_t i = 0; i < sizeof body; i++) { body[i] = (uint8_t)(i * 17); }
+    for (unsigned flags = 0; flags < 32; flags++) {
+        d2k_poison p = {0}; d2k_emit e = {0}; d2k_conn c = {0};
+        p.badsum = !!(flags & 1); p.tcp_ts = !!(flags & 2);
+        p.ip_id_zero = !!(flags & 4); p.ttl = flags & 8 ? 8 : 0;
+        e.poison = (uint8_t)(flags & 7); e.ttl = (uint8_t)p.ttl;
+        e.seq = 123456; e.seq_shift = flags & 16 ? -66000 : 0;
+        e.wire_profile = D2K_WIRE_DETECT_TCP;
+        e.pre = body; e.pre_len = 101; e.bytes = body + 101; e.len = 1299;
+        memcpy(&c.src_ip, src, 4); memcpy(&c.dst_ip, dst, 4);
+        uint8_t ports[] = {0x9c,0x40,0x01,0xbb};
+        memcpy(&c.src_port, ports, 2); memcpy(&c.dst_port, ports + 2, 2);
+        c.ack = 7654321; c.window = 77; c.ttl = 11; c.ip_id = 900;
+        size_t an = build_ipv4_tcp(a, sizeof a, src, dst, 40000, 443,
+            e.seq + (uint32_t)e.seq_shift, c.ack, TCP_PSH | TCP_ACK,
+            body, sizeof body, &p, NULL, 0);
+        size_t bn = d2k_wire_build(&c, &e, b, sizeof b);
+        CHECK(an > 0 && an == bn);
+        CHECK(checksum(b, 20) == 0);
+        if (p.ip_id_zero) { CHECK(b[4] == 0 && b[5] == 0); }
+        /* IP IDs are per-send random draws, not an arm parameter. */
+        memcpy(a + 4, b + 4, 2); a[10] = a[11] = 0;
+        wr16(a + 10, checksum(a, 20));
+        CHECK(an == bn && memcmp(a, b, an) == 0);
+    }
+}
+
 int main(void)
 {
     test_concurrent_ports_are_unique();
     test_checksum_matches_original();
     test_receive_is_owned_by_connection();
+    test_datapath_matches_raw_headers();
     if (failures) { return 1; }
     puts("raw: checksum, connection-owned receives and concurrent ports passed (no network)");
     return 0;

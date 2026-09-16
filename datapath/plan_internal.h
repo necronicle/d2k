@@ -34,7 +34,8 @@ enum {
     REC_PACE    = 0x0105,
     REC_INPUT   = 0x0106,
     REC_SETTLE  = 0x0107,
-    REC_SEGMENT = 0x0108
+    REC_SEGMENT = 0x0108,
+    REC_WIRE    = 0x0109
 };
 
 /* Якоря семантических позиций. */
@@ -95,6 +96,7 @@ struct d2k_plan {
     uint32_t input_len, input_sni_off, input_sni_len;
     uint32_t settle_us;
     uint32_t segment_size;
+    uint8_t wire_profile;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

@@ -48,6 +48,7 @@ int main(void)
     CHECK(seen.mark == 0x2d && seen.repeats == 2);
     CHECK(seen.write_gap_ms == 12 && seen.timeout_ms == 321);
     CHECK(r.verdict == D2K_V_INCONCLUSIVE);
+    CHECK(r.owns_search && r.split_gap_us == 12000);
 
     answer.verdict = D2K_DV_POISONABLE;
     answer.has_hit = 1;
@@ -89,6 +90,10 @@ int main(void)
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     p.seq_shift = 0;
     p.syn_data = 1;
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    p.syn_data = 0; p.oob = 1;
+    CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
+    p.oob = 0; p.md5 = 1;
     CHECK(d2k_arm_from_poison(&p, &arm, why, sizeof why) != 0);
     if (failures) { return 1; }
     puts("bridge: scheduler adapter contracts passed");

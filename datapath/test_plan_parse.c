@@ -38,6 +38,20 @@ int main(void) {
 
     CHECK(loads(good, sizeof good), "правильный план не загрузился");
 
+    {
+        uint8_t b[] = {'D','2','K','P',0,1,0,4,0,0,0,2,
+                       0,2,0,2,6,1, 1,9,0,1,D2K_WIRE_DETECT_TCP};
+        CHECK(loads(b, sizeof b), "detect wire profile rejected");
+        b[7] = 3;
+        CHECK(!loads(b, sizeof b), "detect wire profile accepted with minexec=3");
+        b[7] = 4; b[22] = 2;
+        CHECK(!loads(b, sizeof b), "unknown wire profile accepted");
+        b[22] = 1; b[16] = 17;
+        CHECK(!loads(b, sizeof b), "TCP wire profile accepted for UDP");
+        b[16] = 6; b[21] = 0;
+        CHECK(!loads(b, sizeof b - 1), "empty wire profile accepted");
+    }
+
     /* New measured-context records: validate length, value and minexec. */
     for (unsigned code = 6; code <= 8; code++) {
         uint8_t b[34] = {'D','2','K','P',0,1,0,3,0,0,0,2,0,2,0,2,6,1,1,0,0,0};

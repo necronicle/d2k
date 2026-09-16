@@ -42,6 +42,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "d2k_compose_internal.h"
 #include "d2k_quichello.h"
@@ -72,8 +73,14 @@ static int fails;
 
 static int tcp_calls, quic_calls;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
+static int tcp_owns_search;
+static int tcp_found_arm;
+static size_t tcp_last_wire;
 static d2k_verdict quic_answer = D2K_V_OPAQUE;
 static char tcp_last_ip[64], quic_last_sni[256];
+static pthread_mutex_t snapshot_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t snapshot_cv = PTHREAD_COND_INITIALIZER;
+static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
 
 static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
                          d2k_hello control, uint32_t mark, int repeats,
@@ -81,10 +88,29 @@ static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
     (void)port; (void)trigger; (void)control; (void)mark;
     (void)repeats; (void)gap_us; (void)wait_ms;
     tcp_calls++;
+    tcp_last_wire = trigger.len;
     snprintf(tcp_last_ip, sizeof tcp_last_ip, "%s", ip ? ip : "");
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = tcp_answer;
+    r.owns_search = tcp_owns_search;
+    r.split_pos = tcp_owns_search ? 1 : 0;
+    r.split_gap_us = 60000;
+    if (tcp_found_arm) {
+        r.have_arm = 1; r.arm.badsum = 1;
+        r.arm_input.trigger_len = trigger.len;
+        (void)d2k_hello_sni(trigger.bytes, trigger.len, &r.arm_input.sni_off, &r.arm_input.sni_len);
+    }
+    if (snapshot_enabled) {
+        uint8_t before[2048];
+        memcpy(before, trigger.bytes, trigger.len);
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_entered = 1;
+        pthread_cond_broadcast(&snapshot_cv);
+        while (!snapshot_release) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        snapshot_ok = memcmp(before, trigger.bytes, trigger.len) == 0;
+        pthread_mutex_unlock(&snapshot_mu);
+    }
     snprintf(r.reason, sizeof r.reason, "подменённое дерево вердиктов");
     return r;
 }
@@ -558,6 +584,28 @@ static void confirm_once(d2k_catalog *cat, int link_fd, const char *target,
 }
 
 int main(void) {
+    /* Real default verifier, before replacing hooks: the Plan is scoped to
+     * the reserved socket's port. Opening another socket defeats that scope. */
+    {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0), fd = -1;
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a); a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(lfd >= 0 && bind(lfd, (struct sockaddr *)&a, sizeof a) == 0 &&
+              listen(lfd, 1) == 0, "default-verifier listener failed");
+        socklen_t alen = sizeof a;
+        CHECK(getsockname(lfd, (struct sockaddr *)&a, &alen) == 0, "listener address failed");
+        uint16_t sport = 0;
+        CHECK(d2k_props_bind(&fd, &sport) == 0, "reserve verifier socket failed");
+        if (fd >= 0 && lfd >= 0) {
+            d2k_ver_result r = d2k_sched_ver_hook(fd, "127.0.0.1", ntohs(a.sin_port),
+                                                  6, "probe.example", 50, 0);
+            CHECK(r.fd == fd && r.local_port == ntohs(sport), "verifier replaced reserved socket");
+            if (r.fd != fd) { close(fd); }
+            d2k_verify_close(&r);
+        }
+        if (lfd >= 0) { close(lfd); }
+    }
     d2k_sched_vol_hook = stub_vol;
     d2k_sched_tcp_hook = stub_tcp;
     d2k_sched_quic_hook = stub_quic;
@@ -581,6 +629,83 @@ int main(void) {
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
+
+    /* A completed domain-search provider is not a bare classifier. Its
+     * failure must not launch another property questionnaire or fallback. */
+    for (int mode = 0; mode < 4; mode++) {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        tcp_owns_search = 1;
+        tcp_answer = mode == 0 || mode == 3 ? D2K_V_OPAQUE : mode == 1 ? D2K_V_PREFIX : D2K_V_WHOLE;
+        tcp_found_arm = mode == 3;
+        ver_answer = D2K_VER_NOT_MEASURED; ver_calls = 0; tcp_calls = 0;
+        saidbuf[0] = '\0'; sent_len = 0;
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, (uint16_t)(39990 + mode), "search-owned.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, (uint16_t)(39990 + mode));
+        d2k_sched_event(s, &su);
+        settle(s); spin(s, 100);
+        CHECK(tcp_calls == 1, "domain search repeated");
+        CHECK(!said("спрашиваю коробку о свойствах"), "second property search after original");
+        CHECK(!said("запасного перебора"), "second fallback search after original");
+        CHECK(mode == 0 ? ver_calls == 0 : ver_calls == 1,
+              "original split solution lost or extra candidates tested");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+    }
+    tcp_owns_search = tcp_found_arm = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+
+    /* SHAPE arrives while the oracle holds its trigger. Main-thread writes
+     * must not alter the bytes of an already-running measurement. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        snapshot_enabled = 1; snapshot_entered = snapshot_release = snapshot_ok = 0;
+        tcp_answer = D2K_V_CLEAR;
+        d2k_ev h = ev_hello(6, 39989, "snapshot.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39989);
+        d2k_sched_event(s, &su);
+        pthread_mutex_lock(&snapshot_mu);
+        while (!snapshot_entered) { pthread_cond_wait(&snapshot_cv, &snapshot_mu); }
+        pthread_mutex_unlock(&snapshot_mu);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "snapshot.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "snapshot fixture failed");
+        d2k_sched_event(s, &sh);
+        pthread_mutex_lock(&snapshot_mu);
+        snapshot_release = 1; pthread_cond_broadcast(&snapshot_cv);
+        pthread_mutex_unlock(&snapshot_mu);
+        settle(s);
+        CHECK(snapshot_ok, "SHAPE overwrote a running measurement's trigger");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        snapshot_enabled = 0; tcp_answer = D2K_V_OPAQUE;
+    }
+
+    /* Complete cached input is used; an observable SNI prefix is not.
+       Neither case needs a second visit to obtain the cached observation. */
+    for (int partial = 0; partial < 2; partial++) {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        d2k_ev sh = {0}; sh.kind = D2K_EV_SHAPE; sh.transport = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "complete.example",
+              sh.shape, sizeof sh.shape, &sh.shape_len) == 0, "complete fixture failed");
+        size_t complete_len = sh.shape_len;
+        if (partial) { sh.shape_len--; }
+        size_t off, len;
+        CHECK(d2k_hello_sni(sh.shape, sh.shape_len, &off, &len) == 0,
+              "fragment fixture must still expose SNI");
+        d2k_sched_event(s, &sh);
+        tcp_answer = D2K_V_CLEAR; tcp_last_wire = 0;
+        d2k_ev h = ev_hello(6, 39988, "complete.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39988);
+        d2k_sched_event(s, &su); settle(s);
+        CHECK(partial ? tcp_last_wire > complete_len : tcp_last_wire == complete_len,
+              "complete cache ignored or fragment used as a complete input");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+    }
+    tcp_answer = D2K_V_OPAQUE;
 
     /* --- подозрение по TCP идёт в дерево вердиктов --------------------- */
     {
@@ -2439,8 +2564,8 @@ int main(void) {
             CHECK(d2k_hello_shape(sh.shape, sh.shape_len) == D2K_SHAPE_LEGACY,
                   "собранное приветствие оказалось не старой формы");
             d2k_sched_event(s, &sh);
-            CHECK(said("поймана форма приветствия"),
-                  "снимок приветствия не дошёл до задачи — проверка ниже ничего не значит");
+            CHECK(said("сохранён целый снимок для следующего поиска"),
+                  "снимок приветствия не сохранён для следующего поиска");
         }
 
         d2k_ev h2 = ev_hello(6, 40141, "форма.важна");
@@ -2497,8 +2622,8 @@ int main(void) {
         saidbuf[0] = '\0';
         d2k_sched_event(s, &sh);
 
-        CHECK(said("(TCP) поймана форма приветствия"),
-              "снимок не дошёл до задачи своего транспорта");
+        CHECK(said("(TCP) сохранён целый снимок"),
+              "снимок своего транспорта не сохранён");
         CHECK(!said("(QUIC) поймана форма приветствия"),
               "снимок TCP положили QUIC-задаче — она пойдёт мерить чужими байтами");
         d2k_sched_free(s);
@@ -2821,8 +2946,9 @@ int main(void) {
               "зонду досталась нулевая длина — он пойдёт СВОИМ коротким приветствием, "
               "и подтверждение достанется ему, а не человеку");
 
-        /* Теперь датапат прислал снимок приветствия ЖИВОГО клиента. Со
-           следующего испытания зонд обязан ходить ЕГО длиной. */
+        /* A late observation belongs to the NEXT search, not to another
+           candidate of the experiment already measured on different bytes. */
+        size_t measured_wire = ver_last_wire;
         d2k_ev sh;
         memset(&sh, 0, sizeof sh);
         sh.kind = D2K_EV_SHAPE;
@@ -2831,15 +2957,14 @@ int main(void) {
                                      sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
               "приветствие клиента не собралось — проверять нечем");
         d2k_sched_event(s, &sh);
-        CHECK(said("поймана форма приветствия"), "снимок не дошёл до задачи");
+        CHECK(said("сохранён целый снимок"), "снимок не сохранён");
 
-        size_t want = sh.shape_len;
+        CHECK(sh.shape_len != measured_wire, "fixture must change the input length");
         ver_last_wire = 0;
         ver_answer_port = 40171;
         run_out(s);
-        CHECK(ver_last_wire == want,
-              "зонд пошёл НЕ длиной снятого с клиента приветствия — испытание идёт "
-              "в другом контексте, чем работа человека");
+        CHECK(ver_last_wire == measured_wire,
+              "late SHAPE changed the input length inside the measured experiment");
         d2k_sched_free(s);
         d2k_catalog_free(&cW);
     }

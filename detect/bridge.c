@@ -163,6 +163,8 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     d2k_classify_run(addr, &tr, &opt, &res);
 
     out.verdict = map_verdict(res.verdict);
+    out.owns_search = 1;
+    out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;
     out.probes = res.probes;

@@ -117,7 +117,7 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
         d2k_plan *old = NULL;
         tlv[7] = 2;
         CHECK(d2k_plan_load(tlv, tlv_len, &old, err, sizeof err) != 0);
-        d2k_plan_free(old); tlv[7] = 3;
+        d2k_plan_free(old); tlv[7] = 4;
     }
     rc = d2k_plan_load(tlv, tlv_len, &p, err, sizeof err);
     if (rc) { fprintf(stderr, "%s\n", err); }
@@ -134,6 +134,7 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
     for (size_t i = 0; i < out.n && i < count; i++) {
         const d2k_emit *e = &out.v[i]; const expected_send *x = &expected[i];
         CHECK(e->seq == x->seq && e->seq_shift == x->shift);
+        CHECK(e->wire_profile == D2K_WIRE_DETECT_TCP);
         CHECK(e->delay_us == x->delay && e->kind == x->kind);
         CHECK(e->poison == x->flags && e->ttl == x->ttl);
         CHECK(e->pre_len + e->len == x->len);
@@ -171,6 +172,9 @@ static void malformed(void) {
         "payload-slice 2 1 0 1", "payload 1 01\npayload-slice 2 1 1 1",
         "payload 1 01\npayload-slice 2 1 0 0", "input 0 0 0", "input 10 9 2",
         "input 10 11 0", "settle 0", "settle -1", "segment 0", "segment 65536"
+        ,"payload-pad64 1 4 15 A", "payload-pad64 1 4 15 @@@@",
+        "payload-pad64 1 4 15 AB==", "payload-pad64 1 4 15 AAA=AAAA",
+        "payload-pad64 1 4 15 AA=A", "payload-pad64 1 1 15 AAAA"
     };
     char text[512], err[200]; uint8_t tlv[4096]; size_t len;
     case_name = "malformed measured text";
@@ -197,6 +201,9 @@ int main(void) {
     a.seqovl = 336; run_case("partial-captured-overlap", a, 1538, 500);
     memset(&a, 0, sizeof a); a.badsum = 1; a.repeats = 7;
     run_case("long-filler-not-64", a, 2048, 0);
+    a.seqovl_hello = 1; a.decoy_hello = 1; a.disorder = 1;
+    run_case("full-2048-decoy-in-4096-text-slot", a, 2048, 2048);
+    a.seqovl_hello = 0; a.disorder = 0;
     a.tcpts = 1; a.ipidzero = 1; a.ttl = 8; a.seq_out = 1;
     run_case("fooling", a, 289, 0);
     if (failures) { fprintf(stderr, "measured: %d failures\n", failures); return 1; }

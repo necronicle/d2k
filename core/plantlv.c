@@ -49,7 +49,8 @@ enum {
     REC_PACE    = 0x0105,
     REC_INPUT   = 0x0106,
     REC_SETTLE  = 0x0107,
-    REC_SEGMENT = 0x0108
+    REC_SEGMENT = 0x0108,
+    REC_WIRE    = 0x0109
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -95,7 +96,45 @@ typedef struct {
     uint8_t    guards;
     uint32_t   pace_us;   /* 0 — записи нет */
     uint32_t   input_len, input_sni_off, input_sni_len, settle_us, segment_size;
+    uint8_t    wire_profile;
 } pl_plan;
+
+static int b64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+    if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+    if (c >= '0' && c <= '9') { return c - '0' + 52; }
+    return c == '+' ? 62 : c == '/' ? 63 : -1;
+}
+
+static int parse_base64(const char *s, uint8_t **out, size_t *len) {
+    size_t n = strlen(s), used = 0;
+    *out = NULL; *len = 0;
+    if (!n) { return 0; }
+    if (n % 4) { return -1; }
+    uint8_t *b = malloc(n / 4 * 3);
+    if (!b) { return -1; }
+    for (size_t i = 0; i < n; i += 4) {
+        int a = b64_value((unsigned char)s[i]), c = b64_value((unsigned char)s[i+1]);
+        int d = b64_value((unsigned char)s[i+2]), e = b64_value((unsigned char)s[i+3]);
+        if (a < 0 || c < 0) { goto bad; }
+        b[used++] = (uint8_t)((a << 2) | (c >> 4));
+        if (s[i+2] == '=') {
+            if (s[i+3] != '=' || i + 4 != n || (c & 15)) { goto bad; }
+            break;
+        }
+        if (d < 0) { goto bad; }
+        b[used++] = (uint8_t)((c << 4) | (d >> 2));
+        if (s[i+3] == '=') {
+            if (i + 4 != n || (d & 3)) { goto bad; }
+            break;
+        }
+        if (e < 0) { goto bad; }
+        b[used++] = (uint8_t)((d << 6) | e);
+    }
+    *out = b; *len = used; return 0;
+bad:
+    free(b); return -1;
+}
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
     if (!err || cap == 0) { return; }
@@ -266,7 +305,7 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 goto bad;
             }
             p->n_payloads++;
-        } else if (strcmp(f[0], "payload-pad") == 0) {
+        } else if (strcmp(f[0], "payload-pad") == 0 || strcmp(f[0], "payload-pad64") == 0) {
             unsigned long id, len, fill;
             uint8_t *prefix = NULL;
             size_t prefix_len = 0;
@@ -278,7 +317,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 say(err, errcap, "строка %zu: payload-pad ждёт id длину байт [hex-префикс]", lineno);
                 goto bad;
             }
-            if (parse_hex(nf == 5 ? f[4] : "", &prefix, &prefix_len, why, sizeof why)) {
+            int bad_prefix = strcmp(f[0], "payload-pad64") == 0
+                ? parse_base64(nf == 5 ? f[4] : "", &prefix, &prefix_len)
+                : parse_hex(nf == 5 ? f[4] : "", &prefix, &prefix_len, why, sizeof why);
+            if (bad_prefix) {
+                snprintf(why, sizeof why, "некорректное кодирование префикса");
                 say(err, errcap, "строка %zu: payload-pad: %s", lineno, why); goto bad;
             }
             if (prefix_len > len) {
@@ -313,6 +356,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             v->id = (uint16_t)id; v->len = (size_t)len;
             memcpy(v->bytes, src->bytes + off, v->len);
             p->n_payloads++;
+        } else if (strcmp(f[0], "wire") == 0) {
+            if (nf != 2 || strcmp(f[1], "detect-tcp-v1")) {
+                say(err, errcap, "неизвестный wire profile"); goto bad;
+            }
+            p->wire_profile = 1;
         } else if (strcmp(f[0], "input") == 0) {
             unsigned long len, off, snilen;
             if (nf != 4 || str_u32(f[1], &len) || !len || len > 65535 ||
@@ -427,6 +475,9 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     if ((p->input_len || p->settle_us || p->segment_size) && p->minexec < 3) {
         say(err, errcap, "input/settle/segment требуют minexec=3"); goto bad;
     }
+    if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
+        say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
+    }
     return 0;
 bad:
     plan_free(p);
@@ -472,7 +523,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
-                       (p.segment_size ? 1u : 0u);
+                       (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -553,6 +604,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     if (p.segment_size) {
         put_u16(&w, REC_SEGMENT); put_u16(&w, 4); put_u32(&w, p.segment_size);
     }
+    if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);
     }

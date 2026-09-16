@@ -229,7 +229,7 @@ static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
                  "зонда подтверждения для этого транспорта нет — не измерено");
         return r;
     }
-    return d2k_verify_probe(ip, port, sni, deadline_ms, hello_wire);
+    return d2k_verify_probe_on(use_fd, ip, port, sni, deadline_ms, hello_wire);
 }
 
 /* Умолчание подбора плеча QUIC. Отдельным хуком по той же причине, что и
@@ -383,6 +383,7 @@ typedef struct {
     /* Номер следующего плеча ЗАПАСНОГО ПЕРЕБОРА (третий источник кандидатов,
        после готовых планов и синтеза). */
     size_t     fb_next;
+    int        search_owned;
     /* Хэши уже испытанных текстов планов — чтобы перебор не предлагал то, что
        синтез уже дал. Одинаковый текст это один и тот же план, сколько бы
        источников его ни назвало. */
@@ -856,17 +857,23 @@ static int fill_hellos(d2k_sched *s, task *t) {
    переходит рабочему потоку вместе с этой структурой. Иначе пришлось бы
    читать поле задачи из рабочего потока и гадать, успел ли главный его
    обнулить. */
-typedef struct { d2k_sched *s; task *t; int use_fd; } worker_arg;
+typedef struct {
+    d2k_sched *s; task *t; int use_fd;
+    uint8_t trig[2048], ctrl[2048];
+    size_t trig_len, ctrl_len;
+} worker_arg;
 
 static void *worker_run(void *vp) {
     worker_arg *a = (worker_arg *)vp;
     d2k_sched *s = a->s;
     task *t = a->t;
     int a_use_fd = a->use_fd;
+    uint8_t trigger_bytes[2048], control_bytes[2048];
+    memcpy(trigger_bytes, a->trig, a->trig_len);
+    memcpy(control_bytes, a->ctrl, a->ctrl_len);
+    d2k_hello trig = {trigger_bytes, a->trig_len};
+    d2k_hello ctl = {a->ctrl_len ? control_bytes : NULL, a->ctrl_len};
     free(a);
-
-    d2k_hello trig; trig.bytes = t->trig; trig.len = t->trig_len;
-    d2k_hello ctl;  ctl.bytes  = t->ctrl_len ? t->ctrl : NULL; ctl.len = t->ctrl_len;
 
     if (t->job == JOB_VERIFY) {
         /* Испытание кандидата: своё рукопожатие TLS 1.3 своим ключом и
@@ -884,11 +891,9 @@ static void *worker_run(void *vp) {
            под его порт: зонд обязан пойти С НЕГО, иначе испытание пройдёт
            мимо собственного плана. Владение отдаётся вниз — закроет тот, кто
            им распорядится. */
-        int use_fd = t->probe_fd;
-        t->probe_fd = -1;
-        d2k_ver_result vr = d2k_sched_ver_hook(use_fd, t->ip, t->port, t->transport,
+        d2k_ver_result vr = d2k_sched_ver_hook(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
-                                               t->trig_len);
+                                               trig.len);
         pthread_mutex_lock(&s->mu);
         t->ver = vr;
         t->res_ready = 1;
@@ -988,13 +993,18 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     worker_arg *a = malloc(sizeof *a);
     if (!a) { return -1; }
     a->s = s; a->t = t;
+    a->trig_len = t->trig_len; a->ctrl_len = t->ctrl_len;
+    memcpy(a->trig, t->trig, t->trig_len);
+    memcpy(a->ctrl, t->ctrl, t->ctrl_len);
     /* Сокет вопроса забирается ЗДЕСЬ, в главном потоке, и поле задачи
        очищается сразу: два владельца одного дескриптора — двойное закрытие. */
-    a->use_fd = (job == JOB_CONTACT) ? t->prop_bound_fd : -1;
+    a->use_fd = job == JOB_CONTACT ? t->prop_bound_fd : job == JOB_VERIFY ? t->probe_fd : -1;
     if (job == JOB_CONTACT) { t->prop_bound_fd = -1; }
+    if (job == JOB_VERIFY) { t->probe_fd = -1; }
     t->job = job;
     t->res_ready = 0;
     if (pthread_create(&t->th, NULL, worker_run, a) != 0) {
+        if (a->use_fd >= 0) { close(a->use_fd); }
         free(a);
         return -1;
     }
@@ -1442,6 +1452,7 @@ static void task_done(task *t) {
 
    Возвращает число долитых планов. */
 static size_t refill_from_fallback(const d2k_sched *s, task *t) {
+    if (t->search_owned) { return 0; }
     size_t cap = sizeof t->plans / sizeof t->plans[0];
     size_t added = 0;
     d2k_shape sh = d2k_hello_shape(t->trig, t->trig_len);
@@ -1747,6 +1758,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     t->next_plan = 0;
     t->n_known = 0;
     t->n_plans = 0;
+    t->search_owned = r->owns_search;
     memset(t->plan_boxes, 0, sizeof t->plan_boxes);
     /* Failed reuse does not prove this is the same box. A newly synthesized
        plan must not silently enlarge the first vaguely matching model. */
@@ -1847,6 +1859,19 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         }
     }
 
+    if (r->owns_search) {
+        /* PREFIX/WHOLE are found solutions too: the source measured a
+         * forward split at split_pos with write_gap_ms. No poison search. */
+        if (!r->have_arm && (v == D2K_V_PREFIX || v == D2K_V_WHOLE) &&
+            r->split_pos > 0 && (size_t)r->split_pos < t->trig_len) {
+            int n = snprintf(t->plans[0], sizeof t->plans[0],
+                "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\n"
+                "split payload_start +%d\norder forward\npace %u\n",
+                r->split_pos, (unsigned)r->split_gap_us);
+            if (n > 0 && (size_t)n < sizeof t->plans[0]) { t->n_plans = 1; }
+        }
+        return;
+    }
     if (t->n_plans < cap) {
         t->n_plans += d2k_compose(&t->props, sh, SCHED_DECOY, s->send_cap,
                                   t->plans + t->n_plans, cap - t->n_plans);
@@ -2370,6 +2395,11 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0].trig) { return; }
+    if (ev->transport == 6 && !d2k_hello_complete(ev->shape, ev->shape_len)) {
+        say(s, "снимок TCP (%zu байт) не содержит целого ClientHello — "
+               "не заменяю им вход измерителя", ev->shape_len);
+        return;
+    }
     /* ИМЯ ДОСТАЁТСЯ ТЕМ РАЗБОРОМ, КОТОРОМУ ПРИНАДЛЕЖАТ БАЙТЫ.
        Снимок приходит с транспортом в ключе (датапат кладёт его туда, см.
        ARM_SHAPE в ctlsrv.c), и приветствие QUIC — это Initial, а не запись
@@ -2403,13 +2433,18 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         memcpy(s->tcp_shape, ev->shape, ev->shape_len);
         s->tcp_shape_len = ev->shape_len;
         memcpy(s->tcp_shape_name, name, strlen(name) + 1);
+        say(s, "по %s (TCP) сохранён целый снимок для следующего поиска: %zu байт",
+            name, ev->shape_len);
     }
     /* Кладём ТОЛЬКО задачам своего транспорта: у TCP и QUIC приветствия
        разные, и снимок одного для другого — не «лучше, чем ничего», а чужие
        байты, которыми задача пойдёт мерить. */
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
-        if (t->state != T_FREE && t->transport == ev->transport &&
+        /* The whole experiment, not just the worker, owns its input:
+         * result conversion, Plan guards and verification must describe
+         * the same bytes. New observations remain cached for NEXT search. */
+        if (t->state == T_SHAPE_WAIT && t->transport == ev->transport &&
             strcmp(t->name, name) == 0) {
             memcpy(t->trig, ev->shape, ev->shape_len);
             t->trig_len = ev->shape_len;
@@ -2936,7 +2971,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                Измеритель, вернувший плечо, на этот вопрос уже ответил своими
                зондами; спрашивать то же самое ещё раз через датапат значит
                потратить минуты на повторение готового ответа. */
-            if (r.verdict == D2K_V_OPAQUE && t->transport == 6 && !r.have_arm) {
+            if (r.verdict == D2K_V_OPAQUE && t->transport == 6 && !r.have_arm && !r.owns_search) {
                 /* «Решает содержимое» — единственный вердикт, на который
                    вопросы о свойствах вообще осмысленны: разрез такую коробку
                    не берёт, берёт её отравление буфера пересборки, а чем
