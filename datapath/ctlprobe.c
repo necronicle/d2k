@@ -269,6 +269,9 @@ int main(int argc, char **argv) {
     uint64_t seen = 0;
     uint64_t now = 1000;
     uint16_t port = 40000;
+    /* poll observes the fd, not stdio read-ahead. Buffered fgets could
+       consume several commands and leave the next one invisible to poll. */
+    setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("готов\n");
 
@@ -300,7 +303,7 @@ int main(int argc, char **argv) {
         }
         d2k_ctl_flush(ctl);
 
-        if (p[0].revents & POLLIN) {
+        if (p[0].revents & (POLLIN | POLLHUP)) {
             char line[512];
             if (!fgets(line, sizeof line, stdin)) {
                 break;

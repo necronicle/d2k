@@ -131,6 +131,7 @@ static int run_d2kask(char *const argv[], run_result *r) {
     int status = 0;
     waitpid(pid, &status, 0);
     r->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (WIFSIGNALED(status)) { fprintf(stderr, "d2kask terminated by signal %d\n", WTERMSIG(status)); }
     return 0;
 }
 
@@ -205,7 +206,7 @@ static void part_a(void) {
 
     /* A7: нечётная длина шестнадцатеричной строки в файле. */
     {
-        const char *path = "/tmp/d2kask-test-odd.hex";
+        char path[100]; snprintf(path, sizeof path, "/tmp/d2kask-test-odd-%ld.hex", (long)getpid());
         FILE *f = fopen(path, "w");
         CHECK(f != NULL, "A7: файл не создался");
         if (f) { fputs("abc", f); fclose(f); }
@@ -219,7 +220,7 @@ static void part_a(void) {
 
     /* A8: недопустимый символ в hex-файле — не отбрасывается молча. */
     {
-        const char *path = "/tmp/d2kask-test-badchar.hex";
+        char path[100]; snprintf(path, sizeof path, "/tmp/d2kask-test-badchar-%ld.hex", (long)getpid());
         FILE *f = fopen(path, "w");
         CHECK(f != NULL, "A8: файл не создался");
         if (f) { fputs("abgh", f); fclose(f); }
@@ -326,7 +327,7 @@ static void part_a(void) {
 
     /* A17: hex-файл пуст (0 шестнадцатеричных цифр). */
     {
-        const char *path = "/tmp/d2kask-test-empty.hex";
+        char path[100]; snprintf(path, sizeof path, "/tmp/d2kask-test-empty-%ld.hex", (long)getpid());
         FILE *f = fopen(path, "w");
         CHECK(f != NULL, "A17: файл не создался");
         if (f) { fputs("# только комментарий\n", f); fclose(f); }
@@ -340,7 +341,7 @@ static void part_a(void) {
 
     /* A18: hex-файл длиннее потолка формы приветствия (2048 байт = 4096 цифр). */
     {
-        const char *path = "/tmp/d2kask-test-toolong.hex";
+        char path[100]; snprintf(path, sizeof path, "/tmp/d2kask-test-toolong-%ld.hex", (long)getpid());
         FILE *f = fopen(path, "w");
         CHECK(f != NULL, "A18: файл не создался");
         if (f) {
@@ -588,8 +589,12 @@ static uint16_t peerstand_start(peerstand *s) {
 static int peerstand_accept_one(peerstand *s, uint8_t *peer_ip, uint16_t *peer_port) {
     struct sockaddr_in pa;
     socklen_t pl = sizeof pa;
+    struct pollfd ready = { s->listen_fd, POLLIN, 0 };
+    if (poll(&ready, 1, 5000) <= 0 || !(ready.revents & POLLIN)) { return -1; }
     int c = accept(s->listen_fd, (struct sockaddr *)&pa, &pl);
     if (c < 0) { return -1; }
+    struct timeval tv = {5, 0};
+    (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     memcpy(peer_ip, &pa.sin_addr, 4);
     *peer_port = ntohs(pa.sin_port);
     uint8_t buf[4096];
@@ -624,7 +629,8 @@ static int fakectl_listen(const char *path) {
    идентификатор плана, чтобы ответить «применён» тем же ID, каким вопрос ушёл
    на провод (0009, U1). Тело SET_NAME: [длина имени][имя][план ДВОИЧНЫЙ] —
    d2k_link_set_name раскодирует hex перед отправкой. */
-static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have_id) {
+static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have_id,
+                             uint16_t *kind) {
     uint8_t hdr[6];
     size_t got = 0;
     if (have_id) { *have_id = 0; }
@@ -635,6 +641,7 @@ static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have
     }
     uint32_t plen = (uint32_t)hdr[0] << 24 | (uint32_t)hdr[1] << 16 |
                     (uint32_t)hdr[2] << 8 | hdr[3];
+    *kind = (uint16_t)((uint16_t)hdr[4] << 8 | hdr[5]);
     if (plen < 2) { return -1; }
     size_t remaining = (size_t)plen - 2;
     uint8_t body[4096];
@@ -656,6 +663,7 @@ static int drain_one_command(int fd, uint8_t plan_id[D2K_PLAN_ID_LEN], int *have
     }
     if (plan_id && have >= 1) {
         size_t off = (size_t)2 + body[0] + 12 + 4;   /* +1 байт формы приветствия */
+        if (*kind == D2K_CMD_SET_NAME_PROBE) { off += 2; }
         if (off + D2K_PLAN_ID_LEN <= have) {
             memcpy(plan_id, body + off, D2K_PLAN_ID_LEN);
             if (have_id) { *have_id = 1; }
@@ -734,8 +742,10 @@ typedef struct {
 static void fakectl_run(fakectl_args *a) {
     for (size_t i = 0; i < a->n; i++) {
         uint8_t qid[D2K_PLAN_ID_LEN]; int have_id = 0;
-        if (drain_one_command(a->ctl_fd, qid, &have_id) != 0) { return; }
-        send_ack_ok(a->ctl_fd, D2K_CMD_SET_NAME);
+        uint16_t kind;
+        if (drain_one_command(a->ctl_fd, qid, &have_id, &kind) != 0) { return; }
+        if (kind != D2K_CMD_SET_NAME && kind != D2K_CMD_SET_NAME_PROBE) { return; }
+        send_ack_ok(a->ctl_fd, kind);
 
         uint8_t peer_ip[4]; uint16_t peer_port = 0;
         if (peerstand_accept_one(a->ps, peer_ip, &peer_port) != 0) { return; }
@@ -759,8 +769,16 @@ typedef struct {
 
 static void *fakectl_accept_and_run(void *arg) {
     fakectl_accept_args *a = (fakectl_accept_args *)arg;
+    /* A CLI failing before connect must fail the assertions, not leave
+       main blocked forever in pthread_join on an unused listener. */
+    struct pollfd ready = { a->listen_fd, POLLIN, 0 };
+    if (poll(&ready, 1, 5000) <= 0 || !(ready.revents & POLLIN)) { return NULL; }
     int cfd = accept(a->listen_fd, NULL, NULL);
     if (cfd < 0) { return NULL; }
+    /* A negative question itself waits five seconds. The fake controller
+       must outlive that wait and scheduling overhead, not race it. */
+    struct timeval tv = {15, 0};
+    (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     fakectl_args fa;
     fa.ctl_fd = cfd; fa.ps = a->ps; fa.target_port = a->target_port;
     fa.outcomes = a->outcomes; fa.n = a->n;
@@ -791,7 +809,7 @@ static void part_c(void) {
      * РАЗЛИЧИМО: [2]/[5] как "спрошен: нет" (причина control), [1]/[3]/[4]
      * как "спрошен: да" / "ответ: не измерено". ------------------------- */
     {
-        const char *hexpath = "/tmp/d2kask-test-c1.hex";
+        char hexpath[100]; snprintf(hexpath, sizeof hexpath, "/tmp/d2kask-test-c1-%ld.hex", (long)getpid());
         CHECK(write_hello_hex_file(hexpath, "c1.example") == 0, "C1: снимок не собрался");
 
         char port_s[16]; snprintf(port_s, sizeof port_s, "%u", (unsigned)stand_port);
@@ -856,8 +874,9 @@ static void part_c(void) {
      * 2: настоящий ctlprobe не может дать событие, ключ которого совпадёт с
      * настоящим местным портом d2kask. ------------------------------------ */
     {
-        const char *hexpath = "/tmp/d2kask-test-c2.hex";
-        const char *ctrlpath = "/tmp/d2kask-test-c2-control.hex";
+        char hexpath[100], ctrlpath[100];
+        snprintf(hexpath, sizeof hexpath, "/tmp/d2kask-test-c2-%ld.hex", (long)getpid());
+        snprintf(ctrlpath, sizeof ctrlpath, "/tmp/d2kask-test-c2-control-%ld.hex", (long)getpid());
         CHECK(write_hello_hex_file(hexpath, "c2.example") == 0, "C2: снимок не собрался");
         CHECK(write_hello_hex_file(ctrlpath, "c2-control.example") == 0, "C2: control-снимок не собрался");
 
@@ -891,6 +910,7 @@ static void part_c(void) {
         unlink(sock_path2);
 
         CHECK(r.exit_code == 0, "C2: прогон обязан завершиться кодом 0");
+        if (r.exit_code != 0) { fprintf(stderr, "C2 exit=%d: %s\n", r.exit_code, r.errbuf); }
         const char *p1 = strstr(r.out, "[1/5]");
         const char *p2 = strstr(r.out, "[2/5]");
         CHECK(p1 && p2, "C2: вопросы 1/2 не нашлись");
@@ -928,8 +948,9 @@ static void part_c(void) {
      * ЗАДАН/ДА с примечанием про побочный эффект. Через поддельный
      * управляющий сокет — та же причина, что у C2 выше. -------------------- */
     {
-        const char *hexpath = "/tmp/d2kask-test-c3.hex";
-        const char *ctrlpath = "/tmp/d2kask-test-c3-control.hex";
+        char hexpath[100], ctrlpath[100];
+        snprintf(hexpath, sizeof hexpath, "/tmp/d2kask-test-c3-%ld.hex", (long)getpid());
+        snprintf(ctrlpath, sizeof ctrlpath, "/tmp/d2kask-test-c3-control-%ld.hex", (long)getpid());
         CHECK(write_hello_hex_file(hexpath, "c3.example") == 0, "C3: снимок не собрался");
         CHECK(write_hello_hex_file(ctrlpath, "c3-control.example") == 0, "C3: control-снимок не собрался");
 
@@ -968,6 +989,7 @@ static void part_c(void) {
         unlink(sock_path3);
 
         CHECK(r.exit_code == 0, "C3: прогон обязан завершиться кодом 0");
+        if (r.exit_code != 0) { fprintf(stderr, "C3 exit=%d: %s\n", r.exit_code, r.errbuf); }
         const char *p3 = strstr(r.out, "[3/5]");
         const char *p4 = strstr(r.out, "[4/5]");
         CHECK(p3 && p4 && p3 < p4, "C3: вопросы 3/4 не нашлись в порядке");

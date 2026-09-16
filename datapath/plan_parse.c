@@ -110,6 +110,11 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "неподдержанный TCP wire profile или minexec < 4"); return -1;
             }
             break;
+        case REC_INPUT_TLS:
+            if (rd16(b + 6) < 5 || ln != 0) {
+                fail(err, errlen, "input tls-sni требует minexec=5 и пустую запись"); return -1;
+            }
+            break;
         case REC_SETTLE:
             if (ln != 4 || rd32(b + off) == 0) {
                 fail(err, errlen, "недопустимая пауза перед правдой"); return -1;
@@ -357,6 +362,9 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             p->input_sni_off = rd32(v + 4);
             p->input_sni_len = rd32(v + 8);
             break;
+        case REC_INPUT_TLS:
+            p->input_tls = 1;
+            break;
         case REC_WIRE:
             p->wire_profile = v[0];
             break;
@@ -383,7 +391,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         d2k_plan_free(p);
         return -1;
     }
-    if (p->transport != 6 && (p->input_len || p->settle_us || p->segment_size || p->wire_profile)) {
+    if (p->transport != 6 && (p->input_len || p->input_tls || p->settle_us || p->segment_size || p->wire_profile)) {
         d2k_plan_free(p);
         fail(err, errlen, "измеренные TCP-операции требуют явного транспорта TCP");
         return -1;

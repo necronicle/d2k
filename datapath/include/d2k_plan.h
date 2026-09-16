@@ -24,7 +24,8 @@
  * and explicit TCP segmentation without shortening the logical payload. */
 /* Version 4 adds explicit detect/raw.c TCP wire semantics. Legacy plans
  * retain their old header semantics; learned plans are never reinterpreted. */
-#define D2K_EXEC_VERSION 4
+/* Version 5 adds a complete TLS/SNI input guard for parametric actions. */
+#define D2K_EXEC_VERSION 5
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_SCHEMA_MAX   1
 

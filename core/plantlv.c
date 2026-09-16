@@ -50,7 +50,8 @@ enum {
     REC_INPUT   = 0x0106,
     REC_SETTLE  = 0x0107,
     REC_SEGMENT = 0x0108,
-    REC_WIRE    = 0x0109
+    REC_WIRE    = 0x0109,
+    REC_INPUT_TLS = 0x010a
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -97,6 +98,7 @@ typedef struct {
     uint32_t   pace_us;   /* 0 — записи нет */
     uint32_t   input_len, input_sni_off, input_sni_len, settle_us, segment_size;
     uint8_t    wire_profile;
+    uint8_t    input_tls;
 } pl_plan;
 
 static int b64_value(unsigned char c) {
@@ -362,6 +364,10 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             }
             p->wire_profile = 1;
         } else if (strcmp(f[0], "input") == 0) {
+            if (nf == 2 && strcmp(f[1], "tls-sni") == 0) {
+                p->input_tls = 1;
+                continue;
+            }
             unsigned long len, off, snilen;
             if (nf != 4 || str_u32(f[1], &len) || !len || len > 65535 ||
                 str_u32(f[2], &off) || str_u32(f[3], &snilen) ||
@@ -472,6 +478,9 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         say(err, errcap, "нет заголовка d2k-plan");
         goto bad;
     }
+    if (p->input_tls && (p->minexec < 5 || p->transport != 6)) {
+        say(err, errcap, "input tls-sni требует TCP и minexec=5"); goto bad;
+    }
     if ((p->input_len || p->settle_us || p->segment_size) && p->minexec < 3) {
         say(err, errcap, "input/settle/segment требуют minexec=3"); goto bad;
     }
@@ -523,7 +532,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
-                       (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u);
+                       (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) + (p.input_tls ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -604,6 +613,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     if (p.segment_size) {
         put_u16(&w, REC_SEGMENT); put_u16(&w, 4); put_u32(&w, p.segment_size);
     }
+    if (p.input_tls) { put_u16(&w, REC_INPUT_TLS); put_u16(&w, 0); }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);

@@ -300,7 +300,15 @@ d2kd-linux-arm64:
 # planlab тоже в зависимостях, и это не украшение: он собирается отдельной
 # целью, поэтому однажды check остался зелёным при несобирающейся
 # лаборатории. Проверка, не собирающая всё, что есть, проверяет не дерево.
-check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session
+test_ctlprobe: test_ctlprobe.c ctlprobe
+	$(CC) $(CFLAGS) -o $@ test_ctlprobe.c $(LDFLAGS)
+
+test-ctlprobe: test_ctlprobe
+	./test_ctlprobe
+
+.PHONY: test-ctlprobe
+
+check: all test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-ctlprobe
 
 clean:
-	rm -f *.o $(TESTS) planlab ctlprobe d2kd
+	rm -f *.o $(TESTS) test_ctlprobe planlab ctlprobe d2kd

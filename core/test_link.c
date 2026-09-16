@@ -16,6 +16,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +218,25 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+    /* A real closed AF_UNIX peer must return an error even when the
+       application has the default SIGPIPE disposition (e.g. d2kask). */
+    {
+        pid_t pid = fork();
+        CHECK(pid >= 0, "fork for closed-peer regression");
+        if (pid == 0) {
+            signal(SIGPIPE, SIG_DFL);
+            int sv[2]; char err[128];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { _exit(2); }
+            close(sv[1]);
+            int rc = d2k_link_arm_shape(sv[0], "closed.example", 6, err, sizeof err);
+            close(sv[0]); _exit(rc == -1 ? 0 : 3);
+        }
+        if (pid > 0) {
+            int status = 0; waitpid(pid, &status, 0);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                  "closed peer killed the caller with SIGPIPE");
+        }
+    }
     /* --- ВНЕШНИЙ тип записи живёт на событии (маска seen_types), а не на
      * голом типе записи. Функция называется outer_appdata, а не has_appdata,
      * потому что видит она ровно внешний тип: в TLS 1.3 типом 23 наружу едет

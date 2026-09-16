@@ -115,6 +115,9 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     size_t off = 0, len = 0;
 
     memset(&out, 0, sizeof(out));
+    /* Provider capability, including early input errors: failure to start
+     * the original tool must not authorize a different legacy search. */
+    out.owns_search = 1;
     memset(&opt, 0, sizeof(opt));
     memset(&tr, 0, sizeof(tr));
 
@@ -163,7 +166,6 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
     d2k_classify_run(addr, &tr, &opt, &res);
 
     out.verdict = map_verdict(res.verdict);
-    out.owns_search = 1;
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;

@@ -109,15 +109,24 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
         ? d2k_arm_plan(&a, D2K_SHAPE_MODERN, "decoy.example", 1500, text, sizeof text)
         : d2k_arm_plan_measured(&a, &in, text, sizeof text);
     CHECK(rc == 0); if (rc) { return; }
+    int parametric = strstr(text, "input tls-sni") != NULL;
+    if (parametric) {
+        /* Packet metadata below models parsed SNI; provide its complete
+           record/handshake envelope too. Full real profiles are tested below. */
+        tr[0] = 0x16; tr[1] = 3; tr[2] = 1;
+        tr[3] = (uint8_t)((n - 5) >> 8); tr[4] = (uint8_t)(n - 5);
+        tr[5] = 1; tr[6] = 0;
+        tr[7] = (uint8_t)((n - 9) >> 8); tr[8] = (uint8_t)(n - 9);
+    }
     rc = d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len, err, sizeof err);
     if (rc) { fprintf(stderr, "%s\n", err); }
     CHECK(rc == 0); if (rc) { return; }
     /* Records must not pretend to be executable by the previous daemon. */
     if (!getenv("D2K_TEST_LEGACY_BUILDER")) {
         d2k_plan *old = NULL;
-        tlv[7] = 2;
+        uint8_t version = tlv[7]; tlv[7] = parametric ? 4 : 2;
         CHECK(d2k_plan_load(tlv, tlv_len, &old, err, sizeof err) != 0);
-        d2k_plan_free(old); tlv[7] = 4;
+        d2k_plan_free(old); tlv[7] = version;
     }
     rc = d2k_plan_load(tlv, tlv_len, &p, err, sizeof err);
     if (rc) { fprintf(stderr, "%s\n", err); }
@@ -160,8 +169,37 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
     CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
     d2k_actions_free(&out);
     pkt.payload_len++; pkt.sni_off++;
-    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+    CHECK((d2k_plan_apply(p, NULL, &pkt, &out) == 0) == parametric);
     d2k_actions_free(&out);
+    if (parametric) {
+        /* One plan, several different full inputs: no rebuilding the plan
+           to accidentally make a literal offset look reusable. */
+        static const char *names[] = {"a.co", "longer-target.example", "second.example"};
+        for (size_t k = 0; k < sizeof names / sizeof names[0]; k++) {
+            d2k_arm_input other = {0};
+            CHECK(d2k_hello_from_profile(k == 0 ? D2K_SHAPE_LEGACY : D2K_SHAPE_MODERN,
+                  names[k], tr, sizeof tr, &other.trigger_len) == 0);
+            CHECK(d2k_hello_sni(tr, other.trigger_len, &other.sni_off, &other.sni_len) == 0);
+            pkt.payload_len = other.trigger_len;
+            pkt.sni_off = other.sni_off; pkt.sni_len = other.sni_len;
+            CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
+            reference(&a, &other, tr);
+            CHECK(out.n == count && out.fate == D2K_ORIG_DROP);
+            for (size_t i = 0; i < out.n && i < count; i++) {
+                const d2k_emit *e = &out.v[i]; const expected_send *x = &expected[i];
+                CHECK(e->seq == x->seq && e->delay_us == x->delay && e->len == x->len);
+                CHECK(e->pre_len == 0 && e->wire_profile == D2K_WIRE_DETECT_TCP);
+                if (e->len == x->len) { CHECK(memcmp(e->bytes, x->bytes, e->len) == 0); }
+            }
+            d2k_actions_free(&out);
+            pkt.payload_len--;
+            CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+            d2k_actions_free(&out); pkt.payload_len++;
+            pkt.have_sni = 0;
+            CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+            d2k_actions_free(&out); pkt.have_sni = 1;
+        }
+    }
     d2k_plan_free(p);
 }
 
@@ -171,7 +209,9 @@ static void malformed(void) {
         "payload-pad 1 4 15 zz", "payload-pad 0 4 15", "payload-pad 1 65534 15",
         "payload-slice 2 1 0 1", "payload 1 01\npayload-slice 2 1 1 1",
         "payload 1 01\npayload-slice 2 1 0 0", "input 0 0 0", "input 10 9 2",
-        "input 10 11 0", "settle 0", "settle -1", "segment 0", "segment 65536"
+        "input 10 11 0", "input tls-sni extra", "input unknown",
+        "input tls-sni", /* this fixture declares minexec=3 */
+        "settle 0", "settle -1", "segment 0", "segment 65536"
         ,"payload-pad64 1 4 15 A", "payload-pad64 1 4 15 @@@@",
         "payload-pad64 1 4 15 AB==", "payload-pad64 1 4 15 AAA=AAAA",
         "payload-pad64 1 4 15 AA=A", "payload-pad64 1 1 15 AAAA"

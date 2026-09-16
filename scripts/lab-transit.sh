@@ -118,7 +118,7 @@ iptables -t mangle -A D2KQ -p tcp --dport 443 -j NFQUEUE --queue-num "$QUEUE" --
 DPI=$!
 sleep 1
 
-if inns curl -4 -s -o /dev/null --max-time 12 "https://$NAME/" 2>/dev/null; then
+if inns curl -4 -s -o /dev/null --resolve "$NAME:443:$IP" --max-time 12 "https://$NAME/" 2>/dev/null; then
     fail "цензор не режет: клиент за NAT прошёл мимо него"
 fi
 echo "цензор на месте: клиент за NAT к $NAME не проходит"
@@ -166,7 +166,7 @@ sleep 1
 
 echo "== обращение КЛИЕНТА ЗА NAT =="
 for n in 1 2 3 4; do
-    inns curl -4 -s -o /dev/null --max-time 15 "https://$NAME/" 2>/dev/null || true
+    inns curl -4 -s -o /dev/null --resolve "$NAME:443:$IP" --max-time 15 "https://$NAME/" 2>/dev/null || true
     sleep 4
 done
 
@@ -179,7 +179,7 @@ done
 echo "== проверка: прошёл ли КЛИЕНТ, а не зонд =="
 OK=0
 for n in 1 2 3; do
-    CODE=$(inns curl -4 -s -o /dev/null -w "%{http_code}" --max-time 20 "https://$NAME/" 2>/dev/null) || CODE=""
+    CODE=$(inns curl -4 -s -o /dev/null --resolve "$NAME:443:$IP" -w "%{http_code}" --max-time 20 "https://$NAME/" 2>/dev/null) || CODE=""
     [ -n "$CODE" ] || CODE=000
     echo "  попытка $n: код=$CODE"
     [ "$CODE" = "200" ] && OK=$((OK+1))

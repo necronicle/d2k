@@ -96,9 +96,18 @@ static int read_exact(int fd, uint8_t *buf, size_t n) {
 }
 
 static int write_all(int fd, const uint8_t *buf, size_t n) {
+    /* A disconnected local daemon is an I/O error, not permission to kill
+       its caller with SIGPIPE. Do not change process-wide signal policy. */
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags = MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one) != 0) { return -1; }
+#endif
     size_t sent = 0;
     while (sent < n) {
-        ssize_t w = send(fd, buf + sent, n - sent, 0);
+        ssize_t w = send(fd, buf + sent, n - sent, flags);
         if (w > 0) {
             sent += (size_t)w;
             continue;

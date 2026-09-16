@@ -191,6 +191,18 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (!in->payload || in->payload_len == 0) {
         return -1;
     }
+    if (p->input_tls) {
+        /* SNI-relative actions are reusable, but a first TCP fragment is
+         * not the full input on which raw.c performs its three-part send.
+         * SNI metadata is provided by the normal session TLS parser. */
+        const uint8_t *b = in->payload;
+        size_t n = in->payload_len;
+        if (n < 9 || n > 2048 || b[0] != 0x16 || b[1] != 3 || b[5] != 1 ||
+            5u + ((size_t)b[3] << 8) + b[4] != n ||
+            9u + ((size_t)b[6] << 16) + ((size_t)b[7] << 8) + b[8] != n ||
+            !in->have_sni || in->sni_len <= 1 || !in->sni_off ||
+            in->sni_off > n || in->sni_len > n - in->sni_off) { return -1; }
+    }
     if (p->input_len &&
         (in->payload_len != p->input_len ||
          (in->have_sni ? in->sni_len : 0) != p->input_sni_len ||

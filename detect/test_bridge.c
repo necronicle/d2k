@@ -41,6 +41,11 @@ int main(void)
     d2k_arm arm;
     d2k_poison p;
     char why[160];
+    {
+        d2k_hello empty = {0};
+        r = d2k_detect_sched_tcp("192.0.2.1", 443, empty, empty, 0x2d, 2, 12000, 321);
+        CHECK(r.owns_search && !r.have_arm && r.verdict == D2K_V_FLAKY);
+    }
     answer.verdict = D2K_DV_INCONCLUSIVE;
     r = measure();
     CHECK(seen.control.len == 3);

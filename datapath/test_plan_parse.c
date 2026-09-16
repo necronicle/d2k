@@ -52,6 +52,20 @@ int main(void) {
         CHECK(!loads(b, sizeof b - 1), "empty wire profile accepted");
     }
 
+    {
+        uint8_t b[] = {'D','2','K','P',0,1,0,5,0,0,0,2,
+                       0,2,0,2,6,1, 1,10,0,0,0};
+        CHECK(loads(b, sizeof b - 1), "complete TLS input guard rejected");
+        b[7] = 4;
+        CHECK(!loads(b, sizeof b - 1), "TLS input guard accepted with minexec=4");
+        b[7] = 5; b[16] = 17;
+        CHECK(!loads(b, sizeof b - 1), "TLS input guard accepted for UDP");
+        b[16] = 0;
+        CHECK(!loads(b, sizeof b - 1), "TLS input guard accepted without transport");
+        b[16] = 6; b[21] = 1;
+        CHECK(!loads(b, sizeof b), "TLS input guard accepted unexpected body");
+    }
+
     /* New measured-context records: validate length, value and minexec. */
     for (unsigned code = 6; code <= 8; code++) {
         uint8_t b[34] = {'D','2','K','P',0,1,0,3,0,0,0,2,0,2,0,2,6,1,1,0,0,0};

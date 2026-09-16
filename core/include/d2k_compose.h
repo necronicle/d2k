@@ -130,8 +130,10 @@ typedef struct {
 int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
                  size_t send_cap, char *buf, size_t cap);
 
-/* Exact measured input, not a newly generated profile. Never crops bytes.
- * The executor's packet-size checks remain mandatory before sending. */
+/* Preserves measured bytes, not a newly generated decoy profile. Never
+ * crops bytes. Pure SNI-disorder retains raw.c's input-relative cut and
+ * requires a full TLS/SNI input; arms with captured byte dependencies keep
+ * exact input constraints. Packet-size checks remain mandatory. */
 int d2k_arm_plan_measured(const d2k_arm *arm, const d2k_arm_input *input,
                           char *buf, size_t cap);
 

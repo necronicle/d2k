@@ -632,11 +632,12 @@ int main(void) {
 
     /* A completed domain-search provider is not a bare classifier. Its
      * failure must not launch another property questionnaire or fallback. */
-    for (int mode = 0; mode < 4; mode++) {
+    for (int mode = 0; mode < 5; mode++) {
         d2k_catalog empty = {0};
         d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
         tcp_owns_search = 1;
-        tcp_answer = mode == 0 || mode == 3 ? D2K_V_OPAQUE : mode == 1 ? D2K_V_PREFIX : D2K_V_WHOLE;
+        tcp_answer = mode == 4 ? D2K_V_FLAKY :
+            mode == 0 || mode == 3 ? D2K_V_OPAQUE : mode == 1 ? D2K_V_PREFIX : D2K_V_WHOLE;
         tcp_found_arm = mode == 3;
         ver_answer = D2K_VER_NOT_MEASURED; ver_calls = 0; tcp_calls = 0;
         saidbuf[0] = '\0'; sent_len = 0;
@@ -649,7 +650,7 @@ int main(void) {
         CHECK(tcp_calls == 1, "domain search repeated");
         CHECK(!said("спрашиваю коробку о свойствах"), "second property search after original");
         CHECK(!said("запасного перебора"), "second fallback search after original");
-        CHECK(mode == 0 ? ver_calls == 0 : ver_calls == 1,
+        CHECK(mode == 0 || mode == 4 ? ver_calls == 0 : ver_calls == 1,
               "original split solution lost or extra candidates tested");
         d2k_sched_free(s); d2k_catalog_free(&empty);
     }

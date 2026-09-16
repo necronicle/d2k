@@ -1496,6 +1496,17 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
     if (between) { if (mid >= n) { mid = 1; } ov = 0; }
     else { if (mid < 2) { mid = 2; } if (mid >= n) { mid = n - 1; } }
     if (!fake && !between && !disorder && !ov) { return -1; }
+    /* Pure disorder has no captured payload dependency. raw.c computes
+     * the cut from each input's SNI, not from a stored literal offset.
+     * Reproduce that parameterization, with a full-input guard. Other arms
+     * retain exact lengths/offsets until their dependencies are expressed. */
+    if (disorder && !fake && !ov && in->sni_off > 0 && in->sni_len > 1) {
+        return append_fmt(buf, cap, &pos,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
+            "split payload_start +1\nsplit sni_middle +0\norder reverse\npace 12000\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX);
+    }
     if (append_fmt(buf, cap, &pos,
         "d2k-plan 1 4\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
