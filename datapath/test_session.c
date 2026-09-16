@@ -1046,6 +1046,131 @@ int main(void) {
 
     d2k_session_free(s);
 
+    /* Snapshot assembly is observation, never a packet verdict/byte change.
+       SNI can cross a boundary or be in the first segment. Neither case may
+       publish a truncated SHAPE or duplicate the target event. */
+    {
+        uint8_t whole[2048], part[2100], saved[2100];
+        size_t whole_len = build_hello_pad(whole, 1544);
+        const size_t cuts[] = {1, 4, 8, 60, 64, 70, 1448, 1544};
+        const uint8_t name[] = "hetzner.com";
+        for (size_t j = 0; j < sizeof cuts / sizeof cuts[0]; j++) {
+            d2k_session *g = d2k_session_new(64, 64);
+            CHECK(g != NULL, "capture session allocation");
+            if (!g) { continue; }
+            CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 0,
+                  "empty capture was ready");
+            size_t cut = cuts[j];
+            size_t pn = build_pkt(part, 47000, 0x18, whole, cut);
+            memcpy(saved, part, pn);
+            d2k_session_packet(g, part, pn, 1, buf, sizeof buf, &r);
+            CHECK(r.verdict == D2K_VERDICT_ACCEPT && !r.applied && !r.n_out,
+                  "capture changed first packet verdict");
+            CHECK(!memcmp(saved, part, pn), "capture changed first packet bytes");
+            size_t got_len = 0;
+            if (cut < whole_len) {
+                CHECK(d2k_session_shape(g, 6, &got_len) == NULL,
+                      "partial hello published as SHAPE");
+                CHECK(count_kind(g, D2K_JRN_SHAPE) == 0, "partial SHAPE event");
+                CHECK(count_kind(g, D2K_JRN_HELLO_NONAME) == 0,
+                      "incomplete SNI was called nameless");
+                pn = build_pkt(part, 47000, 0x18, whole + cut, whole_len - cut);
+                wr32(part + 24, 1000 + (uint32_t)cut);
+                memcpy(saved, part, pn);
+                d2k_session_packet(g, part, pn, 2, buf, sizeof buf, &r);
+                CHECK(r.verdict == D2K_VERDICT_ACCEPT && !r.applied && !r.n_out,
+                      "capture changed tail verdict");
+                CHECK(!memcmp(saved, part, pn), "capture changed tail bytes");
+            }
+            const uint8_t *got = d2k_session_shape(g, 6, &got_len);
+            CHECK(got && got_len == whole_len && !memcmp(got, whole, whole_len),
+                  "assembled snapshot differs from original hello");
+            CHECK(count_kind(g, D2K_JRN_SHAPE) == 1, "expected one SHAPE event");
+            CHECK(count_kind(g, D2K_JRN_HELLO_SNI) == 1, "expected one SNI event");
+            CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 1,
+                  "full hello not available to later search");
+            CHECK(d2k_session_shape(g, 17, &got_len) == NULL, "TCP polluted QUIC snapshot");
+            pn = build_pkt(part, 47000, 0x18, whole, whole_len);
+            d2k_session_packet(g, part, pn, 3, buf, sizeof buf, &r);
+            d2k_payload_stats ps;
+            d2k_session_payload_stats(g, &ps);
+            CHECK(ps.capture_complete == 1, "retransmit duplicated completed capture");
+            d2k_session_free(g);
+        }
+        /* Fast successful flows must release slots, not fill all 64 slots
+           for five seconds and starve the next incomplete ClientHello. */
+        {
+            d2k_session *g = d2k_session_new(256, 64);
+            CHECK(g != NULL, "capture pressure allocation");
+            if (g) {
+                for (uint16_t port = 48000; port < 48080; port++) {
+                    size_t pn = build_pkt(part, port, 0x18, whole, whole_len);
+                    d2k_session_packet(g, part, pn, 1, buf, sizeof buf, &r);
+                }
+                d2k_payload_stats ps;
+                d2k_session_payload_stats(g, &ps);
+                CHECK(ps.capture_complete == 80 && ps.capture_full == 0,
+                      "completed captures starved new flows");
+                d2k_session_free(g);
+            }
+        }
+        {
+            /* Even with an installed input-tls plan, completion on a tail
+               is NOT permission to send a reconstructed hello after its
+               original head has already passed. Whole-packet path still works. */
+            static const uint8_t strict_plan[] = {
+                'D','2','K','P', 0,1, 0,5, 0,0, 0,4,
+                0,2, 0,2, 6,1,                 /* TCP/TLS */
+                1,10, 0,0,                     /* input tls-sni */
+                1,0, 0,4, 0,5, 0,0,           /* split sni_middle */
+                1,8, 0,4, 0,0,5,120            /* segment 1400 */
+            };
+            d2k_session *g = d2k_session_new(64, 64);
+            d2k_plan *gp = NULL;
+            CHECK(g != NULL, "strict capture allocation");
+            CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &gp,
+                                err, sizeof err) == 0, "strict capture plan parse");
+            if (g && gp) {
+                d2k_session_set_plan(g, gp);
+                gp = NULL;
+                size_t pn = build_pkt(part, 47500, 0x18, whole, 1448);
+                d2k_session_packet(g, part, pn, 1, buf, sizeof buf, &r);
+                CHECK(!r.applied && !r.n_out && r.verdict == D2K_VERDICT_ACCEPT,
+                      "strict plan consumed incomplete head");
+                pn = build_pkt(part, 47500, 0x18, whole + 1448, whole_len - 1448);
+                wr32(part + 24, 2448);
+                d2k_session_packet(g, part, pn, 2, buf, sizeof buf, &r);
+                CHECK(!r.applied && !r.n_out && r.verdict == D2K_VERDICT_ACCEPT,
+                      "observation executed full plan on passed-through tail");
+                pn = build_pkt(part, 47501, 0x18, whole, whole_len);
+                d2k_session_packet(g, part, pn, 3, buf, sizeof buf, &r);
+                CHECK(r.applied && r.n_out > 0 && r.verdict == D2K_VERDICT_DROP,
+                      "capture prevented whole-packet plan execution");
+            }
+            d2k_plan_free(gp);
+            d2k_session_free(g);
+        }
+
+        /* Reset between pieces: neither FIN nor SYN can join two incarnations. */
+        const uint8_t reset_flags[] = {0x11, 0x14, 0x02};
+        for (size_t j = 0; j < sizeof reset_flags; j++) {
+            d2k_session *g = d2k_session_new(64, 64);
+            CHECK(g != NULL, "reset capture session allocation");
+            if (!g) { continue; }
+            d2k_session_want_shape(g, name, sizeof name - 1, 6);
+            size_t pn = build_pkt(part, 47000, 0x18, whole, 1448);
+            d2k_session_packet(g, part, pn, 1, buf, sizeof buf, &r);
+            pn = build_pkt(part, 47000, reset_flags[j], NULL, 0);
+            d2k_session_packet(g, part, pn, 2, buf, sizeof buf, &r);
+            pn = build_pkt(part, 47000, 0x18, whole + 1448, whole_len - 1448);
+            wr32(part + 24, 2448);
+            d2k_session_packet(g, part, pn, 3, buf, sizeof buf, &r);
+            size_t got_len = 0;
+            CHECK(d2k_session_shape(g, 6, &got_len) == NULL, "reset mixed captures");
+            d2k_session_free(g);
+        }
+    }
+
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;

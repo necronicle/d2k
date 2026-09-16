@@ -253,10 +253,10 @@ typedef struct {
     /* Первый байт последней неузнанной нагрузки: 0x16 — рукопожатие TLS и
      * разбор споткнулся внутри, 0x47 — обычный HTTP, прочее — не TLS. */
     uint8_t  last_first_byte;
-    /* Приветствие узнано, но имя уехало в следующий сегмент. Цена того, что
-     * мы читаем первый сегмент вместо пересборки. Измеряется, а не
-     * принимается на веру. */
+    /* Приветствие узнано, но в первом сегменте имя ещё не видно. */
     uint64_t sni_next_seg;
+    /* Bounded observational capture, separate from Plan application. */
+    uint64_t capture_complete, capture_rejected, capture_expired, capture_full;
 } d2k_payload_stats;
 
 void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);

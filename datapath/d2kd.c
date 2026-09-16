@@ -258,6 +258,10 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                ps.reverse, ps.after_hello, ps.late, ps.not_hello,
                ps.last_first_byte);
         printf("имя уехало во второй сегмент: %" PRIu64 "\n", ps.sni_next_seg);
+        printf("снимки TCP: полных=%" PRIu64 " отвергнутых=%" PRIu64
+               " истекших=%" PRIu64 " отказов ёмкости=%" PRIu64 "\n",
+               ps.capture_complete, ps.capture_rejected,
+               ps.capture_expired, ps.capture_full);
     }
     printf("потеряно ядром %" PRIu64 ", ошибок вердикта %" PRIu64
            ", ошибок отправки %" PRIu64 ", ошибок чтения %" PRIu64 "\n",

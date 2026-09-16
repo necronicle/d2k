@@ -115,6 +115,9 @@ struct d2k_flow {
      * решений не нужно. Имя живёт в журнале, у которого свой предел. */
     int      saw_hello;
     int      had_sni;
+    /* Snapshot delivered or rejected; completed flows consume no assembly
+       slot and retransmissions cannot publish another snapshot. */
+    int      hello_capture_done;
 
     /* Признаки для обнаружения подозрений. Это НАБЛЮДЕНИЯ, а не диагноз:
      * §2.4 говорит, что таймаут не доказывает блокировку, а промах не

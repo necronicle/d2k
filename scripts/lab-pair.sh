@@ -41,15 +41,8 @@ cd /w
 fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 
 echo "== сборка =="
-# Цели d2kd в Makefile нет (на маке он не собирается вовсе — сырые сокеты и
-# NFQUEUE), поэтому собираем тем же списком исходников, что и кросс-цель
-# d2kd-linux-arm64: DAEMON + LINUXSRC + SRC + CORESRC.
-cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
-   -o /tmp/d2kd datapath/d2kd.c datapath/nfq.c datapath/raw.c \
-   datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c \
-   datapath/wire_udp.c datapath/track.c datapath/session.c datapath/nl.c \
-   datapath/sched.c datapath/journal.c datapath/plans.c datapath/ctl.c \
-   datapath/ctlsrv.c core/quic.c core/crypto.c
+make -s -C datapath d2kd >/dev/null
+cp datapath/d2kd /tmp/d2kd
 make -s -C core d2kc >/dev/null
 
 SOCK=/tmp/lab-ctl.sock

@@ -17,6 +17,7 @@
 #include "d2k_session.h"
 #include "d2k_time.h"
 #include "d2k_tls.h"
+#include "d2k_capture.h"
 
 /* Сколько первых пакетов потока имеет смысл разбирать в поисках приветствия.
  * ClientHello приходит первым или почти первым; после этого разбор — чистая
@@ -24,6 +25,7 @@
 #define D2K_HELLO_WINDOW 8
 
 struct d2k_session {
+    d2k_capture capture;
     d2k_table   *flows;
     /* Учёт QUIC/UDP-потоков (задача 4 QUIC-вертикали) — ВТОРАЯ, независимая
      * таблица того же типа d2k_table/d2k_flow, не общая с flows.
@@ -84,6 +86,7 @@ struct d2k_session {
     uint64_t     pay_not_hello;    /* разобрали и это не приветствие */
     uint8_t      last_nonhello_first;
     uint64_t     sni_in_next_seg;
+    uint64_t     captured_hellos;
 
     /* Форма приветствия. Один буфер на всю сессию, и это объявленный предел:
      * хранить приветствие каждого потока значило бы килобайт на поток.
@@ -271,6 +274,7 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
    стороны не было ни одного — и узнать это можно только здесь, в конце. */
 static void on_flow_expire(void *ctx, const d2k_flow *f) {
     d2k_session *s = ctx;
+    d2k_capture_forget(&s->capture, &f->key);
     if (!f->saw_hello || f->rev_after_hello > 0 || f->suspected) {
         return;
     }
@@ -945,6 +949,8 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
     const int rst = (flags & 0x04) != 0;
     const int ack = (flags & 0x10) != 0;
 
+    if (syn && !ack) { d2k_capture_forget(&s->capture, &key); }
+
     d2k_flow *fl = d2k_track_get(s->flows, &key, now_ns);
     if (!fl) {
         /* Таблица полна. Пропускаем — и это правильный исход: обработать
@@ -953,6 +959,8 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "таблица потоков полна";
         return 0;
     }
+
+    if (syn && !ack) { fl->hello_capture_done = 0; }
 
     /* Направление. Сперва по флагам, и только потом по порядку прибытия.
        SYN без ACK шлёт тот, кто открывает соединение; SYN с ACK — тот, кто
@@ -1115,6 +1123,7 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             det.ipid = rd16(pkt + 4);
             suspect(s, now_ns, &key, fl, D2K_SUSPECT_RST, &det);
         }
+        d2k_capture_forget(&s->capture, &key);
         d2k_track_remove(s->flows, &key);
         out->skipped = rst ? "соединение сброшено" : "соединение закрывается";
         return 0;
@@ -1178,40 +1187,12 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
             s->last_nonhello_first = pkt[payload_off];
         }
         if (tls.is_client_hello) {
-            /* Последнее приветствие копится всегда: подозрение возникнет на
-               этом же соединении, и просить форму будет уже поздно. Один
-               буфер, объявленный предел. */
-            if (payload_len <= sizeof s->last_hello[0]) {
-                memcpy(s->last_hello[0], pkt + payload_off, payload_len);
-                s->last_hello_len[0] = payload_len;
-                s->last_name_len[0] = 0;
-                if (tls.have_sni && tls.sni_len <= sizeof s->last_name[0]) {
-                    memcpy(s->last_name[0], pkt + payload_off + tls.sni_off, tls.sni_len);
-                    s->last_name_len[0] = tls.sni_len;
-                }
-            }
-            /* Взведённая ловушка — на случай, когда в момент запроса
-               подходящего приветствия ещё не было. */
-            if (s->shape_armed[0] && payload_len <= sizeof s->shape[0] &&
-                (s->shape_name_len[0] == 0 ||
-                 (tls.have_sni &&
-                  name_same(pkt + payload_off + tls.sni_off, tls.sni_len,
-                            s->shape_name[0], s->shape_name_len[0])))) {
-                memcpy(s->shape[0], pkt + payload_off, payload_len);
-                s->shape_len[0] = payload_len;
-                s->shape_armed[0] = 0;
-                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
-                                (uint32_t)payload_len, NULL, NULL, 0, NULL);
-            }
             fl->hello_ns = now_ns;
             fl->saw_hello = 1;
             fl->had_sni = tls.have_sni ? 1 : 0;
             if (!tls.have_sni && !tls.have_record_end) {
-                /* Приветствие узнали, а имени нет, и запись оборвана: имя
-                   уехало во второй сегмент. Это ЦЕНА размена «читаем первый
-                   сегмент вместо пересборки», и её надо измерять, а не
-                   принимать на веру: донор оценил её как приемлемую на своей
-                   линии, но своя линия у каждого. */
+                /* В первом сегменте имени ещё нет. Сборщик ниже может
+                   дополнить наблюдение; это не диагноз «без домена». */
                 s->sni_in_next_seg++;
             }
             fl->hello_seq = in_seq;
@@ -1221,12 +1202,73 @@ int d2k_session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI, 0, 0,
                                 NULL, pkt + payload_off + tls.sni_off,
                                 tls.sni_len, NULL);
-            } else {
+            } else if (tls.have_record_end) {
                 /* Имени нет — и это нормальное состояние модели (§5.3), а не
                    ошибка разбора. */
                 d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME, 0, 0,
                                 NULL, NULL, 0, NULL);
             }
+        }
+    }
+
+    /* Снимок — только целый ClientHello. Это наблюдение, НЕ замена payload
+       текущего пакета: tls ниже по-прежнему описывает именно этот пакет.
+       Исполнение на составном входе требует отдельного удержания/выпуска. */
+    if (fwd && !fl->hello_capture_done && fl->fwd_pkts <= D2K_CAPTURE_WINDOW &&
+        (rd16(pkt + 6) & 0x3fff) == 0) {
+        const uint8_t *hello;
+        size_t hello_len;
+        uint32_t hello_seq;
+        int captured = d2k_capture_feed(&s->capture, &key, fl->first_ns, now_ns,
+                                        in_seq, pkt + payload_off, payload_len,
+                                        &hello, &hello_len, &hello_seq);
+        if (captured == 1) {
+            d2k_tls_info complete;
+            d2k_tls_parse(hello, hello_len, &complete);
+            if (complete.is_client_hello && complete.have_record_end &&
+                complete.have_hello_middle && !complete.exts_truncated) {
+                s->captured_hellos++;
+                memcpy(s->last_hello[0], hello, hello_len);
+                s->last_hello_len[0] = hello_len;
+                s->last_name_len[0] = 0;
+                if (complete.have_sni && complete.sni_len <= sizeof s->last_name[0]) {
+                    memcpy(s->last_name[0], hello + complete.sni_off, complete.sni_len);
+                    s->last_name_len[0] = complete.sni_len;
+                }
+                if (!fl->saw_hello) {
+                    fl->saw_hello = 1;
+                    fl->hello_ns = now_ns;
+                    fl->hello_seq = hello_seq;
+                    s->hellos++;
+                }
+                if (!fl->had_sni && complete.have_sni) {
+                    fl->had_sni = 1;
+                    s->with_sni++;
+                    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_SNI,
+                                    0, 0, NULL, hello + complete.sni_off,
+                                    complete.sni_len, NULL);
+                } else if (!complete.have_sni &&
+                           !(tls.is_client_hello && tls.have_record_end)) {
+                    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_HELLO_NONAME,
+                                    0, 0, NULL, NULL, 0, NULL);
+                }
+                if (s->shape_armed[0] &&
+                    (s->shape_name_len[0] == 0 ||
+                     name_same(s->last_name[0], s->last_name_len[0],
+                               s->shape_name[0], s->shape_name_len[0]))) {
+                    memcpy(s->shape[0], hello, hello_len);
+                    s->shape_len[0] = hello_len;
+                    s->shape_armed[0] = 0;
+                    d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_SHAPE, 0,
+                                    (uint32_t)hello_len, NULL, NULL, 0, NULL);
+                }
+            } else {
+                s->capture.rejected++;
+            }
+        }
+        if (captured == 1 || captured == -1) {
+            fl->hello_capture_done = 1;
+            d2k_capture_forget(&s->capture, &key);
         }
     }
 
@@ -1866,6 +1908,10 @@ void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out) {
     out->not_hello = s->pay_not_hello;
     out->last_first_byte = s->last_nonhello_first;
     out->sni_next_seg = s->sni_in_next_seg;
+    out->capture_complete = s->captured_hellos;
+    out->capture_rejected = s->capture.rejected;
+    out->capture_expired = s->capture.expired;
+    out->capture_full = s->capture.full;
 }
 
 const d2k_journal *d2k_session_journal(const d2k_session *s) {

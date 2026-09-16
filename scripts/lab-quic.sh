@@ -66,12 +66,8 @@ cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
 cc -std=c99 -O2 -Wall -Wextra -Werror -Icore/include -o /tmp/quicping \
    spike/quicping.c core/quicconn.c core/quicwire.c core/tls13core.c \
    core/h3.c core/crypto.c core/x25519.c core/meas.c
-cc -std=c99 -O2 -Wall -Wextra -Werror -Idatapath/include -Icore/include \
-   -o /tmp/d2kd datapath/d2kd.c datapath/nfq.c datapath/raw.c \
-   datapath/plan_parse.c datapath/plan_apply.c datapath/tls.c datapath/wire.c \
-   datapath/wire_udp.c datapath/track.c datapath/session.c datapath/nl.c \
-   datapath/sched.c datapath/journal.c datapath/plans.c datapath/ctl.c \
-   datapath/ctlsrv.c core/quic.c core/quicwire.c core/crypto.c
+make -s -C datapath d2kd >/dev/null
+cp datapath/d2kd /tmp/d2kd
 make -s -C core d2kc >/dev/null
 
 echo "== линия без цензора: клиент обязан работать =="
