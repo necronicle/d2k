@@ -115,6 +115,11 @@ const char *d2k_trigger_sni(const d2k_trigger *t)
     return "";
 }
 
+int d2k_detect_stopped(const d2k_detect_stop *c)
+{
+    return c && c->fn && c->fn(c->ctx);
+}
+
 void d2k_opts_defaults(d2k_opts *o)
 {
     if (o->repeats <= 0) {
@@ -364,6 +369,14 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
                 close(fd);
                 return -1;
             }
+            /* Донор ждёт паузу на select вместе с ctx.Done(): отменённый
+               замер не должен досиживать её до конца. Пауза бывает и 700 мс
+               (проверка на пересборку), а кусков в зонде несколько. */
+            if (d2k_detect_stopped(&opt->cancel)) {
+                snprintf(err, errcap, "context canceled");
+                close(fd);
+                return -1;
+            }
             d2k_sleep_ms(gap_ms);
         }
     }
@@ -415,7 +428,11 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
     obs->delay_ms = gap_ms;
 
     for (i = 0; i < opt->repeats; i++) {
-        int rc = once_probe(host, port, tr, opt, cuts, ncuts, gap_ms, err, sizeof(err));
+        int rc;
+        if (d2k_detect_stopped(&opt->cancel)) {
+            break;
+        }
+        rc = once_probe(host, port, tr, opt, cuts, ncuts, gap_ms, err, sizeof(err));
         res->probes++;
         if (rc < 0) {
             t.fail++;
@@ -490,7 +507,10 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
     {
         d2k_obs *obs = d2k_trace_add(res, "raw-selftest");
         for (i = 0; i < opt->repeats; i++) {
-            int rc = d2k_raw_probe_handshake(ip4, pnum, opt->timeout_ms, opt->mark, err, sizeof(err));
+            int rc;
+            if (d2k_detect_stopped(&opt->cancel)) { break; }
+            rc = d2k_raw_probe_handshake(ip4, pnum, opt->timeout_ms, opt->mark,
+                                         &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc < 0) {
                 obs->fail++;
@@ -533,14 +553,17 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         for (k = 0; k < ncands; k++) {
             d2k_obs *obs;
             int pass = 0;
+            if (d2k_detect_stopped(&opt->cancel)) {
+                break;
+            }
             if (d2k_opts_skipped(opt, cands[k].name)) {
                 continue;
             }
             obs = d2k_trace_add(res, cands[k].name);
             obs->delay_ms = cands[k].gap_ms;
             for (i = 0; i < opt->repeats; i++) {
-                int rc = d2k_raw_probe_poison(ip4, pnum, tr, &cands[k],
-                                              opt->timeout_ms, opt->mark, err, sizeof(err));
+                int rc = d2k_raw_probe_poison(ip4, pnum, tr, &cands[k], opt->timeout_ms,
+                                              opt->mark, &opt->cancel, err, sizeof(err));
                 res->probes++;
                 if (rc > 0) {
                     pass++;
@@ -564,6 +587,9 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         char pname[128];
         int r;
 
+        if (d2k_detect_stopped(&opt->cancel)) {
+            break;
+        }
         if (opt->only[0] != '\0' && strcmp(p.name, opt->only) != 0) {
             continue;
         }
@@ -576,7 +602,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         bind_decoy(&p, opt);
         for (r = 0; r < opt->repeats; r++) {
             int rc = d2k_raw_probe_poison(ip4, pnum, tr, &p, opt->timeout_ms, opt->mark,
-                                          err, sizeof(err));
+                                          &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc < 0) {
                 obs->fail++;
@@ -861,5 +887,11 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     }
 
 done:
+    /* Пометка ставится ОДИН раз и в конце: флаг отмены липкий (см. заголовок),
+     * а проверять его в каждой точке выхода значило бы двадцать шансов забыть
+     * одну. Брошенный замер не выдаётся за измеренный нигде. */
+    if (d2k_detect_stopped(&opt->cancel)) {
+        res->stopped = 1;
+    }
     res->duration_ms = d2k_now_ms() - start;
 }

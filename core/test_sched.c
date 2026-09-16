@@ -82,13 +82,30 @@ static pthread_mutex_t snapshot_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t snapshot_cv = PTHREAD_COND_INITIALIZER;
 static int snapshot_enabled, snapshot_entered, snapshot_release, snapshot_ok;
 
+/* Сколько измеритель ждёт просьбы бросить, прежде чем сдаться сам. Пять
+   секунд — не «достаточно», а «заведомо больше», чем позволено ждать циклу:
+   если отмена не дойдёт, тест не повиснет навсегда, а честно покажет, во
+   сколько обошлось ожидание. */
+#define STUB_BLOCK_MS 5000
+static int tcp_block_until_stop;
+static int tcp_saw_stop;
+
 static d2k_vres stub_tcp(const char *ip, uint16_t port, d2k_hello trigger,
                          d2k_hello control, uint32_t mark, int repeats,
-                         uint32_t gap_us, uint32_t wait_ms) {
+                         uint32_t gap_us, uint32_t wait_ms,
+                         const volatile sig_atomic_t *stop) {
     (void)port; (void)trigger; (void)control; (void)mark;
     (void)repeats; (void)gap_us; (void)wait_ms;
     tcp_calls++;
     tcp_last_wire = trigger.len;
+    if (tcp_block_until_stop) {
+        /* Так ведёт себя настоящий сетевой оракул: он в сети, и бросить его
+           может только просьба. Без неё цикл ждал бы его до конца. */
+        for (int i = 0; i < STUB_BLOCK_MS; i++) {
+            if (stop && *stop) { tcp_saw_stop = 1; break; }
+            usleep(1000);
+        }
+    }
     snprintf(tcp_last_ip, sizeof tcp_last_ip, "%s", ip ? ip : "");
     d2k_vres r;
     memset(&r, 0, sizeof r);
@@ -655,6 +672,44 @@ int main(void) {
         d2k_sched_free(s); d2k_catalog_free(&empty);
     }
     tcp_owns_search = tcp_found_arm = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+
+    /* ЦИКЛ НЕ ЖДЁТ СЕТЕВОГО ОРАКУЛА.
+     *
+     * task_fail и task_done зовут pthread_join безусловно. Пока у измерителя
+     * не было просьбы бросить, истёкший срок задачи или остановка службы
+     * блокировали ГЛАВНЫЙ поток на всё время замера: один зонд до шести
+     * секунд, полный перебор — десятки минут. Контроллер в это время не читал
+     * событий датапата и не выходил по сигналу — стенд транзита 17.09 повис
+     * ровно так, и это выглядело как «служба не реагирует».
+     *
+     * Проверяем ДВА факта: просьба дошла до измерителя и ожидание уложилось в
+     * малую долю того, сколько он был готов ждать. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        tcp_block_until_stop = 1; tcp_saw_stop = 0; tcp_calls = 0;
+        tcp_answer = D2K_V_INCONCLUSIVE;
+        d2k_sched_set_say(s, collect_say, NULL);
+        d2k_ev h = ev_hello(6, 39977, "slow-oracle.example");
+        d2k_sched_event(s, &h);
+        d2k_ev su = ev_suspect(6, 39977);
+        d2k_sched_event(s, &su);
+        /* Крутим ровно столько, чтобы замер успел начаться, и не столько,
+           чтобы он успел кончиться сам. */
+        spin(s, 60);
+        CHECK(tcp_calls == 1, "замер не начался — проверять было бы нечего");
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        d2k_sched_free(s);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        CHECK(tcp_saw_stop, "измеритель не получил просьбы бросить");
+        CHECK(ms < STUB_BLOCK_MS / 5,
+              "остановка ждала сетевого оракула");
+        d2k_catalog_free(&empty);
+        tcp_block_until_stop = 0;
+        tcp_answer = D2K_V_OPAQUE;
+    }
 
     /* SHAPE arrives while the oracle holds its trigger. Main-thread writes
      * must not alter the bytes of an already-running measurement. */

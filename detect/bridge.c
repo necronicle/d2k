@@ -25,8 +25,33 @@
 #include "d2k_hello.h"
 #include "d2k_verdict.h"
 
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+/* ОСТАНОВКА СЛУЖБЫ НЕ ЖДЁТ ОКОНЧАНИЯ ЗАМЕРА.
+ *
+ * Один зонд стоит до шести секунд, полный перебор — десятки минут, и всё это
+ * время служба не выходила по сигналу: главный цикл флаг видел, а join
+ * рабочего потока досиживал замер до конца. Стенд транзита 17.09 повис на
+ * `wait` ровно так.
+ *
+ * Флаг взводится один раз и не снимается: см. требование липкости в шапке
+ * d2k_detect.h — на нём держится пометка «замер брошен». */
+static volatile sig_atomic_t g_stop_all;
+
+void d2k_detect_stop_all(void) { g_stop_all = 1; }
+
+/* Две причины бросить, и обе обязаны читаться: флаг ЭТОЙ задачи (у неё истёк
+ * срок) и общий флаг остановки службы. Задачный важнее по смыслу — чужой
+ * замер от чужого срока бросать нельзя, — но проверяются оба. */
+static int stop_asked(void *ctx)
+{
+    const volatile sig_atomic_t *task_stop = ctx;
+    if (g_stop_all) { return 1; }
+    return task_stop && *task_stop;
+}
 
 /* Плечо измерителя в термины сборщика планов.
  *
@@ -105,7 +130,8 @@ static d2k_verdict map_verdict(d2k_verdict_t v)
 d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               d2k_hello trigger, d2k_hello control,
                               uint32_t mark, int repeats,
-                              uint32_t gap_us, uint32_t wait_ms)
+                              uint32_t gap_us, uint32_t wait_ms,
+                              const volatile sig_atomic_t *stop)
 {
     d2k_vres out;
     d2k_opts opt;
@@ -161,10 +187,26 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
      * Зашитая константа означала бы, что зонд идёт ЧЕРЕЗ наш же обход и мерит
      * его, а не коробку провайдера. */
     opt.mark = mark;
+    opt.cancel.fn = stop_asked;
+    /* const снимается намеренно и только для передачи: обратно указатель
+     * читается через const-указатель внутри stop_asked, писать по нему
+     * измеритель не может и не пытается. */
+    opt.cancel.ctx = (void *)(uintptr_t)stop;
 
     snprintf(addr, sizeof(addr), "%s:%u", ip, (unsigned)port);
     d2k_classify_run(addr, &tr, &opt, &res);
 
+    if (res.stopped) {
+        /* БРОШЕННЫЙ ЗАМЕР НЕ ВЫДАЁТСЯ ЗА ИЗМЕРЕННЫЙ. Дерево пройдено не до
+         * конца, и любой его вердикт утверждал бы больше, чем известно:
+         * «чисто» сняло бы рабочий план, «режут адрес» закрыло бы цель. */
+        out.verdict = D2K_V_INCONCLUSIVE;
+        snprintf(out.reason, sizeof(out.reason),
+                 "замер брошен по требованию остановки на %d-м зонде — о цели не сказано ничего",
+                 res.probes);
+        out.probes = res.probes;
+        return out;
+    }
     out.verdict = map_verdict(res.verdict);
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);

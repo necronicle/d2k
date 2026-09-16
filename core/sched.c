@@ -248,7 +248,21 @@ static int bind_default(uint8_t transport, int *out_fd, uint16_t *sport_be) {
 d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
 d2k_sched_arm_fn  d2k_sched_arm_hook  = pick_arm_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
-d2k_sched_tcp_fn  d2k_sched_tcp_hook  = d2k_classify;
+/* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
+   контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
+   просто не передаёт флаг дальше, и join такого замера ждёт его до конца.
+   Врать сигнатурой («умеет») было бы хуже: цикл рассчитывал бы на быстрый
+   выход, которого нет. */
+static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
+                                   d2k_hello trigger, d2k_hello control,
+                                   uint32_t mark, int repeats,
+                                   uint32_t gap_us, uint32_t wait_ms,
+                                   const volatile sig_atomic_t *stop) {
+    (void)stop;
+    return d2k_classify(ip, port, trigger, control, mark, repeats, gap_us, wait_ms);
+}
+
+d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 
@@ -435,6 +449,10 @@ typedef struct {
     /* Рабочий поток оракула. */
     pthread_t  th;
     int        th_live;
+    /* Просьба бросить замер, адресованная ЭТОЙ задаче. Взводит цикл (см.
+       join_worker), читает измеритель. Обнуляется вместе со всей задачей в
+       task_reset. */
+    volatile sig_atomic_t stop;
     task_job   job;
     d2k_vres   res;
     d2k_vol_result vol;
@@ -973,7 +991,7 @@ static void *worker_run(void *vp) {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
            нулями — та же передача умолчания вниз. */
-        r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->mark, 0, 0, 0);
+        r = d2k_sched_tcp_hook(t->ip, t->port, trig, ctl, s->mark, 0, 0, 0, &t->stop);
     }
 
     pthread_mutex_lock(&s->mu);
@@ -1012,8 +1030,14 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
     return 0;
 }
 
+/* Просит рабочий поток бросить и дожидается его.
+ *
+ * Просьба ПЕРЕД ожиданием, а не после: наоборот — это и есть прежнее
+ * поведение, из-за которого цикл вставал на минуты. Флаг не снимается здесь;
+ * его обнуляет task_reset, когда задача начинает жизнь заново. */
 static void join_worker(task *t) {
     if (t->th_live) {
+        t->stop = 1;
         pthread_join(t->th, NULL);
         t->th_live = 0;
     }

@@ -50,6 +50,7 @@
 #ifndef D2K_SCHED_H
 #define D2K_SCHED_H
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -67,10 +68,26 @@ typedef struct d2k_sched d2k_sched;
  * транспорту, не выходя в сеть и не завися от того, что сегодня отвечает
  * настоящий instagram.com. По умолчанию указывают на настоящие d2k_classify и
  * d2k_quic_classify. */
+/* stop — ПРОСЬБА БРОСИТЬ, взводится циклом, читается измерителем.
+ *
+ * Без неё цикл вставал целиком. task_fail и task_done зовут pthread_join
+ * безусловно, и когда у задачи истекал срок при живом замере, главный поток
+ * ждал окончания сетевого оракула: один зонд до шести секунд, полный перебор
+ * — десятки минут. Всё это время контроллер не читал событий датапата, не
+ * тикал и не выходил по сигналу (стенд транзита 17.09 повис ровно так).
+ *
+ * Флаг СВОЙ У КАЖДОЙ ЗАДАЧИ, а не один на всех: срок истекает у одной, а
+ * бросать чужой замер — это терять чужую работу. Взводится он и на остановке
+ * службы, но это частный случай, а не назначение.
+ *
+ * Измеритель, который отмену не умеет, просто не читает указатель — и тогда
+ * join честно ждёт его столько, сколько тот идёт. Оба случая видны в коде, ни
+ * один не притворяется другим. */
 typedef d2k_vres (*d2k_sched_tcp_fn)(const char *ip, uint16_t port,
                                      d2k_hello trigger, d2k_hello control,
                                      uint32_t mark, int repeats,
-                                     uint32_t gap_us, uint32_t wait_ms);
+                                     uint32_t gap_us, uint32_t wait_ms,
+                                     const volatile sig_atomic_t *stop);
 typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char *sni,
                                       d2k_hello trigger, d2k_hello control,
                                       uint32_t mark);

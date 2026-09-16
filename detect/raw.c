@@ -552,12 +552,15 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
 }
 
 /* readPayload ждёт от сервера сегмент с данными. */
-static int raw_read_payload(raw_conn *c, int timeout_ms,
+static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
                             uint8_t *out, size_t cap, size_t *outlen)
 {
     long deadline = d2k_now_ms() + timeout_ms;
     while (d2k_now_ms() < deadline) {
         uint8_t flags;
+        if (d2k_detect_stopped(cancel)) {
+            return -1;
+        }
         uint32_t seq, ack;
         const uint8_t *pay;
         size_t plen;
@@ -595,7 +598,8 @@ static void raw_close(raw_conn *c)
     c->buffers = NULL;
 }
 
-static int raw_handshake(raw_conn *c, int timeout_ms, char *err, size_t errcap)
+static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
+                         char *err, size_t errcap)
 {
     long deadline;
     d2k_poison none;
@@ -611,6 +615,10 @@ static int raw_handshake(raw_conn *c, int timeout_ms, char *err, size_t errcap)
         uint32_t seq, ack;
         const uint8_t *pay;
         size_t plen;
+        if (d2k_detect_stopped(cancel)) {
+            snprintf(err, errcap, "context canceled");
+            return -1;
+        }
         if (raw_recv(c, &flags, &seq, &ack, &pay, &plen) != 0) {
             continue;
         }
@@ -637,7 +645,8 @@ static int raw_handshake(raw_conn *c, int timeout_ms, char *err, size_t errcap)
 
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
 static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
-                    int timeout_ms, uint32_t mark_val, char *err, size_t errcap)
+                    int timeout_ms, uint32_t mark_val, const d2k_detect_stop *cancel,
+                    char *err, size_t errcap)
 {
     int one = 1;
     int mark = (int)mark_val;
@@ -694,7 +703,7 @@ static int raw_dial(raw_conn *c, const uint8_t dst[4], uint16_t dport,
     c->seq = (uint32_t)random();
     c->rule_up = suppress_kernel_rst(c->sport);
 
-    if (raw_handshake(c, timeout_ms, err, errcap) != 0) {
+    if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
         raw_close(c);
         return -1;
     }
@@ -733,10 +742,11 @@ static int raw_send_urg(raw_conn *c, const uint8_t *payload, size_t plen)
  * имена, безобидной нагрузки для него не существует, и самопроверка падала не
  * потому, что слой сломан, а потому, что отвечать было не на что. */
 int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
-                            int timeout_ms, uint32_t mark, char *err, size_t errcap)
+                            int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                            char *err, size_t errcap)
 {
     raw_conn c;
-    if (raw_dial(&c, ip4, port, timeout_ms, mark, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, port, timeout_ms, mark, cancel, err, errcap) != 0) {
         return -1;
     }
     raw_close(&c);
@@ -760,7 +770,8 @@ int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
  * фальшивкой и отдать правду — как есть, задом наперёд или внахлёст слева. */
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
-                         int timeout_ms, uint32_t mark, char *err, size_t errcap)
+                         int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                         char *err, size_t errcap)
 {
     uint8_t *fake, *seg, *resp;
     raw_conn c;
@@ -771,7 +782,7 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     size_t n = tr->len;
 
     memset(&none, 0, sizeof(none));
-    if (raw_dial(&c, ip4, port, timeout_ms, mark, err, errcap) != 0) {
+    if (raw_dial(&c, ip4, port, timeout_ms, mark, cancel, err, errcap) != 0) {
         return -1;
     }
     fake = c.buffers->fake;
@@ -811,6 +822,11 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                 return -1;
             }
             if (p->gap_ms > 0 && i + 1 < reps) {
+                if (d2k_detect_stopped(cancel)) {
+                    raw_close(&c);
+                    snprintf(err, errcap, "context canceled");
+                    return -1;
+                }
                 d2k_sleep_ms(p->gap_ms);
             }
         }
@@ -853,7 +869,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
             goto senderr;
         }
         c.seq = base + (uint32_t)n + 1;
-        if (raw_read_payload(&c, timeout_ms, resp, sizeof(c.buffers->resp), &resp_len) != 0) {
+        if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
+                             &resp_len) != 0) {
             raw_close(&c);
             return 0;
         }
@@ -995,7 +1012,8 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     }
     c.seq = base + (uint32_t)n;
 
-    if (raw_read_payload(&c, timeout_ms, resp, sizeof(c.buffers->resp), &resp_len) != 0) {
+    if (raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp),
+                         &resp_len) != 0) {
         raw_close(&c);
         return 0;
     }
@@ -1021,17 +1039,19 @@ int d2k_parse_stale_rst_rule(const char *line, int *port);
 
 int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
-                         int timeout_ms, uint32_t mark, char *err, size_t errcap)
+                         int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                         char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark;
+    (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }
 
 int d2k_raw_probe_handshake(const uint8_t ip4[4], uint16_t port,
-                            int timeout_ms, uint32_t mark, char *err, size_t errcap)
+                            int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
+                            char *err, size_t errcap)
 {
-    (void)ip4; (void)port; (void)timeout_ms; (void)mark;
+    (void)ip4; (void)port; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
 }

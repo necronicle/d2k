@@ -427,6 +427,75 @@ static void test_address_needs_vouched_control(void)
     }
 }
 
+/* БРОШЕННЫЙ ЗАМЕР НЕ ВЫДАЁТСЯ ЗА ИЗМЕРЕННЫЙ.
+ *
+ * Отмена нужна не ради красоты: без неё остановка службы и истёкший срок
+ * задачи ждали окончания перебора — десятки минут (стенд транзита 17.09).
+ * Но важнее самого прерывания то, ЧТО остаётся в результате: дерево пройдено
+ * не до конца, и любой его вердикт утверждал бы больше, чем известно.
+ * Поэтому проверяем два факта, а не один: зондов стало меньше И результат
+ * помечен брошенным. */
+static int stop_now(void *ctx) { return *(int *)ctx; }
+
+static void test_stopped_run_is_marked_and_short(void)
+{
+    d2k_opts opt;
+    d2k_result res, full;
+    int flag = 1;
+
+    /* Сперва — сколько зондов стоит ПОЛНЫЙ прогон на этой же коробке, чтобы
+       сравнение шло с измеренным числом, а не с придуманным. */
+    fast_opts(&opt);
+    run_on(M_PREFIX, 4, &opt, &full);
+
+    fast_opts(&opt);
+    opt.cancel.fn = stop_now;
+    opt.cancel.ctx = &flag;
+    run_on(M_PREFIX, 4, &opt, &res);
+
+    if (!res.stopped) {
+        fail("брошенный замер не помечен — его вердикт неотличим от измеренного");
+    }
+    if (res.probes >= full.probes) {
+        fail("отмена не сократила прогон: зондов %d, полный прогон %d",
+             res.probes, full.probes);
+    }
+    if (res.strategy[0] != '\0') {
+        fail("брошенный замер предложил стратегию «%s»", res.strategy);
+    }
+}
+
+/* Отмена ПОСРЕДИ прогона: база успевает пройти, дальше дерево бросают. */
+static int stop_after_base(void *ctx)
+{
+    int *seen = ctx;
+    return (*seen)++ >= 4;
+}
+
+static void test_stop_midway_keeps_what_was_measured(void)
+{
+    d2k_opts opt;
+    d2k_result res;
+    int seen = 0;
+    int i, saw_whole = 0;
+
+    fast_opts(&opt);
+    opt.cancel.fn = stop_after_base;
+    opt.cancel.ctx = &seen;
+    run_on(M_PREFIX, 4, &opt, &res);
+
+    if (!res.stopped) {
+        fail("замер, брошенный посреди дерева, не помечен");
+    }
+    /* Измеренное остаётся в трассе: бросили — не значит стёрли. */
+    for (i = 0; i < res.ntrace; i++) {
+        if (strcmp(res.trace[i].probe, "whole") == 0) { saw_whole = 1; }
+    }
+    if (!saw_whole) {
+        fail("трасса брошенного замера потеряла то, что успели измерить");
+    }
+}
+
 static void test_loopback_guard_rejects_misresolved_target(void)
 {
     d2k_opts opt;
@@ -454,6 +523,8 @@ int main(void)
     test_address_block_is_not_called_opaque();
     test_address_needs_vouched_control();
     test_loopback_guard_rejects_misresolved_target();
+    test_stopped_run_is_marked_and_short();
+    test_stop_midway_keeps_what_was_measured();
     if (fails) {
         printf("перенос: ПРОВАЛОВ %d\n", fails);
         return 1;

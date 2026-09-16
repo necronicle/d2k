@@ -143,6 +143,9 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
         char label[160];
         int pass = 0, got;
 
+        if (d2k_detect_stopped(&opt->cancel)) {
+            break;
+        }
         if (d2k_opts_skipped(opt, p.name)) {
             continue;
         }
@@ -158,7 +161,7 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
         obs->delay_ms = p.gap_ms;
         for (j = 0; j < opt->repeats; j++) {
             int rc = d2k_raw_probe_poison(ip4, port, tr, &p, opt->timeout_ms, opt->mark,
-                                          err, sizeof(err));
+                                          &opt->cancel, err, sizeof(err));
             res->probes++;
             if (rc > 0) {
                 pass++;
