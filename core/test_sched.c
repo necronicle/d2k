@@ -673,6 +673,50 @@ int main(void) {
     }
     tcp_owns_search = tcp_found_arm = 0; tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
 
+    /* СТАРЫЙ КЛИЕНТ НЕ ПОЛУЧАЕТ ПОКРЫТИЯ МОЛЧА.
+     *
+     * Замер идёт приветствием КЛИЕНТА, а подтверждает найденное НАШ зонд —
+     * он ведёт рукопожатие TLS 1.3, и привязка пишется под его форму. Когда
+     * клиент старый, формы расходятся: план подтверждён для современных
+     * приветствий, а тому клиенту по ключу формы не достанется вовсе.
+     * Ложного в каталоге при этом нет, но молчание читается как покрытие,
+     * которого нет. Проверяем, что расхождение названо вслух. */
+    {
+        d2k_catalog empty = {0};
+        d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+        saidbuf[0] = '\0';
+        d2k_sched_set_say(s, collect_say, NULL);
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_calls = 0; ver_answer_port = 40507;
+        d2k_ev h = ev_hello(6, 40507, "staryi.klient.example");
+        d2k_sched_event(s, &h);
+        {
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_LEGACY, "staryi.klient.example",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "приветствие старой формы не собралось — проверять нечем");
+            d2k_sched_event(s, &sh);
+        }
+        d2k_ev su = ev_suspect(6, 40507);
+        d2k_sched_event(s, &su);
+        settle(s);
+        CHECK(ver_calls >= 1, "планировщик не испытал кандидата сам");
+        /* Датапат говорит, что план применился к пакетам ЭТОГО потока —
+           без этого подтверждения не бывает, и проверять было бы нечего. */
+        d2k_ev ap = ev_applied(6, 40507);
+        d2k_sched_event(s, &ap);
+        spin(s, 60);
+        CHECK(said("ПОДТВЕРЖДЕНО"), "подтверждения не случилось — оговорку проверять не на чем");
+        CHECK(said("СТАРАЯ форма приветствия"),
+              "старый клиент остался без покрытия МОЛЧА");
+        d2k_sched_free(s); d2k_catalog_free(&empty);
+        ver_answer = D2K_VER_APPLICATION; tcp_answer = D2K_V_OPAQUE;
+    }
+
     /* ЦИКЛ НЕ ЖДЁТ СЕТЕВОГО ОРАКУЛА.
      *
      * task_fail и task_done зовут pthread_join безусловно. Пока у измерителя
