@@ -391,14 +391,24 @@ static d2k_tally frag_real(const char *addr, uint16_t port, d2k_hello msg, uint3
             }
             uint8_t buf[2048];
             ssize_t n = recv(rx_fd, buf, sizeof buf, 0);
-            got++;
-            if (n > 0 && d2k_quic_verify_response(buf, (size_t)n, msg) == 0) {
+            if (n <= 0) {
+                break;
+            }
+            /* СЧИТАЕМ ТОЛЬКО ПОДТВЕРЖДЁННЫЕ, а неподтверждённую датаграмму
+               НЕ засчитываем попыткой вовсе — тот же дефект, что был у
+               оракула вопросов и разобран замером 17.09
+               (docs/field/2026-09-17-quic-oracle-first-datagram.md): сервер,
+               получивший несколько Initial, отвечает СНАЧАЛА подтверждением,
+               а ServerHello шлёт следом. Прежняя редакция съедала первым
+               `ACK` слот попытки и записывала его в неудачу, а разведочный
+               зонд фрагментации ходит ОДНОЙ попыткой — то есть кончался на
+               первом же `ACK`, не увидев настоящего ответа. */
+            if (d2k_quic_verify_response(buf, (size_t)n, msg) == 0 && got < sent) {
+                got++;
                 t.pass++;
-            } else {
-                t.fail++;
             }
         }
-        t.fail += (sent - got); /* тайм-аут без ответа на оставшиеся отправленные попытки */
+        t.fail += (sent - got); /* тайм-аут без подтверждённого ответа на остальные попытки */
     }
     close(rx_fd);
 
