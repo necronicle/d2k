@@ -639,6 +639,8 @@ static const char *verdict_name(d2k_verdict v) {
     case D2K_V_UNREACHABLE:  return "до цели нет транспорта";
     case D2K_V_ADDRESS:      return "режут адрес, а не содержимое";
     case D2K_V_RESPONSE:     return "режут ответ сервера";
+    case D2K_V_NO_QUIC:      return "хост не обслуживает HTTP/3";
+    case D2K_V_LOCAL_ADDRESS: return "имя разрешается в приватный адрес";
     }
     return "неизвестный вердикт";
 }
@@ -1819,11 +1821,14 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
     t->box_id[0] = '\0';
 
     if (v == D2K_V_CLEAR || v == D2K_V_UNREACHABLE ||
-        v == D2K_V_ADDRESS || v == D2K_V_RESPONSE) {
+        v == D2K_V_ADDRESS || v == D2K_V_RESPONSE ||
+        v == D2K_V_NO_QUIC || v == D2K_V_LOCAL_ADDRESS) {
         /* Кандидатов НЕТ, и это не бедность перебора. При блоке по адресу
            десинк не снимает ничего (ответ — туннель), а при блоке ответа
-           резать запрос бессмысленно: он и так проходит. Предлагать сюда
-           планы значило бы жечь бюджет зондов на заведомо ложной гипотезе. */
+           резать запрос бессмысленно: он и так проходит. Не обслуживающему
+           HTTP/3 хосту обход не нужен вовсе, а имя, разрешённое в приватный
+           адрес, мы не мерили и мерить не можем. Предлагать сюда планы
+           значило бы жечь бюджет зондов на заведомо ложной гипотезе. */
         return;
     }
     /* Inconclusive/flaky classification limits our diagnosis, not the
