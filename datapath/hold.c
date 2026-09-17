@@ -103,8 +103,14 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     }
     if (!v.payload || (s && v.src_low != s->head.src_low)) { return 0; }
     if (!s) {
-        if (!allow_start || p[v.header] != 22 || (v.flags & ~0x18) || !(v.flags&0x10)) { return 0; }
-        if (v.payload >= 5 && 5u + r16(p + v.header + 3) <= v.payload) { return 0; }
+        /* ЧТО ЭТО ЗА СОДЕРЖИМОЕ — РЕШАЕТ ВЫЗЫВАЮЩИЙ, А НЕ ЗДЕСЬ.
+           Проверки «начинается запись TLS» и «запись уже целиком» стояли и
+           тут, и в d2k_session_hold_candidate — две копии одного правила.
+           Разошлись они на первом же случае, который правило не покрывало:
+           кусок приветствия, пришедший НЕ ПЕРВЫМ, записи не начинает, и
+           сессия его удержать разрешала, а здесь он отвергался молча (поле
+           17.09.2026). Остаётся структурное: флаги сегмента. */
+        if (!allow_start || (v.flags & ~0x18) || !(v.flags&0x10)) { return 0; }
         if (!vacant) { h->stats.full++; return 0; }
         s = vacant;
         s->head = v;

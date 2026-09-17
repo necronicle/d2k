@@ -1193,6 +1193,54 @@ int main(void) {
                 CHECK(r.applied && r.n_out > 0 && r.verdict == D2K_VERDICT_DROP,
                       "capture prevented whole-packet plan execution");
 
+                /* ХВОСТ ПРИВЕТСТВИЯ ПРИШЁЛ ПЕРВЫМ — ЕГО ТОЖЕ НАДО УДЕРЖАТЬ.
+                 *
+                 * Поле 17.09.2026, живая линия, зонд подтверждения d2k:
+                 *   пакет 51359->443 seq=3909908605 нагрузка=146   <- ХВОСТ
+                 *   пакет 51359->443 seq=3909907217 нагрузка=1388  <- голова
+                 * Разница ровно 1388 — второй сегмент пришёл раньше первого.
+                 *
+                 * Удержание начиналось только с сегмента сразу за SYN, и хвост
+                 * уходил на провод ГОЛЫМ, прямо в коробку. Потом приходила
+                 * голова, заводила удержание и ждала хвоста, которого уже нет:
+                 * таймаут, план не применён, рабочий обход выброшен
+                 * собственным подтверждением. Сборка по смещениям у датапата
+                 * есть (capture.c собирает по seq) — не хватало права НАЧАТЬ
+                 * удержание не с первого куска. */
+                {
+                    d2k_hold *h2 = d2k_hold_new();
+                    d2k_hold_batch b2;
+                    CHECK(h2 != NULL, "hold allocation for out-of-order case");
+                    if (h2) {
+                        pn = build_pkt(part, 47503, 0x02, NULL, 0);
+                        d2k_session_packet(g, part, pn, 7, buf, sizeof buf, &r);
+
+                        /* Хвост. Записи TLS он не начинает (первый байт не 22)
+                           и стоит не сразу за SYN — по прежнему правилу не
+                           кандидат. */
+                        pn = build_pkt(part, 47503, 0x18, whole + 1448, whole_len - 1448);
+                        wr32(part + 24, 2449);
+                        int a2 = d2k_session_hold_candidate(g, part, pn);
+                        CHECK(a2, "хвост приветствия, пришедший первым, не удержан — "
+                                  "он уйдёт голым в коробку");
+                        CHECK(d2k_hold_feed(h2, 90, part, pn, 8,
+                                            d2k_session_plan_revision(g), a2,
+                                            hold_release, g, &b2) == 1,
+                              "хвост не взят в удержание");
+
+                        /* Голова. Слот уже есть, и она обязана его дособрать. */
+                        pn = build_pkt(part, 47503, 0x18, whole, 1448);
+                        wr32(part + 24, 1001);
+                        CHECK(d2k_hold_feed(h2, 91, part, pn, 9,
+                                            d2k_session_plan_revision(g), 0,
+                                            hold_release, g, &b2) == 2,
+                              "приветствие не собралось из кусков, пришедших в обратном порядке");
+                        CHECK(b2.count == 2,
+                              "собраны не оба куска — один ушёл бы на провод без плана");
+                        d2k_hold_free(h2);
+                    }
+                }
+
                 /* The explicit owning path is allowed to execute the WHOLE
                    held hello, once, using its first seq/ACK and normal NAT. */
                 d2k_hold *h = d2k_hold_new();

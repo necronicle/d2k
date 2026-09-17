@@ -19,6 +19,10 @@ typedef struct {
     uint32_t seq;
     size_t contiguous, high;
     unsigned state; /* 0 free, 1 collecting, 2 rejected, 3 delivered */
+    /* Якорь стоит на НАЧАЛЕ записи TLS. Ноль значит, что слот заведён куском,
+       пришедшим раньше головы: такой якорь временный и сдвинется, когда
+       голова придёт (см. d2k_capture_feed). */
+    unsigned anchored;
     uint8_t bytes[D2K_CAPTURE_BYTES];
     uint8_t present[D2K_CAPTURE_BYTES / 8];
 } d2k_capture_slot;

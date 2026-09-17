@@ -1618,26 +1618,66 @@ void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
            "составное приветствие не собралось — план не применён к его пакетам");
 }
 
+/* НАСКОЛЬКО ДАЛЕКО ОТ SYN ЕЩЁ МОЖЕТ ЛЕЖАТЬ КУСОК ПРИВЕТСТВИЯ.
+ *
+ * Приветствие TLS ограничено 16 КБ записи (RFC 8446 §5.1), а составное входит
+ * в несколько сегментов подряд. Шестнадцати килобайт хватает с запасом, и это
+ * не «на всякий случай»: окно нужно, чтобы не удерживать данные СЕРЕДИНЫ
+ * соединения, приняв их за кусок приветствия. */
+#define HOLD_EARLY_WINDOW 16384u
+
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     d2k_hold_info v;
-    if (!s || !d2k_hold_parse(p, n, &v) || !v.payload || p[v.header] != 22 ||
+    if (!s || !d2k_hold_parse(p, n, &v) || !v.payload ||
         (v.flags & ~0x18) || !(v.flags & 0x10)) { return 0; }
-    if (v.payload >= 5 && 5u + rd16(p + v.header + 3) <= v.payload) { return 0; }
     d2k_flow *fl = d2k_track_find(s->flows, &v.key);
     /* Do not retain a tail of an already-passed stream or guess direction.
        Only a first payload anchored by the observed client SYN qualifies. */
     if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
-        fl->saw_hello || fl->stream_attempted || fl->damaged ||
-        v.seq != fl->syn_seq + 1) { return 0; }
+        fl->saw_hello || fl->stream_attempted || fl->damaged) { return 0; }
+
+    /* КУСОК ПРИВЕТСТВИЯ МОЖЕТ ПРИЙТИ НЕ ПЕРВЫМ, И ЕГО ТОЖЕ НАДО УДЕРЖАТЬ.
+     *
+     * Прежнее правило требовало, чтобы сегмент стоял сразу за SYN и НАЧИНАЛ
+     * запись TLS. Поле 17.09.2026, зонд подтверждения d2k на живой линии:
+     *   seq=3909908605 нагрузка=146   <- ХВОСТ пришёл первым
+     *   seq=3909907217 нагрузка=1388  <- голова, после
+     * Хвост кандидатом не становился и уходил на провод ГОЛЫМ — прямо в
+     * коробку; голова заводила удержание и ждала того, чего уже нет. Таймаут,
+     * план не применён, рабочий обход выброшен собственным подтверждением.
+     *
+     * Сборка по смещениям у датапата есть (capture.c собирает по seq) — не
+     * хватало права НАЧАТЬ удержание не с первого куска. Окно и остальные
+     * условия (SYN виден, приветствия ещё не было, поток не испорчен) держат
+     * это правило узким: удерживается только раннее содержимое потока, для
+     * цели которого план уже есть. */
+    int at_head = (v.seq == fl->syn_seq + 1);
+    uint32_t off = v.seq - (fl->syn_seq + 1);
+    if (!at_head && off >= HOLD_EARLY_WINDOW) { return 0; }
+    if (at_head) {
+        /* Голова обязана начинать запись TLS — иначе это не приветствие, а
+           данные, и удерживать их незачем. */
+        if (p[v.header] != 22) { return 0; }
+        /* Запись целиком в этом куске — собирать нечего. */
+        if (v.payload >= 5 && 5u + rd16(p + v.header + 3) <= v.payload) { return 0; }
+    }
+
     d2k_tls_info tls;
-    d2k_tls_parse(p + v.header, v.payload, &tls);
+    memset(&tls, 0, sizeof tls);
+    /* Разбирать имеет смысл только голову: у хвоста заголовка записи нет, и
+       имя из него не достать. Для него план ищется по адресу и порту — этого
+       достаточно, чтобы не удерживать чужие потоки. */
+    if (at_head) { d2k_tls_parse(p + v.header, v.payload, &tls); }
     int candidate = d2k_plan_stream_input(s->plan) ||
         d2k_plantab_stream_candidate(s->plans,
             tls.have_sni ? p + v.header + tls.sni_off : NULL,
             tls.have_sni ? tls.sni_len : 0, v.dst_be, v.sport_be);
     /* Also mark a failed capacity attempt: its head must not be held later
-       after we have already released it unchanged. */
-    if (candidate) { fl->stream_attempted = 1; }
+       after we have already released it unchanged.
+       ТОЛЬКО ДЛЯ ГОЛОВЫ: пометка закрывает потоку удержание навсегда, и
+       поставить её на ХВОСТ значило бы отнять у головы её же попытку —
+       ровно наоборот тому, ради чего хвост и стали удерживать. */
+    if (candidate && at_head) { fl->stream_attempted = 1; }
     return candidate;
 }
 
