@@ -60,6 +60,8 @@ static char *field_after(char *s, const char *name, char **next) {
     return NULL;
 }
 
+d2k_nat_fn d2k_nat_hook = d2k_nat_outside;
+
 int d2k_nat_outside(const char *path, uint8_t proto,
                     uint32_t src_ip, uint16_t src_port,
                     uint32_t dst_ip, uint16_t dst_port,

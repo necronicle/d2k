@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include "d2k_nat.h"
 #include "d2k_session.h"
 #include "d2k_hold.h"
 #include "d2k_tls.h"
@@ -311,6 +312,39 @@ static size_t build_rev_pkt_ttl(uint8_t *o, uint16_t client_port, uint8_t flags,
         memcpy(o + 40, pay, paylen);
     }
     return total;
+}
+
+/* --- ПРОМАХ CONNTRACK: ОДИН ОТВЕТ ЕЩЁ НЕ ОТВЕТ ----------------------------
+ *
+ * Справка о трансляции читается из /proc/net/nf_conntrack, и это чтение НЕ
+ * атомарно: замер 17.09 на стенде транзита поймал случай, когда запрос вернул
+ * «записи нет», а повторный запрос сразу же, без паузы, ту же запись нашёл
+ * (диагностика печатала «ПОВТОР СРАЗУ ЖЕ: rc=0»).
+ *
+ * Цена одного промаха оказалась несоразмерной. Мелкое следствие: клиент, чьё
+ * приветствие пришлось на промах, остаётся без обхода — один из тридцати.
+ * Тяжёлое: если промах попадает на поток СОБСТВЕННОГО ЗОНДА, план к нему не
+ * применяется, зонд не доходит до приложения, единственный найденный
+ * кандидат объявляется негодным и цель остаётся без обхода ЦЕЛИКОМ. Именно
+ * это дало «прошло 0 из 30» в прогоне 17.09.
+ *
+ * Поэтому промах перепроверяется. Здесь проверяется ровно это, и с двух
+ * сторон: гонка обязана лечиться, а настоящее отсутствие записи обязано
+ * по-прежнему отвергать план — иначе посылки уйдут мимо NAT с локальным
+ * адресом (13.09, docs/field/2026-09-13-transit-vs-local.md). */
+static int nat_calls;
+static int nat_miss_first_n;   /* сколько первых вызовов отвечают «нет записи» */
+
+static int nat_stub(const char *path, uint8_t proto,
+                    uint32_t src_ip, uint16_t src_port,
+                    uint32_t dst_ip, uint16_t dst_port,
+                    uint32_t *out_src, uint16_t *out_sport) {
+    (void)path; (void)proto; (void)dst_ip; (void)dst_port;
+    nat_calls++;
+    if (nat_calls <= nat_miss_first_n) { return -1; }
+    *out_src = src_ip;
+    *out_sport = src_port;
+    return 0;
 }
 
 int main(void) {
@@ -1267,6 +1301,59 @@ int main(void) {
             CHECK(d2k_session_shape(g, 6, &got_len) == NULL, "reset mixed captures");
             d2k_session_free(g);
         }
+    }
+
+    /* --- ПРОМАХ CONNTRACK (см. пояснение у nat_stub) --------------------- */
+    {
+        d2k_nat_fn saved = d2k_nat_hook;
+        d2k_nat_hook = nat_stub;
+
+        /* ГОНКА: первый ответ «нет», сразу следом «есть». План обязан
+           примениться — запись существует, её просто не увидели с первого
+           раза. Без перепроверки здесь теряется и клиент, и зонд. */
+        {
+            d2k_session *g = d2k_session_new(8, 4);
+            d2k_plan *gp = NULL;
+            CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0,
+                  "план гонки не загрузился");
+            d2k_session_set_plan(g, gp);
+            nat_calls = 0;
+            nat_miss_first_n = 1;
+            size_t nn = build_pkt(pkt, 41100, 0x18, hello, hlen);
+            d2k_result rr;
+            d2k_session_packet(g, pkt, nn, 1000, buf, sizeof buf, &rr);
+            CHECK(rr.skipped == NULL,
+                  "промах conntrack принят с первого ответа — клиент и зонд остаются без обхода");
+            CHECK(rr.n_out > 0, "план не исполнен, хотя запись conntrack существует");
+            CHECK(nat_calls >= 2, "перепроверки не было вовсе");
+            d2k_session_free(g);
+        }
+
+        /* ЗАПИСИ ДЕЙСТВИТЕЛЬНО НЕТ: сколько ни спрашивай, ответ один. План
+           обязан быть отвергнут — иначе посылки уйдут с локальным адресом
+           мимо NAT, и это ровно тот дефект, ради которого проверка заведена. */
+        {
+            d2k_session *g = d2k_session_new(8, 4);
+            d2k_plan *gp = NULL;
+            CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &gp, err, sizeof err) == 0,
+                  "план отсутствия не загрузился");
+            d2k_session_set_plan(g, gp);
+            nat_calls = 0;
+            nat_miss_first_n = 1000;
+            size_t nn = build_pkt(pkt, 41200, 0x18, hello, hlen);
+            d2k_result rr;
+            d2k_session_packet(g, pkt, nn, 1000, buf, sizeof buf, &rr);
+            CHECK(rr.skipped != NULL,
+                  "план применён без записи conntrack — посылки уйдут мимо NAT");
+            CHECK(rr.n_out == 0, "посылки собраны, хотя уйдут с локальным адресом");
+            /* Перепроверка не должна превращаться в бесконечный опрос: цена
+               каждой — чтение таблицы в сотни строк, и платит за неё пакетный
+               путь. */
+            CHECK(nat_calls <= 8, "перепроверок слишком много — цена каждой чтение всей таблицы");
+            d2k_session_free(g);
+        }
+
+        d2k_nat_hook = saved;
     }
 
     if (fails) {

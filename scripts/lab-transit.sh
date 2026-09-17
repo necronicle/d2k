@@ -28,7 +28,11 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Журналы прогона переживают контейнер: он уходит с --rm, а разбирать потом
+# приходится именно их (см. keep_logs в драйвере). Каталог называется явно,
+# чтобы человек знал, куда смотреть, а не искал во временной директории.
+LABOUT=${D2K_LAB_OUT:-/tmp/d2k-lab-transit}
+trap 'mkdir -p "$LABOUT" 2>/dev/null; cp -R "$WORK/labout/." "$LABOUT/" 2>/dev/null; rm -rf "$WORK"' EXIT
 tar -C "$ROOT" -cf - --exclude='.git' --exclude='*.o' --exclude='state' . | tar -C "$WORK" -xf -
 
 cat > "$WORK/transit.sh" <<'DRIVER'
@@ -53,6 +57,29 @@ dump() {
     echo "--- d2kd ---";    tail -25 /tmp/d2kd.log 2>/dev/null || true
     echo "--- d2kc ---";    tail -25 /tmp/d2kc.log 2>/dev/null || true
     echo "--- правила ---"; iptables -t mangle -S 2>/dev/null | grep -i d2k || true
+    keep_logs
+}
+
+# ЖУРНАЛЫ ЦЕЛИКОМ НАРУЖУ, а не хвостом в вывод.
+#
+# Разбор 17.09 уткнулся ровно в это: в выводе видно «план не применён: поток
+# не ведётся conntrack», а сколько таких отказов было за прогон и на каких
+# потоках — нет, потому что dump показывает последние двадцать пять строк.
+# Контейнер уходит с --rm, файлы внутри пропадают вместе с ним.
+#
+# Каталог /w смонтирован снаружи, так что копия переживает контейнер. Зовётся
+# и при провале (из dump), и при успехе: сравнивать зелёный прогон с красным
+# — первое, что понадобится.
+keep_logs() {
+    mkdir -p /w/labout 2>/dev/null || return 0
+    for f in d2kd d2kc labdpi server; do
+        [ -f "/tmp/$f.log" ] && cp "/tmp/$f.log" "/w/labout/$f.log" 2>/dev/null
+    done
+    cp /tmp/ctmiss-*.txt /tmp/ctbefore-*.txt /w/labout/ 2>/dev/null || true
+    # Снимок таблицы соединений на момент конца прогона: по нему видно, ведётся
+    # ли поток клиента conntrack вообще и с какой трансляцией.
+    cat /proc/net/nf_conntrack > /w/labout/conntrack.txt 2>/dev/null || true
+    return 0
 }
 inns() { ip netns exec "$CLNS" "$@"; }
 
@@ -252,14 +279,59 @@ echo "ждали подтверждения $WAITED с"
 sed -n 's/.*вердикт: \(.*\)/  вердикт: \1/p' /tmp/d2kc.log | tail -2
 
 echo "== проверка: прошёл ли КЛИЕНТ, а не зонд =="
+# СКОЛЬКО РАЗ СПРАШИВАТЬ КЛИЕНТОМ. Три — рабочее умолчание: столько нужно,
+# чтобы отличить обход от случайного прохода, и не больше, чтобы прогон не
+# стоил лишних минут.
+#
+# Больше нужно для РЕДКИХ отказов: 17.09 один клиент из двадцати остался без
+# обхода (план не применился, conntrack не нашёл поток), и на трёх попытках
+# такое ловится раз в несколько прогонов. D2K_LAB_CLIENT_TRIES=30 превращает
+# стенд в нагрузочный, не меняя того, что он проверяет: доля остаётся той же.
+TRIES=${D2K_LAB_CLIENT_TRIES:-3}
+# СКОЛЬКО КЛИЕНТОВ РАЗОМ. Один по очереди — не роутер: там разом ходят
+# телефон, телевизор и ноутбук, и таблица соединений всё это время меняется
+# под руками. Промах conntrack (17.09) ловится именно конкуренцией: на
+# последовательных запросах с паузами он выпадает раз в несколько прогонов,
+# и отличить «починили» от «не повезло воспроизвести» на них нельзя.
+PAR=${D2K_LAB_CLIENT_PAR:-1}
+NEED=$(( TRIES * 2 / 3 ))
+[ "$NEED" -lt 1 ] && NEED=1
 OK=0
-for n in 1 2 3; do
+if [ "$PAR" -gt 1 ]; then
+    rm -f /tmp/cl-*.code
+    n=0
+    while [ "$n" -lt "$TRIES" ]; do
+        i=0
+        PIDS=""
+        while [ "$i" -lt "$PAR" ] && [ "$n" -lt "$TRIES" ]; do
+            n=$((n+1)); i=$((i+1))
+            (
+                C=$(inns curl -4 -sk -o /dev/null --resolve "$NAME:443:$IP" \
+                    -w "%{http_code}" --max-time 20 "https://$NAME/" 2>/dev/null) || C=""
+                echo "$C" > "/tmp/cl-$n.code"
+            ) &
+            PIDS="$PIDS $!"
+        done
+        # ЖДЁМ ТОЛЬКО КЛИЕНТОВ, ПОИМЁННО. Голый `wait` ждёт ВСЕ фоновые
+        # задания оболочки — а здесь фоном работают цензор, датапат,
+        # контроллер и сервер цели, и они не кончаются никогда. Первая
+        # редакция этого цикла с голым `wait` повисла намертво после первой
+        # же партии.
+        # shellcheck disable=SC2086
+        wait $PIDS
+    done
+    OK=$(grep -l '^200$' /tmp/cl-*.code 2>/dev/null | wc -l | tr -d ' ')
+    echo "  прошло $OK из $TRIES (по $PAR разом)"
+else
+for n in $(seq 1 "$TRIES"); do
     CODE=$(inns curl -4 -sk -o /dev/null --resolve "$NAME:443:$IP" -w "%{http_code}" --max-time 20 "https://$NAME/" 2>/dev/null) || CODE=""
     [ -n "$CODE" ] || CODE=000
-    echo "  попытка $n: код=$CODE"
+    [ "$TRIES" -le 5 ] && echo "  попытка $n: код=$CODE"
     [ "$CODE" = "200" ] && OK=$((OK+1))
     sleep 2
 done
+[ "$TRIES" -gt 5 ] && echo "  прошло $OK из $TRIES"
+fi
 
 # ЦЕНЗОР ОБЯЗАН БЫТЬ ЖИВ И ОБЯЗАН БЫЛ РЕЗАТЬ. Правило очереди стоит с
 # --queue-bypass (иначе смерть стенда остановила бы весь трафик), а значит
@@ -287,9 +359,15 @@ echo "цензор снял по имени: $DROPPED"
 grep -q "ПОДТВЕРЖДЕНО" /tmp/d2kc.log 2>/dev/null || \
     fail "клиент прошёл, но план никто не подтверждал — прошёл не обход"
 
-if [ "$OK" -ge 2 ]; then
+if [ "$OK" -ge "$NEED" ]; then
     echo
-    echo "ОБХОД ДОШЁЛ ДО КЛИЕНТА ЗА NAT: $OK из 3"
+    # СКОЛЬКО РАЗ ПЛАН НЕ ПРИМЕНИЛСЯ ИЗ-ЗА CONNTRACK — вслух даже на зелёном
+    # прогоне. Критерий «два из трёх» пройден и при одном потерянном клиенте,
+    # и без этой строки потеря выглядит как полный успех (найдено 17.09).
+    MISSED=$(grep -c "не ведётся conntrack" /tmp/d2kd.log 2>/dev/null || echo 0)
+    [ "$MISSED" -gt 0 ] && echo "ВНИМАНИЕ: планов не применено из-за conntrack: $MISSED"
+    keep_logs
+    echo "ОБХОД ДОШЁЛ ДО КЛИЕНТА ЗА NAT: $OK из $TRIES"
     exit 0
 fi
 
@@ -298,7 +376,7 @@ fi
 if grep -q "ПОДТВЕРЖДЕНО" /tmp/d2kc.log 2>/dev/null; then
     fail "зонд подтвердил план, а клиент за NAT не прошёл — обход не доходит до транзита"
 fi
-fail "обход не найден вовсе (клиент за NAT: $OK из 3)"
+fail "обход не найден вовсе (клиент за NAT: $OK из $TRIES)"
 DRIVER
 
 # SYS_ADMIN нужен ровно для одного: завести сетевое пространство клиента
@@ -308,4 +386,6 @@ docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=SYS_ADMIN \
     --sysctl net.ipv4.ip_forward=1 \
     -e "D2K_LAB_TRANSIT_NAME=${D2K_LAB_TRANSIT_NAME:-tranzit.example}" \
     -e "D2K_LAB_TRANSIT_TARGET=${D2K_LAB_TRANSIT_TARGET:-local}" \
+    -e "D2K_LAB_CLIENT_TRIES=${D2K_LAB_CLIENT_TRIES:-3}" \
+    -e "D2K_LAB_CLIENT_PAR=${D2K_LAB_CLIENT_PAR:-1}" \
     -v "$WORK:/w" -w /w gcc:14 sh /w/transit.sh

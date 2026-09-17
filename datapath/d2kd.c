@@ -297,10 +297,11 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
         /* Ведётся ли поток conntrack (d2k_nat.h): без этого посылки плана
            уходят мимо NAT, и обход работает только для трафика самого
            роутера. */
-        uint64_t nok = 0, nm = 0, nn = 0;
-        d2k_session_nat_stats(&nok, &nm, &nn);
+        uint64_t nok = 0, nm = 0, nn = 0, nr = 0;
+        d2k_session_nat_stats(&nok, &nm, &nn, &nr);
         printf("поток ведётся conntrack: да %" PRIu64 ", нет %" PRIu64
-               ", таблицы нет %" PRIu64 "\n", nok, nm, nn);
+               ", таблицы нет %" PRIu64 ", спасла перепроверка %" PRIu64 "\n",
+               nok, nm, nn, nr);
     }
     printf("сырым сокетом отправлено %" PRIu64 ", ошибок %" PRIu64 "\n",
                d2k_raw_sent(r), d2k_raw_errors(r));

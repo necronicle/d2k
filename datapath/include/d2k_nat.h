@@ -70,4 +70,21 @@ int d2k_nat_outside(const char *path, uint8_t proto,
                     uint32_t dst_ip, uint16_t dst_port,
                     uint32_t *out_src, uint16_t *out_sport);
 
+/* Точка подмены справки о трансляции — для тестов.
+ *
+ * Настоящий ответ приходит из /proc/net/nf_conntrack, то есть из состояния
+ * ядра той машины, где идёт тест. Проверить по нему поведение датапата при
+ * ПРОМАХЕ нельзя: промах там — редкая гонка (замер 17.09: один случай на
+ * несколько прогонов по тридцать клиентов), и тест, который его ждёт, либо
+ * не воспроизведёт его никогда, либо будет падать через раз.
+ *
+ * Тот же приём и та же причина, что у d2k_mark_hook (core/d2k_meas.h): право
+ * и состояние ядра — не то, от чего должен зависеть вердикт теста.
+ * По умолчанию указывает на настоящее чтение. */
+typedef int (*d2k_nat_fn)(const char *path, uint8_t proto,
+                          uint32_t src_ip, uint16_t src_port,
+                          uint32_t dst_ip, uint16_t dst_port,
+                          uint32_t *out_src, uint16_t *out_sport);
+extern d2k_nat_fn d2k_nat_hook;
+
 #endif /* D2K_NAT_H */
