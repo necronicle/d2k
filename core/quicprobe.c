@@ -724,6 +724,16 @@ static int qp_send_one(const char *addr, uint16_t port,
         close(fd);
         return -1;
     }
+#ifdef IP_RECVTTL
+    /* СЫРОЙ TTL ОТВЕТА. Просим ядро принести его вместе с датаграммой; отказ
+       не важен и не проверяется — поле тогда останется нулём, что и значит
+       «не измерено». Ради факта, который и так придёт, отдельного зонда не
+       заводим. */
+    {
+        int on = 1;
+        (void)setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof on);
+    }
+#endif
     if (prefix && prefix_len > 0) {
         int orig_ttl = -1;
         if (prefix_ttl > 0) {
@@ -817,12 +827,67 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    0 — "не трогать", им TTL-приём не нужен, а расширять уже рассмотренный
    ревью публичный контракт ради одного вызывающего задачи 6 значило бы
    тащить лишний параметр через всё дерево). */
+/* Принимает датаграмму и, если ядро принесло, достаёт TTL из контрольных
+   данных. Обычный recv() этого не отдаёт: TTL живёт в IP-заголовке, а сокет
+   отдаёт только полезную нагрузку — единственный переносимый способ узнать
+   его с пользовательского сокета — попросить IP_RECVTTL и читать recvmsg.
+   Ядро без этой опции просто не положит ничего, и *ttl останется нулём —
+   «не измерено», а не выдуманное число. */
+static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
+    *ttl = 0;
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = cap;
+    union {
+        struct cmsghdr align;
+        uint8_t space[256];
+    } ctl;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof msg);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctl.space;
+    msg.msg_controllen = sizeof ctl.space;
+    ssize_t n = recvmsg(fd, &msg, 0);
+    if (n <= 0) { return n; }
+#ifdef IP_RECVTTL
+    /* ПОДАВЛЕНИЕ ТОЧЕЧНОЕ И НЕ НАШЕ. CMSG_NXTHDR у musl сам сравнивает
+       знаковое с беззнаковым внутри макроса; под -Werror это ломает
+       кросс-сборку на строке, где нашего кода нет вовсе. Переписывать обход
+       контрольных данных руками значило бы завести свою копию выравнивания
+       cmsg — цена выше ошибки. Подавляем ровно на этот цикл. */
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#endif
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level != IPPROTO_IP) { continue; }
+        /* Linux отдаёт IP_TTL, BSD и macOS — IP_RECVTTL под тем же номером,
+           что и опция. Принимаем оба: имя различается, смысл один. */
+        if (c->cmsg_type != IP_TTL && c->cmsg_type != IP_RECVTTL) { continue; }
+        size_t len = (size_t)c->cmsg_len - (size_t)CMSG_LEN(0);
+        if (len >= sizeof(int)) {
+            int v = 0;
+            memcpy(&v, CMSG_DATA(c), sizeof v);
+            if (v > 0 && v <= 255) { *ttl = (uint8_t)v; }
+        } else if (len >= 1) {
+            *ttl = *(uint8_t *)CMSG_DATA(c);
+        }
+        break;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#endif
+    return n;
+}
+
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                               int prefix_copies, int src_port, const char *split_sni,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
-                              int *sent_out, qp_verify_fn verify) {
+                              int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -863,6 +928,9 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     }
     if (rtt_ms_out) {
         *rtt_ms_out = 0;
+    }
+    if (ttl_in_out) {
+        *ttl_in_out = 0;
     }
 
     int fds[D2K_QUIC_MAX_ADDRS];
@@ -999,13 +1067,17 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             done[i] = 1;
             pending--;
             uint8_t buf[2048];
-            ssize_t n = recv(fds[i], buf, sizeof buf, 0);
+            uint8_t ttl_seen = 0;
+            ssize_t n = qp_recv_ttl(fds[i], buf, sizeof buf, &ttl_seen);
             if (n > 0) {
                 /* Проверять ответ надо ключами ТОЙ копии, что ушла с этого
                    сокета: у каждой свой идентификатор, а из него выводятся
                    ключи сервера. */
                 if (verify(buf, (size_t)n, sent[i]) == 0) {
                     result[i] = 1;
+                    if (ttl_in_out && *ttl_in_out == 0 && ttl_seen > 0) {
+                        *ttl_in_out = ttl_seen;
+                    }
                     if (rtt_ms_out) {
                         struct timespec arrived;
                         clock_gettime(CLOCK_MONOTONIC, &arrived);
@@ -1063,9 +1135,10 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
-                           int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
+                           int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
+                           uint8_t *ttl_in_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        repeats, rtt_ms_out, refused_out, sent_out, qp_verify_aead);
+                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1090,7 +1163,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, qp_verify_vn);
+                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn);
 }
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
@@ -1102,7 +1175,7 @@ static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *pr
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, 0, NULL, msg, wait_ms,
-                        mark, repeats, NULL, NULL, sent_out, qp_verify_aead);
+                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
@@ -1120,7 +1193,7 @@ static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
                                   int copies, d2k_hello msg, uint32_t wait_ms,
                                   uint32_t mark, int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, 0, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
 }
 d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
 
@@ -1131,7 +1204,7 @@ static d2k_tally quic_ask_srcport(const char *addr, uint16_t port, int src_port,
                                    d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                    int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, src_port, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
 }
 d2k_quic_ask_srcport_fn d2k_quic_ask_srcport_hook = quic_ask_srcport;
 
@@ -1142,7 +1215,7 @@ static d2k_tally quic_ask_split(const char *addr, uint16_t port, d2k_hello snap,
                                  const char *sni, uint32_t wait_ms, uint32_t mark,
                                  int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, sni, snap, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
 }
 d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 
@@ -1365,7 +1438,7 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
             const uint8_t *pre = (q->kind == QK_JUNK) ? garbage16 : NULL;
             size_t pre_len = (q->kind == QK_JUNK) ? sizeof garbage16 : 0;
             t = d2k_quic_ask_hook(addr, port, pre, pre_len, msg, wait_ms, mark,
-                                  D2K_QUIC_REPEATS, NULL, NULL, &sent);
+                                  D2K_QUIC_REPEATS, NULL, NULL, &sent, NULL);
         }
         r->probes += sent; /* сколько реально ушло на провод, не pass+fail */
         if (!t.marked) {
@@ -1525,14 +1598,20 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
         reason_set(&r, "бюджет исчерпан до базовой проверки живости — вопрос НЕ ЗАДАН");
     } else {
         uint32_t rtt_ms = 0;
+        uint8_t ttl_in = 0;
         int refused = 0;
         int base_sent = 0;
         d2k_tally base_ctl = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, d2k_quic_wait_ms,
-                                                mark, D2K_QUIC_REPEATS, &rtt_ms, &refused, &base_sent);
+                                                mark, D2K_QUIC_REPEATS, &rtt_ms, &refused, &base_sent, &ttl_in);
         r.probes += base_sent; /* сколько реально ушло на провод, не pass+fail (находка 4 ревью, круг 5) */
         if (!base_ctl.marked) {
             all_marked = 0;
         }
+        /* СЫРОЙ TTL ОТВЕТА — с ПЕРВОГО же подтверждённого пакета, то есть с
+           контроля базовой живости: дальше зонды пойдут на другие адреса, и
+           TTL смешался бы с маршрутом. Без пересчёта в расстояние — см.
+           d2k_quic_props.server_ttl_in. */
+        r.qprops.server_ttl_in = ttl_in;
 
         /* НАХОДКА 2 РЕВЬЮ (круг 5): порог refused>0 ВЛОЖЕН внутрь pass==0, а
            не проверяется первым независимо от pass — донор, probe.go:292-297
@@ -1638,7 +1717,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                 if (budget_left(&start)) {
                     own = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger,
                                             d2k_quic_wait_ms, mark, D2K_QUIC_REPEATS,
-                                            &own_rtt, &own_refused, &own_sent);
+                                            &own_rtt, &own_refused, &own_sent, NULL);
                     r.probes += own_sent;
                     if (!own.marked) { all_marked = 0; }
                 }
@@ -1687,7 +1766,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
             /* ===== ШАГ 1: прямой зонд (тот же адрес — живость уже подтверждена) ===== */
             int base_sent2 = 0;
             d2k_tally base = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
-                                                D2K_QUIC_REPEATS, NULL, NULL, &base_sent2);
+                                                D2K_QUIC_REPEATS, NULL, NULL, &base_sent2, NULL);
             r.probes += base_sent2; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
             if (!base.marked) {
                 all_marked = 0;
@@ -1701,7 +1780,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                 int confirm_sent = 0;
                 d2k_tally confirm = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
                                                        D2K_QUIC_CLEAR_CONFIRM_REPEATS, NULL, NULL,
-                                                       &confirm_sent);
+                                                       &confirm_sent, NULL);
                 r.probes += confirm_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
                 if (!confirm.marked) {
                     all_marked = 0;
@@ -1742,7 +1821,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                     nap_us(D2K_QUIC_GAP_US); /* §7: пауза между вопросами по той же тройке */
                     int same_sent = 0;
                     d2k_tally same = d2k_quic_ask_hook(pool[0], port, NULL, 0, control, dyn_wait, mark,
-                                                        D2K_QUIC_REPEATS, NULL, NULL, &same_sent);
+                                                        D2K_QUIC_REPEATS, NULL, NULL, &same_sent, NULL);
                     r.probes += same_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
                     if (!same.marked) {
                         all_marked = 0;
@@ -1796,7 +1875,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                                 int clean_sent = 0;
                                 d2k_tally clean = d2k_quic_ask_hook(fresh1, port, NULL, 0, control, dyn_wait,
                                                                      mark, D2K_QUIC_REPEATS, NULL, NULL,
-                                                                     &clean_sent);
+                                                                     &clean_sent, NULL);
                                 r.probes += clean_sent; /* сколько реально ушло на провод (находка 4, круг 5) */
                                 if (!clean.marked) {
                                     all_marked = 0;

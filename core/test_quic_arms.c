@@ -91,10 +91,12 @@ static int decoy_is_derived(const uint8_t *prefix, size_t prefix_len) {
 
 static d2k_tally mock_ask(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark, int repeats,
-                           uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
+                           uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
+                           uint8_t *ttl_in_out) {
     (void)port;
     (void)msg;
     (void)wait_ms;
+    if (ttl_in_out) { *ttl_in_out = 0; } /* мок сокетов не трогает: TTL взять неоткуда */
     g_ask_mark_seen = mark;
     if (addr) {
         strncpy(g_ask_last_addr, addr, sizeof g_ask_last_addr - 1);
@@ -196,13 +198,28 @@ static int g_frag_calls;
 static int g_frag_works = 0;
 static int g_frag_confirm_ok = 1;
 
+/* ВЫЖИВАЮТ ЛИ ФРАГМЕНТЫ НА КАНАЛЕ ВООБЩЕ. Мок отличает этот зонд от боевого
+   по имени внутри: проверка выживаемости идёт на ЗАВЕДОМО ОТВЕЧАЮЩЕМ имени
+   (имени приманки), а плечо — на имени цели. Отличать по счётчику вызовов
+   было бы хуже: тест перестал бы ловить перестановку зондов местами. */
+static int g_frag_survive_calls;
+static int g_frag_survives = 1;
+
 static d2k_tally mock_ask_frag(const char *addr, uint16_t port, d2k_hello msg, uint32_t wait_ms,
                                 uint32_t mark, int repeats, int *sent_out) {
     (void)addr;
     (void)port;
-    (void)msg;
     (void)wait_ms;
     (void)mark;
+    if (decoy_is_derived(msg.bytes, msg.len)) {
+        g_frag_survive_calls++;
+        d2k_tally st;
+        memset(&st, 0, sizeof st);
+        st.marked = 1;
+        if (g_frag_survives) { st.pass = repeats; } else { st.fail = repeats; }
+        if (sent_out) { *sent_out = repeats; }
+        return st;
+    }
     g_frag_calls++;
     d2k_tally t;
     memset(&t, 0, sizeof t);
@@ -257,6 +274,8 @@ static void mocks_reset(void) {
     g_ttl_pass_at = -1;
     g_ttl_confirm_ok = 1;
     g_frag_calls = 0;
+    g_frag_survive_calls = 0;
+    g_frag_survives = 1;
     g_frag_works = 0;
     g_frag_confirm_ok = 1;
     g_resolve_n = 3;
@@ -357,6 +376,49 @@ static void test_ladder_frag_is_last_resort(void) {
     CHECK(a.kind == D2K_QA_FRAG, "если ни блоб, ни TTL не помогли — последнее и самое дорогое средство: фрагментация");
     CHECK(g_ttl_calls == 255, "развёртка обязана дойти до предела поля TTL (RFC 791 §3.1, 8 бит), не остановиться раньше без причины");
     CHECK(g_frag_calls == 2, "один одиночный зонд фрагментацией + одно подтверждение повторами");
+}
+
+/* --- ФРАГМЕНТЫ НЕ ЖИВУТ НА КАНАЛЕ: СЕМЕЙСТВО НЕ ПРЕДЛАГАТЬ -------------
+ *
+ * Условие корректности, а не осторожность. Если фрагменты режет CGNAT или
+ * сама коробка, «не помогло» будет значить «приём убивает трафик», а не
+ * «коробка собирает». Выдать такое плечо человеку — тихо сломать ему сеть, и
+ * он даже не свяжет одно с другим.
+ *
+ * Поэтому выживаемость меряется ПЕРВОЙ и на ЗАВЕДОМО ОТВЕЧАЮЩЕМ имени: если
+ * фрагментированная датаграмма не доходит даже с ним, дело не в коробке. */
+static void test_frag_not_offered_when_fragments_die(void) {
+    mocks_reset();
+    g_ask_pass_single = 0;
+    g_ttl_pass_at = -1;
+    g_frag_survives = 0;  /* фрагменты режет сам канал */
+    g_frag_works = 1;     /* и «помогли» бы, если бы дошли */
+    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
+
+    CHECK(g_frag_survive_calls > 0, "выживаемость фрагментов не проверялась вовсе");
+    CHECK(a.kind != D2K_QA_FRAG,
+          "фрагментация предложена на канале, где фрагменты не доживают, — это не обход, а потеря трафика");
+    CHECK(g_frag_calls == 0, "боевой зонд фрагментацией ушёл, хотя канал её не пропускает");
+    CHECK(a.frag_survives == D2K_PROP_NO, "свойство «фрагменты доходят» не записано");
+    CHECK(strstr(a.reason, "фрагмент") != NULL,
+          "причина обязана назвать канал, а не выдать молчание за «приём не помог»");
+}
+
+/* Выживаемость ПРОВЕРЕНА и подтверждена — плечо предлагается как раньше, и
+   свойство записано. Обратная половина той же проверки: без неё «не
+   предлагать никогда» тоже прошло бы. */
+static void test_frag_offered_when_fragments_live(void) {
+    mocks_reset();
+    g_ask_pass_single = 0;
+    g_ttl_pass_at = -1;
+    g_frag_survives = 1;
+    g_frag_works = 1;
+    d2k_hello trig = {g_trig_bytes, sizeof g_trig_bytes};
+    d2k_quic_arm a = d2k_quic_pick_arm("1.2.3.4", 443, "example.com", TEST_DECOY_SNI, trig, 0);
+
+    CHECK(a.kind == D2K_QA_FRAG, "фрагменты доходят и плечо помогает — оно обязано быть предложено");
+    CHECK(a.frag_survives == D2K_PROP_YES, "свойство «фрагменты доходят» не записано");
 }
 
 static void test_nothing_works_is_honest_not_found(void) {
@@ -760,6 +822,8 @@ int main(void) {
     test_decoy_is_derived();
     test_ladder_copies_second_point();
     test_ladder_frag_is_last_resort();
+    test_frag_not_offered_when_fragments_die();
+    test_frag_offered_when_fragments_live();
     test_nothing_works_is_honest_not_found();
     test_confirm_disagreement_is_flaky_not_escalation();
     test_confirm_needs_fresh_address_honestly();

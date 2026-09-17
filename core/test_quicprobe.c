@@ -173,9 +173,11 @@ static struct mock_addr_state *mock_state_for(const char *addr) {
 static d2k_tally mock_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
-                           int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
+                           int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
+                           uint8_t *ttl_in_out) {
     (void)port;
     (void)wait_ms;
+    if (ttl_in_out) { *ttl_in_out = 0; } /* мок сокетов не трогает: TTL взять неоткуда */
     /* Мок проверяет ДИСЦИПЛИНУ ДЕРЕВА по содержимому, не сетевые коды
        ошибок — различие "не отправилось" от "отправилось и получило отказ"
        (находка 5 ревью, круг 4) проверяется НАСТОЯЩИМИ, ПЕРЕНОСИМЫМИ
@@ -250,14 +252,14 @@ static d2k_tally mock_ask_srcport(const char *addr, uint16_t port, int src_port,
                                    d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                    int repeats, int *sent_out) {
     (void)src_port;
-    return mock_ask(addr, port, NULL, 0, msg, wait_ms, mark, repeats, NULL, NULL, sent_out);
+    return mock_ask(addr, port, NULL, 0, msg, wait_ms, mark, repeats, NULL, NULL, sent_out, NULL);
 }
 
 static d2k_tally mock_ask_split(const char *addr, uint16_t port, d2k_hello snap,
                                  const char *sni, uint32_t wait_ms, uint32_t mark,
                                  int repeats, int *sent_out) {
     (void)sni;
-    return mock_ask(addr, port, NULL, 0, snap, wait_ms, mark, repeats, NULL, NULL, sent_out);
+    return mock_ask(addr, port, NULL, 0, snap, wait_ms, mark, repeats, NULL, NULL, sent_out, NULL);
 }
 
 static char g_extra_pool[8][D2K_QUIC_ADDR_LEN];
@@ -686,7 +688,7 @@ int main(void) {
         int refused = -1;
         int sent = -1;
         d2k_tally t =
-            real_ask("127.0.0.1", 443, NULL, 0, trig_hello(), 150, 0, 99, &rtt_ms, &refused, &sent);
+            real_ask("127.0.0.1", 443, NULL, 0, trig_hello(), 150, 0, 99, &rtt_ms, &refused, &sent, NULL);
         CHECK(t.err == 99, "repeats > D2K_QUIC_MAX_ADDRS обязан отказать всей серии, err == repeats");
         CHECK(t.fail == 99, "отказ — это fail тоже (d2k_tally: err — подмножество fail)");
         CHECK(t.pass == 0, "отказанная серия не может дать ни одного pass");
@@ -906,6 +908,30 @@ int main(void) {
               "вопрос, который вопросник не задаёт, не имеет права получить значение");
         CHECK(r.probes == 9 + 7 * D2K_QUIC_REPEATS,
               "3(база)+3(прямой)+3(шаг2)+семь вопросов по три");
+    }
+
+    /* --- СЫРОЙ TTL ОТВЕТА: ФАКТ, А НЕ РАССТОЯНИЕ ------------------------
+     *
+     * Оригинал снимает TTL входящего пакета и кладёт его в вывод БЕЗ
+     * пересчёта в расстояние — и это не осторожность: замер 04.09 показал,
+     * что на один и тот же адрес ICMP и QUIC отдают разные TTL (56 против
+     * 86), то есть отвечают РАЗНЫЕ УЗЛЫ, и «расстояние» из одного наблюдения
+     * было бы выдуманным числом. Здесь того же факта не снималось вовсе.
+     *
+     * Проверяем, что он снимается и что ноль означает «не измерено», а не
+     * «TTL нулевой»: нулевого TTL у дошедшего пакета не бывает. */
+    {
+        mock_reset();
+        g_mock_poison_on_trigger = 0;
+        g_extra_n = 0;
+        d2k_hello snap;
+        snap.bytes = d2k_test_v1_initial;
+        snap.len = sizeof d2k_test_v1_initial;
+        d2k_vres r = d2k_quic_classify("10.0.22.1", 443, "www.example.com", snap, ctl_hello(), 0);
+        /* Мок сокетов не трогает и TTL ниоткуда взять не может — значит
+           «не измерено», и никакого выдуманного числа. */
+        CHECK(r.qprops.server_ttl_in == 0,
+              "TTL выдуман там, где пакетов не было вовсе");
     }
 
     /* --- НАХОДКИ: ПРИЁМ ВЗЯЛ, А ИСПОЛНИТЬ ЕГО НЕЧЕМ ----------------------
@@ -1141,6 +1167,22 @@ int main(void) {
         uint16_t port = rs_start();
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_CLEAR, "настоящий аутентичный ответ с CRYPTO на триггер — должен быть CLEAR");
+        close(g_rs_fd);
+    }
+
+    /* --- СЫРОЙ TTL ОТВЕТА СНИМАЕТСЯ С НАСТОЯЩЕГО ПАКЕТА ------------------
+     * На петле ответ приходит с обычным TTL хоста (у Linux и macOS 64), и
+     * важно здесь не конкретное число, а что поле ЗАПОЛНЕНО измеренным
+     * значением: ноль означал бы «не измерено», а выдуманное число — ровно ту
+     * ошибку, из-за которой оригинал и держит этот факт СЫРЫМ, без пересчёта
+     * в расстояние (замер 04.09: ICMP и QUIC на один адрес отдали 56 и 86 —
+     * отвечают разные узлы). */
+    {
+        g_rs_respond = 1;
+        uint16_t port = rs_start();
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        CHECK(r.qprops.server_ttl_in > 0,
+              "TTL входящего ответа не снят — сырой факт потерян");
         close(g_rs_fd);
     }
 

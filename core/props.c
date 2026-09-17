@@ -471,7 +471,7 @@ static d2k_quic_arm qa_confirm(const char pool[][D2K_QUIC_ADDR_LEN], size_t n_po
                                       mark, D2K_QUIC_REPEATS, &sent);
     } else {
         t = d2k_quic_ask_hook(fresh, port, bytes, blen, trigger, d2k_quic_wait_ms, mark, D2K_QUIC_REPEATS,
-                               NULL, NULL, &sent);
+                               NULL, NULL, &sent, NULL);
     }
     *probes += sent;
     if (t.err > 0) {
@@ -602,7 +602,7 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni,
     {
         int sent = 0;
         d2k_tally t = d2k_quic_ask_hook(pool[0], port, decoy, decoy_len, trigger,
-                                        d2k_quic_wait_ms, mark, 1, NULL, NULL, &sent);
+                                        d2k_quic_wait_ms, mark, 1, NULL, NULL, &sent, NULL);
         probes += sent;
         if (t.pass == 1) {
             return qa_confirm(pool, n_pool, &next_fresh, port, trigger, mark, &probes,
@@ -688,17 +688,60 @@ d2k_quic_arm d2k_quic_pick_arm(const char *ip, uint16_t port, const char *sni,
         a.probes = probes;
         return a;
     }
+    /* СПЕРВА — ДОЖИВАЮТ ЛИ ФРАГМЕНТЫ ДО СЕРВЕРА НА ЭТОМ КАНАЛЕ ВООБЩЕ, и
+       меряется это на ЗАВЕДОМО ОТВЕЧАЮЩЕМ имени (той же приманке), ДО всяких
+       выводов о коробке.
+
+       Это условие корректности, а не осторожность. Фрагменты режет и CGNAT, и
+       сама коробка, и промежуточный узел; если они не доживают, «приём не
+       помог» будет значить «приём убивает трафик». Выдать такое плечо
+       человеку — тихо сломать ему сеть, и он даже не свяжет одно с другим.
+       Отрицательный ответ закрывает ВСЁ семейство ipfrag на этой линии,
+       включая TCP-ветку: канал общий. */
+    int surv_sent = 0;
+    d2k_hello decoy_hello;
+    decoy_hello.bytes = decoy;
+    decoy_hello.len = decoy_len;
+    d2k_tally ts = d2k_quic_ask_frag_hook(pool[0], port, decoy_hello, d2k_quic_wait_ms, mark,
+                                          D2K_QUIC_REPEATS, &surv_sent);
+    probes += surv_sent;
+    if (ts.err > 0 || (ts.pass > 0 && ts.pass < D2K_QUIC_REPEATS)) {
+        /* Ни отправить, ни сойтись повторам — значит про фрагменты сказать
+           нечего. Свойство остаётся неизмеренным, и семейство не оговаривается
+           ни в ту, ни в другую сторону. */
+        a.kind = D2K_QA_NOT_FOUND;
+        a.frag_survives = D2K_PROP_UNKNOWN;
+        snprintf(a.reason, sizeof a.reason,
+                 "ни блоб, ни развёртка TTL не дали прохода; выживаемость фрагментов НЕ ИЗМЕРЕНА "
+                 "(%d/%d, сбоев %d) — ipfrag не проверялся",
+                 ts.pass, D2K_QUIC_REPEATS, ts.err);
+        a.probes = probes;
+        return a;
+    }
+    if (ts.pass != D2K_QUIC_REPEATS) {
+        a.kind = D2K_QA_NOT_FOUND;
+        a.frag_survives = D2K_PROP_NO;
+        snprintf(a.reason, sizeof a.reason,
+                 "фрагменты не доживают: с заведомо рабочим именем тоже не дошли. Семейство "
+                 "ipfrag на этом канале не обход, а потеря трафика");
+        a.probes = probes;
+        return a;
+    }
+
     int frag_sent = 0;
     d2k_tally tf = d2k_quic_ask_frag_hook(pool[0], port, trigger, d2k_quic_wait_ms, mark, 1, &frag_sent);
     probes += frag_sent;
     if (tf.pass == 1) {
-        return qa_confirm_frag(pool, n_pool, &next_fresh, port, trigger, mark, &probes);
+        d2k_quic_arm got = qa_confirm_frag(pool, n_pool, &next_fresh, port, trigger, mark, &probes);
+        got.frag_survives = D2K_PROP_YES;
+        return got;
     }
 
     a.kind = D2K_QA_NOT_FOUND;
+    a.frag_survives = D2K_PROP_YES; /* измерено выше: фрагменты доходят, просто не помогают */
     snprintf(a.reason, sizeof a.reason,
-             "ни один блоб, ни развёртка TTL до предела поля (255), ни фрагментация не дали прохода в "
-             "пределах бюджета — каталог исчерпан");
+             "ни блоб, ни развёртка TTL (до 255), ни фрагментация не дали прохода в пределах "
+             "бюджета — каталог исчерпан; фрагменты доходят");
     a.probes = probes;
     return a;
 }
