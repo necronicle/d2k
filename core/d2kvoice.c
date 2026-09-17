@@ -26,7 +26,6 @@ static void usage(void) {
         "  --addr       мерить этот адрес вместо поиска живого разговора\n"
         "  --control    публичный STUN для проверки, что UDP на канале ходит\n"
         "               (умолчание " D2K_VOICE_CONTROL_DEFAULT ")\n"
-        "  --blobs      каталог с фальшивками (умолчание /opt/zapret2/files/fake)\n"
         "  --conntrack  таблица соединений (умолчание /proc/net/nf_conntrack)\n"
         "  --wait       сколько ждать ответа, мс (умолчание 3000)\n"
         "  --mark       метка SO_MARK для зондов; без неё замер про наш же обход\n"
@@ -55,6 +54,7 @@ static const char *verdict_word(d2k_voice_verdict v) {
     case D2K_VOICE_NO_CALL: return "мерить нечего";
     case D2K_VOICE_FLAKY:   return "не воспроизводится";
     case D2K_VOICE_NO_ORACLE: return "мерить этим зондом нечем";
+    case D2K_VOICE_UNMEASURED: return "измерение не закончено";
     }
     return "неизвестный вердикт";
 }
@@ -76,7 +76,6 @@ int main(int argc, char **argv) {
             }
             o.port = (uint16_t)p;
         } else if (strcmp(f, "--control") == 0 && i + 1 < argc) { o.control = argv[++i]; }
-        else if (strcmp(f, "--blobs") == 0 && i + 1 < argc) { o.blob_dir = argv[++i]; }
         else if (strcmp(f, "--conntrack") == 0 && i + 1 < argc) { o.ct_path = argv[++i]; }
         else if (strcmp(f, "--wait") == 0 && i + 1 < argc) {
             o.wait_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -97,7 +96,10 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < n; i++) {
             char a[24];
             d2k_ip4_text(t[i].ip, a, sizeof a);
-            printf("  %s:%u  пакетов %d\n", a, t[i].port, t[i].packets);
+            char c[24];
+            d2k_ip4_text(t[i].src_ip, c, sizeof c);
+            printf("  %s:%u  <- %s:%u  пакетов %d%s\n", a, t[i].port, c, t[i].sport,
+                   t[i].packets, t[i].replied ? "" : "  (ответов нет)");
         }
         return 0;
     }

@@ -109,9 +109,24 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
            почему признак надёжнее счётчика на этом роутере. */
         int replied = (strstr(line, "[UNREPLIED]") == NULL);
 
+        /* ПОТОК — ПЯТЁРКА, А НЕ АДРЕС СЕРВЕРА. Записи разных клиентов к одной
+           точке раньше складывались, и признак «отвечает» брался ИЛИ по всем:
+           ответ одному клиенту объявлял живым поток другого. Теперь каждый
+           поток отдельной строкой; складываются только записи ОДНОГО потока
+           (conntrack держит их раздельно по направлению). */
+        char sbuf[64], spbuf[64];
+        char *next2 = NULL;
+        const char *sv = field_val(line, "src", &next2, sbuf);
+        uint32_t src_ip = 0;
+        if (!sv || d2k_ip4_parse(sv, &src_ip) != 0) { continue; }
+        next2 = NULL;
+        sv = field_val(line, "sport", &next2, spbuf);
+        unsigned long sport = sv ? strtoul(sv, NULL, 10) : 0;
+
         size_t i = 0;
         for (; i < n; i++) {
-            if (out[i].ip == ip && out[i].port == (uint16_t)dport) {
+            if (out[i].ip == ip && out[i].port == (uint16_t)dport &&
+                out[i].src_ip == src_ip && out[i].sport == (uint16_t)sport) {
                 out[i].packets += (int)packets;
                 out[i].replied |= replied;
                 break;
@@ -120,6 +135,8 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
         if (i == n && n < cap) {
             out[n].ip = ip;
             out[n].port = (uint16_t)dport;
+            out[n].src_ip = src_ip;
+            out[n].sport = (uint16_t)sport;
             out[n].packets = (int)packets;
             out[n].replied = replied;
             n++;
@@ -342,69 +359,20 @@ static void add_reason(d2k_voice_res *r, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* ФАЛЬШИВКИ БОЕВОГО ПРОФИЛЯ discord_udp, В ПОРЯДКЕ ПРОВЕРКИ. Имена — те же,
-   что в строке стратегии: мерить одним файлом, а рекомендовать другой значило
-   бы выдать человеку приём, который он не сможет применить. */
-static const struct { const char *name, *file; } voice_blobs[] = {
-    { "active_discord_udp", "active_discord_udp.bin" },
-    { "stun", "stun.bin" },
-    { "quic_dbankcloud", "quic_initial_dbankcloud_ru.bin" }
-};
-
-/* ЛЕСТНИЦА КОПИЙ — ДВЕ ТОЧКИ ОРИГИНАЛА: одна копия могла потеряться, а могла
-   и не хватить коробке. Это точечные числа из замера, а не диапазон перебора
-   (§"мерить, а не перебирать"). */
-static const int voice_copies[] = { 1, 6 };
-
-static size_t load_blob(const char *dir, const char *file, uint8_t *out, size_t cap) {
-    char path[512];
-    if (snprintf(path, sizeof path, "%s/%s", dir, file) < 0) { return 0; }
-    FILE *f = fopen(path, "rb");
-    if (!f) { return 0; }
-    size_t n = fread(out, 1, cap, f);
-    fclose(f);
-    /* Короче шестнадцати байт — это не фальшивка, а обрывок: слать его
-       значило бы мерить мусор и назвать исход свойством коробки. */
-    return (n >= 16) ? n : 0;
-}
-
-static void ask_voice_arms(d2k_voice_res *r, const d2k_voice_opt *o, uint32_t wait_ms) {
-    const char *dir = o->blob_dir ? o->blob_dir : "/opt/zapret2/files/fake";
-    uint8_t blob[4096];
-    int had_file = 0;
-
-    for (size_t b = 0; b < sizeof voice_blobs / sizeof voice_blobs[0]; b++) {
-        size_t blen = load_blob(dir, voice_blobs[b].file, blob, sizeof blob);
-        if (blen == 0) { continue; }
-        had_file = 1;
-        for (size_t c = 0; c < sizeof voice_copies / sizeof voice_copies[0]; c++) {
-            d2k_tally t = d2k_voice_ask_hook(r->ip, r->port, blob, blen, voice_copies[c],
-                                             wait_ms, o->mark, D2K_VOICE_REPEATS, NULL);
-            r->probes += D2K_VOICE_REPEATS - t.err; /* ушедшее на провод, не запрошенное */
-            if (!t.marked) { r->marked = 0; }
-            if (t.pass != D2K_VOICE_REPEATS) { continue; }
-            /* ЧИСЛО КОПИЙ — ТО, КОТОРЫМ ПРИЁМ ВЗЯЛ, но не меньше двух:
-               одиночная датаграмма на живом канале теряется, и приём,
-               подтверждённый одной копией, на проводе надо ставить с запасом
-               (то же решение у оригинала, questions.go: max(n, 2)). */
-            int n = voice_copies[c] > 2 ? voice_copies[c] : 2;
-            snprintf(r->arm, sizeof r->arm, "%s:repeats=%d", voice_blobs[b].name, n);
-            snprintf(r->strategy, sizeof r->strategy,
-                     "--lua-desync=fake:payload=all:blob=%s:repeats=%d",
-                     voice_blobs[b].name, n);
-            add_reason(r, "; приём: %s", r->arm);
-            return;
-        }
-    }
-    if (!had_file) {
-        /* НЕ ИЗМЕРЕНО — НЕ «НЕ ПОМОГЛО». Отсутствие файлов это про запуск (не
-           на роутере), а не про коробку, и склеить их значило бы выдать
-           собственную нехватку за факт. */
-        add_reason(r, "; приёмы НЕ ИЗМЕРЕНЫ: нет ни одного файла блоба в %s", dir);
-        return;
-    }
-    add_reason(r, "; ни одна фальшивка не пробивает");
-}
+/* ПОЧЕМУ ЗДЕСЬ НЕТ ПОДБОРА ПРИЁМА.
+ *
+ * Он был: лестница фальшивок боевого профиля, испытываемая зондом STUN. Поле
+ * 17.09.2026 показало, что этот зонд оракулом быть не может — голосовая точка
+ * Дискорда молчит на STUN, на нули и на мусор одинаково при ЖИВОМ разговоре.
+ * Значит молчание зонда С приманкой доказывает ровно столько же, сколько без
+ * неё, то есть ничего, а вывод «ни одна фальшивка не пробивает» был выводом
+ * из непригодного измерения.
+ *
+ * Подтверждать приём надо НА САМОМ РАЗГОВОРЕ: применить воздействие к его
+ * потоку через датапат и посмотреть, пошли ли по нему ответы (пометка
+ * [UNREPLIED] снимается). Это работа датапата, а не зонда, и её ещё нет.
+ * Держать вместо неё лестницу, которая ничего не меряет, хуже, чем не держать
+ * ничего: она выглядела бы измерением. */
 
 d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
     d2k_voice_opt o;
@@ -477,22 +445,39 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
             asked0 = 1;
             ctl_ok = (c0.pass > 0);
         }
-        if (asked0 && !ctl_ok) {
+        if (!asked0) {
+            /* КОНТРОЛЬ НЕ СПРОШЕН — ВЫБОРА МЕЖДУ ДВУМЯ ОБЪЯСНЕНИЯМИ НЕТ.
+               «Режут этот поток» и «UDP не ходит вовсе» различает только он.
+               Объявлять первое вердиктом, потому что второе не проверено, —
+               вывод из недостачи данных (ревью, P1-3). Приёмы тем более не
+               подбираем: подбирать не к чему. */
+            r.verdict = D2K_VOICE_UNMEASURED;
+            say_reason(&r, "поток к %s:%u идёт без единого ответа, но контроль НЕ СПРОШЕН "
+                           "(имя %s не разрешилось): отделить «режут этот поток» от «UDP не "
+                           "ходит вовсе» нечем — измерение не закончено", addr, r.port, ctl0);
+        } else if (!ctl_ok) {
             r.verdict = D2K_VOICE_NO_UDP;
             say_reason(&r, "поток к %s:%u идёт без единого ответа, и публичный STUN %s тоже "
                            "молчит: на этом канале не ходит UDP или его режут целиком — "
                            "обходить голос отдельно бессмысленно", addr, r.port, ctl0);
         } else {
             r.verdict = D2K_VOICE_BLOCKED;
-            if (asked0) {
-                say_reason(&r, "поток к %s:%u идёт, а ответов нет НИ ОДНОГО, при живом "
-                               "публичном STUN: режут именно этот поток", addr, r.port);
-            } else {
-                say_reason(&r, "поток к %s:%u идёт без единого ответа; контроль НЕ СПРОШЕН "
-                               "(имя %s не разрешилось) — «UDP не ходит» не исключено",
-                           addr, r.port, ctl0);
-            }
-            ask_voice_arms(&r, &o, wait_ms);
+            say_reason(&r, "поток к %s:%u идёт, а ответов нет НИ ОДНОГО, при живом "
+                           "публичном STUN: режут именно этот поток", addr, r.port);
+            /* ПРИЁМЫ ЗДЕСЬ НЕ ИСПЫТЫВАЮТСЯ, И ЭТО НЕ ПРОБЕЛ, А ЧЕСТНОСТЬ.
+               Базовый оракул заменён наблюдением разговора именно потому, что
+               голосовая точка не отвечает посторонним (поле 17.09: молчит на
+               STUN, на нули и на мусор одинаково при живом разговоре).
+               Испытывать приманки тем же отвергнутым зондом и делать вывод
+               «не пробивает» значило бы повторить ту же ошибку на шаг позже:
+               молчание зонда с приманкой доказывает ровно столько же, сколько
+               без неё, то есть ничего.
+               Подтверждать приём надо НА САМОМ РАЗГОВОРЕ — применив
+               воздействие к его потоку и посмотрев, пошли ли ответы. Этого
+               сегодня нет, и вместо вывода стоит причина, по которой его
+               нет. */
+            add_reason(&r, "; приём не подтвердить: голосовая точка не отвечает "
+                           "посторонним, а воздействие на сам разговор не применяется");
         }
         if (!r.marked) {
             add_reason(&r, "; СОКЕТ НЕ ПОМЕЧЕН — зонд шёл через наш же обход");
