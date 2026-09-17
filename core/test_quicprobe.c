@@ -477,6 +477,19 @@ static size_t build_authentic_v1(const uint8_t *dcid, size_t dcid_len,
 static volatile int g_rs_respond;
 static int g_rs_fd = -1;
 
+/* Кадр ACK (RFC 9000 §19.3): тип, наибольший номер, задержка, число
+   диапазонов, первый диапазон. Ровно то, чем настоящий сервер отвечает
+   первым, подтверждая приём, но ещё не начиная рукопожатие. */
+static size_t build_ack_body(uint8_t *out, size_t cap) {
+    if (cap < 5) { return 0; }
+    out[0] = 0x02; /* ACK без ECN */
+    out[1] = 0x01; /* наибольший подтверждённый номер */
+    out[2] = 0x00; /* задержка */
+    out[3] = 0x00; /* дополнительных диапазонов нет */
+    out[4] = 0x01; /* первый диапазон */
+    return 5;
+}
+
 static void *rs_run(void *arg) {
     (void)arg;
     for (;;) {
@@ -508,10 +521,24 @@ static void *rs_run(void *arg) {
             dcid = g_ctl_bytes + QP_DCID_OFF;
         }
         if (dcid) {
+            /* РЕЖИМ 5: СНАЧАЛА ACK, ПОТОМ ServerHello — ДВУМЯ ДАТАГРАММАМИ.
+               Так отвечает настоящий сервер, когда клиент прислал несколько
+               Initial: замер 17.09 на www.google.com дал ровно это — 48 байт
+               с одним кадром ACK, потом ещё ACK, и лишь ТРЕТЬИМ пакетом
+               CRYPTO. Оракул, закрывающий зонд на первой же пришедшей
+               датаграмме, объявит такой сервер молчащим. */
+            uint8_t resp[512];
+            if (g_rs_respond == 5) {
+                uint8_t ack[32];
+                size_t al2 = build_ack_body(ack, sizeof ack);
+                size_t rl0 = build_authentic_v1(dcid, QP_DCID_LEN, ack, al2, resp, sizeof resp);
+                if (rl0 > 0) {
+                    (void)sendto(g_rs_fd, resp, rl0, 0, (struct sockaddr *)&from, fl);
+                }
+            }
             uint8_t body[32];
             size_t bl = (g_rs_respond == 4) ? build_close_body(body, sizeof body)
                                              : build_crypto_body(body, sizeof body);
-            uint8_t resp[512];
             size_t rl = build_authentic_v1(dcid, QP_DCID_LEN, body, bl, resp, sizeof resp);
             if (rl > 0) {
                 (void)sendto(g_rs_fd, resp, rl, 0, (struct sockaddr *)&from, fl);
@@ -908,6 +935,20 @@ int main(void) {
               "вопрос, который вопросник не задаёт, не имеет права получить значение");
         CHECK(r.probes == 9 + 7 * D2K_QUIC_REPEATS,
               "3(база)+3(прямой)+3(шаг2)+семь вопросов по три");
+
+        /* ТРАССА: по строке на КАЖДЫЙ заданный вопрос, с числами. Из одних
+           свойств «приём не сработал» неотличимо от «зонд не долетел по
+           другой причине» — а на стенде это различие уже понадобилось. */
+        int lines = 0;
+        for (size_t qi = 0; qi < D2K_QTRACE_MAX; qi++) {
+            if (!r.qtrace[qi].label[0]) { continue; }
+            lines++;
+            CHECK(r.qtrace[qi].sent == D2K_QUIC_REPEATS,
+                  "в трассе не столько зондов, сколько ушло на провод");
+            CHECK(r.qtrace[qi].answered <= r.qtrace[qi].sent,
+                  "ответов больше, чем зондов");
+        }
+        CHECK(lines == 7, "трасса обязана нести строку на каждый заданный вопрос");
     }
 
     /* --- СЫРОЙ TTL ОТВЕТА: ФАКТ, А НЕ РАССТОЯНИЕ ------------------------
@@ -1167,6 +1208,27 @@ int main(void) {
         uint16_t port = rs_start();
         d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
         CHECK(r.verdict == D2K_V_CLEAR, "настоящий аутентичный ответ с CRYPTO на триггер — должен быть CLEAR");
+        close(g_rs_fd);
+    }
+
+    /* --- СЕРВЕР ОТВЕТИЛ ACK, А ServerHello ПРИСЛАЛ СЛЕДОМ ----------------
+     *
+     * Так отвечает НАСТОЯЩИЙ сервер, когда клиент прислал несколько Initial:
+     * замер 17.09 на www.google.com — 48 байт с одним кадром ACK, потом ещё
+     * ACK, и только ТРЕТЬИМ пакетом CRYPTO. Это не редкость и не край:
+     * браузер с постквантовым key_share шлёт два Initial ВСЕГДА, то есть так
+     * будет отвечать вся живая цель.
+     *
+     * Оракул, закрывающий зонд на первой же пришедшей датаграмме, объявит
+     * такой сервер молчащим — а молчание здесь и есть основание всех
+     * вердиктов. Стенд 17.09 поймал это как «вопрос про две датаграммы 0/3»
+     * там, где игрушечная коробка обязана была пропустить. */
+    {
+        g_rs_respond = 5;
+        uint16_t port = rs_start();
+        d2k_vres r = d2k_quic_classify("127.0.0.1", port, "x.example", trig_hello(), ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_CLEAR,
+              "ServerHello пришёл ВТОРОЙ датаграммой, а зонд закрылся на первой — сервер объявлен молчащим");
         close(g_rs_fd);
     }
 

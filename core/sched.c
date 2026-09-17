@@ -3149,6 +3149,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                ровно эти строки говорят, куда движку расти, и ровно они
                теряются первыми, если складывать их в текст причины (384
                байта на весь вердикт). См. d2k_quic_props_findings. */
+            /* ТРАССА ВОПРОСНИКА — по строке на заданный вопрос. Свойство
+               говорит «помог ли приём», трасса — «что при этом видели»:
+               без неё «приём не сработал» неотличимо от «зонд не долетел по
+               другой причине» (см. d2k_quic_step). */
+            for (size_t qi = 0; qi < D2K_QTRACE_MAX; qi++) {
+                const d2k_quic_step *st = &r.qtrace[qi];
+                if (!st->label[0]) { continue; }
+                say(s, "по %s вопрос «%s»: %u/%u%s", t->name, st->label,
+                    (unsigned)st->answered, (unsigned)st->sent,
+                    st->outcome == D2K_PROP_UNKNOWN ? " — не измерено" :
+                    (st->outcome == D2K_PROP_YES ? " — взял" : ""));
+            }
             {
                 char found[1024];
                 if (d2k_quic_props_findings(&r.qprops, found, sizeof found) > 0) {

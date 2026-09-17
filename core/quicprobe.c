@@ -1064,8 +1064,6 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                 continue;
             }
             int i = idx_of[k];
-            done[i] = 1;
-            pending--;
             uint8_t buf[2048];
             uint8_t ttl_seen = 0;
             ssize_t n = qp_recv_ttl(fds[i], buf, sizeof buf, &ttl_seen);
@@ -1074,6 +1072,8 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                    сокета: у каждой свой идентификатор, а из него выводятся
                    ключи сервера. */
                 if (verify(buf, (size_t)n, sent[i]) == 0) {
+                    done[i] = 1;
+                    pending--;
                     result[i] = 1;
                     if (ttl_in_out && *ttl_in_out == 0 && ttl_seen > 0) {
                         *ttl_in_out = ttl_seen;
@@ -1087,12 +1087,26 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                             *rtt_ms_out = rtt_ms;
                         }
                     }
-                } else {
-                    result[i] = 0; /* пришло, но не подтверждено — не доказательство */
                 }
+                /* НЕ ПОДТВЕРДИЛОСЬ — ЗОНД НЕ ЗАКРЫВАЕМ, и это не мелочь.
+                   Прежняя редакция закрывала его на ПЕРВОЙ же пришедшей
+                   датаграмме, чем бы она ни была. Настоящий сервер, получив
+                   несколько Initial, отвечает СНАЧАЛА подтверждением, а
+                   ServerHello шлёт следом: замер 17.09 на www.google.com дал
+                   48 байт с одним кадром ACK, потом ещё ACK, и лишь ТРЕТЬИМ
+                   пакетом CRYPTO. Закрытый на первом ACK зонд объявлял такой
+                   сервер МОЛЧАЩИМ — а молчание здесь основание всех вердиктов.
+                   И это не край: браузер с постквантовым key_share шлёт два
+                   Initial всегда, то есть так отвечала бы вся живая цель.
+                   Цикл всё равно ограничен сроком ожидания: каждая итерация
+                   съедает одну датаграмму и перечитывает остаток времени. */
             } else if (n == 0) {
+                done[i] = 1;
+                pending--;
                 result[i] = 0;
             } else {
+                done[i] = 1;
+                pending--;
                 /* POLLERR/явная ошибка recv() ПОСЛЕ успешной отправки — это
                    сетевой отказ (ICMP «порт недоступен» и подобное), не
                    "опыт не состоялся": датаграмма ушла, ответ (в широком
@@ -1445,6 +1459,13 @@ static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN],
             *all_marked = 0;
         }
         *slot = qp_outcome(t);
+        if (qi < D2K_QTRACE_MAX) {
+            d2k_quic_step *st = &r->qtrace[qi];
+            snprintf(st->label, sizeof st->label, "%s", q->label);
+            st->sent = (uint8_t)(sent < 0 ? 0 : sent);
+            st->answered = (uint8_t)t.pass;
+            st->outcome = *slot;
+        }
         if (*slot == D2K_PROP_YES && tn + strlen(q->label) + 2 < sizeof took) {
             if (tn) { took[tn++] = ','; }
             memcpy(took + tn, q->label, strlen(q->label));
