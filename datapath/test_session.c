@@ -160,6 +160,10 @@ static uint16_t htons16(uint16_t v) {
 }
 
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static uint32_t rd32(const uint8_t *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
 static void wr32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
     p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
@@ -1224,7 +1228,7 @@ int main(void) {
                         CHECK(a2, "хвост приветствия, пришедший первым, не удержан — "
                                   "он уйдёт голым в коробку");
                         CHECK(d2k_hold_feed(h2, 90, part, pn, 8,
-                                            d2k_session_plan_revision(g), a2,
+                                            d2k_session_plan_revision(g), a2, 1001, 1,
                                             hold_release, g, &b2) == 1,
                               "хвост не взят в удержание");
 
@@ -1232,12 +1236,99 @@ int main(void) {
                         pn = build_pkt(part, 47503, 0x18, whole, 1448);
                         wr32(part + 24, 1001);
                         CHECK(d2k_hold_feed(h2, 91, part, pn, 9,
-                                            d2k_session_plan_revision(g), 0,
+                                            d2k_session_plan_revision(g), 0, 1001, 1,
                                             hold_release, g, &b2) == 2,
                               "приветствие не собралось из кусков, пришедших в обратном порядке");
                         CHECK(b2.count == 2,
                               "собраны не оба куска — один ушёл бы на провод без плана");
+                        /* НОМЕР ПОСЛЕДОВАТЕЛЬНОСТИ — ГОЛОВЫ, А НЕ ПЕРВОГО
+                           ПРИШЕДШЕГО. Содержимое собрано верно, но заголовок
+                           брался у первого пришедшего пакета — у ХВОСТА. План
+                           ушёл бы верными байтами на неверные позиции потока,
+                           и сервер выбросил бы их как уже полученные. */
+                        CHECK(rd32(b2.packet + 24) == 1001,
+                              "в собранном пакете номер последовательности хвоста, а не головы");
                         d2k_hold_free(h2);
+                    }
+                }
+
+                /* ТРИ КУСКА В ОБРАТНОМ ПОРЯДКЕ И ХВОСТ, НАЧИНАЮЩИЙСЯ С 0x16.
+                 *
+                 * Начало приветствия определялось по первому байту куска
+                 * (0x16 — тип записи TLS). Это догадка по содержимому, и она
+                 * неверна дважды: третий кусок, пришедший первым, головой не
+                 * является, а хвост вполне может начинаться с 0x16 случайно —
+                 * это просто байт данных. Начало обязано браться из известной
+                 * позиции потока (сразу за SYN), а не угадываться. */
+                {
+                    d2k_hold *h3 = d2k_hold_new();
+                    d2k_hold_batch b3;
+                    CHECK(h3 != NULL, "hold allocation for permutation case");
+                    if (h3) {
+                        pn = build_pkt(part, 47504, 0x02, NULL, 0);
+                        d2k_session_packet(g, part, pn, 10, buf, sizeof buf, &r);
+                        size_t a = 600, b = 1200;   /* три куска: 0..a, a..b, b..конец */
+                        int rc3 = 0;
+                        /* третий */
+                        pn = build_pkt(part, 47504, 0x18, whole + b, whole_len - b);
+                        wr32(part + 24, (uint32_t)(1001 + b));
+                        rc3 = d2k_hold_feed(h3, 92, part, pn, 11,
+                                            d2k_session_plan_revision(g),
+                                            d2k_session_hold_candidate(g, part, pn), 1001, 1,
+                                            hold_release, g, &b3);
+                        CHECK(rc3 == 1, "третий кусок, пришедший первым, не удержан");
+                        /* второй */
+                        pn = build_pkt(part, 47504, 0x18, whole + a, b - a);
+                        wr32(part + 24, (uint32_t)(1001 + a));
+                        rc3 = d2k_hold_feed(h3, 93, part, pn, 12,
+                                            d2k_session_plan_revision(g), 0, 1001, 1,
+                                            hold_release, g, &b3);
+                        CHECK(rc3 == 1, "средний кусок не принят");
+                        /* первый */
+                        pn = build_pkt(part, 47504, 0x18, whole, a);
+                        wr32(part + 24, 1001);
+                        rc3 = d2k_hold_feed(h3, 94, part, pn, 13,
+                                            d2k_session_plan_revision(g), 0, 1001, 1,
+                                            hold_release, g, &b3);
+                        CHECK(rc3 == 2, "три куска в обратном порядке не собрались");
+                        CHECK(b3.count == 3, "собраны не все три куска");
+                        CHECK(rd32(b3.packet + 24) == 1001,
+                              "номер последовательности взят не у головы");
+                        d2k_hold_free(h3);
+                    }
+                }
+
+                /* Хвост, случайно начинающийся с 0x16. Головой он не является,
+                   и принять его за голову значит собрать приветствие со
+                   сдвигом — то есть отправить мусор. */
+                {
+                    d2k_hold *h4 = d2k_hold_new();
+                    d2k_hold_batch b4;
+                    CHECK(h4 != NULL, "hold allocation for 0x16 tail case");
+                    if (h4) {
+                        static uint8_t tricky[2048];
+                        size_t tw = whole_len;
+                        memcpy(tricky, whole, tw);
+                        tricky[1448] = 0x16;   /* хвост теперь начинается с 0x16 */
+                        pn = build_pkt(part, 47505, 0x02, NULL, 0);
+                        d2k_session_packet(g, part, pn, 14, buf, sizeof buf, &r);
+                        pn = build_pkt(part, 47505, 0x18, tricky + 1448, tw - 1448);
+                        wr32(part + 24, 2449);
+                        int a4 = d2k_session_hold_candidate(g, part, pn);
+                        int rc4 = d2k_hold_feed(h4, 95, part, pn, 15,
+                                                d2k_session_plan_revision(g), a4, 1001, 1,
+                                                hold_release, g, &b4);
+                        CHECK(rc4 == 1, "хвост с байтом 0x16 не удержан");
+                        pn = build_pkt(part, 47505, 0x18, tricky, 1448);
+                        wr32(part + 24, 1001);
+                        rc4 = d2k_hold_feed(h4, 96, part, pn, 16,
+                                            d2k_session_plan_revision(g), 0, 1001, 1,
+                                            hold_release, g, &b4);
+                        CHECK(rc4 == 2,
+                              "хвост с 0x16 принят за голову — приветствие собрано со сдвигом");
+                        CHECK(rd32(b4.packet + 24) == 1001,
+                              "номер последовательности взят у хвоста с 0x16");
+                        d2k_hold_free(h4);
                     }
                 }
 
@@ -1254,11 +1345,11 @@ int main(void) {
                     int allow = d2k_session_hold_candidate(g, part, pn);
                     CHECK(allow, "installed measured plan did not enable hold");
                     CHECK(d2k_hold_feed(h, 80, part, pn, 5, d2k_session_plan_revision(g),
-                        allow, hold_release, g, &batch) == 1, "first piece not owned");
+                        allow, 0, 0, hold_release, g, &batch) == 1, "first piece not owned");
                     pn = build_pkt(part, 47502, 0x18, whole + 1448, whole_len - 1448);
                     wr32(part + 24, 2449);
                     CHECK(d2k_hold_feed(h, 81, part, pn, 6, d2k_session_plan_revision(g),
-                        0, hold_release, g, &batch) == 2, "held hello not completed");
+                        0, 0, 0, hold_release, g, &batch) == 2, "held hello not completed");
                     CHECK(batch.count == 2 && batch.ids[0] == 80 && batch.ids[1] == 81,
                           "original ownership lost");
                     d2k_session_packet(g, batch.packet, batch.len, 7, buf, sizeof buf, &r);
@@ -1299,7 +1390,7 @@ int main(void) {
                     allow = d2k_session_hold_candidate(g, part, pn);
                     CHECK(allow, "second hold not enabled");
                     CHECK(d2k_hold_feed(h, 82, part, pn, 14, d2k_session_plan_revision(g),
-                        allow, hold_release, g, &batch) == 1, "revision test not held");
+                        allow, 0, 0, hold_release, g, &batch) == 1, "revision test not held");
                     d2k_session_set_plan(g, NULL);
                     d2k_hold_flush(h, 15, d2k_session_plan_revision(g), 0, hold_release, g);
                     CHECK(hold_released == 1 && d2k_hold_next(h) == 0,

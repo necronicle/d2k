@@ -760,9 +760,17 @@ int main(int argc, char **argv) {
                     d2k_hold_batch batch;
                     memset(&batch, 0, sizeof batch);
                     if (holding && np.have_payload && !np.truncated) {
+                        /* НАЧАЛО ПОТОКА — ИЗ САМОГО ПОТОКА, а не из первого
+                           байта куска: куски приветствия приходят в любом
+                           порядке (замерено 17.09), и угадывать по содержимому
+                           нельзя (см. d2k_capture_feed). */
+                        uint32_t anchor = 0;
+                        int have_anchor = d2k_session_stream_anchor(sess, np.payload,
+                                                                    np.payload_len, &anchor);
                         int hr = d2k_hold_feed(holding, np.id, np.payload, np.payload_len,
                             t, d2k_session_plan_revision(sess),
                             d2k_session_hold_candidate(sess, np.payload, np.payload_len),
+                            anchor, have_anchor,
                             release_original, &hc, &batch);
                         if (hr == 1) { continue; } /* ID still held or already released */
                         if (hr == 2) {

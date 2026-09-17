@@ -37,8 +37,17 @@ typedef struct {
  * or unsupported, -2 capacity. Identical retransmits do not duplicate READY.
  * generation is the owning flow's first_ns; forget on SYN/FIN/RST as well.
  */
+/* anchor/have_anchor — ИЗВЕСТНОЕ начало потока (номер сразу за SYN). С ним
+ * кусок кладётся по смещению от начала и порядок прихода перестаёт значить
+ * что-либо. Без него слот заводится только куском, начинающим запись TLS, —
+ * прежнее поведение для вызывающих, которые начала не знают.
+ *
+ * Угадывать начало по первому байту (0x16) НЕЛЬЗЯ: третий кусок, пришедший
+ * первым, головой не является, а хвост может начинаться с 0x16 случайно — это
+ * просто байт данных. Обе ошибки воспроизведены (test_session.c). */
 int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
-                     uint64_t now_ns, uint32_t seq, const uint8_t *bytes,
+                     uint64_t now_ns, uint32_t seq, uint32_t anchor, int have_anchor,
+                     const uint8_t *bytes,
                      size_t len, const uint8_t **hello, size_t *hello_len,
                      uint32_t *hello_seq);
 void d2k_capture_forget(d2k_capture *c, const d2k_key *key);

@@ -1281,8 +1281,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         const uint8_t *hello;
         size_t hello_len;
         uint32_t hello_seq;
+        /* Снимок приветствия собирается от НАЧАЛА ПОТОКА, когда оно известно:
+           куски приходят в любом порядке, и угадывать начало по первому байту
+           нельзя (см. d2k_capture_feed). SYN не наблюдался — работаем
+           по-прежнему, от куска, начинающего запись. */
         int captured = d2k_capture_feed(&s->capture, &key, fl->first_ns, now_ns,
-                                        in_seq, pkt + payload_off, payload_len,
+                                        in_seq, fl->syn_seq + 1, fl->saw_syn,
+                                        pkt + payload_off, payload_len,
                                         &hello, &hello_len, &hello_seq);
         if (captured == 1) {
             d2k_tls_info complete;
@@ -1588,6 +1593,16 @@ void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_
 
 uint64_t d2k_session_plan_revision(const d2k_session *s) {
     return s ? s->plan_revision + d2k_plantab_revision(s->plans) : 0;
+}
+
+int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
+                              uint32_t *anchor) {
+    d2k_hold_info v;
+    if (!s || !anchor || !d2k_hold_parse(p, n, &v)) { return 0; }
+    d2k_flow *fl = d2k_track_find(s->flows, &v.key);
+    if (!fl || !fl->saw_syn) { return 0; }
+    *anchor = fl->syn_seq + 1;
+    return 1;
 }
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook) {

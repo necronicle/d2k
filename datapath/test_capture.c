@@ -11,7 +11,11 @@ static const uint8_t *result;
 static size_t result_len;
 static uint32_t result_seq;
 static int feed(uint64_t gen, uint64_t now, uint32_t seq, const uint8_t *b, size_t n) {
-    return d2k_capture_feed(&c, &key, gen, now, seq, b, n,
+    /* Начало потока этому тесту неизвестно — он проверяет обрамление, а не
+       привязку к потоку: ноль во втором аргументе значит «не знаем», и слот
+       заводится по прежнему правилу (кусок, начинающий запись). Привязка к
+       потоку проверяется там, где поток есть, — test_session.c. */
+    return d2k_capture_feed(&c, &key, gen, now, seq, 0, 0, b, n,
                             &result, &result_len, &result_seq);
 }
 /* Only framing is this module's job. Full TLS parsing is tested at session. */

@@ -37,8 +37,15 @@ void d2k_hold_free(d2k_hold *h); /* flush ALL first */
  * allow_start is a conservative plan prefilter, NOT execution authority.
  * Existing groups always consume tails even when allow_start is false.
  */
+/* anchor/have_anchor — известное начало потока (номер сразу за SYN). Нужны по
+ * двум причинам сразу: сборщик кладёт куски по смещению от него (порядок
+ * прихода перестаёт значить что-либо), а собранный пакет берёт заголовок у
+ * НАСТОЯЩЕЙ головы, а не у первого пришедшего. Без второго содержимое
+ * собиралось верно, но уезжало с номером хвоста — верные байты на неверных
+ * позициях потока, и сервер выбрасывает их как уже полученные. */
 int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
                   uint64_t now, uint64_t revision, int allow_start,
+                  uint32_t anchor, int have_anchor,
                   d2k_hold_release release, void *ctx, d2k_hold_batch *batch);
 /* Release on timeout, revision change or all=1 (loss/shutdown). */
 void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,

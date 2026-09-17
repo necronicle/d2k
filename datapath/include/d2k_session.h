@@ -138,6 +138,15 @@ uint64_t d2k_session_plan_revision(const d2k_session *s);
 void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
                                   uint64_t now_ns);
 
+/* НАЧАЛО ПОТОКА, КОТОРОМУ ПРИНАДЛЕЖИТ ЭТОТ ПАКЕТ (номер сразу за SYN).
+ *
+ * 1 — известно и положено в *anchor, 0 — потока не видно или SYN не наблюдался.
+ * Нужно удержанию и сборщику: с ним куски приветствия кладутся по смещению от
+ * начала, и порядок прихода перестаёт значить что-либо. Догадка по первому
+ * байту (0x16) для этого не годится — см. d2k_capture_feed. */
+int d2k_session_stream_anchor(d2k_session *s, const uint8_t *p, size_t n,
+                              uint32_t *anchor);
+
 void d2k_session_set_hook(d2k_session *s, uint8_t hook);
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);

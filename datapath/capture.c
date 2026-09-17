@@ -22,7 +22,8 @@ static int reject(d2k_capture *c, d2k_capture_slot *s) {
 }
 
 int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
-                     uint64_t now_ns, uint32_t seq, const uint8_t *bytes,
+                     uint64_t now_ns, uint32_t seq, uint32_t anchor, int have_anchor,
+                     const uint8_t *bytes,
                      size_t len, const uint8_t **hello, size_t *hello_len,
                      uint32_t *hello_seq) {
     *hello = NULL;
@@ -43,51 +44,36 @@ int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
         }
         if (!p->state && !vacant) { vacant = p; }
     }
+    /* ЯКОРЬ ПРИНИМАЕТСЯ, ТОЛЬКО ЕСЛИ ОН СОГЛАСЕН С ЭТИМ КУСКОМ.
+       Наблюдённый SYN и данные могут разойтись: SYN не виден, номера
+       переписаны по дороге, поток начат до нас. Доверять такому якорю —
+       значит класть байты по выдуманному смещению. Не согласен — работаем
+       по-прежнему, от куска, начинающего запись. */
+    if (have_anchor) {
+        uint32_t off_from_anchor = seq - anchor;
+        if ((int32_t)off_from_anchor < 0 || off_from_anchor >= D2K_CAPTURE_BYTES ||
+            len > D2K_CAPTURE_BYTES - off_from_anchor) {
+            have_anchor = 0;
+        }
+    }
     if (!s) {
-        /* КУСОК, ПРИШЕДШИЙ РАНЬШЕ ГОЛОВЫ, ТОЖЕ ЗАВОДИТ СЛОТ.
-           Раньше слот начинался только с начала записи TLS, и приветствие,
-           чей ХВОСТ пришёл первым, не собиралось никогда: хвост отбрасывался,
-           а голова ждала его до таймаута (поле 17.09.2026, зонд
-           подтверждения). Якорь такого слота временный и сдвинется, когда
-           голова придёт. */
+        /* НАЧАЛО БЕРЁТСЯ ИЗ ПОТОКА, А НЕ ИЗ СОДЕРЖИМОГО.
+           Знаем начало — слот заводит любой кусок, и порядок прихода не
+           значит ничего. Не знаем — прежнее правило: только тот, что начинает
+           запись TLS. */
+        if (!have_anchor && bytes[0] != 22) { return 0; }
         if (!vacant) { c->full++; return -2; }
         s = vacant;
         memset(s, 0, sizeof *s);
         s->key = *key;
         s->generation = generation;
         s->started_ns = now_ns;
-        s->seq = seq;
+        s->seq = have_anchor ? anchor : seq;
         s->state = 1;
-        s->anchored = (bytes[0] == 22);
+        s->anchored = 1;
     }
     if (s->state != 1) { return 0; }
 
-    /* ГОЛОВА ПРИШЛА ПОЗЖЕ — ПЕРЕСТАВИТЬ ЯКОРЬ НА НЕЁ.
-       Сдвигаем уже собранное вправо на разницу номеров: смещения внутри
-       приветствия считаются от начала записи, и временный якорь их смещал. */
-    if (!s->anchored && bytes[0] == 22) {
-        uint32_t back = s->seq - seq;
-        if (back != 0 && (int32_t)back > 0) {
-            if (back >= D2K_CAPTURE_BYTES || s->high + back > D2K_CAPTURE_BYTES) {
-                return reject(c, s);
-            }
-            uint8_t old[D2K_CAPTURE_BYTES / 8];
-            memcpy(old, s->present, sizeof old);
-            memmove(s->bytes + back, s->bytes, s->high);
-            memset(s->bytes, 0, back);
-            memset(s->present, 0, sizeof s->present);
-            for (size_t i = 0; i < s->high; i++) {
-                if (old[i / 8] & (uint8_t)(1u << (i % 8))) {
-                    size_t q = i + back;
-                    s->present[q / 8] |= (uint8_t)(1u << (q % 8));
-                }
-            }
-            s->seq = seq;
-            s->high += back;
-            s->contiguous = 0;
-        }
-        s->anchored = 1;
-    }
     /* Unsigned subtraction also handles sequence wrap. Bytes before the
      * observed head are ambiguous, not a license to move the head. */
     uint32_t delta = seq - s->seq;
@@ -115,7 +101,6 @@ int d2k_capture_feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
        не начало записи, а середина приветствия. Прежде проверки заголовка
        шли и тут, и слот немедленно отвергался на первом же куске, пришедшем
        раньше головы. Ждём голову. */
-    if (!s->anchored) { return 0; }
     if ((n >= 2 && b[1] != 3) || (n >= 6 && b[5] != 1)) {
         return reject(c, s);
     }

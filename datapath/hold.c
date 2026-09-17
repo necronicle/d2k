@@ -85,6 +85,7 @@ size_t d2k_hold_verdicts(const uint32_t *ids, size_t count, uint32_t verdict,
 }
 int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
                   uint64_t now, uint64_t revision, int allow_start,
+                  uint32_t anchor, int have_anchor,
                   d2k_hold_release release, void *ctx, d2k_hold_batch *batch) {
     memset(batch, 0, sizeof *batch);
     if (!h) { return 0; }
@@ -134,18 +135,42 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     size_t hello_len;
     uint32_t hello_seq;
     int rc = d2k_capture_feed(&h->capture, &v.key, s->deadline, now, v.seq,
+                              anchor, have_anchor,
                               p + v.header, v.payload, &hello, &hello_len, &hello_seq);
     if (rc < 0) { release_slot(h, s, release, ctx); return 1; }
     if (!rc) { return 1; }
+    /* ЗАГОЛОВОК — У НАСТОЯЩЕЙ ГОЛОВЫ, А НЕ У ПЕРВОГО ПРИШЕДШЕГО.
+       Куски приходят в любом порядке, и первым может лежать хвост. Собранное
+       содержимое от этого верно, а вот номер последовательности — нет:
+       уехали бы верные байты на неверных позициях потока, и сервер выбросил
+       бы их как уже полученные. Голову узнаём по номеру, который вернул
+       сборщик. */
+    size_t head_i = s->count;
+    for (size_t i = 0; i < s->count; i++) {
+        d2k_hold_info hv;
+        if (d2k_hold_parse(s->packets[i], s->len[i], &hv) && hv.seq == hello_seq) {
+            head_i = i;
+            break;
+        }
+    }
+    if (head_i == s->count) {
+        /* Головы среди удержанных нет — собирать пакет не из чего. Отпускаем
+           как есть: выдумать заголовок нельзя, а взять чужой — та самая
+           ошибка, ради которой этот поиск и написан. */
+        release_slot(h, s, release, ctx);
+        return 1;
+    }
+    d2k_hold_info hv;
+    (void)d2k_hold_parse(s->packets[head_i], s->len[head_i], &hv);
     batch->count = s->count;
     memcpy(batch->ids, s->ids, s->count * sizeof s->ids[0]);
-    batch->len = s->head.header + hello_len;
-    memcpy(batch->packet, s->packets[0], s->head.header);
-    memcpy(batch->packet + s->head.header, hello, hello_len);
+    batch->len = hv.header + hello_len;
+    memcpy(batch->packet, s->packets[head_i], hv.header);
+    memcpy(batch->packet + hv.header, hello, hello_len);
     batch->packet[2] = (uint8_t)(batch->len >> 8);
     batch->packet[3] = (uint8_t)batch->len;
-    /* Sequence/ACK/context remain those of the held first packet. The
-       synthetic IPv4/TCP checksums are intentionally not for transmission. */
+    /* Sequence/ACK/context — головы. Синтетические суммы IPv4/TCP намеренно
+       не для отправки. */
     h->stats.pending -= s->count;
     h->stats.ready++;
     d2k_capture_forget(&h->capture, &v.key);
