@@ -134,6 +134,7 @@
 #include <unistd.h>
 
 #include "d2k_quic.h"       /* d2k_quic_is_initial — канонический разбор заголовка Task 2 */
+#include "d2k_net4.h"
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
@@ -1487,15 +1488,11 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
     if (!d2k_quic_allow_local) {
         struct in_addr a;
         if (inet_pton(AF_INET, ip, &a) == 1) {
-            uint32_t v = ntohl(a.s_addr);
-            int local = (v >> 24) == 127 ||            /* 127/8 — петля */
-                        (v >> 24) == 10 ||             /* 10/8 */
-                        (v & 0xfff00000u) == 0xac100000u || /* 172.16/12 */
-                        (v & 0xffff0000u) == 0xc0a80000u || /* 192.168/16 */
-                        (v & 0xffff0000u) == 0xa9fe0000u || /* 169.254/16 */
-                        (v & 0xffc00000u) == 0x64400000u || /* 100.64/10 */
-                        v == 0;
-            if (local) {
+            /* Список диапазонов — ОДИН на проект (d2k_net4.h): тот же вопрос
+               задаёт голосовой путь, и второй экземпляр списка разошёлся бы с
+               этим молча — обе копии продолжали бы «работать», просто считая
+               разное. */
+            if (d2k_ip4_private(a.s_addr)) {
                 r.verdict = D2K_V_LOCAL_ADDRESS;
                 reason_set(&r, "имя разрешается в адрес %s из приватного диапазона — это подмена "
                                "на уровне DNS (роутер, AdGuard или свой редирект по хостлисту), "
