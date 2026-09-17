@@ -103,11 +103,17 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
         char kbuf[64];
         v = field_val(line, "packets", &next, kbuf);
         long packets = v ? strtol(v, NULL, 10) : 0;
+        /* Пометку ставит ядро, пока ОБРАТНОГО трафика по потоку не было
+           (RFC-ничего, это состояние conntrack). Её отсутствие и значит
+           «точка кому-то отвечает» — см. d2k_voice_target.replied про то,
+           почему признак надёжнее счётчика на этом роутере. */
+        int replied = (strstr(line, "[UNREPLIED]") == NULL);
 
         size_t i = 0;
         for (; i < n; i++) {
             if (out[i].ip == ip && out[i].port == (uint16_t)dport) {
                 out[i].packets += (int)packets;
+                out[i].replied |= replied;
                 break;
             }
         }
@@ -115,6 +121,7 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
             out[n].ip = ip;
             out[n].port = (uint16_t)dport;
             out[n].packets = (int)packets;
+            out[n].replied = replied;
             n++;
         }
     }
@@ -295,7 +302,24 @@ static int voice_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
     return 0;
 }
 
+/* ЖИВ ЛИ ПОТОК К ЭТОЙ ТОЧКЕ — два снимка счётчика пакетов из той же таблицы,
+   откуда берётся цель. Второго источника не заводим: расхождение двух
+   источников про один поток было бы хуже отсутствия второго.
+
+   Пауза короткая: голос идёт непрерывно (замер 17.09 — пакет каждые 20 мс),
+   и четверти секунды хватает, чтобы счётчик сдвинулся. -1 — потока не видно
+   или таблицы нет: опровергать молчание нечем, и выдумывать нечего. */
+static int voice_alive(const char *ct_path, uint32_t ip, uint16_t port) {
+    d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
+    size_t n = d2k_voice_targets(ct_path, t, D2K_VOICE_MAX_TARGETS);
+    for (size_t i = 0; i < n; i++) {
+        if (t[i].ip == ip && t[i].port == port) { return t[i].replied ? 1 : 0; }
+    }
+    return -1; /* потоков к этой точке не видно — опровергать молчание нечем */
+}
+
 d2k_voice_ask_fn d2k_voice_ask_hook = voice_ask;
+d2k_voice_alive_fn d2k_voice_alive_hook = voice_alive;
 
 d2k_voice_ask_fn voice_ask_real(void) { return voice_ask; }
 d2k_voice_resolve_fn d2k_voice_resolve_hook = voice_resolve;
@@ -415,7 +439,77 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
     char addr[24];
     d2k_ip4_text(r.ip, addr, sizeof addr);
 
-    /* ===== СЛОЙ 1: достижим ли голосовой сервер ===== */
+    /* ===== СЛОЙ 0: ОТВЕЧАЕТ ЛИ ТОЧКА НАСТОЯЩЕМУ КЛИЕНТУ =====
+     *
+     * ГЛАВНЫЙ ОРАКУЛ, И ОН НАБЛЮДАТЕЛЬНЫЙ, А НЕ ЗОНДОВЫЙ. Поле 17.09.2026
+     * доказало прямым замером, что зонд оракулом быть НЕ МОЖЕТ: голосовая
+     * точка Дискорда молчит на STUN, на нули и на мусор одинаково — при живом
+     * разговоре через тот же адрес. Она обслуживает только установленную
+     * сессию, по SSRC от гейтвея.
+     *
+     * Зато ядро видит, идёт ли ОБРАТНЫЙ трафик по потоку настоящего клиента
+     * (пометка [UNREPLIED]). Это ответ про ТОТ САМЫЙ поток, который надо
+     * пробить, а не про наш зонд, и получается он бесплатно — данные уже
+     * прочитаны при поиске цели.
+     *
+     * 1 — отвечает: резать нечего, и ни одного зонда слать не надо.
+     * 0 — поток идёт, ответов нет: вот это и есть блокировка потока.
+     * -1 — наблюдать нечего (задан явный адрес, таблицы нет): тогда и только
+     *      тогда работает старый зондовый путь, со своей оговоркой. */
+    int obs = d2k_voice_alive_hook(o.ct_path, r.ip, r.port);
+    if (obs == 1) {
+        r.verdict = D2K_VOICE_CLEAR;
+        say_reason(&r, "разговор с %s:%u идёт, и сервер по нему отвечает", addr, r.port);
+        return r;
+    }
+    if (obs == 0) {
+        /* Поток без единого ответа. Контроль нужен ровно затем, чтобы
+           отделить «режут этот поток» от «UDP не ходит вовсе». */
+        uint32_t cip0 = 0;
+        uint16_t cport0 = 0;
+        const char *ctl0 = o.control ? o.control : D2K_VOICE_CONTROL_DEFAULT;
+        int ctl_ok = 0, asked0 = 0;
+        if (d2k_voice_resolve_hook(ctl0, &cip0, &cport0) == 0) {
+            d2k_tally c0 = d2k_voice_ask_hook(cip0, cport0, NULL, 0, 0, wait_ms, o.mark,
+                                              D2K_VOICE_REPEATS, NULL);
+            r.probes += D2K_VOICE_REPEATS - c0.err;
+            if (!c0.marked) { r.marked = 0; }
+            asked0 = 1;
+            ctl_ok = (c0.pass > 0);
+        }
+        if (asked0 && !ctl_ok) {
+            r.verdict = D2K_VOICE_NO_UDP;
+            say_reason(&r, "поток к %s:%u идёт без единого ответа, и публичный STUN %s тоже "
+                           "молчит: на этом канале не ходит UDP или его режут целиком — "
+                           "обходить голос отдельно бессмысленно", addr, r.port, ctl0);
+        } else {
+            r.verdict = D2K_VOICE_BLOCKED;
+            if (asked0) {
+                say_reason(&r, "поток к %s:%u идёт, а ответов нет НИ ОДНОГО, при живом "
+                               "публичном STUN: режут именно этот поток", addr, r.port);
+            } else {
+                say_reason(&r, "поток к %s:%u идёт без единого ответа; контроль НЕ СПРОШЕН "
+                               "(имя %s не разрешилось) — «UDP не ходит» не исключено",
+                           addr, r.port, ctl0);
+            }
+            ask_voice_arms(&r, &o, wait_ms);
+        }
+        if (!r.marked) {
+            add_reason(&r, "; СОКЕТ НЕ ПОМЕЧЕН — зонд шёл через наш же обход");
+        }
+        return r;
+    }
+
+    /* ===== НАБЛЮДАТЬ НЕЧЕГО: ОСТАЁТСЯ ЗОНД, И ОН ПОЧТИ НИЧЕГО НЕ ДОКАЗЫВАЕТ =====
+     *
+     * Сюда попадают только два случая: адрес задан вручную на машине без
+     * таблицы соединений, либо потока к этой точке ядро не видит вовсе.
+     *
+     * ПОЛОЖИТЕЛЬНЫЙ исход зонда по-прежнему информативен: ответил — значит
+     * точка достижима и отвечает посторонним (так ведут себя настоящие
+     * серверы STUN). ОТРИЦАТЕЛЬНЫЙ не значит ничего: голосовая точка Дискорда
+     * молчит и на исправной линии (поле 17.09). Выдавать это молчание за
+     * блокировку — ровно та ложь, которую поле и вскрыло. */
     uint32_t rtt = 0;
     d2k_tally direct = d2k_voice_ask_hook(r.ip, r.port, NULL, 0, 0, wait_ms, o.mark,
                                           D2K_VOICE_REPEATS, &rtt);
@@ -424,48 +518,19 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
 
     if (direct.pass == D2K_VOICE_REPEATS) {
         r.verdict = D2K_VOICE_CLEAR;
-        say_reason(&r, "голосовой сервер %s:%u отвечает (%d/%d за %u мс) — резать нечего",
+        say_reason(&r, "точка %s:%u отвечает на зонд (%d/%d за %u мс) — резать нечего",
                    addr, r.port, direct.pass, D2K_VOICE_REPEATS, rtt);
     } else if (direct.pass > 0) {
         r.verdict = D2K_VOICE_FLAKY;
         say_reason(&r, "ответов %d из %d — не воспроизводится, вердикт выносить нельзя",
                    direct.pass, D2K_VOICE_REPEATS);
     } else {
-        /* ===== СЛОЙ 2: КОНТРОЛЬ — публичный STUN на том же канале ===== */
-        uint32_t cip = 0;
-        uint16_t cport = 0;
-        const char *ctl = o.control ? o.control : D2K_VOICE_CONTROL_DEFAULT;
-        int ctl_silent = 0, ctl_asked = 0;
-        if (d2k_voice_resolve_hook(ctl, &cip, &cport) == 0) {
-            d2k_tally c = d2k_voice_ask_hook(cip, cport, NULL, 0, 0, wait_ms, o.mark,
-                                             D2K_VOICE_REPEATS, NULL);
-            r.probes += D2K_VOICE_REPEATS - c.err;
-            if (!c.marked) { r.marked = 0; }
-            ctl_asked = 1;
-            ctl_silent = (c.pass == 0);
-        }
-
-        if (ctl_asked && ctl_silent) {
-            r.verdict = D2K_VOICE_NO_UDP;
-            say_reason(&r, "молчит и голосовой сервер %s:%u, и публичный STUN %s: на этом "
-                           "канале не ходит UDP или его режут целиком — обходить голос "
-                           "отдельно бессмысленно", addr, r.port, ctl);
-        } else {
-            r.verdict = D2K_VOICE_BLOCKED;
-            if (ctl_asked) {
-                say_reason(&r, "голосовой сервер %s:%u молчит, а публичный STUN на том же "
-                               "канале отвечает: UDP ходит, режут именно этот поток",
-                           addr, r.port);
-            } else {
-                /* Контроль не спрошен — вердикт слабее, и это сказано вслух:
-                   без него «режут поток» не отделено от «UDP не ходит». */
-                say_reason(&r, "голосовой сервер %s:%u молчит; контроль НЕ СПРОШЕН (имя %s "
-                               "не разрешилось) — «UDP не ходит» не исключено",
-                           addr, r.port, ctl);
-            }
-            /* ===== СЛОЙ 3: приёмы боевого профиля ===== */
-            ask_voice_arms(&r, &o, wait_ms);
-        }
+        r.verdict = D2K_VOICE_NO_ORACLE;
+        say_reason(&r, "зонд к %s:%u молчит (0/%d), а разговора к этой точке ядро не видит — "
+                       "опровергнуть молчание нечем. Голосовая точка не отвечает посторонним "
+                       "и на исправной линии, поэтому её молчание блокировкой НЕ является: "
+                       "мерить этим способом нечем",
+                   addr, r.port, D2K_VOICE_REPEATS);
     }
 
     if (!r.marked) {

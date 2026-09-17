@@ -54,6 +54,7 @@ static const char *verdict_word(d2k_voice_verdict v) {
     case D2K_VOICE_NO_UDP:  return "UDP не ходит вовсе";
     case D2K_VOICE_NO_CALL: return "мерить нечего";
     case D2K_VOICE_FLAKY:   return "не воспроизводится";
+    case D2K_VOICE_NO_ORACLE: return "мерить этим зондом нечем";
     }
     return "неизвестный вердикт";
 }

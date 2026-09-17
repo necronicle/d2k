@@ -92,6 +92,12 @@ static d2k_tally stub_ask(uint32_t ip, uint16_t port, const uint8_t *pre, size_t
     return t;
 }
 
+static int g_alive;
+static int stub_alive(const char *ct_path, uint32_t ip, uint16_t port) {
+    (void)ct_path; (void)ip; (void)port;
+    return g_alive;
+}
+
 static uint32_t g_ctl_ip;
 static int stub_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
     (void)hostport;
@@ -167,11 +173,13 @@ static void reset(void) {
     g_last_copies = 0;
     g_marked_ok = 1;
     g_ctl_ip = ip4(162, 159, 128, 233);
+    g_alive = -1;   /* по умолчанию сказать нечего */
 }
 
 int main(void) {
     d2k_voice_ask_hook = stub_ask;
     d2k_voice_resolve_hook = stub_resolve;
+    d2k_voice_alive_hook = stub_alive;
 
     /* --- ЦЕЛЬ ИЗ ЖИВОГО РАЗГОВОРА ---------------------------------------
      * Формат строки conntrack на разных ядрах отличается началом (есть или
@@ -208,6 +216,11 @@ int main(void) {
         size_t n = d2k_voice_targets(path, t, D2K_VOICE_MAX_TARGETS);
 
         CHECK(n == 2, "найдено не два голосовых потока — фильтр по портам или протоколу неверен");
+        /* Пометки [UNREPLIED] в этих строках нет — значит точка отвечала. */
+        if (n == 2) {
+            CHECK(t[0].replied == 1 && t[1].replied == 1,
+                  "поток с обратным трафиком объявлен безответным");
+        }
         if (n == 2) {
             CHECK(t[0].ip == ip4(104, 16, 58, 99) && t[0].port == 50003,
                   "первым идёт не самый нагруженный разговор");
@@ -218,6 +231,27 @@ int main(void) {
 
         CHECK(d2k_voice_targets("/nonexistent/d2k-voice", t, D2K_VOICE_MAX_TARGETS) == 0,
               "нечитаемая таблица выдала цели");
+    }
+
+    /* --- [UNREPLIED]: ТОЧКА НИКОМУ НЕ ОТВЕЧАЛА --------------------------
+     * Признак берётся вместо счётчика пакетов: на роутере Марка голосовой
+     * поток уходит в железо ([FASTNAT]), и счётчик замирает (замер 17.09:
+     * 5593, 5593, 5593, 5594 за три секунды при непрерывном разговоре).
+     * Флаг состояния железо не стирает. */
+    {
+        const char *path = write_ct(
+            "ipv4     2 udp      17 3 src=88.87.93.11 dst=104.16.58.99 sport=57581 "
+            "dport=50004 packets=10 bytes=13850 [UNREPLIED] src=104.16.58.99 "
+            "dst=88.87.93.11 sport=50004 dport=57581 packets=0 bytes=0 [FASTNAT] use=2\n");
+        d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
+        size_t n = d2k_voice_targets(path, t, D2K_VOICE_MAX_TARGETS);
+        CHECK(n == 1, "поток без ответа обязан находиться — он цель не хуже прочих");
+        if (n == 1) {
+            CHECK(t[0].replied == 0,
+                  "поток с пометкой [UNREPLIED] объявлен отвечающим — это выдача своих же "
+                  "зондов за живой разговор");
+        }
+        remove(path);
     }
 
     /* --- РАЗГОВОРА НЕТ: мерить нечего, и это НЕ «всё хорошо» -------------- */
@@ -234,6 +268,60 @@ int main(void) {
         CHECK(strstr(r.reason, "позвони") != NULL || strstr(r.reason, "разговор") != NULL,
               "причина обязана объяснить человеку, что делать");
         remove(path);
+    }
+
+    /* --- ОРАКУЛ ПО САМОМУ РАЗГОВОРУ, А НЕ ПО СВОЕМУ ЗОНДУ -----------------
+     *
+     * Поле 17.09 доказало, что зонд STUN оракулом быть не может: голосовая
+     * точка молчит на что угодно с чужого сокета. Зато в таблице соединений
+     * видно, отвечает ли она НАСТОЯЩЕМУ клиенту — по отсутствию пометки
+     * [UNREPLIED]. Это и есть оракул: он про тот самый поток, который надо
+     * пробить, а не про наш зонд.
+     *
+     * Отвечает — резать нечего, и никаких зондов слать не надо вовсе. */
+    {
+        reset();
+        g_answer_ip = 0;   /* зонд молчал бы, и это больше не важно */
+        g_alive = 1;
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_CLEAR,
+              "сервер отвечает настоящему клиенту, а вердикт не «резать нечего»");
+        CHECK(g_calls == 0, "зонды ушли там, где ответ уже виден в таблице соединений");
+        CHECK(r.probes == 0, "опыты посчитаны там, где их не было");
+    }
+
+    /* Поток есть, ответов НЕТ — вот это и есть блокировка потока. Контроль
+       нужен, чтобы отделить «режут этот поток» от «UDP не ходит вовсе». */
+    {
+        reset();
+        g_answer_ip = g_ctl_ip;   /* публичный STUN отвечает — UDP на канале жив */
+        g_alive = 0;              /* а голосовой поток идёт без ответа */
+        char dir[64];
+        snprintf(dir, sizeof dir, "/tmp/d2k-voice-blobs-%d", (int)getpid());
+        CHECK(mkdir(dir, 0700) == 0 || errno == EEXIST, "каталог блобов не создался");
+        char file[256];
+        snprintf(file, sizeof file, "%s/stun.bin", dir);
+        FILE *f = fopen(file, "wb");
+        for (int i = 0; i < 64; i++) { fputc(0x42, f); }
+        fclose(f);
+        g_answer_with_pre = ip4(104, 16, 58, 99);
+        g_need_copies = 6;
+
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        o.blob_dir = dir;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_BLOCKED,
+              "поток идёт без единого ответа, а контроль жив — это блокировка потока");
+        CHECK(strstr(r.arm, "repeats=6") != NULL,
+              "приём не подобран там, где блокировка настоящая");
+        remove(file); rmdir(dir);
     }
 
     /* --- СЛОЙ 1: голосовой сервер отвечает — резать нечего ---------------- */
@@ -268,6 +356,7 @@ int main(void) {
     {
         reset();
         g_answer_ip = 0; /* не отвечает никто */
+        g_alive = 0;     /* поток к точке идёт, ответов по нему нет */
         d2k_voice_opt o;
         memset(&o, 0, sizeof o);
         o.ip = ip4(104, 16, 58, 99);
@@ -277,13 +366,54 @@ int main(void) {
               "молчит и контроль — значит режут UDP целиком, а не голос");
         CHECK(strstr(r.reason, "бессмысленно") != NULL,
               "причина обязана сказать, что обходить голос отдельно незачем");
-        CHECK(g_calls == 2, "контроль обязан быть спрошен ровно один раз");
+        CHECK(g_calls == 1, "спрошен обязан быть только контроль: про сам поток ответ уже есть");
+    }
+
+    /* --- МОЛЧАНИЕ ЗОНДА ПРИ ЖИВОМ РАЗГОВОРЕ — НЕ БЛОКИРОВКА --------------
+     *
+     * Поле 17.09: голосовая точка Дискорда молчит на STUN, на нули и на мусор
+     * одинаково, при живом разговоре через тот же адрес. Она обслуживает
+     * только установленную сессию. Вердикт «режут именно этот поток» на
+     * исправном голосе — прямая ложь, и опровергается она тем же источником,
+     * откуда взята цель: счётчик пакетов потока растёт. */
+    {
+        reset();
+        g_answer_ip = g_ctl_ip;   /* контроль отвечает — UDP на канале ходит */
+        g_alive = 1;              /* а разговор к цели идёт прямо сейчас */
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        d2k_voice_res r = d2k_voice_run(&o);
+
+        CHECK(r.verdict == D2K_VOICE_CLEAR,
+              "поток жив и сервер отвечает — резать нечего");
+        CHECK(r.arm[0] == '\0',
+              "приём подбирался там, где резать нечего");
+    }
+
+    /* Наблюдать нечего И зонд молчит — честное «мерить нечем», а НЕ
+       «режут»: голосовая точка молчит и на исправной линии. */
+    {
+        reset();
+        g_answer_ip = 0;
+        g_alive = -1;   /* потока к этой точке ядро не видит */
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ip = ip4(104, 16, 58, 99);
+        o.port = 50003;
+        o.blob_dir = "/nonexistent/d2k-blobs";
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_NO_ORACLE,
+              "молчание зонда выдано за блокировку там, где наблюдать нечего");
+        CHECK(r.arm[0] == '\0', "приём подбирался там, где мерить нечем");
     }
 
     /* --- СЛОЙ 3: режут именно этот поток, фальшивка его пробивает --------- */
     {
         reset();
         g_answer_ip = g_ctl_ip;                    /* контроль отвечает — UDP ходит */
+        g_alive = 0;                               /* поток идёт, ответов нет — режут */
         g_answer_with_pre = ip4(104, 16, 58, 99);  /* голос берётся фальшивкой */
         g_need_copies = 6;                         /* и только шестью копиями */
 
@@ -319,6 +449,7 @@ int main(void) {
     {
         reset();
         g_answer_ip = g_ctl_ip;
+        g_alive = 0;
         d2k_voice_opt o;
         memset(&o, 0, sizeof o);
         o.ip = ip4(104, 16, 58, 99);
