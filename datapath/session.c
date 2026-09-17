@@ -9,6 +9,7 @@
  * Времена в наносекундах целыми. Плавающей арифметики на пакетном пути нет.
  */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "d2k_plans.h"
@@ -1591,6 +1592,30 @@ uint64_t d2k_session_plan_revision(const d2k_session *s) {
 
 void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
     if (s) { s->hook = hook; }
+}
+
+void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
+                                  uint64_t now_ns) {
+    d2k_hold_info v;
+    if (!s || !d2k_hold_parse(p, n, &v)) { return; }
+    d2k_flow *fl = d2k_track_find(s->flows, &v.key);
+    /* НЕ ЧАЩЕ ОДНОГО РАЗА НА ПОТОК: отпускается несколько пакетов, а событие
+       про них одно. Потока может и не быть в таблице — тогда сказать нечего,
+       и выдумывать ключ незачем. */
+    if (!fl || fl->noted_unassembled) { return; }
+    fl->noted_unassembled = 1;
+    /* ЧИСЛА — В ЛОГ, А НЕ В ЖУРНАЛ: журнал хранит УКАЗАТЕЛЬ на текст, не
+       копию, и локальный буфер там повис бы. А числа нужны: они отличают
+       «пришёл один кусок, остаток не дошёл» от «куски пришли, не собрались».
+       Объявленная длина записи против пришедшей и есть этот ответ. */
+    if (v.payload >= 5) {
+        unsigned declared = 5u + (unsigned)rd16(p + v.header + 3);
+        fprintf(stderr, "d2kd: составное приветствие отпущено без сборки: "
+                        "объявлено %u байт записи, в этом куске %zu\n",
+                declared, v.payload);
+    }
+    refuse(s, now_ns, &v.key,
+           "составное приветствие не собралось — план не применён к его пакетам");
 }
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {

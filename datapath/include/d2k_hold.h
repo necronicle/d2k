@@ -44,7 +44,12 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
 void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,
                     d2k_hold_release release, void *ctx);
 uint64_t d2k_hold_next(const d2k_hold *h);
-typedef struct { uint64_t started, ready, released, full, timed_out; size_t pending; } d2k_hold_stats;
+/* timed_out_pkts — сколько ПАКЕТОВ лежало в слотах, отпущенных по таймауту.
+   Отличает «второй сегмент не дошёл до очереди» (1) от «дошёл, а разбор не
+   собрал» (2 и больше). Без этого числа обе причины выглядят одинаково:
+   «начато=1 собрано=0 таймаутов=1». */
+typedef struct { uint64_t started, ready, released, full, timed_out, timed_out_pkts;
+                 size_t pending; } d2k_hold_stats;
 void d2k_hold_get_stats(const d2k_hold *h, d2k_hold_stats *out);
 /* Try ALL IDs even if one verdict fails. Zero alone acknowledges the
  * logical original group; caller must never report per-ID Plan completion. */

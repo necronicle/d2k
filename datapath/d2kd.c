@@ -164,8 +164,20 @@ static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     if (verdict == D2K_NF_DROP) { st.dropped++; } else { st.accepted++; }
     return rc;
 }
+/* ОТПУЩЕН БЕЗ СБОРКИ — ЭТО ОТДЕЛЬНЫЙ ИСХОД, И ЕГО НАДО НАЗВАТЬ ПО ПОТОКУ.
+ *
+ * Удержание начинается, когда TLS-запись пришла НЕПОЛНОЙ и к цели есть план:
+ * план обязан лечь на приветствие целиком. Если остаток не пришёл, пакеты
+ * отпускаются как есть — плана на них не будет, причины пропуска тоже
+ * (её ставит другая ветка), и в журнале остаётся только «приветствие».
+ *
+ * Поле 17.09.2026: ровно так терялся зонд подтверждения на живой линии.
+ * У клиентских потоков строка «план не применён» есть на каждом, у зонда — ни
+ * одной, и по общему счётчику («составной вход: начато=1 собрано=0
+ * таймаутов=1») нельзя было сказать, ЧЕЙ это поток. Теперь можно. */
 static void release_original(void *ctx, uint32_t id, const uint8_t *p, size_t n) {
     hold_context *c = ctx;
+    d2k_session_note_unassembled(c->sess, p, n, now_ns());
     d2k_session_observe_tcp(c->sess, p, n, now_ns());
     (void)send_original_verdict(ctx, id, D2K_NF_ACCEPT);
 }
@@ -231,9 +243,10 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     d2k_hold_stats hs;
     d2k_hold_get_stats(holding, &hs);
     printf("составной вход: начато=%" PRIu64 " собрано=%" PRIu64
-           " отпущено=%" PRIu64 " таймаутов=%" PRIu64 " отказов ёмкости=%" PRIu64
-           " ожидающих пакетов=%zu\n", hs.started, hs.ready, hs.released,
-           hs.timed_out, hs.full, hs.pending);
+           " отпущено=%" PRIu64 " таймаутов=%" PRIu64 " (пакетов в них=%" PRIu64 ")"
+           " отказов ёмкости=%" PRIu64 " ожидающих пакетов=%zu\n",
+           hs.started, hs.ready, hs.released, hs.timed_out, hs.timed_out_pkts,
+           hs.full, hs.pending);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);

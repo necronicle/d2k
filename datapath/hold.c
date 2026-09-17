@@ -51,7 +51,14 @@ void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,
         held *s = &h->slots[i];
         if (!s->count) { continue; }
         if (all || now >= s->deadline || revision != s->revision) {
-            if (now >= s->deadline) { h->stats.timed_out++; }
+            if (now >= s->deadline) {
+                h->stats.timed_out++;
+                /* СКОЛЬКО ПАКЕТОВ ТАК И ОСТАЛОСЬ ЛЕЖАТЬ. Один — второй
+                   сегмент до очереди не дошёл; два и больше — дошёл, а разбор
+                   приветствия его не собрал. Без этого числа обе причины
+                   неразличимы (поле 17.09, зонд подтверждения). */
+                h->stats.timed_out_pkts += s->count;
+            }
             release_slot(h, s, release, ctx);
         }
     }
