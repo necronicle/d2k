@@ -66,7 +66,7 @@ TESTHDR = test_stand.h
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
 TESTS   = test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_arms test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
 
-.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
+.PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-arms test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-verify FORCE
 
 all: meas.o verdict.o crypto.o quic.o quicprobe.o net4.o props.o hello.o catalog.o match.o compose.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
@@ -616,6 +616,15 @@ BUILDDIR ?= ../builds
 # бинарник, и промежуточные объектники host-сборки сюда не годятся.
 DETECT_SRC = ../detect/bridge.c ../detect/classify.c ../detect/poison.c \
              ../detect/props.c ../detect/raw.c ../detect/trigger.c ../detect/response.c
+
+# Голосовой замер под роутер. Статикой и на musl — по той же причине, что
+# d2kc: на коробке нет ни glibc, ни наших библиотек.
+d2kvoice-linux-arm64:
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -static \
+		-o $(BUILDDIR)/d2kvoice-linux-arm64 d2kvoice.c voice.c stun.c net4.c \
+		tls13core.c crypto.c x25519.c meas.c -lpthread
+	@ls -l $(BUILDDIR)/d2kvoice-linux-arm64
 
 d2kc-linux-arm64: hello_profiles.inc
 	@mkdir -p $(BUILDDIR)
