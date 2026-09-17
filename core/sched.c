@@ -3143,6 +3143,24 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     t->name, verdict_name(r.verdict), r.reason, took_s, r.probes,
                     t->n_plans);
             }
+            /* НАХОДКИ — ОТДЕЛЬНЫМИ СТРОКАМИ И ПОСЛЕ ВЕРДИКТА.
+               Приём, который коробку ломает, а движку исполнить нечем, — это
+               не кандидат и в план не пойдёт; но и молчать о нём нельзя:
+               ровно эти строки говорят, куда движку расти, и ровно они
+               теряются первыми, если складывать их в текст причины (384
+               байта на весь вердикт). См. d2k_quic_props_findings. */
+            {
+                char found[1024];
+                if (d2k_quic_props_findings(&r.qprops, found, sizeof found) > 0) {
+                    char *line = found;
+                    while (line && *line) {
+                        char *nl = strchr(line, '\n');
+                        if (nl) { *nl = '\0'; }
+                        say(s, "по %s приём взял, а движку нечем: %s", t->name, line);
+                        line = nl ? nl + 1 : NULL;
+                    }
+                }
+            }
             if (t->n_plans == 0) {
                 task_fail(s, t, now_ms);
                 moved++;

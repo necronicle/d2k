@@ -41,6 +41,7 @@
 #include "d2k_crypto.h"
 #include "d2k_meas.h"
 #include "d2k_quicprobe.h"
+#include "test_quic_vector.h"
 
 static int fails;
 #define CHECK(cond, msg)                          \
@@ -237,6 +238,26 @@ static d2k_tally mock_ask(const char *addr, uint16_t port,
         *rtt_ms_out = (t.pass > 0) ? 10u : 0u;
     }
     return t;
+}
+
+/* Вопросы 4 и 7 ходят своими хуками (пара датаграмм и низкий исходный порт —
+ * см. d2k_quicprobe.h, почему не расширением d2k_quic_ask_fn). Подменять надо
+ * и их: неподменённый хук — это НАСТОЯЩИЕ сокеты в наружную сеть прямо из
+ * теста, то есть минуты ожидания и вердикт, зависящий от чужой линии. Обе
+ * заглушки сводятся к тому же mock_ask — вопросник проверяется по дисциплине
+ * (что задано, что записано), а не по транспорту. */
+static d2k_tally mock_ask_srcport(const char *addr, uint16_t port, int src_port,
+                                   d2k_hello msg, uint32_t wait_ms, uint32_t mark,
+                                   int repeats, int *sent_out) {
+    (void)src_port;
+    return mock_ask(addr, port, NULL, 0, msg, wait_ms, mark, repeats, NULL, NULL, sent_out);
+}
+
+static d2k_tally mock_ask_split(const char *addr, uint16_t port, d2k_hello snap,
+                                 const char *sni, uint32_t wait_ms, uint32_t mark,
+                                 int repeats, int *sent_out) {
+    (void)sni;
+    return mock_ask(addr, port, NULL, 0, snap, wait_ms, mark, repeats, NULL, NULL, sent_out);
 }
 
 static char g_extra_pool[8][D2K_QUIC_ADDR_LEN];
@@ -647,6 +668,8 @@ int main(void) {
 
     d2k_quic_ask_fn real_ask = d2k_quic_ask_hook;
     d2k_quic_ask_hook = mock_ask;
+    d2k_quic_ask_srcport_hook = mock_ask_srcport;
+    d2k_quic_ask_split_hook = mock_ask_split;
 
     /* --- НАХОДКА 2 РЕВЬЮ (круг 4): d2k_quic_ask_hook — ЧАСТЬ ПУБЛИЧНОГО
      * КОНТРАКТА (extern в d2k_quicprobe.h), не только внутренность дерева.
@@ -749,11 +772,22 @@ int main(void) {
            говорило "не задано (адреса)", хотя спросить было чем — pool[0]
            уже дважды подтверждён живым. Теперь плечо спрашивает pool[0] и
            реально измеряется (3 опыта, не "незадано"). */
-        CHECK(strstr(r.reason, "плечо не задано") == NULL,
-              "спросить было чем (адрес живой) — плечо не имеет права остаться незаданным");
-        CHECK(strstr(r.reason, "плечо(мусор)=0/") != NULL,
-              "плечо обязано реально измериться на закреплённом адресе, а не быть пропущено");
-        CHECK(r.probes == 12, "3(база)+3(прямой)+3(шаг2)+3(плечо на pool[0], без ротации)");
+        CHECK(strstr(r.reason, "не задано 1 (адреса)") == NULL &&
+              strstr(r.reason, "не задано 2 (адреса)") == NULL,
+              "спросить было чем (адрес живой) — вопросы не имеют права остаться незаданными по адресам");
+        CHECK(r.qprops.junk_ahead == D2K_PROP_NO,
+              "вопрос про мусор обязан реально измериться на закреплённом адресе, а не быть пропущен");
+        CHECK(r.qprops.low_source_port == D2K_PROP_NO,
+              "вопрос про низкий исходный порт обязан измериться: снимок ему не нужен");
+        /* Снимок у этого мока — не настоящий Initial, поэтому четыре вопроса
+           с пересборкой и пара датаграмм честно НЕ СОБИРАЮТСЯ и остаются
+           неизмеренными: несобравшийся зонд не измерение. */
+        CHECK(r.qprops.split_crypto == D2K_PROP_UNKNOWN &&
+              r.qprops.split_datagrams == D2K_PROP_UNKNOWN,
+              "несобравшийся зонд обязан оставить свойство неизмеренным, а не «не помогает»");
+        CHECK(strstr(r.reason, "не задано 5 (не собралось)") != NULL,
+              "несобранные вопросы обязаны быть названы прямо");
+        CHECK(r.probes == 15, "3(база)+3(прямой)+3(шаг2)+3(мусор)+3(низкий порт) на pool[0]");
     }
 
     /* --- остаточная блокировка ЕСТЬ, но лишних адресов НОЛЬ: шаг 3 (ротация)
@@ -784,9 +818,9 @@ int main(void) {
 
         CHECK(r.verdict == D2K_V_OPAQUE, "устройство измерено — должен быть OPAQUE несмотря на "
                                           "нехватку адреса для плеча");
-        CHECK(strstr(r.reason, "плечо не задано") != NULL,
-              "нехватка адреса на плече обязана быть названа прямо, а не проглочена");
-        CHECK(r.probes == 12, "3+3+3+3 — вопрос про плечо не задан, его опыты не считаются");
+        CHECK(strstr(r.reason, "не задано 2 (адреса)") != NULL,
+              "нехватка адресов на вопросник обязана быть названа прямо, а не проглочена");
+        CHECK(r.probes == 12, "3+3+3+3 — вопросы не заданы, их опыты не считаются");
     }
 
     /* --- нет контрольного имени: даже базовая живость не проверяется ------- */
@@ -826,8 +860,103 @@ int main(void) {
         d2k_vres r = d2k_quic_classify("10.0.6.1", 443, "x.example", trig_hello(), ctl_hello(), 0);
 
         CHECK(r.verdict == D2K_V_OPAQUE, "плечо не отменяет вердикт по содержимому — остаётся OPAQUE");
-        CHECK(strstr(r.reason, "плечо(мусор)=3/3") != NULL,
-              "reason обязан назвать положительный сигнал по плечу прямо");
+        CHECK(strstr(r.reason, "взяли мусор") != NULL,
+              "reason обязан назвать положительный сигнал по мусору прямо");
+        CHECK(r.qprops.junk_ahead == D2K_PROP_YES,
+              "свойство обязано быть записано, а не только упомянуто в тексте причины");
+    }
+
+    /* --- ВОПРОСНИК ЦЕЛИКОМ: СЕМЬ ВОПРОСОВ НА НАСТОЯЩЕМ СНИМКЕ -------------
+     *
+     * Прочие проверки этой части дают моку выдуманный снимок, и четыре
+     * вопроса с пересборкой честно не собираются. Здесь снимок НАСТОЯЩИЙ
+     * (вектор RFC 9001 A.2), значит собирается всё, и проверяется главное:
+     * задан КАЖДЫЙ вопрос и записано КАЖДОЕ свойство.
+     *
+     * Почему это важнее, чем кажется: неизмеренное свойство и «приём не
+     * помогает» — разные вещи, и раскладка с нулём в значении «не измерено»
+     * (d2k_quic_props) молчаливо превращает первое во второе при любой
+     * ошибке в вопроснике. Утверждение «ни одно свойство не осталось
+     * неизмеренным» ловит ровно это. */
+    {
+        mock_reset();
+        g_mock_poison_on_trigger = 0; /* коробка молчит на триггер, но адрес не поражает */
+        g_extra_n = 0;
+
+        d2k_hello snap;
+        snap.bytes = d2k_test_v1_initial;
+        snap.len = sizeof d2k_test_v1_initial;
+        d2k_vres r = d2k_quic_classify("10.0.20.1", 443, "www.example.com", snap, ctl_hello(), 0);
+
+        CHECK(r.verdict == D2K_V_OPAQUE, "контроль жив до и после — решает содержимое");
+        CHECK(strstr(r.reason, "не собралось") == NULL,
+              "на настоящем снимке не собраться не может ни один вопрос");
+        CHECK(r.qprops.junk_ahead != D2K_PROP_UNKNOWN &&
+              r.qprops.split_crypto != D2K_PROP_UNKNOWN &&
+              r.qprops.split_datagrams != D2K_PROP_UNKNOWN &&
+              r.qprops.version2 != D2K_PROP_UNKNOWN &&
+              r.qprops.clear_fixed_bit != D2K_PROP_UNKNOWN &&
+              r.qprops.low_source_port != D2K_PROP_UNKNOWN &&
+              r.qprops.longer != D2K_PROP_UNKNOWN,
+              "хоть одно свойство осталось неизмеренным — вопрос не задан, а вывод по нему будет");
+        /* Восьмой вопрос оригинала (фальшивка с разрешённым именем) здесь не
+           задаётся намеренно: он живёт в задаче 6 вместе с числом копий и
+           развёрткой TTL. Незаданное обязано остаться неизмеренным. */
+        CHECK(r.qprops.fake_ahead == D2K_PROP_UNKNOWN,
+              "вопрос, который вопросник не задаёт, не имеет права получить значение");
+        CHECK(r.probes == 9 + 7 * D2K_QUIC_REPEATS,
+              "3(база)+3(прямой)+3(шаг2)+семь вопросов по три");
+    }
+
+    /* --- НАХОДКИ: ПРИЁМ ВЗЯЛ, А ИСПОЛНИТЬ ЕГО НЕЧЕМ ----------------------
+     *
+     * Шесть из семи вопросов ломают коробку, но движок сегодня не умеет ни
+     * одного. Оригинал такие исходы называет прямо и отдельно от плеч, и это
+     * не формальность: прятать их значит терять самый ценный выход замера, а
+     * выдавать за плечо — обещать человеку обход, которого нет. */
+    {
+        d2k_quic_props p;
+        memset(&p, 0, sizeof p);
+        char out[1024];
+
+        CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 0 && out[0] == '\0',
+              "не измерено ничего, а находки нашлись");
+
+        p.split_crypto = D2K_PROP_NO;
+        CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 0,
+              "«приём не помогает» — это не находка");
+
+        p.split_crypto = D2K_PROP_YES;
+        CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 1 &&
+              strstr(out, "кадра CRYPTO") != NULL,
+              "взявший приём обязан быть назван человеку");
+        CHECK(strstr(out, "не умеет") != NULL,
+              "находку нельзя выдавать за готовый обход: движок её не исполняет");
+
+        p.version2 = D2K_PROP_YES;
+        p.low_source_port = D2K_PROP_YES;
+        CHECK(d2k_quic_props_findings(&p, out, sizeof out) == 3,
+              "три взявших приёма — три находки");
+
+        /* Буфер меньше находки: обрезать можно, выйти за него нельзя. */
+        char tiny[8];
+        memset(tiny, 0x7f, sizeof tiny);
+        (void)d2k_quic_props_findings(&p, tiny, sizeof tiny);
+        CHECK(tiny[sizeof tiny - 1] == '\0', "находки вышли за буфер");
+    }
+
+    /* --- свойства НЕ ЗАПОЛНЯЮТСЯ, когда вопросника не было ----------------
+     * Ноль в d2k_quic_props значит «не измерено», и вердикт, до вопросника
+     * не доживший, обязан оставить все свойства нулевыми — иначе он молча
+     * утверждает «ни один приём не помогает». */
+    {
+        mock_reset();
+        d2k_vres r = d2k_quic_classify("10.0.21.1", 443, "x.example", no_hello(), ctl_hello(), 0);
+        CHECK(r.verdict == D2K_V_FLAKY, "снимка нет — измерения не было");
+        CHECK(r.qprops.junk_ahead == D2K_PROP_UNKNOWN &&
+              r.qprops.low_source_port == D2K_PROP_UNKNOWN &&
+              r.qprops.longer == D2K_PROP_UNKNOWN,
+              "вердикт без вопросника выдал свойства коробки — это выдумка, а не замер");
     }
 
     /* --- бюджет исчерпан ДО базовой живости (спецслучай budget_s==0,

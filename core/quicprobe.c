@@ -125,6 +125,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -673,7 +674,7 @@ static void nap_us(uint32_t us) {
    этом файле нужен только фрагментации (props.c), не приманке с TTL. */
 static int qp_send_one(const char *addr, uint16_t port,
                         const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
-                        int prefix_copies,
+                        int prefix_copies, int src_port,
                         d2k_hello msg, uint32_t mark, int *marked) {
     *marked = (mark == 0);
     if (!addr || !msg.bytes || msg.len == 0) {
@@ -685,6 +686,27 @@ static int qp_send_one(const char *addr, uint16_t port,
     }
     if (mark != 0 && d2k_mark_hook(fd, mark) == 0) {
         *marked = 1;
+    }
+    /* ИСХОДНЫЙ ПОРТ — ТОЛЬКО когда его СПРОСИЛИ (вопрос 7 оригинала: коробка
+       экономит на разборе и не смотрит на датаграммы, у которых исходный порт
+       не больше порта назначения; у GFW подтверждено перебором пар портов).
+       Во всех прочих вопросах bind'а нет намеренно: свой эфемерный порт на
+       каждую попытку — это и есть то, чем шаг 2 доказывает независимость
+       остаточной блокировки от исходного порта.
+
+       Порт ниже 1024 требует прав, и отказ bind'а — это НЕ сетевой факт:
+       попытка не отправляется вовсе (-1, «наша сторона»), и вопрос честно
+       остаётся незаданным, а не «не помог». */
+    if (src_port > 0 && src_port < 65536) {
+        struct sockaddr_in src;
+        memset(&src, 0, sizeof src);
+        src.sin_family = AF_INET;
+        src.sin_addr.s_addr = htonl(INADDR_ANY);
+        src.sin_port = htons((uint16_t)src_port);
+        if (bind(fd, (struct sockaddr *)&src, sizeof src) != 0) {
+            close(fd);
+            return -1;
+        }
     }
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
@@ -796,7 +818,7 @@ static int qp_verify_vn(const uint8_t *p, size_t n, d2k_hello msg) {
    тащить лишний параметр через всё дерево). */
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
-                              int prefix_copies,
+                              int prefix_copies, int src_port, const char *split_sni,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
                               int *sent_out, qp_verify_fn verify) {
@@ -876,11 +898,37 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
      * состояния соединения на сервере не заводится. */
     static const size_t COPY_CAP = D2K_QW_MAX_DGRAM;
     uint8_t copies[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
+    uint8_t tails[D2K_QUIC_MAX_ADDRS][D2K_QW_MAX_DGRAM];
+    const uint8_t *pfx[D2K_QUIC_MAX_ADDRS];
+    size_t pfx_len[D2K_QUIC_MAX_ADDRS];
     d2k_hello sent[D2K_QUIC_MAX_ADDRS];
     for (int i = 0; i < repeats; i++) {
-        size_t clen = 0;
-        if (msg.bytes && msg.len &&
-            d2k_quic_hello_recid(msg.bytes, msg.len, copies[i], COPY_CAP, &clen) == 0) {
+        size_t clen = 0, tlen = 0;
+        pfx[i] = prefix;
+        pfx_len[i] = prefix_len;
+        if (split_sni) {
+            /* ПАРА ДАТАГРАММ СОБИРАЕТСЯ НА КАЖДУЮ ПОПЫТКУ ЦЕЛИКОМ, а не
+               пересобирается идентификатором, как одиночный пакет: обе
+               половины обязаны нести ОДИН DCID (иначе сервер увидит два
+               соединения по половине приветствия), и свежесть на попытку
+               даёт сама сборка пары. Не собралось — попытка НЕ отправляется
+               (sent[i].bytes=NULL даст "не отправилось"), и вопрос останется
+               незаданным: подменить пару одиночным снимком значило бы
+               измерить другой вопрос под этим именем. */
+            if (msg.bytes && msg.len &&
+                d2k_quic_hello_split(msg.bytes, msg.len, split_sni,
+                                     copies[i], COPY_CAP, &clen,
+                                     tails[i], COPY_CAP, &tlen) == 0) {
+                sent[i].bytes = copies[i];
+                sent[i].len = clen;
+                pfx[i] = tails[i];   /* хвост уезжает ПЕРВЫМ */
+                pfx_len[i] = tlen;
+            } else {
+                sent[i].bytes = NULL;
+                sent[i].len = 0;
+            }
+        } else if (msg.bytes && msg.len &&
+                   d2k_quic_hello_recid(msg.bytes, msg.len, copies[i], COPY_CAP, &clen) == 0) {
             sent[i].bytes = copies[i];
             sent[i].len = clen;
         } else {
@@ -889,7 +937,11 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     }
 
     for (int i = 0; i < repeats; i++) {
-        fds[i] = qp_send_one(addr, port, prefix, prefix_len, prefix_ttl, prefix_copies,
+        /* Свой порт на каждую попытку: три параллельные попытки с одним
+           bind'ом подрались бы за него, и две упали бы с EADDRINUSE (то же
+           решение у оригинала, questions.go: port-1-attempt). */
+        int sp = (src_port > 0) ? src_port - i : 0;
+        fds[i] = qp_send_one(addr, port, pfx[i], pfx_len[i], prefix_ttl, prefix_copies, sp,
                               sent[i], mark, &marked[i]);
         if (!marked[i]) {
             t.marked = 0;
@@ -1011,8 +1063,8 @@ static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, msg, wait_ms, mark, repeats,
-                        rtt_ms_out, refused_out, sent_out, qp_verify_aead);
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg, wait_ms, mark,
+                        repeats, rtt_ms_out, refused_out, sent_out, qp_verify_aead);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1036,8 +1088,8 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     d2k_hello msg;
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
-    return quic_ask_ex(addr, port, NULL, 0, 0, 1, msg, wait_ms, mark, D2K_QUIC_REPEATS, NULL, NULL,
-                        sent_out, qp_verify_vn);
+    return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
+                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, qp_verify_vn);
 }
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
@@ -1048,8 +1100,8 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
 static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *prefix, size_t prefix_len,
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, msg, wait_ms, mark, repeats,
-                        NULL, NULL, sent_out, qp_verify_aead);
+    return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, 0, NULL, msg, wait_ms,
+                        mark, repeats, NULL, NULL, sent_out, qp_verify_aead);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
@@ -1066,10 +1118,32 @@ static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
                                   const uint8_t *prefix, size_t prefix_len,
                                   int copies, d2k_hello msg, uint32_t wait_ms,
                                   uint32_t mark, int repeats, int *sent_out) {
-    return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, msg, wait_ms, mark, repeats,
-                        NULL, NULL, sent_out, qp_verify_aead);
+    return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, 0, NULL, msg, wait_ms, mark,
+                        repeats, NULL, NULL, sent_out, qp_verify_aead);
 }
 d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
+
+/* Вопрос 7: исходный порт НИЖЕ порта назначения. Отдельным хуком, а не
+   расширением d2k_quic_ask_fn, по той же причине, что TTL и копии: контракт
+   дерева уже прошёл ревью, а параметр нужен одному вопросу. */
+static d2k_tally quic_ask_srcport(const char *addr, uint16_t port, int src_port,
+                                   d2k_hello msg, uint32_t wait_ms, uint32_t mark,
+                                   int repeats, int *sent_out) {
+    return quic_ask_ex(addr, port, NULL, 0, 0, 1, src_port, NULL, msg, wait_ms, mark,
+                        repeats, NULL, NULL, sent_out, qp_verify_aead);
+}
+d2k_quic_ask_srcport_fn d2k_quic_ask_srcport_hook = quic_ask_srcport;
+
+/* Вопрос 4: приветствие ДВУМЯ датаграммами, хвост первым. Берёт СНИМОК и имя,
+   а не готовый пакет: пара собирается заново на каждую попытку (общий DCID у
+   половин, свежий у каждой попытки — см. quic_ask_ex). */
+static d2k_tally quic_ask_split(const char *addr, uint16_t port, d2k_hello snap,
+                                 const char *sni, uint32_t wait_ms, uint32_t mark,
+                                 int repeats, int *sent_out) {
+    return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, sni, snap, wait_ms, mark,
+                        repeats, NULL, NULL, sent_out, qp_verify_aead);
+}
+d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 
 /* Реальный оракул — умолчание d2k_quic_ask_hook (см. d2k_quicprobe.h про то,
    зачем этот хук вообще существует). Дерево ниже зовёт ИСКЛЮЧИТЕЛЬНО хук, не
@@ -1154,43 +1228,219 @@ static const char *qp_pinned_or_next(const char pool[][D2K_QUIC_ADDR_LEN], size_
     return pool[(*next_addr)++];
 }
 
-/* Шаг 4: вопрос про исполнимое плечо (мусор перед Initial, простейшее из
-   плеч донора) — общий хвост для ОБЕИХ веток, которыми дерево приходит к
-   D2K_V_OPAQUE (без ротации и с ней, см. шапку файла). Вынесен в отдельную
-   функцию, а не продублирован дважды, — тело d2k_quic_classify и так
-   держит единственный выход, дублирование пятнадцати строк не помогло бы
-   этому, только расползлось бы при следующей правке одной копии без другой.
-   Дописывает в r->reason (уже содержащий причину OPAQUE) через
-   reason_append, ничего не возвращает — вызывающему нечего с этим делать,
-   кроме как продолжить к своему единственному return.
-   residual_detected — см. qp_pinned_or_next. */
-static void qp_arm_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN], size_t n_pool,
-                         size_t *next_addr, int residual_detected, uint16_t port, d2k_hello trigger,
-                         uint32_t wait_ms, uint32_t mark, int *all_marked, const struct timespec *start) {
-    if (!budget_left(start)) {
-        reason_append(r, "; плечо не задано (бюджет)");
-        return;
+/* ШАГ 4: ВОПРОСНИК ПРО УСТРОЙСТВО КОРОБКИ.
+ *
+ * Семь вопросов оригинала (internal/quicprobe/questions.go), по одному, В ТОМ
+ * ЖЕ ПОРЯДКЕ: он там не случаен — сперва дешёвое и уже бравшее живые коробки.
+ * Прежняя редакция задавала из них ровно один (мусор перед Initial) и
+ * называла его «плечом»; имя было точным, пока вопрос был один, и стало
+ * враньём, как только их стало семь — исполнимо здесь ровно одно, остальные
+ * шесть коробку ЛОМАЮТ, но исполнить их движку сегодня нечем, и это самый
+ * ценный выход замера, а не повод его прятать.
+ *
+ * ВОСЬМОЙ ВОПРОС ОРИГИНАЛА (фальшивый Initial с разрешённым именем перед
+ * своим) здесь НЕ задаётся и остаётся «не измерено»: он живёт в задаче 6
+ * (props.c, D2K_QA_BLOB) вместе с числом копий и развёрткой TTL, и задать его
+ * дважды значило бы потратить бюджет на то, что уже меряется подробнее.
+ *
+ * Общий хвост для ОБЕИХ веток, которыми дерево приходит к D2K_V_OPAQUE.
+ * residual_detected — см. qp_pinned_or_next. */
+typedef enum {
+    QK_JUNK = 0,  /* мусорная датаграмма перед снимком */
+    QK_RESHAPE,   /* снимок пересобран иначе (d2k_quic_hello_ask) */
+    QK_SPLIT,     /* снимок уехал двумя датаграммами */
+    QK_SRCPORT    /* снимок как есть, но с низкого исходного порта */
+} qp_kind;
+
+typedef struct {
+    const char  *label;  /* как назвать в причине — коротко: 384 байта на весь вердикт */
+    qp_kind      kind;
+    d2k_quic_ask ask;    /* для QK_RESHAPE */
+    size_t       slot;   /* поле d2k_quic_props, куда ложится исход */
+} qp_question;
+
+static const qp_question qp_list[] = {
+    { "мусор",      QK_JUNK,    D2K_QASK_PLAIN,           offsetof(d2k_quic_props, junk_ahead) },
+    { "кадры",      QK_RESHAPE, D2K_QASK_SPLIT_CRYPTO,    offsetof(d2k_quic_props, split_crypto) },
+    { "датаграммы", QK_SPLIT,   D2K_QASK_PLAIN,           offsetof(d2k_quic_props, split_datagrams) },
+    { "версия2",    QK_RESHAPE, D2K_QASK_VERSION2,        offsetof(d2k_quic_props, version2) },
+    { "бит",        QK_RESHAPE, D2K_QASK_CLEAR_FIXED_BIT, offsetof(d2k_quic_props, clear_fixed_bit) },
+    { "низкийпорт", QK_SRCPORT, D2K_QASK_PLAIN,           offsetof(d2k_quic_props, low_source_port) },
+    { "длина",      QK_RESHAPE, D2K_QASK_LONGER,          offsetof(d2k_quic_props, longer) }
+};
+#define QP_N_QUESTIONS (sizeof qp_list / sizeof qp_list[0])
+
+/* Исход одного вопроса -> значение свойства. ЕДИНОГЛАСИЕ ИЛИ НИЧЕГО (см.
+   d2k_quic_props): разошедшиеся повторы — это «не измерено», а не «не
+   помогает». Сбой отправки (err) — тоже: он про нашу сторону, не про
+   коробку. */
+static int8_t qp_outcome(d2k_tally t) {
+    if (t.err > 0 || (t.pass > 0 && t.pass < D2K_QUIC_REPEATS)) {
+        return D2K_PROP_UNKNOWN;
     }
-    const char *fresh = qp_pinned_or_next(pool, n_pool, next_addr, residual_detected);
-    if (!fresh) {
-        reason_append(r, "; плечо не задано (адреса)");
-        return;
+    return (t.pass == D2K_QUIC_REPEATS) ? D2K_PROP_YES : D2K_PROP_NO;
+}
+
+static void qp_questions_step(d2k_vres *r, const char pool[][D2K_QUIC_ADDR_LEN], size_t n_pool,
+                               size_t *next_addr, int residual_detected, uint16_t port,
+                               const char *sni, d2k_hello trigger,
+                               uint32_t wait_ms, uint32_t mark, int *all_marked,
+                               const struct timespec *start) {
+    /* Ровно 16 нулей — тот же мусор, что и у оригинала (questions.go:97), и
+       ровно те байты, которые потом уйдут в строке стратегии
+       (blob=0x000...0): слать случайное, а рекомендовать нули значило бы
+       мерить одно, а применять другое. */
+    static const uint8_t garbage16[16];
+
+    char took[192];
+    size_t tn = 0;
+    int n_budget = 0, n_addr = 0, n_unbuilt = 0;
+    uint8_t shaped[D2K_QW_MAX_DGRAM], scratch[D2K_QW_MAX_DGRAM];
+
+    for (size_t qi = 0; qi < QP_N_QUESTIONS; qi++) {
+        const qp_question *q = &qp_list[qi];
+        int8_t *slot = (int8_t *)&r->qprops + q->slot;
+
+        if (!budget_left(start)) {
+            n_budget++;
+            continue;
+        }
+
+        /* СНАЧАЛА СОБРАТЬ, ПОТОМ СПРАШИВАТЬ. Несобравшийся зонд — не
+           измерение (оригинал: NotBuilt), и отправлять вместо него снимок
+           как есть значило бы измерить другой вопрос под этим именем.
+           Проверка идёт ДО взятия адреса: незаданный вопрос не имеет права
+           тратить свежую тройку. */
+        d2k_hello msg = trigger;
+        size_t slen = 0;
+        int src_port = 0;
+        if (q->kind == QK_RESHAPE) {
+            if (!trigger.bytes ||
+                d2k_quic_hello_ask(trigger.bytes, trigger.len, q->ask, sni,
+                                   shaped, sizeof shaped, &slen) != 0) {
+                n_unbuilt++;
+                continue;
+            }
+            msg.bytes = shaped;
+            msg.len = slen;
+        } else if (q->kind == QK_SPLIT) {
+            size_t tlen = 0;
+            if (!trigger.bytes ||
+                d2k_quic_hello_split(trigger.bytes, trigger.len, sni,
+                                     shaped, sizeof shaped, &slen,
+                                     scratch, sizeof scratch, &tlen) != 0) {
+                n_unbuilt++;
+                continue;
+            }
+            /* Пара собирается заново внутри оракула, на каждую попытку: здесь
+               она построена только чтобы убедиться, что вопрос ВЫРАЗИМ. */
+        } else if (q->kind == QK_SRCPORT) {
+            /* Порт ниже порта назначения, свой на каждую попытку (оракул
+               вычитает номер попытки). Ниже 1024 bind требует прав — тогда
+               попытка не отправится и вопрос останется «не измерено»; это
+               честнее, чем взять порт повыше и назвать его «низким». */
+            if (port <= (uint16_t)D2K_QUIC_REPEATS) {
+                n_unbuilt++;
+                continue;
+            }
+            src_port = (int)port - 1;
+        }
+
+        const char *addr = qp_pinned_or_next(pool, n_pool, next_addr, residual_detected);
+        if (!addr) {
+            n_addr++;
+            continue;
+        }
+
+        int sent = 0;
+        d2k_tally t;
+        if (q->kind == QK_SPLIT) {
+            t = d2k_quic_ask_split_hook(addr, port, trigger, sni, wait_ms, mark,
+                                        D2K_QUIC_REPEATS, &sent);
+        } else if (q->kind == QK_SRCPORT) {
+            t = d2k_quic_ask_srcport_hook(addr, port, src_port, msg, wait_ms, mark,
+                                          D2K_QUIC_REPEATS, &sent);
+        } else {
+            const uint8_t *pre = (q->kind == QK_JUNK) ? garbage16 : NULL;
+            size_t pre_len = (q->kind == QK_JUNK) ? sizeof garbage16 : 0;
+            t = d2k_quic_ask_hook(addr, port, pre, pre_len, msg, wait_ms, mark,
+                                  D2K_QUIC_REPEATS, NULL, NULL, &sent);
+        }
+        r->probes += sent; /* сколько реально ушло на провод, не pass+fail */
+        if (!t.marked) {
+            *all_marked = 0;
+        }
+        *slot = qp_outcome(t);
+        if (*slot == D2K_PROP_YES && tn + strlen(q->label) + 2 < sizeof took) {
+            if (tn) { took[tn++] = ','; }
+            memcpy(took + tn, q->label, strlen(q->label));
+            tn += strlen(q->label);
+        }
     }
-    static const uint8_t garbage16[16]; /* ровно 16 нулей — тот же мусор, что и у донора (questions.go:97) */
-    int sent = 0;
-    d2k_tally armed = d2k_quic_ask_hook(fresh, port, garbage16, sizeof garbage16, trigger, wait_ms,
-                                         mark, D2K_QUIC_REPEATS, NULL, NULL, &sent);
-    r->probes += sent; /* сколько реально ушло на провод, не pass+fail (находка 4 ревью, круг 5) */
-    if (!armed.marked) {
-        *all_marked = 0;
-    }
-    if (armed.err > 0 || (armed.pass > 0 && armed.pass < D2K_QUIC_REPEATS)) {
-        reason_append(r, "; плечо: расхождение");
-    } else if (armed.pass == D2K_QUIC_REPEATS) {
-        reason_append(r, "; плечо(мусор)=%d/%d — старт для задачи 6", armed.pass, D2K_QUIC_REPEATS);
+    took[tn] = '\0';
+
+    if (tn) {
+        reason_append(r, "; вопросы(%d): взяли %s", (int)QP_N_QUESTIONS, took);
     } else {
-        reason_append(r, "; плечо(мусор)=0/%d", D2K_QUIC_REPEATS);
+        reason_append(r, "; вопросы(%d): не взял ни один", (int)QP_N_QUESTIONS);
     }
+    if (n_budget) { reason_append(r, "; не задано %d (бюджет)", n_budget); }
+    if (n_addr) { reason_append(r, "; не задано %d (адреса)", n_addr); }
+    if (n_unbuilt) { reason_append(r, "; не задано %d (не собралось)", n_unbuilt); }
+}
+
+/* Находки — см. контракт в d2k_quicprobe.h. Тексты перенесены из оригинала
+   (questions.go, поле finding) дословно по смыслу: они не описание приёма, а
+   ответ на вопрос «и что мне с этим делать», и именно эта половина обычно
+   теряется при переносе. */
+int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
+    if (!out || cap == 0) { return 0; }
+    out[0] = '\0';
+    if (!p) { return 0; }
+
+    static const struct { size_t slot; const char *text; } texts[] = {
+        { offsetof(d2k_quic_props, split_crypto),
+          "приветствие, разложенное на два кадра CRYPTO, проходит — коробка их не пересобирает. "
+          "Движок так не умеет: расшифровать Initial он может, а собрать и зашифровать обратно нет. "
+          "Это новая функция lua-desync, а не настройка существующей." },
+        { offsetof(d2k_quic_props, split_datagrams),
+          "приветствие, разложенное на две датаграммы, проходит — коробка их не собирает. "
+          "Исполнить нечем по той же причине, что и разрез на кадры: движок так не умеет." },
+        { offsetof(d2k_quic_props, version2),
+          "Initial второй версии проходит — коробка знает только первую. На живом пакете версию "
+          "не переписать: она входит в связанные данные AEAD, и правка ломает рукопожатие самого "
+          "пользователя. Движок так не умеет; это довод для клиента, не для движка." },
+        { offsetof(d2k_quic_props, clear_fixed_bit),
+          "с погашенным фиксированным битом Initial проходит. Сервер обязан такой пакет принять "
+          "только если сам объявил grease_quic_bit, поэтому приём ненадёжен, а движок его не умеет." },
+        { offsetof(d2k_quic_props, low_source_port),
+          "с исходным портом ниже порта назначения Initial проходит — коробка так экономит на "
+          "разборе. Десинком это не выражается и движок так не умеет: нужен SNAT исходного порта, "
+          "отдельное правило фаервола." },
+        /* Мусор перед Initial и удлинённая датаграмма ИСПОЛНИМЫ — их
+           подхватывает подбор плеча (задача 6), и повторять их здесь значило
+           бы называть находкой то, что уже стало плечом. */
+        { offsetof(d2k_quic_props, fake_ahead),
+          "фальшивый Initial с разрешённым именем перед своим проходит — коробка считает поток "
+          "разрешённым. Это исполнимо: ровно то же делает приманка движка." }
+    };
+
+    int found = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof texts / sizeof texts[0]; i++) {
+        if (*((const int8_t *)p + texts[i].slot) != D2K_PROP_YES) {
+            continue;
+        }
+        found++;
+        if (used + 1 < cap) {
+            int n = snprintf(out + used, cap - used, "%s%s", used ? "\n" : "", texts[i].text);
+            if (n < 0) { break; }
+            used += (size_t)n;
+            if (used >= cap) { used = cap - 1; break; }
+        }
+    }
+    out[(used < cap) ? used : cap - 1] = '\0';
+    return found;
 }
 
 d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
@@ -1523,7 +1773,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                            (см. qp_pinned_or_next) — плечо тоже спрашивает
                            закреплённый pool[0], не ротирует (правка ревью
                            2026-09-06 круг 3, находка B). */
-                        qp_arm_step(&r, pool, n_pool, &next_addr, 0, port, trigger, dyn_wait, mark,
+                        qp_questions_step(&r, pool, n_pool, &next_addr, 0, port, sni, trigger, dyn_wait, mark,
                                     &all_marked, &start);
                     } else {
                         /* same.pass == 0: остаточная блокировка ОБНАРУЖЕНА —
@@ -1580,7 +1830,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                                        плечо продолжает с того же next_addr,
                                        забирая СЛЕДУЮЩИЙ свежий (см.
                                        qp_pinned_or_next). */
-                                    qp_arm_step(&r, pool, n_pool, &next_addr, 1, port, trigger, dyn_wait,
+                                    qp_questions_step(&r, pool, n_pool, &next_addr, 1, port, sni, trigger, dyn_wait,
                                                 mark, &all_marked, &start);
                                 }
                             }
