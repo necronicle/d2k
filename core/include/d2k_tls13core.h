@@ -103,4 +103,8 @@ int d2k_t13_flight_next(const uint8_t *buf, size_t len, size_t *off,
  * доказательства от неё не растёт (§4.2). */
 int d2k_t13_cert_name_ok(const uint8_t *body, size_t len, const char *host);
 
+/* То же для раскладки TLS 1.2: там нет ни контекста запроса, ни расширений
+ * записи. Сверка имени общая — см. комментарий у реализации. */
+int d2k_t13_cert_name_ok12(const uint8_t *body, size_t len, const char *host);
+
 #endif /* D2K_TLS13CORE_H */

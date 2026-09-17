@@ -108,6 +108,19 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
                                    const char *sni, int deadline_ms, size_t hello_wire);
 
+/* То же, но рукопожатием TLS 1.2 — для клиента СТАРОЙ формы.
+ *
+ * Подтверждать его обход современным рукопожатием значит записывать план под
+ * форму, которой у этого клиента нет: по ключу формы такой план ему не
+ * достанется вовсе (MVP_CHECKLIST, пункт 3). Приветствие берётся из профиля,
+ * а не из живого снимка — почему, сказано у самой функции.
+ *
+ * hello_wire — та же надобность, что у зонда 1.3: план, чьи куски помещаются
+ * в посылку на коротком приветствии, на длинном не помещается вовсе. */
+d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
+                                     const char *sni, int deadline_ms,
+                                     size_t hello_wire);
+
 /* ТО ЖЕ САМОЕ, НО ПО QUIC. Уровни и их смысл не меняются ни на йоту:
  * TRANSPORT — датаграммы уходят, ответа нет; HANDSHAKE — рукопожатие
  * завершено, приложение молчит; APPLICATION — пришёл код ответа HTTP/3.

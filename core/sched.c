@@ -212,7 +212,8 @@ static int refuse_is_damage(uint8_t code) {
  * Когда такой зонд появится, он встанет сюда же. */
 static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
                                      uint8_t transport, const char *sni,
-                                     int deadline_ms, size_t hello_wire) {
+                                     int deadline_ms, size_t hello_wire,
+                                     uint8_t client_shape) {
     if (transport == 17) {
         /* Зонд QUIC появился: доводит рукопожатие до прикладных ключей и
            берёт код ответа HTTP/3. Порог доказательства тот же, что у TCP, —
@@ -228,6 +229,10 @@ static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
         snprintf(r.reason, sizeof r.reason,
                  "зонда подтверждения для этого транспорта нет — не измерено");
         return r;
+    }
+    if (client_shape == (uint8_t)D2K_SHAPE_LEGACY) {
+        /* ТЕМ ЖЕ ПРОТОКОЛОМ, ЧТО И КЛИЕНТ. */
+        return d2k_verify_probe12_on(use_fd, ip, port, sni, deadline_ms, hello_wire);
     }
     return d2k_verify_probe_on(use_fd, ip, port, sni, deadline_ms, hello_wire);
 }
@@ -911,7 +916,10 @@ static void *worker_run(void *vp) {
            им распорядится. */
         d2k_ver_result vr = d2k_sched_ver_hook(a_use_fd, t->ip, t->port, t->transport,
                                                t->name, SCHED_VERIFY_STEP_MS,
-                                               trig.len);
+                                               trig.len,
+                                               (uint8_t)(t->transport == 17
+                                                         ? D2K_SHAPE_UNKNOWN
+                                                         : d2k_hello_shape(t->trig, t->trig_len)));
         pthread_mutex_lock(&s->mu);
         t->ver = vr;
         t->res_ready = 1;
@@ -2563,11 +2571,21 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        (SCHED_PROBE_SHAPE). Записывается вместе с успехом, а не выводится
        потом: через день по файлу будет не восстановить, чем именно он
        добыт. */
+    /* ФОРМА — ТА, КОТОРОЙ ГОВОРИЛ ЗОНД, а она теперь равна форме КЛИЕНТА:
+       со старым клиентом зонд ведёт рукопожатие TLS 1.2 (d2k_verify_probe12_on).
+       Неразобранное приветствие означает, что зонд пошёл современным, — и
+       записывается современная форма, а не «не знаю». */
+    uint8_t rec_shape;
+    if (t->transport == 17) {
+        rec_shape = (uint8_t)D2K_LINK_SHAPE_QUIC;
+    } else {
+        d2k_shape cs = d2k_hello_shape(t->trig, t->trig_len);
+        rec_shape = (uint8_t)(cs == D2K_SHAPE_LEGACY ? D2K_SHAPE_LEGACY
+                                                     : SCHED_PROBE_SHAPE);
+    }
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, t->transport,
-                         t->transport == 17 ? (uint8_t)D2K_LINK_SHAPE_QUIC
-                                            : (uint8_t)SCHED_PROBE_SHAPE,
+                         t->name, t->transport, rec_shape,
                          D2K_VERBY_PROBE,
                          wall_s(s, now_ms), &t->fp);
     /* Запоминаем владельца подтверждённого плана. */
@@ -2576,29 +2594,19 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     say(s, "по %s (%s) ПОДТВЕРЖДЕНО собственным зондом: %s, приложение ответило %d "
            "(план применён к потоку зонда)",
         t->name, t->transport == 17 ? "QUIC" : "TCP", plan_id, t->ver.status);
-    /* ЧЕЙ КЛИЕНТ ЗАВЁЛ ПОИСК — И ЧЬЕЙ ФОРМЕ ДОСТАЛСЯ ОТВЕТ.
+    /* ЧЕЙ КЛИЕНТ ЗАВЁЛ ПОИСК — ТОТ ПРОТОКОЛ И ПОДТВЕРДИЛ.
      *
-     * Замер идёт приветствием КЛИЕНТА (снятым датапатом), а подтверждает
-     * найденное НАШ зонд — он ведёт своё рукопожатие TLS 1.3, и привязка
-     * пишется под его форму (SCHED_PROBE_SHAPE). Пока формы совпадают, это
-     * одно и то же. Когда клиент старый (TLS 1.2, телевизор или приставка),
-     * они расходятся: план подтверждён для современных приветствий, а
-     * клиенту, который и заставил нас искать, он по ключу формы не
-     * достанется вовсе.
-     *
-     * Ничего ложного в каталог при этом не попадает — привязка честно
-     * помечена формой зонда. Но МОЛЧАНИЕ здесь читается как покрытие,
-     * которого нет, поэтому расхождение называется вслух. Закрывается оно не
-     * оговоркой, а зондом старой формы (MVP_CHECKLIST, пункт 3), и до него
-     * это остаётся непокрытым случаем, а не мелочью оформления. */
-    if (t->transport == 6) {
-        d2k_shape client_shape = d2k_hello_shape(t->trig, t->trig_len);
-        if (client_shape == D2K_SHAPE_LEGACY) {
-            say(s, "по %s оговорка: поиск завела СТАРАЯ форма приветствия (TLS 1.2), "
-                   "а подтвердил зонд современной — план записан для современных и "
-                   "тому клиенту по ключу формы не достанется. Зонда старой формы нет",
-                t->name);
-        }
+     * Раньше здесь стояла оговорка: замер идёт приветствием клиента, а
+     * подтверждает зонд TLS 1.3, и для старого клиента план записывался под
+     * чужую форму — по ключу формы он такого плана не получал вовсе.
+     * Оговорка называла разрыв, но не закрывала его. Теперь со старым
+     * клиентом зонд ведёт рукопожатие TLS 1.2 (d2k_verify_probe12_on), и
+     * привязка пишется под ЕГО форму. Говорим об этом вслух — не как об
+     * оговорке, а как о факте, который потом придётся сопоставлять с
+     * каталогом. */
+    if (t->transport == 6 && d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY) {
+        say(s, "по %s подтверждение вёл зонд СТАРОЙ формы (TLS 1.2) — тем же протоколом, "
+               "что и клиент, и привязка записана под неё", t->name);
     }
     /* Решение принято — только теперь сокет зонда можно закрыть: до этого FIN
        удалил бы ячейку потока в датапате раньше события применения

@@ -143,6 +143,23 @@ static int cert_name_ok(const uint8_t *der, size_t len, const char *host) {
    §4.4.2) и сверяет его имя. Тело: длина контекста (байт), затем список,
    каждая запись — трёхбайтная длина, DER, двухбайтные расширения. Нужен
    только первый: подписывает ответ сервера именно он. */
+/* Первый сертификат из списка TLS 1.2 (RFC 5246 §7.4.2): трёхбайтовая длина
+ * списка, затем трёхбайтовая длина первого сертификата. Контекста запроса и
+ * расширений записи, которые есть в 1.3, здесь нет вовсе — потому это и
+ * отдельный вход, а не «тот же разбор с поправкой». Сама сверка имени одна на
+ * оба: второй её экземпляр означал бы, что терминирующая коробка отличима в
+ * одной версии протокола и неотличима в другой. */
+int d2k_t13_cert_name_ok12(const uint8_t *body, size_t len, const char *host) {
+    if (len < 6) { return -1; }
+    size_t list = (size_t)body[0] << 16 | (size_t)body[1] << 8 | body[2];
+    size_t o = 3;
+    if (list < 3 || o + list > len) { return -1; }
+    size_t clen = (size_t)body[o] << 16 | (size_t)body[o + 1] << 8 | body[o + 2];
+    o += 3;
+    if (clen == 0 || o + clen > len) { return -1; }
+    return cert_name_ok(body + o, clen, host);
+}
+
 int d2k_t13_cert_name_ok(const uint8_t *body, size_t len, const char *host) {
     if (len < 1) { return -1; }
     size_t ctx = body[0];

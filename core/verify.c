@@ -33,6 +33,7 @@
 #include "d2k_h3.h"
 #include "d2k_quicconn.h"
 #include "d2k_tls13.h"
+#include "d2k_tls12.h"
 #include "d2k_verify.h"
 
 static int64_t verify_now_ms(void) {
@@ -81,7 +82,24 @@ static const uint8_t *find_eol(const uint8_t *b, size_t n) {
  * Заголовки HTTP нулевого байта содержать не вправе, поэтому проверка на него
  * осталась — но только ДО конца заголовков, где она и означает «ответ битый».
  */
-static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
+/* Чтение прикладных данных отдано вызывающему функцией: разбор ответа один и
+   тот же, а сессия под ним бывает и 1.3, и 1.2 (d2k_tls12.h — зачем второй
+   клиент). Второй экземпляр этого разбора рядом означал бы, что находка
+   14.09 про нулевой байт в теле живёт в одном из них и не живёт в другом. */
+typedef long (*read_fn)(void *sess, uint8_t *buf, size_t cap, int wait_ms,
+                        char *err, size_t errcap);
+
+static long read13(void *sess, uint8_t *buf, size_t cap, int wait_ms,
+                   char *err, size_t errcap) {
+    return d2k_tls_read((d2k_tls *)sess, buf, cap, wait_ms, err, errcap);
+}
+
+static long read12(void *sess, uint8_t *buf, size_t cap, int wait_ms,
+                   char *err, size_t errcap) {
+    return d2k_tls12_read((d2k_tls12 *)sess, buf, cap, wait_ms, err, errcap);
+}
+
+static int read_status_rd(read_fn rd, void *sess, int wait_ms, char *err, size_t errcap) {
     uint8_t buf[8193];
     size_t used = 0;
     int64_t until = verify_now_ms() + (wait_ms > 0 ? wait_ms : 8000);
@@ -119,7 +137,7 @@ static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
         if (used >= sizeof buf - 1) { return 0; }
         int64_t left = until - verify_now_ms();
         if (left <= 0) { return 0; }
-        long got = d2k_tls_read(t, buf + used, sizeof buf - 1 - used, (int)left, err, errcap);
+        long got = rd(sess, buf + used, sizeof buf - 1 - used, (int)left, err, errcap);
         if (got <= 0) { return 0; }
         used += (size_t)got;
     }
@@ -133,6 +151,10 @@ d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет (d2k_props_bind), чей местный порт вызывающий
    назвал датапату заранее, чтобы пробный план достался только этому потоку.
    Меньше нуля — создать свой, тогда это в точности d2k_verify_probe. */
+static int read_status(d2k_tls *t, int wait_ms, char *err, size_t errcap) {
+    return read_status_rd(read13, t, wait_ms, err, errcap);
+}
+
 d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, const char *sni,
                                    int deadline_ms, size_t hello_wire) {
     d2k_ver_result r;
@@ -199,6 +221,78 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port, co
        (d2k_tls13.h), а закрыть его здесь значило бы послать FIN и потерять
        ячейку потока в датапате раньше, чем вызывающий свяжет с ней событие. */
     d2k_tls_free(t);
+    return r;
+}
+
+/* ТО ЖЕ САМОЕ, НО ПО TLS 1.2 — и это не «вторая проба», а та же проба другим
+   протоколом. Зовётся там, где КЛИЕНТ старой формы: подтверждать его обход
+   современным рукопожатием значит записывать план под форму, которой у него
+   нет, и он такого плана не получит вовсе (MVP_CHECKLIST, пункт 3).
+
+   Приветствие зонд собирает сам и добивает до длины клиентского — ровно как
+   зонд 1.3 и по той же причине. Почему не профиль старого клиента, сказано в
+   шапке d2k_tls12.h: он предлагает шифрнаборы, которых зонд не умеет, и
+   сервер выбирал бы именно их. */
+d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
+                                     const char *sni, int deadline_ms,
+                                     size_t hello_wire) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    snprintf(r.reason, sizeof r.reason, "проба не начиналась");
+    const char *host = (sni && sni[0]) ? sni : ip;
+    if (!host || !host[0]) { return r; }
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        if (*p <= 32 || *p == 127) {
+            snprintf(r.reason, sizeof r.reason, "недопустимый символ в имени HTTP");
+            return r;
+        }
+    }
+
+    d2k_hello none;
+    none.bytes = NULL;
+    none.len = 0;
+    if (d2k_props_contact_on(use_fd, ip, port, none, r.local_ip4, &r.local_port, &r.fd) != 0) {
+        snprintf(r.reason, sizeof r.reason, "нет TCP");
+        return r;
+    }
+    r.level = D2K_VER_TRANSPORT;
+    snprintf(r.reason, sizeof r.reason, "транспорт встал, рукопожатия нет");
+
+    char err[160];
+    err[0] = '\0';
+    d2k_tls12 *t = NULL;
+    if (d2k_tls12_connect(r.fd, sni, deadline_ms, hello_wire, &t, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "нет TLS 1.2: %.140s", err);
+        return r;
+    }
+    r.level = D2K_VER_HANDSHAKE;
+    r.name_ok = d2k_tls12_peer_name(t);
+    snprintf(r.reason, sizeof r.reason, "рукопожатие 1.2 завершено, приложение молчит");
+
+    char req[512];
+    int n = snprintf(req, sizeof req,
+                     "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+                     "Accept: */*\r\nConnection: close\r\n\r\n",
+                     host);
+    if (n <= 0 || (size_t)n >= sizeof req) {
+        snprintf(r.reason, sizeof r.reason, "запрос не собрался: имя длиннее запроса");
+    } else if (d2k_tls12_write(t, (const uint8_t *)req, (size_t)n, err, sizeof err) != 0) {
+        snprintf(r.reason, sizeof r.reason, "запрос не ушёл: %.150s", err);
+    } else {
+        int code = read_status_rd(read12, t, deadline_ms, err, sizeof err);
+        if (code) {
+            r.level = D2K_VER_APPLICATION;
+            r.status = code;
+            snprintf(r.reason, sizeof r.reason,
+                     "HTTP-заголовки получены по TLS 1.2, статус %d", code);
+        } else {
+            snprintf(r.reason, sizeof r.reason,
+                     "нет полных заголовков окончательного HTTP-ответа: %.100s", err);
+        }
+    }
+    d2k_tls12_free(t);
     return r;
 }
 

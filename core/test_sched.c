@@ -202,11 +202,15 @@ static int ver_unsupported;
    Подменённый зонд в сеть не ходит, но владение обязан взять: иначе каждый
    опыт течёт дескриптором, и тест упрётся в их предел. */
 static int ver_last_fd = -2;
+static uint8_t ver_last_shape;
+
 static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
-                               const char *sni, int deadline_ms, size_t hello_wire) {
+                               const char *sni, int deadline_ms, size_t hello_wire,
+                               uint8_t client_shape) {
     ver_last_fd = use_fd;
     if (use_fd >= 0) { close(use_fd); }
     (void)ip; (void)port; (void)sni; (void)deadline_ms;
+    ver_last_shape = client_shape;
     ver_last_wire = hello_wire;
     ver_calls++;
     ver_last_transport = transport;
@@ -616,7 +620,8 @@ int main(void) {
         CHECK(d2k_props_bind(&fd, &sport) == 0, "reserve verifier socket failed");
         if (fd >= 0 && lfd >= 0) {
             d2k_ver_result r = d2k_sched_ver_hook(fd, "127.0.0.1", ntohs(a.sin_port),
-                                                  6, "probe.example", 50, 0);
+                                                  6, "probe.example", 50, 0,
+                                                  (uint8_t)D2K_SHAPE_MODERN);
             CHECK(r.fd == fd && r.local_port == ntohs(sport), "verifier replaced reserved socket");
             if (r.fd != fd) { close(fd); }
             d2k_verify_close(&r);
@@ -711,8 +716,17 @@ int main(void) {
         d2k_sched_event(s, &ap);
         spin(s, 60);
         CHECK(said("ПОДТВЕРЖДЕНО"), "подтверждения не случилось — оговорку проверять не на чем");
-        CHECK(said("СТАРАЯ форма приветствия"),
-              "старый клиент остался без покрытия МОЛЧА");
+        /* ПРОТОКОЛ ПОДТВЕРЖДЕНИЯ ВЫБИРАЕТСЯ ПО ФОРМЕ КЛИЕНТА. Зонд подменён,
+           поэтому проверяем не сам обмен, а то, ЧТО ему сказали: с чужой
+           формой он пошёл бы современным рукопожатием к старому клиенту. */
+        CHECK(ver_last_shape == (uint8_t)D2K_SHAPE_LEGACY,
+              "зонду не сказали, что клиент старой формы — он подтвердит не тем протоколом");
+        {
+            const d2k_cat_binding *bd = binding_of(&empty, "staryi.klient.example", 6);
+            CHECK(bd != NULL && bd->shape == (uint8_t)D2K_SHAPE_LEGACY,
+                  "привязка записана НЕ под форму клиента — по ключу формы он её не получит");
+        }
+        CHECK(said("зонд СТАРОЙ формы"), "подтверждение старой формой не названо в журнале");
         d2k_sched_free(s); d2k_catalog_free(&empty);
         ver_answer = D2K_VER_APPLICATION; tcp_answer = D2K_V_OPAQUE;
     }

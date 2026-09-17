@@ -191,20 +191,41 @@ echo "== ЛАБОРАТОРИЯ ПРОВЕРЯЕТ СВОЙ ИНСТРУМЕНТ
 cat > /tmp/probecheck.c <<'PC'
 #include <stdio.h>
 #include "d2k_verify.h"
+/* ОБА ЗОНДА, А НЕ ОДИН. Подтверждать найденное надо ТЕМ ЖЕ протоколом, каким
+   говорит клиент (MVP_CHECKLIST, пункт 3): у старого клиента это TLS 1.2, и
+   зонд для него отдельный. Если он неисправен, опыт со старой формой покажет
+   неудачу на каждом плече, включая рабочие, — ровно та же беда, ради которой
+   заведена проверка зонда 1.3 ниже. */
 int main(void) {
+    int bad = 0;
     d2k_ver_result r = d2k_verify_probe("10.203.0.1", 4443, "control.example", 4000, 0);
-    printf("уровень %d, статус %d, причина: %s\n", (int)r.level, r.status, r.reason);
+    printf("TLS 1.3: уровень %d, статус %d, причина: %s\n", (int)r.level, r.status, r.reason);
+    if (r.level != D2K_VER_APPLICATION) { bad = 1; }
     d2k_verify_close(&r);
-    return r.level == D2K_VER_APPLICATION ? 0 : 1;
+
+    d2k_ver_result r12 = d2k_verify_probe12_on(-1, "10.203.0.1", 4443,
+                                               "control.example", 4000, 0);
+    printf("TLS 1.2: уровень %d, статус %d, имя %d, причина: %s\n",
+           (int)r12.level, r12.status, r12.name_ok, r12.reason);
+    if (r12.level != D2K_VER_APPLICATION) { bad = 1; }
+    /* Имя сверяется и здесь: терминирующая коробка со страницей блокировки
+       обязана быть отличима от рабочего обхода в ОБЕИХ версиях протокола. */
+    if (r12.name_ok != 1) {
+        printf("TLS 1.2: имя из сертификата не сошлось — зонд не отличит "
+               "терминирующую коробку от сервера\n");
+        bad = 1;
+    }
+    d2k_verify_close(&r12);
+    return bad;
 }
 PC
 cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
-   core/verify.c core/tls13.c core/tls13core.c core/x25519.c core/crypto.c \
+   core/verify.c core/tls13.c core/tls12.c core/tls13core.c core/x25519.c core/crypto.c \
    core/hello.c core/meas.c core/link.c core/compose.c core/quicconn.c core/quicwire.c core/h3.c
 if ! /tmp/probecheck; then
     fail "СОБСТВЕННЫЙ ЗОНД не доходит до приложения на ГОЛОЙ линии — опыт бессмыслен: он покажет неудачу на каждом плече, включая рабочие"
 fi
-echo "инструмент исправен: зонд доходит до приложения без цензора"
+echo "инструмент исправен: оба зонда доходят до приложения без цензора"
 
 echo "== сборка =="
 make -s -C datapath d2kd

@@ -44,7 +44,15 @@ int main(int argc, char **argv) {
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) { ERR_print_errors_fp(stderr); return 1; }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    /* ОБЕ ВЕРСИИ, А НЕ ТОЛЬКО 1.3.
+     *
+     * Здесь стоял минимум TLS 1.3 — и это делало стенд слепым к целому классу
+     * клиентов. Подтверждать найденное надо ТЕМ ЖЕ протоколом, каким говорит
+     * клиент (MVP_CHECKLIST, пункт 3), а у старого клиента это TLS 1.2; зонд
+     * для него отдельный, и проверить его было негде: сервер отвечал тревогой
+     * 70 (protocol_version). Настоящий сервер в сети обслуживает и тех, и
+     * других, и стенд обязан быть таким же. */
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     if (SSL_CTX_use_certificate_file(ctx, argv[2], SSL_FILETYPE_PEM) != 1 ||
         SSL_CTX_use_PrivateKey_file(ctx, argv[3], SSL_FILETYPE_PEM) != 1) {
         ERR_print_errors_fp(stderr);

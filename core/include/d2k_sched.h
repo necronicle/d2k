@@ -131,9 +131,15 @@ extern d2k_sched_arm_fn  d2k_sched_arm_hook;
 /* use_fd — УЖЕ ЗАНЯТЫЙ сокет зонда, под чей местный порт поставлен пробный
  * план (d2k_props_bind + d2k_link_set_name_probe). Меньше нуля — сокета нет,
  * зонд заводит свой; владение сокетом переходит вызываемому. */
+/* client_shape — форма приветствия КЛИЕНТА, из-за которого идёт поиск
+ * (d2k_shape). По ней выбирается протокол подтверждения: старому клиенту
+ * (TLS 1.2) современное рукопожатие не годится — план записался бы под форму,
+ * которой у него нет, и по ключу формы он его не получил бы вовсе
+ * (MVP_CHECKLIST, пункт 3). */
 typedef d2k_ver_result (*d2k_sched_ver_fn)(int use_fd, const char *ip, uint16_t port,
                                            uint8_t transport, const char *sni,
-                                           int deadline_ms, size_t hello_wire);
+                                           int deadline_ms, size_t hello_wire,
+                                           uint8_t client_shape);
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;
 
 extern d2k_sched_tcp_fn  d2k_sched_tcp_hook;
