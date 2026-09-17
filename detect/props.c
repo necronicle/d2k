@@ -169,6 +169,7 @@ int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
         }
         obs->pass = pass;
         obs->fail = opt->repeats - pass;
+        if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = pass == opt->repeats;
         apply_set(&res->props, pp[i].set, got);
         if (got) {

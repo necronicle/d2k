@@ -33,6 +33,9 @@ static void usage(void)
         "                     пойдёт ЧЕРЕЗ наш обход и замерит его, а не коробку\n"
         "  --allow-loopback   снять защиту от цели на localhost (для стенда)\n"
         "  --json             выдать результат как JSON\n"
+        "  --progress         печатать каждый зонд по мере готовности.\n"
+        "                     Трасса печатается в конце, а поиск на трудной цели идёт\n"
+        "                     десятки минут: без этого «идёт» не отличить от «висит»\n"
         "  --dump-trigger     напечатать байты триггера hex и выйти\n"
         "                     (тем же hex кормится эталон: z2k-detect classify -raw ...,\n"
         "                      только так сверка меряет АЛГОРИТМ, а не разные приветствия)\n");
@@ -176,6 +179,18 @@ static void print_json(const d2k_result *r)
     printf("\n  ]\n}\n");
 }
 
+/* Один зонд закончен — сказать об этом сразу, в поток ошибок.
+ *
+ * Именно в stderr, а не в stdout: разбор вывода (--json и человеческий отчёт)
+ * не должен спотыкаться о прогресс, а человек увидит его в терминале рядом. */
+static void print_progress(void *ctx, const d2k_obs *o)
+{
+    long *t0 = ctx;
+    fprintf(stderr, "  [%4ld с] %-28s прошло=%d не прошло=%d %s\n",
+            (d2k_now_ms() - *t0) / 1000, o->probe, o->pass, o->fail, o->err);
+    fflush(stderr);
+}
+
 static const char *tri_word(d2k_tri t)
 {
     if (t == D2K_TRI_UNSET) { return "не измерено"; }
@@ -262,6 +277,7 @@ int main(int argc, char **argv)
     const char *sni = NULL, *raw = NULL, *ctl_sni = NULL, *ctl_raw = NULL, *hello = "modern";
     int as_json = 0;
     int dump_trigger = 0;
+    int progress = 0;
     int i;
 
     memset(&opt, 0, sizeof(opt));
@@ -296,6 +312,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--allow-loopback") == 0)    { opt.allow_loopback = 1; }
         else if (strcmp(a, "--json") == 0)              { as_json = 1; }
         else if (strcmp(a, "--dump-trigger") == 0)      { dump_trigger = 1; }
+        else if (strcmp(a, "--progress") == 0)          { progress = 1; }
         else {
             fprintf(stderr, "classify: неизвестный флаг %s\n", a);
             usage();
@@ -386,6 +403,11 @@ int main(int argc, char **argv)
         (void)d2k_trigger_control("d2k", &opt.control, err, sizeof(err));
     }
 
+    long progress_t0 = d2k_now_ms();
+    if (progress) {
+        opt.on_obs = print_progress;
+        opt.on_obs_ctx = &progress_t0;
+    }
     d2k_classify_run(addr, &tr, &opt, &res);
 
     if (as_json) {

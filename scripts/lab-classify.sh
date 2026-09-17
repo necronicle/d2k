@@ -73,7 +73,9 @@ echo "цензор на месте: прямое обращение к $NAME н�
 
 echo "== поиск: полная трасса =="
 START=$(date +%s)
-./detect/d2k-detect classify "$IP:443" --sni "$NAME" --repeats 3 2>&1 || true
+# --progress: трасса печатается в конце, а поиск идёт десятки минут. Без него
+# «идёт» не отличить от «висит» — ровно это и случилось 17.09 дважды.
+./detect/d2k-detect classify "$IP:443" --sni "$NAME" --repeats 3 --progress 2>&1 || true
 END=$(date +%s)
 echo "поиск занял $((END-START)) с"
 

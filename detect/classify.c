@@ -185,6 +185,17 @@ d2k_obs *d2k_trace_add(d2k_result *res, const char *probe)
     return o;
 }
 
+/* Наблюдение закончено: записано в трассу и объявлено наружу. Одна функция на
+ * все пять мест, где зонды заканчиваются, — иначе очередное место молча
+ * осталось бы без строки, и «тишина в журнале» опять значила бы два разных
+ * состояния. */
+static void obs_done(const d2k_opts *opt, const d2k_obs *o)
+{
+    if (opt->on_obs) {
+        opt->on_obs(opt->on_obs_ctx, o);
+    }
+}
+
 void d2k_note(d2k_result *res, const char *fmt, ...)
 {
     va_list ap;
@@ -449,6 +460,7 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
     }
     obs->pass = t.pass;
     obs->fail = t.fail;
+    obs_done(opt, obs);
     return t;
 }
 
@@ -523,6 +535,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                 obs->fail++;
             }
         }
+        obs_done(opt, obs);
         if (obs->pass == 0) {
             res->raw_usable = 0;
             return 0;
@@ -571,6 +584,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             }
             obs->pass = pass;
             obs->fail = opt->repeats - pass;
+            obs_done(opt, obs);
             if (pass == opt->repeats && d2k_opts_acceptable(opt, &cands[k])) {
                 *hit = cands[k];
                 res->composed = 1;
@@ -615,6 +629,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                 obs->fail++;
             }
         }
+        obs_done(opt, obs);
         /* Единогласие обязательно: одна случайная удача назначила бы
          * стратегией то, что не работает. */
         if (obs->pass == opt->repeats) {
