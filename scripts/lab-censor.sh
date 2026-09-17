@@ -64,8 +64,20 @@ control_passes() {
 #   - проверка подлинности (--cacert): зонд её не делает вовсе (0006);
 #   - ПРИВЕТСТВИЕ ДРУГОЙ ДЛИНЫ — вчетверо длиннее зондового. Ровно на этом
 #     различии ломается переносимость (седьмая находка), и здесь оно живое.
+#   - ВЕРСИЯ ПРОТОКОЛА, если задан D2K_LAB_TLS12=1. Тогда клиент говорит
+#     ТОЛЬКО по TLS 1.2 — это телевизор, приставка, старая прошивка. Его
+#     приветствие другой ФОРМЫ (нет supported_versions), значит и план ему
+#     нужен свой, и подтверждать его обязан зонд той же версии
+#     (MVP_CHECKLIST, пункт 3). Без этого ключа весь класс таких клиентов
+#     в лаборатории не встречался ни разу.
+CURL_VER=""
+if [ "${D2K_LAB_TLS12:-0}" = "1" ]; then
+    CURL_VER="--tlsv1.2 --tls-max 1.2"
+fi
+
 real_client() {
-    body=$(timeout 10 curl -sS --cacert /tmp/c.pem \
+    # shellcheck disable=SC2086
+    body=$(timeout 10 curl -sS $CURL_VER --cacert /tmp/c.pem \
         --resolve "$1:$PORT:10.203.0.1" "https://$1:$PORT/" 2>/tmp/curl.err) || return 1
     [ "$body" = "ok" ] || return 1
     return 0
@@ -592,4 +604,5 @@ docker run --rm --cap-add=NET_ADMIN --cap-add=NET_RAW \
     -e "D2K_LAB_TINYMTU=${D2K_LAB_TINYMTU:-0}" \
     -e "D2K_LAB_WRONGCERT=${D2K_LAB_WRONGCERT:-0}" \
     -e "D2K_LAB_REASM=${D2K_LAB_REASM:-0}" \
+    -e "D2K_LAB_TLS12=${D2K_LAB_TLS12:-0}" \
     -v "$WORK:/w" -w /w gcc:14 sh /w/censor.sh
