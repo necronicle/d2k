@@ -293,7 +293,69 @@ static size_t build_tcp_syn(uint8_t *o, uint16_t sport, uint16_t dport) {
     return total;
 }
 
+/* --- НАПРАВЛЕНИЕ ПО КРЮЧКУ, А НЕ ПО ПОРТУ ----------------------------------
+ *
+ * Пока весь периметр стоял на 443, направление выводилось из порта. Для любого
+ * другого порта это неверно, и session.c это прямо называл: улика — номер
+ * крючка netfilter, а не порт.
+ *
+ * Проверяется на голосовом порту Дискорда (50004, боевой профиль discord_udp),
+ * потому что там порт уликой не работает вовсе: у клиента эфемерный порт, у
+ * сервера 50004, и по одним портам сторону не назвать. */
+static void test_direction_by_hook(void) {
+    /* Клиент -> сервер: очередь на OUTPUT. Пакет обязан быть РАЗОБРАН как
+       исходящий, то есть дойти до поиска плана, а не быть отброшенным на
+       «направление по порту неизвестно». */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096];
+        d2k_result r;
+        uint8_t voice[48];
+        memset(voice, 0x90, sizeof voice);
+        size_t n = build_udp_pkt(pkt, 64035, 50004, voice, sizeof voice);
+
+        d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.skipped == NULL || strstr(r.skipped, "направление") == NULL,
+              "исходящий пакет на голосовой порт отвергнут как «направление неизвестно», "
+              "хотя крючок OUTPUT сторону называет прямо");
+        d2k_session_free(s);
+    }
+
+    /* Сервер -> клиент: очередь на INPUT. Разбирать как клиентский пакет
+       нельзя ни при каком содержимом. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096];
+        d2k_result r;
+        uint8_t voice[48];
+        memset(voice, 0x90, sizeof voice);
+        size_t n = build_udp_pkt(pkt, 50004, 64035, voice, sizeof voice);
+
+        d2k_session_set_hook(s, D2K_HOOK_INPUT);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.skipped != NULL && strstr(r.skipped, "от сервера") != NULL,
+              "входящий пакет не опознан как серверная сторона по крючку INPUT");
+        d2k_session_free(s);
+    }
+
+    /* Крючок НЕ ЗАДАН — прежний вывод по порту, слово в слово. Иначе правка
+       молча поменяла бы поведение всем, кто крючка не знает. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 50000, 443, v1_initial, sizeof v1_initial);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_hellos(s) == 1,
+              "без крючка вывод по порту 443 перестал работать");
+        d2k_session_free(s);
+    }
+}
+
 int main(void) {
+    test_direction_by_hook();
+
     /* --- Initial узнаётся, имя уходит контроллеру ТЕМ ЖЕ событием, что и
        для TLS (Step 1, пункт 1 брифа) ------------------------------------ */
     {

@@ -776,6 +776,11 @@ int main(int argc, char **argv) {
                         st.truncated++;
                         res.skipped = "пакет обрезан copy_range";
                     } else {
+                        /* КРЮЧОК — ПЕРЕД ПАКЕТОМ, и это не украшение: по нему
+                           сессия называет сторону на ЛЮБОМ порту, а не только
+                           на 443 (см. d2k_session_set_hook). Провод его уже
+                           разбирал, дело было только донести. */
+                        d2k_session_set_hook(sess, np.have_hdr ? np.hook : D2K_HOOK_UNKNOWN);
                         d2k_session_packet(sess, np.payload, np.payload_len, t,
                                            obuf, sizeof obuf, &res);
                     }

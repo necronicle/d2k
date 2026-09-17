@@ -26,6 +26,10 @@
 #define D2K_HELLO_WINDOW 8
 
 struct d2k_session {
+    /* Крючок netfilter для ТЕКУЩЕГО пакета — см. d2k_session_set_hook.
+       D2K_HOOK_UNKNOWN значит «не сказали», и тогда направление выводится
+       по порту, как и раньше. */
+    uint8_t hook;
     d2k_capture capture;
     d2k_table   *flows;
     /* Учёт QUIC/UDP-потоков (задача 4 QUIC-вертикали) — ВТОРАЯ, независимая
@@ -144,6 +148,10 @@ d2k_session *d2k_session_new(size_t capacity, size_t journal) {
     if (!s) {
         return NULL;
     }
+    /* НЕ НОЛЬ. calloc обнулил бы поле, а ноль — это PREROUTING, то есть
+       «серверная сторона»: молча и для ВСЕХ прежних вызывающих, которые про
+       крючок ничего не знают. Умолчание обязано значить «не сказали». */
+    s->hook = D2K_HOOK_UNKNOWN;
     s->flows = d2k_track_new(capacity);
     /* Тот же capacity, что у TCP-таблицы: это не новое число, а
        унаследованное — оператор уже выбрал бюджет числа потоков одним
@@ -540,9 +548,25 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
      * нужно — но тот, кто в будущем возьмётся за не-443-порты, обязан
      * заменить порт на крючок здесь, а не унаследовать привязку к 443 по
      * инерции молча. */
+    /* НАПРАВЛЕНИЕ: СНАЧАЛА КРЮЧОК, ПОТОМ ПОРТ.
+       Крючок — прямая улика и работает на ЛЮБОМ порту (см. d2k_session_set_hook
+       и абзац выше про границу приёма по 443). Порт остаётся запасным ответом
+       ровно для тех вызывающих, кто крючка не знает. */
     int dst_is_443 = (rd16(u + 2) == 443);
     int src_is_443 = (rd16(u + 0) == 443);
-    if (src_is_443 && !dst_is_443) {
+    int from_client = -1;   /* -1 — не установлено */
+    if (s->hook == D2K_HOOK_OUTPUT || s->hook == D2K_HOOK_POSTROUTING) {
+        from_client = 1;
+    } else if (s->hook == D2K_HOOK_INPUT || s->hook == D2K_HOOK_PREROUTING ||
+               s->hook == D2K_HOOK_FORWARD) {
+        /* FORWARD несёт транзит в ОБЕ стороны, и одной стороной его назвать
+           нельзя. Пока сюда попадает только входящее (правило INPUT ставится
+           на обратное направление), но выдавать транзит за серверную сторону
+           нельзя — для него крючок уликой не является, и мы честно падаем
+           обратно на порт. */
+        from_client = (s->hook == D2K_HOOK_FORWARD) ? -1 : 0;
+    }
+    if (from_client == 0 || (from_client < 0 && src_is_443 && !dst_is_443)) {
         /* СЕРВЕРНАЯ СТОРОНА. Разбирать её как клиентский Initial нельзя (см.
            выше), а вот УЧЕСТЬ обязаны — и это не бухгалтерия ради полноты.
            Ровно два вывода стоят на этих двух счётчиках, и без них оба
@@ -563,7 +587,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "датаграмма едет от сервера — не клиентский Initial";
         return;
     }
-    if (!dst_is_443 || src_is_443) {
+    if (from_client != 1 && (!dst_is_443 || src_is_443)) {
         /* Остаток: оба конца на 443 либо ни одного. Клиентской стороной это
            не объявишь — и «оба 443» тут не крючкотворство, а живой случай
            (сервер, отвечающий с 443 на 443). */
@@ -1563,6 +1587,10 @@ void d2k_session_observe_tcp(d2k_session *s, const uint8_t *p, size_t n, uint64_
 
 uint64_t d2k_session_plan_revision(const d2k_session *s) {
     return s ? s->plan_revision + d2k_plantab_revision(s->plans) : 0;
+}
+
+void d2k_session_set_hook(d2k_session *s, uint8_t hook) {
+    if (s) { s->hook = hook; }
 }
 
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {

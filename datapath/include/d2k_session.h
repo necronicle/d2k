@@ -99,6 +99,33 @@ typedef struct {
 typedef struct d2k_session d2k_session;
 
 uint64_t d2k_session_plan_revision(const d2k_session *s);
+/* НОМЕР КРЮЧКА NETFILTER ДЛЯ СЛЕДУЮЩЕГО ПАКЕТА.
+ *
+ * ЗАЧЕМ. Направление пакета (клиент->сервер или обратно) датапат до сих пор
+ * выводил ИЗ ПОРТА: «назначение 443, источник не 443 — клиентская сторона».
+ * Приём верен ровно настолько, насколько весь периметр привязан к 443, и в
+ * session.c это записано прямо, вместе с правильным ответом на будущее: когда
+ * дойдёт до произвольных портов, порт перестаёт быть уликой, а улика —
+ * НОМЕР КРЮЧКА из NFQA_PACKET_HDR. Очередь на OUTPUT или POSTROUTING значит
+ * исходящее, на INPUT, PREROUTING или FORWARD — входящее.
+ *
+ * Провод его уже разбирает (d2k_nl_pkt.hook), и дело было только в том, чтобы
+ * донести. Отдельным вызовом, а не параметром d2k_session_packet: у того
+ * подпись прошла не одно ревью и зовут её из десятка тестов, а крючок нужен
+ * ровно одному месту.
+ *
+ * D2K_HOOK_UNKNOWN (умолчание) — вернуться к прежнему выводу по порту. Это не
+ * заглушка на будущее, а поведение для всех, кто крючка не знает: тесты,
+ * лаборатория planlab, старые вызывающие. */
+#define D2K_HOOK_UNKNOWN     0xff
+#define D2K_HOOK_PREROUTING  0
+#define D2K_HOOK_INPUT       1
+#define D2K_HOOK_FORWARD     2
+#define D2K_HOOK_OUTPUT      3
+#define D2K_HOOK_POSTROUTING 4
+
+void d2k_session_set_hook(d2k_session *s, uint8_t hook);
+
 int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n);
 /* Accounting/capture for originals released without intervention. Never
  * applies a plan or emits an APPLIED event. TCP-only hold rollback path. */
