@@ -3006,9 +3006,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                    потолок поиск. Сам замер бросается просьбой (join_worker),
                    и его вердикт никуда не идёт: дерево пройдено не до конца. */
                 if (t->state == T_ASKING) {
-                    say(s, "по %s замер не уложился в %d мин и брошен на %d-м зонде — "
+                    say(s, "по %s замер не уложился в %d мин и брошен — "
                            "в каталог не идёт ничего",
-                        t->name, SCHED_TASK_LIFE_MS / 60000, t->probes);
+                        t->name, SCHED_TASK_LIFE_MS / 60000);
                 }
                 task_fail(s, t, now_ms);
             }
@@ -3057,14 +3057,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                шёл третью минуту при окне стенда в две. Числа берём
                измеренные — часы задачи и её же счётчик зондов. */
             long long took_s = (long long)((now_ms - t->started_ms + 500) / 1000);
+            /* Зонды берём У ЗАМЕРА (r.probes), а не у задачи (t->probes):
+               задачный счётчик считает поставленные кандидаты, а не опыты
+               измерителя, и печатал «0 зондов» там, где их было восемнадцать. */
             if (t->n_known > 0) {
-                say(s, "по %s вердикт: %s (%s) за %lld с и %d зондов, кандидатов %zu — "
+                say(s, "по %s вердикт: %s (%s) за %lld с и %d зондов замера, кандидатов %zu — "
                        "из них %zu готовых планов узнанной коробки %s",
-                    t->name, verdict_name(r.verdict), r.reason, took_s, t->probes,
+                    t->name, verdict_name(r.verdict), r.reason, took_s, r.probes,
                     t->n_plans, t->n_known, t->box_id);
             } else {
-                say(s, "по %s вердикт: %s (%s) за %lld с и %d зондов, кандидатов %zu",
-                    t->name, verdict_name(r.verdict), r.reason, took_s, t->probes,
+                say(s, "по %s вердикт: %s (%s) за %lld с и %d зондов замера, кандидатов %zu",
+                    t->name, verdict_name(r.verdict), r.reason, took_s, r.probes,
                     t->n_plans);
             }
             if (t->n_plans == 0) {
