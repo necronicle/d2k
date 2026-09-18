@@ -1649,7 +1649,9 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     /* Do not retain a tail of an already-passed stream or guess direction.
        Only a first payload anchored by the observed client SYN qualifies. */
     if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
-        fl->saw_hello || fl->stream_attempted || fl->damaged) { return 0; }
+        fl->saw_hello || fl->stream_attempted || fl->damaged) {
+        return 0;
+    }
 
     /* КУСОК ПРИВЕТСТВИЯ МОЖЕТ ПРИЙТИ НЕ ПЕРВЫМ, И ЕГО ТОЖЕ НАДО УДЕРЖАТЬ.
      *
