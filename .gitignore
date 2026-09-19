@@ -54,3 +54,8 @@ detect/*
 !detect/Makefile
 !detect/include/
 !detect/tests/
+
+# Локальная навигация C-кода; конфигурация и пути зависят от машины.
+/compile_commands.json
+/.serena/
+/.cache/clangd/

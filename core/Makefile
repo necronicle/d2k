@@ -300,8 +300,8 @@ d2kvoice: d2kvoice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o 
 test_voice: test_voice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_voice.c voice.o stun.o net4.o tls13core.o crypto.o x25519.o meas.o $(TEST_LDFLAGS)
 
-test_quichello: test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test_quichello: test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quichello.c quichello.o quic.o quicwire.o hello.o tls13core.o crypto.o x25519.o quicconn.o meas.o $(TEST_LDFLAGS)
 
 test_catalog: test_catalog.c catalog.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_catalog.c catalog.o $(TEST_LDFLAGS)
@@ -526,9 +526,9 @@ cross: hello_profiles.inc
 		test_hello.c hello.c -lpthread || exit 1
 	@echo "== test_quichello целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_quichello-a64 \
-		test_quichello.c quichello.c quic.c quicwire.c hello.c tls13core.c crypto.c x25519.c -lpthread || exit 1
+		test_quichello.c quichello.c quic.c quicwire.c hello.c tls13core.c crypto.c x25519.c quicconn.c meas.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_quichello-mipsel \
-		test_quichello.c quichello.c quic.c quicwire.c hello.c tls13core.c crypto.c x25519.c -lpthread || exit 1
+		test_quichello.c quichello.c quic.c quicwire.c hello.c tls13core.c crypto.c x25519.c quicconn.c meas.c -lpthread || exit 1
 	@echo "== test_catalog целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_catalog-a64 \
 		test_catalog.c catalog.c -lpthread || exit 1

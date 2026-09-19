@@ -195,17 +195,20 @@ static size_t build_ack(uint8_t *out, size_t cap, uint64_t largest) {
 
 /* Отправляет один пакет уровня lvl с готовым телом. pad_to — добить всю
  * датаграмму до этой длины PADDING'ом (для Initial обязательно 1200). */
-static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
-                      size_t payload_len, size_t pad_to, char *err, size_t errcap) {
+/* Запечатывает пакет уровня lvl в pkt (не короче DGRAM_OUT) и сдвигает номер.
+   Отдельно от отправки: первый Initial нужен и БАЙТАМИ — приманкой голоса
+   (d2k_qc_first_initial), без всякого соединения. */
+static size_t seal_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
+                         size_t payload_len, size_t pad_to, uint8_t *pkt, size_t pkt_cap,
+                         char *err, size_t errcap) {
     level *L = &c->lv[lvl];
-    if (!L->tx.have) { say(err, errcap, "нет ключей уровня для отправки"); return -1; }
+    if (!L->tx.have) { say(err, errcap, "нет ключей уровня для отправки"); return 0; }
 
     uint8_t body[DGRAM_OUT];
-    if (payload_len > sizeof body) { say(err, errcap, "тело пакета длиннее датаграммы"); return -1; }
+    if (payload_len > sizeof body) { say(err, errcap, "тело пакета длиннее датаграммы"); return 0; }
     memcpy(body, payload, payload_len);
     size_t blen = payload_len;
 
-    uint8_t pkt[DGRAM_OUT];
     size_t pn_len = d2k_qw_pn_len(L->next_pn, -1);
     size_t hlen;
     if (lvl == D2K_QW_LEVEL_APP) {
@@ -226,7 +229,7 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
             size_t h0 = d2k_qw_long_hdr(probe, sizeof probe, c->version, type,
                                         c->dcid, c->dcid_len,
                                         c->scid, c->scid_len, pn_len, blen);
-            if (h0 == 0) { say(err, errcap, "заголовок не собрался"); return -1; }
+            if (h0 == 0) { say(err, errcap, "заголовок не собрался"); return 0; }
             size_t total = h0 + pn_len + blen + 16;
             if (total < pad_to && blen + (pad_to - total) <= sizeof body) {
                 size_t add = pad_to - total;
@@ -234,19 +237,27 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                 blen += add;
             }
         }
-        hlen = d2k_qw_long_hdr(pkt, sizeof pkt, c->version, type,
+        hlen = d2k_qw_long_hdr(pkt, pkt_cap, c->version, type,
                                c->dcid, c->dcid_len,
                                c->scid, c->scid_len, pn_len, blen);
     }
 
     size_t n = d2k_qw_seal(&L->tx, lvl != D2K_QW_LEVEL_APP, pkt, hlen,
-                           L->next_pn, pn_len, body, blen, pkt, sizeof pkt);
-    if (n == 0) { say(err, errcap, "пакет не собрался"); return -1; }
+                           L->next_pn, pn_len, body, blen, pkt, pkt_cap);
+    if (n == 0) { say(err, errcap, "пакет не собрался"); return 0; }
     if (getenv("D2K_QC_TRACE")) {
         fprintf(stderr, "[шлём] уровень %d номер %llu байт %zu тело %zu\n",
                 (int)lvl, (unsigned long long)L->next_pn, n, blen);
     }
     L->next_pn++;
+    return n;
+}
+
+static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
+                      size_t payload_len, size_t pad_to, char *err, size_t errcap) {
+    uint8_t pkt[DGRAM_OUT];
+    size_t n = seal_level(c, lvl, payload, payload_len, pad_to, pkt, sizeof pkt, err, errcap);
+    if (n == 0) { return -1; }
     if (send(c->fd, pkt, n, 0) != (ssize_t)n) {
         say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
         return -1;
@@ -564,6 +575,92 @@ static size_t crypto_frame(uint8_t *out, size_t cap, uint64_t off,
     return o;
 }
 
+/* ПЕРВЫЙ ПОЛЁТ КЛИЕНТА — без сокета: идентификаторы соединения, ключи уровня
+   Initial и ClientHello с транспортными параметрами в кадре CRYPTO. priv —
+   закрытый ключ обмена, он нужен соединению дальше. Вынесено из
+   d2k_qc_connect, чтобы тот же первый Initial можно было получить БАЙТАМИ
+   (d2k_qc_first_initial) — не второй сборкой рядом, а этой же. */
+static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad_to,
+                        uint8_t priv[32], uint8_t *frame, size_t cap, size_t *flen,
+                        char *err, size_t errcap) {
+    c->dcid_len = c->scid_len = 8;
+    uint8_t pub[32], rnd[32];
+    if (d2k_t13_random(c->dcid, c->dcid_len) != 0 ||
+        d2k_t13_random(c->scid, c->scid_len) != 0 ||
+        d2k_t13_random(priv, 32) != 0 || d2k_t13_random(rnd, 32) != 0) {
+        say(err, errcap, "нет случайности: /dev/urandom недоступен");
+        return -1;
+    }
+    memcpy(c->odcid, c->dcid, c->dcid_len);
+    c->odcid_len = c->dcid_len;
+    if (d2k_x25519_base(pub, priv) != 0) {
+        say(err, errcap, "открытый ключ не посчитался"); return -1;
+    }
+
+
+    /* Ключи уровня Initial: обе стороны выводятся из DCID нашего первого
+       пакета (RFC 9001 §5.2). */
+    uint8_t sec[32];
+    if (d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len, D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(c->version, sec, &c->lv[D2K_QW_LEVEL_INITIAL].tx) != 0 ||
+        d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len, D2K_QW_SERVER, sec) != 0 ||
+        d2k_qw_keys_from_secret(c->version, sec, &c->lv[D2K_QW_LEVEL_INITIAL].rx) != 0) {
+        say(err, errcap, "начальные ключи не вывелись"); return -1;
+    }
+
+    /* ClientHello с транспортными параметрами и ALPN. */
+    uint8_t tp[320];
+    size_t tp_len = tp_build(c, tp, sizeof tp);
+    if (tp_len == 0) { say(err, errcap, "транспортные параметры не собрались"); return -1; }
+
+    uint8_t ch[2560];
+    d2k_t13_ch_opts cho;
+    memset(&cho, 0, sizeof cho);
+    cho.sni = sni;
+    cho.pub = pub;
+    cho.random = rnd;
+    cho.session_id_len = 0;      /* RFC 9001 §8.4: у QUIC он обязан быть пуст */
+    cho.alpn = alpn ? alpn : "h3";
+    cho.extra = tp;
+    cho.extra_len = tp_len;
+    cho.pad_to = pad_to;
+    size_t ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
+    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); return -1; }
+    memcpy(c->transcript, ch, ch_len);
+    c->tr_len = ch_len;
+
+    *flen = crypto_frame(frame, cap, 0, ch, ch_len);
+    if (*flen == 0) { say(err, errcap, "кадр CRYPTO не собрался"); return -1; }
+    return 0;
+}
+
+int d2k_qc_first_initial(const char *sni, uint8_t *out, size_t cap, size_t *out_len) {
+    if (!sni || !out || !out_len) { return -1; }
+    *out_len = 0;
+    d2k_qc *c = calloc(1, sizeof *c);
+    if (!c) { return -1; }
+    c->fd = -1;
+    c->version = D2K_QW_V1;
+    uint8_t priv[32];
+    uint8_t frame[2600];
+    size_t flen = 0;
+    char err[128];
+    int rc = -1;
+    if (first_flight(c, sni, NULL, 0, priv, frame, sizeof frame, &flen, err, sizeof err) == 0) {
+        uint8_t pkt[DGRAM_OUT];
+        size_t n = seal_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200,
+                              pkt, sizeof pkt, err, sizeof err);
+        if (n > 0 && n <= cap) {
+            memcpy(out, pkt, n);
+            *out_len = n;
+            rc = 0;
+        }
+    }
+    memset(priv, 0, sizeof priv);
+    free(c);
+    return rc;
+}
+
 int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
     if (!o || !o->ip || !out) { say(err, errcap, "нечем поднимать соединение"); return -1; }
@@ -575,18 +672,12 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     c->peer_name = -1;
     c->version = D2K_QW_V1;
 
-    c->dcid_len = c->scid_len = 8;
-    uint8_t priv[32], pub[32], rnd[32];
-    if (d2k_t13_random(c->dcid, c->dcid_len) != 0 ||
-        d2k_t13_random(c->scid, c->scid_len) != 0 ||
-        d2k_t13_random(priv, 32) != 0 || d2k_t13_random(rnd, 32) != 0) {
-        say(err, errcap, "нет случайности: /dev/urandom недоступен");
-        free(c); return -1;
-    }
-    memcpy(c->odcid, c->dcid, c->dcid_len);
-    c->odcid_len = c->dcid_len;
-    if (d2k_x25519_base(pub, priv) != 0) {
-        say(err, errcap, "открытый ключ не посчитался"); free(c); return -1;
+    uint8_t priv[32];
+    uint8_t frame[2600];
+    size_t flen = 0;
+    if (first_flight(c, o->sni, o->alpn, o->pad_to, priv, frame, sizeof frame, &flen,
+                     err, errcap) != 0) {
+        d2k_qc_close(c); return -1;
     }
 
     c->fd = (o->use_fd > 0) ? o->use_fd : socket(AF_INET, SOCK_DGRAM, 0);
@@ -611,41 +702,6 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         memcpy(c->local_ip4, &me.sin_addr.s_addr, 4);
         c->local_port = ntohs(me.sin_port);
     }
-
-    /* Ключи уровня Initial: обе стороны выводятся из DCID нашего первого
-       пакета (RFC 9001 §5.2). */
-    uint8_t sec[32];
-    if (d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len, D2K_QW_CLIENT, sec) != 0 ||
-        d2k_qw_keys_from_secret(c->version, sec, &c->lv[D2K_QW_LEVEL_INITIAL].tx) != 0 ||
-        d2k_qw_initial_secret(c->version, c->dcid, c->dcid_len, D2K_QW_SERVER, sec) != 0 ||
-        d2k_qw_keys_from_secret(c->version, sec, &c->lv[D2K_QW_LEVEL_INITIAL].rx) != 0) {
-        say(err, errcap, "начальные ключи не вывелись"); d2k_qc_close(c); return -1;
-    }
-
-    /* ClientHello с транспортными параметрами и ALPN. */
-    uint8_t tp[320];
-    size_t tp_len = tp_build(c, tp, sizeof tp);
-    if (tp_len == 0) { say(err, errcap, "транспортные параметры не собрались"); d2k_qc_close(c); return -1; }
-
-    uint8_t ch[2560];
-    d2k_t13_ch_opts cho;
-    memset(&cho, 0, sizeof cho);
-    cho.sni = o->sni;
-    cho.pub = pub;
-    cho.random = rnd;
-    cho.session_id_len = 0;      /* RFC 9001 §8.4: у QUIC он обязан быть пуст */
-    cho.alpn = o->alpn ? o->alpn : "h3";
-    cho.extra = tp;
-    cho.extra_len = tp_len;
-    cho.pad_to = o->pad_to;
-    size_t ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
-    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); d2k_qc_close(c); return -1; }
-    memcpy(c->transcript, ch, ch_len);
-    c->tr_len = ch_len;
-
-    uint8_t frame[2600];
-    size_t flen = crypto_frame(frame, sizeof frame, 0, ch, ch_len);
-    if (flen == 0) { say(err, errcap, "кадр CRYPTO не собрался"); d2k_qc_close(c); return -1; }
     /* Первая датаграмма клиента обязана быть не короче 1200 байт
        (RFC 9000 §14.1): иначе сервер вправе её не обслуживать. */
     if (send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap) != 0) {

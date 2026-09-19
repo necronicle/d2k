@@ -110,6 +110,15 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
         : d2k_arm_plan_measured(&a, &in, text, sizeof text);
     CHECK(rc == 0); if (rc) { return; }
     int parametric = strstr(text, "input tls-sni") != NULL;
+    /* ПЛЕЧО БЕЗ ПРИМАНКИ И БЕЗ ПЕРЕСТАНОВКИ НИ ОТ ЧЕГО ВО ВХОДЕ НЕ ЗАВИСИТ,
+       кроме имени: ни одного числа, снятого с конкретного приветствия, в нём
+       нет. Пришпиливать такой план к длине входа значит не применить его к
+       ПЕРВОМУ СЕГМЕНТУ составного приветствия — а это ровно тот случай,
+       который встретился в поле 18.09.2026 (1534 байта при MSS 1388, «план
+       неприменим к этому пакету» на зонде подтверждения). */
+    if (a.seqovl && !a.disorder && !a.between && !a.badsum && !a.ttl && !a.seq_out) {
+        CHECK(parametric);
+    }
     if (parametric) {
         /* Packet metadata below models parsed SNI; provide its complete
            record/handshake envelope too. Full real profiles are tested below. */
@@ -165,8 +174,13 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
         }
     }
     d2k_actions_free(&out);
+    /* НА БАЙТ КОРОЧЕ ОБЪЯВЛЕННОЙ ЗАПИСИ — ЭТО ПЕРВЫЙ СЕГМЕНТ, а не порча
+       входа: приветствие длиннее сегмента обычное дело (1534 байта при MSS
+       1388, поле 18.09.2026). Параметрический план считает свои смещения от
+       имени и такой вход принимает; план с ИЗМЕРЕННЫМИ байтами — нет, они
+       собраны под вход до байта. */
     pkt.payload_len--;
-    CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+    CHECK((d2k_plan_apply(p, NULL, &pkt, &out) == 0) == parametric);
     d2k_actions_free(&out);
     pkt.payload_len++; pkt.sni_off++;
     CHECK((d2k_plan_apply(p, NULL, &pkt, &out) == 0) == parametric);
@@ -187,13 +201,19 @@ static void run_case(const char *name, d2k_arm a, size_t n, size_t decoy_len) {
             CHECK(out.n == count && out.fate == D2K_ORIG_DROP);
             for (size_t i = 0; i < out.n && i < count; i++) {
                 const d2k_emit *e = &out.v[i]; const expected_send *x = &expected[i];
-                CHECK(e->seq == x->seq && e->delay_us == x->delay && e->len == x->len);
-                CHECK(e->pre_len == 0 && e->wire_profile == D2K_WIRE_DETECT_TCP);
-                if (e->len == x->len) { CHECK(memcmp(e->bytes, x->bytes, e->len) == 0); }
+                CHECK(e->seq == x->seq && e->delay_us == x->delay);
+                CHECK(e->wire_profile == D2K_WIRE_DETECT_TCP);
+                /* Приставка перекрытия — часть посылки, а не отдельный
+                   случай: ожидаемое хранит pre и данные одной строкой. */
+                CHECK(e->pre_len + e->len == x->len);
+                if (e->pre_len + e->len == x->len) {
+                    if (e->pre_len) { CHECK(memcmp(e->pre, x->bytes, e->pre_len) == 0); }
+                    if (e->len) { CHECK(memcmp(e->bytes, x->bytes + e->pre_len, e->len) == 0); }
+                }
             }
             d2k_actions_free(&out);
-            pkt.payload_len--;
-            CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);
+            pkt.payload_len--;  /* первый сегмент того же приветствия */
+            CHECK(d2k_plan_apply(p, NULL, &pkt, &out) == 0);
             d2k_actions_free(&out); pkt.payload_len++;
             pkt.have_sni = 0;
             CHECK(d2k_plan_apply(p, NULL, &pkt, &out) != 0);

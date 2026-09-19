@@ -244,8 +244,12 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
     d2k_hold_get_stats(holding, &hs);
     printf("составной вход: начато=%" PRIu64 " собрано=%" PRIu64
            " отпущено=%" PRIu64 " таймаутов=%" PRIu64 " (пакетов в них=%" PRIu64 ")"
+           " по смене плана=%" PRIu64 " по сбросу=%" PRIu64
+           " добавлено к голове=%" PRIu64 " несовместимых=%" PRIu64
+           " с другой стороны=%" PRIu64
            " отказов ёмкости=%" PRIu64 " ожидающих пакетов=%zu\n",
            hs.started, hs.ready, hs.released, hs.timed_out, hs.timed_out_pkts,
+           hs.plan_changed, hs.dropped_all, hs.joined, hs.mismatched, hs.sided,
            hs.full, hs.pending);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",

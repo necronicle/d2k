@@ -269,6 +269,11 @@ int d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap) {
             out->tos = rest[3];
             out->ipid = (uint16_t)((uint16_t)rest[4] << 8 | rest[5]);
         }
+        if (rlen >= 7) {
+            /* Применялся ли план к этому потоку. Отсутствие байта — «не
+               сказано», и менять по нему смысл подозрения нельзя. */
+            out->planned = rest[6];
+        }
         break;
     case D2K_EV_STATS:
         /* Счётчики необязательны по длине: старый датапат их не слал вовсе, и
@@ -580,6 +585,21 @@ int d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
 
 int d2k_link_del_name(int fd, const char *name, char *err, size_t errcap) {
     return send_name_only(fd, D2K_CMD_DEL_NAME, "DEL_NAME", name, err, errcap);
+}
+
+int d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap) {
+    if (fd < 0 || !ip4) {
+        say(err, errcap, "сокет не открыт или адрес цели не задан");
+        return -1;
+    }
+    uint8_t frame[HDR + 4] = {0, 0, 0, 6,
+        (uint8_t)(D2K_CMD_DEL_ADDR >> 8), (uint8_t)D2K_CMD_DEL_ADDR};
+    memcpy(frame + HDR, ip4, 4);
+    if (write_all(fd, frame, sizeof frame) != 0) {
+        say(err, errcap, "команда DEL_ADDR не отправилась: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 

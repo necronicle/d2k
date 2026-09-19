@@ -81,6 +81,13 @@ DUMP_IF=${D2K_DUMP_IF:-}
 DUMP_N=${D2K_DUMP_N:-40}
 # Поднимать ли контроллер: он учится на подозрениях и строит каталог коробок.
 LEARN=${D2K_LEARN:-0}
+# Голос Дискорда: UDP на портах боевого профиля discord_udp, только первые
+# пакеты каждого направления (как files/S99d2k). Сужается тем же SRC/DST.
+VOICE=${D2K_VOICE:-0}
+# QUIC: UDP на тех же портах PORTS, что и TCP. Туда — первые пакеты потока,
+# оттуда — ответы (транзит на FORWARD, ответы собственному зонду на INPUT).
+QUIC=${D2K_QUIC:-0}
+VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TOKEN="d2k$$"
@@ -121,14 +128,22 @@ teardown() {
     # Обе цепочки: правило обратного направления живёт в FORWARD, и уборка,
     # смотрящая только в POSTROUTING, оставила бы его висеть.
     $SSH "
+        echo \"--- счётчики правил перед снятием ---\"
+        for ch in POSTROUTING FORWARD OUTPUT INPUT; do
+            iptables -t mangle -L \$ch -v -n 2>/dev/null | grep -- '$TOKEN' || true
+        done
         for ch in POSTROUTING FORWARD OUTPUT INPUT; do
             iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
             sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
         done
+        # MASQUERADE своих посылок по UDP живёт в nat — без этого прохода
+        # правило с жетоном переживало бы опыт.
+        iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '--comment $TOKEN' |
+        sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t nat \$r\"; done
         [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
         [ -f /tmp/d2k.$TOKEN.pid ] && kill \$(cat /tmp/d2k.$TOKEN.pid) 2>/dev/null
         [ -f /tmp/d2kd.$TOKEN.tcpdump.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid) 2>/dev/null
-        echo \"остаток правил с жетоном: \$(iptables -t mangle -S 2>/dev/null | grep -c -- '--comment $TOKEN')\"
+        echo \"остаток правил с жетоном: \$(iptables -t mangle -S 2>/dev/null | grep -c -- '--comment $TOKEN') в mangle, \$(iptables -t nat -S 2>/dev/null | grep -c -- '--comment $TOKEN') в nat\"
     " >&2 || true
 }
 cleanup() {
@@ -239,10 +254,32 @@ if [ $LEARN = 1 ]; then
     # вежливости: применение плана к чужому соединению это уже не эксперимент.
     iptables -t mangle -I INPUT -p tcp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
 fi
+if [ $VOICE = 1 ]; then
+    # Первые пакеты туда: IP Discovery и повторы — по ним датапат узнаёт
+    # голос и приговаривает «молчат». Первые оттуда: ответ сервера —
+    # ЕДИНСТВЕННОЕ подтверждение приёма голоса, зонда у голоса нет.
+    iptables -t mangle -I POSTROUTING -p udp -m multiport --dports $VOICE_PORTS $NARROW $NOTSELF -m connbytes --connbytes 0:4 --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p udp -m multiport --sports $VOICE_PORTS $RNARROW -m connbytes --connbytes 0:4 --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+fi
+if [ $QUIC = 1 ]; then
+    iptables -t mangle -I POSTROUTING -p udp --dport $PORTS $NARROW $NOTSELF -m connbytes --connbytes $CONNBYTES --connbytes-dir original --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    iptables -t mangle -I FORWARD -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    if [ $LEARN = 1 ]; then
+        iptables -t mangle -I INPUT -p udp --sport $PORTS $RNARROW -m connbytes --connbytes $CONNBYTES --connbytes-dir reply --connbytes-mode packets -m comment --comment $TOKEN -j NFQUEUE --queue-num $QUEUE --queue-bypass
+    fi
+fi
+if [ $VOICE = 1 ] || [ $QUIC = 1 ]; then
+    # Свои посылки по UDP уходят с локальным адресом клиента: первая
+    # датаграмма и есть приветствие, записи conntrack под неё ещё нет (см.
+    # files/S99d2k). Трансляцию заводит наша первая посылка.
+    iptables -t nat -I POSTROUTING -p udp -m mark --mark $MARK -m comment --comment $TOKEN -j MASQUERADE
+fi
 for ch in POSTROUTING FORWARD OUTPUT INPUT; do
     n=\$(iptables -t mangle -S \$ch 2>/dev/null | grep -c -- '--comment $TOKEN' || true)
     [ \"\$n\" != 0 ] && printf '%s=%s ' \"\$ch\" \"\$n\"
-done; echo
+done
+n=\$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -c -- '--comment $TOKEN' || true)
+[ \"\$n\" != 0 ] && printf 'nat=%s ' \"\$n\"; echo
 " | sed 's/^/  правил: /' >&2
 
 # Сторож на случай, если управляющая сторона умрёт: снимает ТОЛЬКО свои
@@ -253,6 +290,8 @@ $SSH "
     iptables -t mangle -S \$ch 2>/dev/null | grep -- '--comment $TOKEN' |
     sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t mangle \$r\"; done
   done
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '--comment $TOKEN' |
+  sed 's/^-A /-D /' | while IFS= read -r r; do eval \"iptables -t nat \$r\"; done
   [ -f /tmp/d2kd.$TOKEN.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.pid) 2>/dev/null
   [ -f /tmp/d2k.$TOKEN.pid ] && kill \$(cat /tmp/d2k.$TOKEN.pid) 2>/dev/null
   [ -f /tmp/d2kd.$TOKEN.tcpdump.pid ] && kill \$(cat /tmp/d2kd.$TOKEN.tcpdump.pid) 2>/dev/null

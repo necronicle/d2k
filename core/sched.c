@@ -58,6 +58,7 @@
 #include "d2k_hello.h"
 #include "d2k_quic.h"
 #include "d2k_quichello.h"
+#include "d2k_quicconn.h"
 #include "d2k_plantlv.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
@@ -80,6 +81,11 @@
 
 /* Отдых цели после неудачи: не долбить одну и ту же цель подряд. */
 #define SCHED_REST_MS (2 * 60 * 1000)
+/* Сколько ждать решения по потоку разговора с применённым приёмом голоса.
+   Приговор «молчит» датапат выносит через две секунды после приветствия
+   (silence_deadline); пятнадцать — с запасом на медленную очередь событий, и
+   не больше, чем человек готов слушать тишину в звонке. */
+#define SCHED_VOICE_WATCH_MS (15 * 1000)
 
 /* Сколько выведенных планов держит задача. Это же потолок, который
    d2k_compose получает под свои плечи. */
@@ -331,7 +337,14 @@ typedef enum {
        стоит. Последующий TLS-ответ остаётся наблюдением, а не новым
        прикладным подтверждением. */
     T_WATCHING,
-    T_RESTING        /* неудача, цель отдыхает */
+    T_RESTING,       /* неудача, цель отдыхает */
+    /* ГОЛОС: приём стоит на классе голоса, ждём потока разговора, к которому
+       он применится. Зонда у голоса нет (точка молчит посторонним), и решает
+       только поток самого клиента. */
+    T_VOICE_TRIAL,
+    /* Приём применился к потоку разговора — ждём по нему ответа сервера или
+       молчания. */
+    T_VOICE_WATCH
 } task_state;
 
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
@@ -348,6 +361,18 @@ typedef struct {
     int64_t    started_ms;
     int64_t    rest_until_ms;
     int        probes;
+
+    /* ГОЛОС: поток разговора, к которому применился приём, и что по нему
+       пришло. Флаги ставят обработчики событий, решает тик: у событий нет
+       часов, а запись в каталог их требует. */
+    /* ЦЕЛЬ — АДРЕС, А НЕ ИМЯ. Так бывает у QUIC, чьё приветствие разбросано
+       по датаграммам: имя не читается ни нами, ни коробкой, а приём разноса
+       от имени не зависит. Выдумывать имя запрещено (D2K_SPEC). */
+    int         by_addr;
+    d2k_flowkey voice_flow;
+    int         voice_answered;
+    int         voice_silent;
+    int64_t     voice_watch_ms;
 
     /* Приветствия. trigger — снятое датапатом, если уже поймано; иначе
        профиль холодного старта. control — приманка ДРУГИМ именем (§7). */
@@ -1145,9 +1170,9 @@ static int64_t wall_s(const d2k_sched *s, int64_t now_ms) {
 
 static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_id,
                           const char *plan_text, const char *proto,
-                          const char *target, uint8_t transport,
-                          uint8_t shape, uint8_t verified_by, int64_t at_s,
-                          const d2k_cat_fp *fp) {
+                          const char *target, const char *kind, uint8_t transport,
+                          uint8_t shape, uint8_t verified_by, uint8_t input,
+                          int64_t at_s, const d2k_cat_fp *fp) {
     d2k_cat_box *b = box_ensure(c, box_id);
     if (!b) { return -1; }
     if (b->created == 0) { b->created = at_s; }
@@ -1188,6 +1213,11 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
             snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
             if (shape) { bd->shape = shape; }
             if (verified_by) { bd->verified_by = verified_by; }
+            /* Полнота входа пишется только СИЛЬНЕЕ прежней: замер байтами
+               клиента отменяет прежнюю заготовку, обратное — нет. Иначе
+               следующий холодный старт объявил бы слабым уже доказанное
+               (§2.4). Ноль — «не измерено» — не пишется никогда. */
+            if (input == D2K_INPUT_CLIENT || bd->input == 0) { bd->input = input; }
             return 0;
         }
     }
@@ -1196,7 +1226,9 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     b->binds = nb;
     d2k_cat_binding *bd = &b->binds[b->n_binds];
     memset(bd, 0, sizeof *bd);
-    snprintf(bd->kind, sizeof bd->kind, "name");
+    /* Вид цели — от вызывающего: у QUIC без читаемого имени цель адресная, и
+       записать её именем значило бы выдумать имя (D2K_SPEC). */
+    snprintf(bd->kind, sizeof bd->kind, "%s", kind);
     snprintf(bd->target, sizeof bd->target, "%s", target);
     snprintf(bd->plan_id, sizeof bd->plan_id, "%s", plan_id);
     bd->level = 3;
@@ -1206,6 +1238,7 @@ static int bind_confirmed(d2k_catalog *c, const char *box_id, const char *plan_i
     bd->transport = transport;
     bd->shape = shape;
     bd->verified_by = verified_by;
+    bd->input = input;
     b->n_binds++;
     return 0;
 }
@@ -1497,7 +1530,19 @@ static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     ver_close(t);
     if (t->trial_installed) {
         char err[160];
-        if (d2k_link_del_name(s->link_fd, t->name, err, sizeof err) != 0) {
+        int rc;
+        if (t->by_addr) {
+            uint8_t ip4[4];
+            if (inet_pton(AF_INET, t->ip, ip4) != 1) {
+                snprintf(err, sizeof err, "неверный адрес цели: %s", t->ip);
+                rc = -1;
+            } else {
+                rc = d2k_link_del_addr(s->link_fd, ip4, err, sizeof err);
+            }
+        } else {
+            rc = d2k_link_del_name(s->link_fd, t->name, err, sizeof err);
+        }
+        if (rc != 0) {
             say(s, "по %s не удалось снять пробный план: %s", t->name, err);
         }
         t->trial_installed = 0;
@@ -1772,6 +1817,23 @@ static int install_next(d2k_sched *s, task *t) {
  * приметой, проверен на ней же, а синтез — только выведен. Порт buildQueue
  * (controller.go), включая порядок по числу подтверждённых успехов (§3.4).
  * Возвращает, сколько кандидатов взято из каталога. */
+/* Привязка этой цели в каталоге — та, что подходит по транспорту. Нужна
+   там, где решение зависит не от плана, а от того, ЧЕМ он был добыт. */
+static const d2k_cat_binding *binding_for(const d2k_sched *s, const char *name,
+                                          uint8_t transport) {
+    if (!s->cat) { return NULL; }
+    for (size_t bi = 0; bi < s->cat->n_boxes; bi++) {
+        const d2k_cat_box *b = &s->cat->boxes[bi];
+        for (size_t i = 0; i < b->n_binds; i++) {
+            const d2k_cat_binding *bd = &b->binds[i];
+            if (bd->transport == transport && strcmp(bd->target, name) == 0) {
+                return bd;
+            }
+        }
+    }
+    return NULL;
+}
+
 static size_t known_plans(d2k_sched *s, task *t) {
     if (t->fp.n_sig == 0) { return 0; }
     /* Ambiguity yields candidates, not the identity of the first catalog
@@ -2085,6 +2147,8 @@ static const char *task_phase(const task *t) {
                                      : "проверяем выведенный план";
     case T_WATCHING:      return "подтверждено, смотрим живой трафик";
     case T_RESTING:       return "цель отдыхает после неудачи";
+    case T_VOICE_TRIAL:   return "приём голоса стоит, ждём разговора";
+    case T_VOICE_WATCH:   return "приём применился к разговору, ждём ответа сервера";
     default:              return "заводим поиск";
     }
 }
@@ -2317,16 +2381,16 @@ int d2k_sched_sync_step(d2k_sched *s) {
                снятый до появления поля; принимаем как TCP, потому что до
                задачи 5 иных привязок не заводилось.
 
-               ФОРМА ПРИВЕТСТВИЯ С 12.09 ЕДЕТ. Прежняя оговорка «не едет тем
-               более» устарела вместе с dcf2b79: датапат хранит форму у записи
-               и не отдаёт план приветствию другой объявленной формы.
-               Остаётся следствие, которое ещё не закрыто: две привязки ОДНОЙ
-               цели, различающиеся только формой, поставят план дважды по
-               одному ключу имени, и победит последняя по файлу. Сегодня такой
-               пары не бывает по построению — зонд один и форма у него одна
-               (SCHED_PROBE_SHAPE), а наблюдение привязок не заводит; когда
-               появится второй зонд, таблице планов понадобится ключ «имя +
-               форма», а не только имя. */
+               ФОРМА ПРИВЕТСТВИЯ С 12.09 ЕДЕТ, и датапат держит запись на
+               ИМЯ + ФОРМУ (d2k_plantab_set_name_probe): план не отдаётся
+               приветствию другой объявленной формы, а неизвестная форма не
+               подходит ни к одной измеренной (shape_fits в plans.c).
+
+               Две привязки одной цели, различающиеся формой, законны: зондов
+               два (TLS 1.3 и TLS 1.2, d2k_verify_probe12_on), и браузер со
+               старым клиентом одного имени получают каждый свою. Каждая
+               уезжает под своей формой и ложится в датапате отдельной записью
+               — проверено test_sched («две формы одной цели») и test_plans. */
             uint8_t tr = bd->transport ? bd->transport : 6;
             /* Форма — ИЗ ЗАПИСИ КАТАЛОГА, а не из текущего наблюдения: план
                подтверждён на той форме, и применять его к другой нельзя.
@@ -2426,6 +2490,191 @@ static int start_search(d2k_sched *s, task *t) {
     return 1;
 }
 
+/* ИМЯ КОРОБКИ, которой идёт подтверждённое знание. Одной функцией на два
+   подтверждения — зондом (verify_confirm) и разговором (voice_confirm): два
+   правила именования разошлись бы, и одна коробка завелась бы дважды. */
+static void box_id_for(const task *t, const char *text, char *box_id, size_t cap) {
+    if (t->box_id[0]) {
+        /* Коробка узнана по отпечатку — успех идёт ей, а не новой записи:
+           иначе каталог наполнялся бы клонами одной и той же коробки. */
+        snprintf(box_id, cap, "%s", t->box_id);
+    } else if (t->fp.n_sig == 0) {
+        /* Примет нет вовсе — узнавать нечем. Знание пишется под отдельную
+           запись, и это честнее, чем выдать её за узнанную коробку. */
+        snprintf(box_id, cap, "box-без-приметы");
+    } else {
+        /* Новая коробка, и её имя выводится ИЗ ОТПЕЧАТКА, а не из счётчика и
+           не из транспорта: та же коробка, встреченная завтра на другой цели,
+           обязана получить то же имя. */
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < t->fp.n_sig; i++) {
+            char b[64];
+            snprintf(b, sizeof b, "%s/%u/%u/%u", t->fp.sig[i].kind,
+                     (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
+                     (unsigned)t->fp.sig[i].ipid);
+            h ^= fnv1a(b);
+            h *= 1099511628211ULL;
+        }
+        /* Coarse passive evidence is not enough to merge a NEW solution
+           into an old model whose ready plans failed. Keep it separate. */
+        h ^= fnv1a(text);
+        snprintf(box_id, cap, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
+    }
+}
+
+/* --- ГОЛОС ДИСКОРДА: испытание на самом разговоре ----------------------
+ *
+ * ПОЧЕМУ НЕ ЗАМЕР И НЕ ЗОНД. Голосовая точка Дискорда отвечает только
+ * установленной сессии (SSRC от шлюза) и молчит посторонним — на STUN, нули и
+ * мусор одинаково, при живом разговоре через тот же адрес (поле 17.09.2026).
+ * Ни вопросить коробку своим обращением, ни подтвердить приём своим зондом
+ * нельзя. Оракул один: ответ сервера по потоку САМОГО клиента.
+ *
+ * ПОЭТОМУ ИСПЫТАНИЕ ИДЁТ ЗА СЧЁТ РАЗГОВОРА. Приём ставится на класс голоса
+ * для ВСЕХ потоков, а не под порт зонда — зонда нет. Это честно называется
+ * вслух; стоит он до решения, и решает ближайший поток разговора.
+ *
+ * ОДИН КАНДИДАТ, УНАСЛЕДОВАННЫЙ. Приманка Initial QUIC перед IP Discovery,
+ * десять копий, без порчи — боевой профиль discord_udp z2k (strategy=1,
+ * «рабочий референс»), только приманка своя, а не чужой блоб. Перебора нет:
+ * мерить голос нечем, а перебирать вслепую за счёт чужого разговора — хуже,
+ * чем честно сказать «не пробил». */
+static void voice_start(d2k_sched *s, task *t) {
+    uint8_t decoy[1500];
+    size_t dlen = 0;
+    if (d2k_qc_first_initial(SCHED_DECOY, decoy, sizeof decoy, &dlen) != 0 ||
+        d2k_voice_plan(decoy, dlen, t->plans[0], sizeof t->plans[0]) != 0) {
+        say(s, "по %s приманку голоса собрать не удалось — испытывать нечем", t->name);
+        task_reset(t);
+        return;
+    }
+    t->n_plans = 1;
+    t->next_plan = 1;
+    t->n_known = 0;
+    static char wire[sizeof t->plans[0]];
+    char cat_id[40], err[160];
+    plan_ident(t->plans[0], cat_id, sizeof cat_id, t->ver_plan_id);
+    snprintf(wire, sizeof wire, "%s", t->plans[0]);
+    if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
+        memset(t->ver_plan_id, 0, sizeof t->ver_plan_id);
+    }
+    static char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
+        d2k_link_set_name(s->link_fd, t->name, 17, hex, D2K_LINK_SHAPE_VOICE,
+                          err, sizeof err) != 0) {
+        say(s, "по %s приём голоса не поставился: %s", t->name, err);
+        task_reset(t);
+        return;
+    }
+    t->trial_installed = 1;
+    t->probes++;
+    s->probes_used++;
+    t->state = T_VOICE_TRIAL;
+    say(s, "по %s (голос) испытываю приём на самом разговоре: %s — приманка Initial "
+           "QUIC ×%u перед IP Discovery. Зонда у голоса нет: точка молчит посторонним, "
+           "поэтому приём стоит для ВСЕХ голосовых потоков, пока не решит ближайший "
+           "разговор", t->name, cat_id, (unsigned)D2K_VOICE_DECOY_REPEATS);
+}
+
+/* ЦЕЛЬ ПО АДРЕСУ ДЛЯ QUIC: приём разноса Initial-датаграмм.
+ *
+ * Имени у такой цели нет и быть не может — приветствие разбросано по
+ * датаграммам, и его не читает ни датапат, ни коробка (поле 19.09.2026).
+ * Выдумывать имя запрещено (D2K_SPEC), поэтому цель адресная.
+ *
+ * Приём единственный и от цели не зависит вовсе: выдержка перед первой
+ * посылкой разводит датаграммы приветствия во времени, и складывать из них
+ * имя коробке становится не из чего. Перебирать тут нечего — измерять цель
+ * тоже нечем (вопросник QUIC требует контроля с другим именем, а имени нет).
+ *
+ * Подтверждает следующий поток САМОГО клиента, как у голоса: наш зонд ходит
+ * своим приветствием, которое коробка как раз читает, и его судьба о судьбе
+ * клиента не говорит. */
+static void quic_addr_start(d2k_sched *s, task *t) {
+    if (d2k_quic_delay_plan(t->plans[0], sizeof t->plans[0]) != 0) {
+        say(s, "по %s план разноса датаграмм не собрался", t->name);
+        task_reset(t);
+        return;
+    }
+    t->n_plans = 1;
+    t->next_plan = 1;
+    t->n_known = 0;
+    t->by_addr = 1;
+    static char wire[sizeof t->plans[0]];
+    char cat_id[40], err[160];
+    plan_ident(t->plans[0], cat_id, sizeof cat_id, t->ver_plan_id);
+    snprintf(wire, sizeof wire, "%s", t->plans[0]);
+    if (stamp_plan_id(wire, t->ver_plan_id) != 0) {
+        memset(t->ver_plan_id, 0, sizeof t->ver_plan_id);
+    }
+    static char hex[2 * D2K_PLAN_TLV_MAX + 1];
+    uint8_t ip4[4];
+    unsigned a, b, c, d;
+    if (sscanf(t->name, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
+        a > 255 || b > 255 || c > 255 || d > 255) {
+        say(s, "по %s адрес не разбирается — ставить план некуда", t->name);
+        task_reset(t);
+        return;
+    }
+    ip4[0] = (uint8_t)a; ip4[1] = (uint8_t)b; ip4[2] = (uint8_t)c; ip4[3] = (uint8_t)d;
+    if (d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) != 0 ||
+        d2k_link_set_addr(s->link_fd, ip4, hex, err, sizeof err) != 0) {
+        say(s, "по %s приём по адресу не поставился: %s", t->name, err);
+        task_reset(t);
+        return;
+    }
+    t->trial_installed = 1;
+    t->probes++;
+    s->probes_used++;
+    t->state = T_VOICE_TRIAL;
+    say(s, "по %s (QUIC) имя из приветствия не читается — цель беру ПО АДРЕСУ: %s, "
+           "приём разноса Initial-датаграмм. Испытываю на самом трафике: зонд ходит "
+           "своим приветствием, которое коробка читает, и о судьбе клиента не говорит",
+        t->name, cat_id);
+}
+
+static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
+    const char *text = t->plans[0];
+    char plan_id[40], box_id[40];
+    uint8_t wire_id[D2K_PLAN_ID_LEN];
+    plan_ident(text, plan_id, sizeof plan_id, wire_id);
+    box_id_for(t, text, box_id, sizeof box_id);
+    /* Подтверждено разговором клиента — единственно возможным для голоса
+       способом (D2K_VERBY_CLIENT), и мерили тоже его байтами: приём применился
+       к НАСТОЯЩЕМУ IP Discovery (D2K_INPUT_CLIENT). */
+    (void)bind_confirmed(s->cat, box_id, plan_id, text,
+                         t->by_addr ? "quic" : "voice", t->name,
+                         t->by_addr ? "addr" : "name", 17,
+                         (uint8_t)(t->by_addr ? D2K_LINK_SHAPE_GRANDFATHER
+                                              : D2K_LINK_SHAPE_VOICE),
+                         D2K_VERBY_CLIENT,
+                         (uint8_t)D2K_INPUT_CLIENT, wall_s(s, now_ms), &t->fp);
+    snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
+    s->confirms++;
+    if (t->by_addr) {
+        say(s, "по %s (QUIC, цель по адресу) ПОДТВЕРЖДЕНО трафиком клиента: %s — "
+               "после приёма сервер ответил по его потоку", t->name, plan_id);
+    } else {
+        say(s, "по %s (голос) ПОДТВЕРЖДЕНО разговором: %s — после приёма сервер ответил "
+               "по потоку клиента. Приём общий для всех голосовых точек: коробка узнаёт "
+               "голос по первому пакету, а не по адресу", t->name, plan_id);
+    }
+    t->trial_installed = 0;   /* подтверждён — остаётся стоять */
+    t->state = T_WATCHING;
+    s->sync_pending = 1;
+}
+
+static void voice_fail(d2k_sched *s, task *t, int64_t now_ms) {
+    say(s, "по %s (%s) приём не пробил: поток с применённым приёмом остался без "
+           "ответа сервера. Перебирать дальше вслепую за счёт чужого трафика не "
+           "буду — снимаю приём", t->name, t->by_addr ? "QUIC по адресу" : "голос");
+    task_fail(s, t, now_ms);
+}
+
+static int is_voice_class(const char *name, uint8_t transport) {
+    return transport == 17 && strcmp(name, D2K_LINK_VOICE_CLASS) == 0;
+}
+
 static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     /* Имя копируется СРАЗУ, а не держится указателем в кольцо имён: и потому
        что кольцо переживает вытеснение (следующее приветствие может занять
@@ -2441,6 +2690,17 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         memcpy(name, found, n);
         name[n] = '\0';
     }
+    int by_addr = name[0] == '\0' && ev->transport == 17;
+    if (by_addr) {
+        /* ИМЕНИ НЕТ, НО ЕСТЬ АДРЕС. У QUIC приветствие настоящего клиента
+           разбросано по датаграммам, и имя из него не читает никто — ни мы,
+           ни коробка (поле 19.09.2026). Раньше такое подозрение выбрасывалось
+           («искать не по чему»), и обход QUIC не заводился вовсе. */
+        uint16_t sport = 0;
+        server_of(ev, name, sizeof name, &sport);
+        /* Дальше — общий жизненный цикл. Ранний return при найденной
+           адресной задаче терял и молчание опыта, и деградацию WATCHING. */
+    }
     if (name[0] == '\0') {
         /* Имени нет — искать не по чему. Это не отказ: датапат подозревает
            поток, а не имя, и поток без приветствия (или с приветствием, уже
@@ -2448,6 +2708,12 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         return 0;
     }
     task *t = task_of(s, name, ev->transport);
+    if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
+        /* Поток разговора, к которому применился приём, остался без ответа —
+           решает тик (записи и снятию нужны часы). */
+        t->voice_silent = 1;
+        return 0;
+    }
     if (t) {
         /* Поиск уже идёт — но примета всё равно наша: отпечаток растёт по мере
            того, как коробка себя проявляет, и первое подозрение редко
@@ -2461,6 +2727,19 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
            незачем. Запись в каталоге при этом не трогаем — отрицательное не
            хранится и положительного не переписывает (§10, §13), а следующее
            подозрение (датапат не молчит) заведёт поиск заново. */
+        /* УЛИКОЙ ПРОТИВ ПЛАНА ЯВЛЯЕТСЯ НЕ ВСЯКОЕ ПОДОЗРЕНИЕ.
+           Поток, к которому план НЕ применялся, шёл без обхода — обычно
+           потому, что начался раньше, чем план доехал до датапата. Поле
+           18.09.2026: такое подозрение приходило через две секунды после
+           подтверждения, при том что клиент тут же получал 200 четыре раза
+           подряд, и наблюдение снималось зря. Ноль в поле — «не сказано»
+           (старая служба), и по нему поведение остаётся прежним. */
+        if (ev->planned == D2K_LINK_PLANNED_NO) {
+            say(s, "по %s подозрение о потоке, к которому план НЕ ПРИМЕНЯЛСЯ "
+                   "(начат раньше, чем план встал) — уликой против подтверждённого "
+                   "плана не считаю, наблюдение продолжаю", t->name);
+            return 0;
+        }
         say(s, "по %s подозрение при подтверждённом плане — наблюдение прекращаю",
             t->name);
         task_done(t);
@@ -2484,6 +2763,16 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
     }
     server_of(ev, t->ip, sizeof t->ip, &t->port);
     t->started_ms = 0;
+    if (by_addr) {
+        quic_addr_start(s, t);
+        return t->state == T_VOICE_TRIAL;
+    }
+    if (is_voice_class(t->name, t->transport)) {
+        /* Голос — не QUIC: снимок Initial ему не нужен, замер и зонд
+           бесполезны. Своя дорога целиком. */
+        voice_start(s, t);
+        return t->state == T_VOICE_TRIAL;
+    }
     /* Снимок заказывается ДО подбора приветствий, а не после: для QUIC он не
        «уточнение», а единственный источник байт, и порядок здесь несущий. */
     if (!t->shape_armed) {
@@ -2493,6 +2782,30 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
         }
     }
     return start_search(s, t);
+}
+
+/* ПЕРЕМЕР ПОДТВЕРЖДЁННОЙ ЦЕЛИ СНЯТЫМИ БАЙТАМИ.
+ *
+ * Привязка добыта заготовкой холодного старта, а снимок настоящего клиента
+ * этой цели есть: поиск повторяется им. Подтверждённый план при этом стоит
+ * как стоял — перемер может его только подтвердить заново (и тогда привязка
+ * получает полноту «байты клиента») или найти другой. Состояние прошлого
+ * поиска сбрасывается ПЕРЕД новым, иначе кандидаты прошлого вердикта доживают
+ * до установки. Повтор один: после него trig_snapped взведён, и сюда задача
+ * больше не попадает. */
+static void remeasure_snapped(d2k_sched *s, task *t, const uint8_t *bytes, size_t len) {
+    if (len == 0 || len > sizeof t->trig) { return; }
+    memcpy(t->trig, bytes, len);
+    t->trig_len = len;
+    t->trig_snapped = 1;
+    t->reasked = 1;
+    t->ctrl_len = 0;   /* контроль соберётся из новых байт */
+    t->researched = 0;
+    t->n_plans = 0;
+    t->next_plan = 0;
+    say(s, "по %s привязка добыта заготовкой, а снимок клиента есть — "
+           "перемеряю снимком: %zu байт", t->name, len);
+    (void)start_search(s, t);
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
@@ -2546,6 +2859,24 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
         /* The whole experiment, not just the worker, owns its input:
          * result conversion, Plan guards and verification must describe
          * the same bytes. New observations remain cached for NEXT search. */
+        /* ПОДТВЕРЖДЁННОЕ ЗАГОТОВКОЙ ПЕРЕМЕРЯЕТСЯ СНЯТЫМИ БАЙТАМИ.
+         *
+         * Пока задача смотрит за подтверждённой целью, её привязка может быть
+         * добыта заготовкой холодного старта: форма клиента угадана верно, а
+         * байты — нет, и коробке никто не запрещал смотреть на содержимое
+         * (§6). Такое доказательство слабее, и сказать об этом в отчёте мало:
+         * снимок этой же цели пришёл — значит настоящие байты наконец есть, и
+         * поиск повторяется ими. Повторяется ОДИН раз: перемер записывает
+         * полноту входа «байты клиента», и следующий снимок сюда уже не
+         * заходит. */
+        if (t->state == T_WATCHING && t->transport == ev->transport &&
+            strcmp(t->name, name) == 0) {
+            const d2k_cat_binding *bd = binding_for(s, t->name, t->transport);
+            if (bd && bd->input == D2K_INPUT_PROFILE) {
+                remeasure_snapped(s, t, ev->shape, ev->shape_len);
+            }
+            continue;
+        }
         if (t->state == T_SHAPE_WAIT && t->transport == ev->transport &&
             strcmp(t->name, name) == 0) {
             memcpy(t->trig, ev->shape, ev->shape_len);
@@ -2611,32 +2942,7 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         t->state = T_PLANNING;
         return;
     }
-    if (t->box_id[0]) {
-        /* Коробка узнана по отпечатку — успех идёт ей, а не новой записи:
-           иначе каталог наполнялся бы клонами одной и той же коробки. */
-        snprintf(box_id, sizeof box_id, "%s", t->box_id);
-    } else if (t->fp.n_sig == 0) {
-        /* Примет нет вовсе — узнавать нечем. Знание пишется под отдельную
-           запись, и это честнее, чем выдать её за узнанную коробку. */
-        snprintf(box_id, sizeof box_id, "box-без-приметы");
-    } else {
-        /* Новая коробка, и её имя выводится ИЗ ОТПЕЧАТКА, а не из счётчика и
-           не из транспорта: та же коробка, встреченная завтра на другой цели,
-           обязана получить то же имя. */
-        uint64_t h = 1469598103934665603ULL;
-        for (size_t i = 0; i < t->fp.n_sig; i++) {
-            char b[64];
-            snprintf(b, sizeof b, "%s/%u/%u/%u", t->fp.sig[i].kind,
-                     (unsigned)t->fp.sig[i].ttl, (unsigned)t->fp.sig[i].tos,
-                     (unsigned)t->fp.sig[i].ipid);
-            h ^= fnv1a(b);
-            h *= 1099511628211ULL;
-        }
-        /* Coarse passive evidence is not enough to merge a NEW solution
-           into an old model whose ready plans failed. Keep it separate. */
-        h ^= fnv1a(text);
-        snprintf(box_id, sizeof box_id, "box-%08x", (unsigned)(h & 0xFFFFFFFFu));
-    }
+    box_id_for(t, text, box_id, sizeof box_id);
     /* Контекст: проверку вёл СОБСТВЕННЫЙ зонд и СВОЕЙ формой приветствия
        (SCHED_PROBE_SHAPE). Записывается вместе с успехом, а не выводится
        потом: через день по файлу будет не восстановить, чем именно он
@@ -2653,10 +2959,15 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
         rec_shape = (uint8_t)(cs == D2K_SHAPE_LEGACY ? D2K_SHAPE_LEGACY
                                                      : SCHED_PROBE_SHAPE);
     }
+    /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ЭТОТ ПЛАН ВЫВЕДЕН. Не то же, что форма:
+       форма у заготовки и у снимка может совпадать, а байты — нет, и коробке
+       никто не запрещал смотреть на содержимое (§6). */
+    uint8_t rec_input = t->trig_snapped ? (uint8_t)D2K_INPUT_CLIENT
+                                        : (uint8_t)D2K_INPUT_PROFILE;
     (void)bind_confirmed(s->cat, box_id, plan_id, text,
                          t->transport == 17 ? "quic" : "tls",
-                         t->name, t->transport, rec_shape,
-                         D2K_VERBY_PROBE,
+                         t->name, "name", t->transport, rec_shape,
+                         D2K_VERBY_PROBE, rec_input,
                          wall_s(s, now_ms), &t->fp);
     /* Запоминаем владельца подтверждённого плана. */
     snprintf(t->box_id, sizeof t->box_id, "%s", box_id);
@@ -2674,6 +2985,18 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
      * привязка пишется под ЕГО форму. Говорим об этом вслух — не как об
      * оговорке, а как о факте, который потом придётся сопоставлять с
      * каталогом. */
+    /* ГРАНИЦА ЭТОГО ДОКАЗАТЕЛЬСТВА НАЗЫВАЕТСЯ ВСЛУХ, а не подразумевается.
+       Подтверждение всегда ведёт СОБСТВЕННОЕ рукопожатие зонда — чужой
+       ClientHello ему не воспроизвести (core/verify.c). Значит байтами
+       настоящего клиента приём может быть добыт только на ЗАМЕРЕ, и если
+       замер шёл заготовкой холодного старта, то байты клиента не проверял
+       никто. Это записано в привязке (input) и сказано здесь. */
+    if (!t->trig_snapped) {
+        say(s, "по %s замер шёл ЗАГОТОВКОЙ холодного старта, а не снятыми байтами "
+               "клиента: форма та же, содержимое — нет. Приём подтверждён, но "
+               "байтами клиента его не проверял никто — повторю поиск, как "
+               "только датапат снимет приветствие этой цели", t->name);
+    }
     if (t->transport == 6 && d2k_hello_shape(t->trig, t->trig_len) == D2K_SHAPE_LEGACY) {
         say(s, "по %s подтверждение вёл зонд СТАРОЙ формы (TLS 1.2) — тем же протоколом, "
                "что и клиент, и привязка записана под неё", t->name);
@@ -2693,6 +3016,14 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        события создал бы то самое окно слепоты, ради устранения которого
        проход и разложен на порции. */
     s->sync_pending = 1;
+    /* СНИМОК ПРИШЁЛ, ПОКА ШЛО ИСПЫТАНИЕ. Повтор после замера к этому времени
+       уже прошёл, а крючок наблюдения (on_shape) ловит только снимки,
+       пришедшие ПОСЛЕ подтверждения. Без этой проверки привязка легла бы
+       заготовкой при настоящих байтах на руках. */
+    if (!t->trig_snapped && t->transport == 6 && s->tcp_shape_len > 0 &&
+        strcmp(s->tcp_shape_name, t->name) == 0) {
+        remeasure_snapped(s, t, s->tcp_shape, s->tcp_shape_len);
+    }
 }
 
 /* Тот ли это идентификатор, с которым кандидат ушёл на провод.
@@ -2740,6 +3071,26 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev);
 static void on_applied(d2k_sched *s, const d2k_ev *ev) {
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
+        if (t->state == T_VOICE_TRIAL) {
+            /* Приём голоса применился к потоку разговора — ИМЕННО наш: чужой
+               план на голосовом потоке ничего не говорит о нашем. */
+            if (ev->transport != 17 || !plan_id_is_ours(t, ev)) { continue; }
+            /* У адресных QUIC-целей один и тот же план имеет один ID.
+               Чужой адрес/порт не может выбрать эту задачу для WATCH:
+               последующий EXCHANGE иначе подтвердит не ту цель.
+               Голосовой класс намеренно общий, его этим не ограничиваем. */
+            if (t->by_addr && !applied_of_candidate(t, ev)) { continue; }
+            memcpy(t->voice_flow.a_ip, ev->low_ip, 4);
+            memcpy(t->voice_flow.b_ip, ev->high_ip, 4);
+            t->voice_flow.a_port = ev->low_port;
+            t->voice_flow.b_port = ev->high_port;
+            t->voice_flow.transport = ev->transport;
+            t->voice_answered = 0;
+            t->voice_silent = 0;
+            t->voice_watch_ms = 0;
+            t->state = T_VOICE_WATCH;
+            return;
+        }
         if (t->state == T_PROPS_WAIT) {
             /* Зонд вопроса: «применён» по КЛЮЧУ НАШЕГО потока И ПО ID НАШЕГО
                плана есть то доказательство, которого вопрос ждёт вместо
@@ -2936,6 +3287,16 @@ static void on_refused(d2k_sched *s, const d2k_ev *ev) {
    опросника (0009, U1). Для ПОСЛЕДУЮЩЕГО живого соединения наблюдение
    остаётся прежним: там вопрос другой. */
 static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
+    /* Ответ сервера по потоку разговора с применённым приёмом голоса. Раньше
+       всех прочих разборов: у UDP нет типов записей TLS, и проверка на
+       прикладные данные ниже отбросила бы его. */
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
+            t->voice_answered = 1;
+            return;
+        }
+    }
     /* Сперва — не ответ ли это на заданный вопрос. Своё это обращение или
        чужое, решает КЛЮЧ ПОТОКА: событие обмена не адресовано команде, и без
        фильтра чужой обмен засчитался бы за наш зонд (ревью 11.09, находка 1
@@ -3113,6 +3474,30 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             continue;
         }
 
+        if (t->state == T_VOICE_WATCH) {
+            if (t->voice_answered) {
+                voice_confirm(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            if (t->voice_silent) {
+                voice_fail(s, t, now_ms);
+                moved++;
+                continue;
+            }
+            /* Ни ответа, ни приговора датапата: поток кончился, не решив
+               ничего (закрыли звонок раньше срока молчания). Ждём следующего
+               разговора, а не выдумываем исход. */
+            if (t->voice_watch_ms == 0) { t->voice_watch_ms = now_ms; }
+            if (now_ms - t->voice_watch_ms > SCHED_VOICE_WATCH_MS) {
+                say(s, "по %s (%s) поток с приёмом не решил ничего — жду следующего",
+                    t->name, t->by_addr ? "QUIC по адресу" : "голос");
+                t->state = T_VOICE_TRIAL;
+            }
+            continue;
+        }
+        if (t->state == T_VOICE_TRIAL) { continue; }
+
         if (t->state == T_ASKING) {
             int ready;
             d2k_vres r;
@@ -3158,22 +3543,40 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                Повторяем ОДИН раз: снимок уже на руках, второго расхождения
                взяться неоткуда, а бесконечный перезапуск был бы хуже любого
                неверного вердикта. */
+            /* ТА ЖЕ ФОРМА — ЕЩЁ НЕ ТЕ БАЙТЫ.
+               Повтор заводился только при расхождении ФОРМЫ. Поле 18.09.2026,
+               discord.com: замер заготовкой в 1534 байта (два сегмента), а
+               снимок клиента — 321 байт одним сегментом; оба современные, и
+               повтора не было — привязка легла заготовкой при снимке на
+               руках. Коробка вправе смотреть на содержимое и длину, а не
+               только на версию (§6), поэтому повод для повтора один: мерили
+               НЕ байтами клиента, а они уже есть. */
             if (t->transport == 6 && !t->reasked && s->tcp_shape_len > 0 &&
                 strcmp(s->tcp_shape_name, t->name) == 0 &&
                 s->tcp_shape_len <= sizeof t->trig &&
-                d2k_hello_shape(s->tcp_shape, s->tcp_shape_len)
-                    != (d2k_shape)t->asked_shape) {
+                (!t->trig_snapped ||
+                 d2k_hello_shape(s->tcp_shape, s->tcp_shape_len)
+                     != (d2k_shape)t->asked_shape)) {
+                int other_form = d2k_hello_shape(s->tcp_shape, s->tcp_shape_len)
+                                     != (d2k_shape)t->asked_shape;
                 /* Снимок берём ТОЛЬКО ТЕПЕРЬ, когда замер закончен: вход
                    опыта неизменен, пока опыт идёт (см. on_shape — снимок
                    кладётся лишь задачам, которые его ЖДУТ). */
                 t->reasked = 1;
+                size_t was_len = t->trig_len;
                 memcpy(t->trig, s->tcp_shape, s->tcp_shape_len);
                 t->trig_len = s->tcp_shape_len;
                 t->trig_snapped = 1;
                 t->ctrl_len = 0;   /* контроль соберётся из новых байт */
-                say(s, "по %s замер шёл приветствием другой формы, чем у клиента "
-                       "(снимок пришёл позже старта) — повторяю поиск его байтами: %zu",
-                    t->name, t->trig_len);
+                if (other_form) {
+                    say(s, "по %s замер шёл приветствием другой формы, чем у клиента "
+                           "(снимок пришёл позже старта) — повторяю поиск его байтами: %zu",
+                        t->name, t->trig_len);
+                } else {
+                    say(s, "по %s замер шёл заготовкой (%zu байт), а снимок клиента "
+                           "пришёл позже старта (%zu байт) — повторяю поиск его байтами",
+                        t->name, was_len, t->trig_len);
+                }
                 t->researched = 0;
                 t->n_plans = 0;
                 t->next_plan = 0;

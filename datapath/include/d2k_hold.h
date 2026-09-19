@@ -55,7 +55,16 @@ uint64_t d2k_hold_next(const d2k_hold *h);
    Отличает «второй сегмент не дошёл до очереди» (1) от «дошёл, а разбор не
    собрал» (2 и больше). Без этого числа обе причины выглядят одинаково:
    «начато=1 собрано=0 таймаутов=1». */
-typedef struct { uint64_t started, ready, released, full, timed_out, timed_out_pkts;
+/* plan_changed/dropped_all — СЛОТЫ, отпущенные не по сроку: первое из-за
+   смены плана под носом у ожидания, второе из-за сброса всего удержания
+   (потеря пакетов ядром, остановка). Общее «отпущено» считает ПАКЕТЫ и три
+   причины смешивает, а на живой линии это три разных диагноза. */
+/* joined/mismatched/sided — судьба кусков, пришедших к УЖЕ открытому слоту:
+   взят к голове, отвергнут как несовместимый (номера, флаги, размер) или
+   пришёл с другой стороны. Без них «таймаутов=1 (пакетов в них=1)» не
+   отличает «второй сегмент до очереди не дошёл» от «дошёл и был отвергнут». */
+typedef struct { uint64_t started, ready, released, full, timed_out, timed_out_pkts,
+                 plan_changed, dropped_all, joined, mismatched, sided;
                  size_t pending; } d2k_hold_stats;
 void d2k_hold_get_stats(const d2k_hold *h, d2k_hold_stats *out);
 /* Try ALL IDs even if one verdict fails. Zero alone acknowledges the

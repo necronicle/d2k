@@ -111,6 +111,83 @@ int main(void) {
         same("счёт дубликатов", text, tlv, tlv_len);
     }
 
+    /* --- delay: выдержка перед единственной посылкой ---------------------
+     *
+     * Ни pace, ни settle её не выражают (см. d2k_plan_internal.h про
+     * delay_us). Требует minexec=6: старый датапат выдержки не знает, и
+     * молча выпустить посылку без паузы значит исполнить не тот план. */
+    {
+        uint8_t out[1024];
+        size_t n = 0;
+        char err[200];
+        static const char *h6 =
+            "d2k-plan 1 6\nid 00000000000000000000000000000000\nproto udp quic\n";
+        static const char *h1 =
+            "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto udp quic\n";
+        char text[1024];
+
+        snprintf(text, sizeof text, "%sdelay 15000\n", h6);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) == 0,
+              "выдержка не собралась");
+        {
+            static const uint8_t want[4] = { 0x01, 0x0b, 0x00, 0x04 };
+            int seen = 0;
+            for (size_t i = 0; n >= 4 && i + 4 <= n; i++) {
+                if (memcmp(out + i, want, 4) == 0) { seen = 1; break; }
+            }
+            CHECK(seen, "записи выдержки нет в TLV");
+        }
+
+        /* ГЛАВНАЯ ПРОВЕРКА — ЧТО ПЛАН ПРИМЕТ РАЗБОР ДАТАПАТА, а не что байты
+           записи где-то лежат. Поле 19.09.2026: запись выдержки собиралась,
+           но не попала в СЧЁТЧИК записей заголовка, и служба отвергла план
+           целиком — «число записей не совпадает с заявленным». Тест, который
+           смотрел только на наличие байтов, этого не поймал. */
+        {
+            const char *pp = "/tmp/d2k-test-delay.bin";
+            const char *sp = "/tmp/d2k-test-delay.scn";
+            CHECK(write_file_bytes(pp, out, n) == 0, "план выдержки не записался");
+            CHECK(write_file_text(sp, "pkt 1000 11 17 "
+                    "16030100200100001c0303000000000000000000000000000000000000"
+                    "0000000000000000000000000000\n") == 0, "сценарий не записался");
+            char cmd[400];
+            snprintf(cmd, sizeof cmd, "../datapath/planlab %s %s 2>&1", pp, sp);
+            FILE *pf = popen(cmd, "r");
+            CHECK(pf != NULL, "planlab не запустился");
+            char o[4096];
+            size_t got = 0;
+            if (pf) {
+                while (got + 1 < sizeof o) {
+                    size_t r = fread(o + got, 1, sizeof o - 1 - got, pf);
+                    if (r == 0) { break; }
+                    got += r;
+                }
+                pclose(pf);
+            }
+            o[got] = '\0';
+            CHECK(strstr(o, "reject") == NULL,
+                  "разбор датапата отверг план с выдержкой");
+            remove(pp);
+            remove(sp);
+        }
+
+        snprintf(text, sizeof text, "%sdelay 15000\n", h1);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "выдержка принята при minexec=1 — старый датапат исполнит не тот план");
+
+        snprintf(text, sizeof text, "%sdelay 0\n", h6);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "delay 0 принят — он неотличим от отсутствия строки");
+
+        snprintf(text, sizeof text, "%sdelay 15ms\n", h6);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "delay принял не-число");
+
+        snprintf(text, sizeof text, "%sdelay 15000 20000\n", h6);
+        CHECK(d2k_plan_text_to_tlv(text, out, sizeof out, &n, err, sizeof err) != 0,
+              "delay принял два значения");
+    }
+
     /* --- pace: ноль и мусор отвергаются ---------------------------------
      *
      * «pace 0» запрещён нарочно: он и отсутствие строки означали бы одно и то

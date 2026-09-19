@@ -51,6 +51,8 @@ void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,
         held *s = &h->slots[i];
         if (!s->count) { continue; }
         if (all || now >= s->deadline || revision != s->revision) {
+            if (all) { h->stats.dropped_all++; }
+            else if (now < s->deadline) { h->stats.plan_changed++; }
             if (now >= s->deadline) {
                 h->stats.timed_out++;
                 /* СКОЛЬКО ПАКЕТОВ ТАК И ОСТАЛОСЬ ЛЕЖАТЬ. Один — второй
@@ -99,10 +101,14 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
         if (!q->count && !vacant) { vacant = q; }
     }
     if (s && ((v.flags & 7) || (v.src_low != s->head.src_low && v.payload))) {
+        if (v.src_low != s->head.src_low) { h->stats.sided++; }
         release_slot(h, s, release, ctx);
         return 0;
     }
-    if (!v.payload || (s && v.src_low != s->head.src_low)) { return 0; }
+    if (!v.payload || (s && v.src_low != s->head.src_low)) {
+        if (s && v.src_low != s->head.src_low) { h->stats.sided++; }
+        return 0;
+    }
     if (!s) {
         /* ЧТО ЭТО ЗА СОДЕРЖИМОЕ — РЕШАЕТ ВЫЗЫВАЮЩИЙ, А НЕ ЗДЕСЬ.
            Проверки «начинается запись TLS» и «запись уже целиком» стояли и
@@ -122,11 +128,13 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     if (s->count == D2K_HOLD_IDS || v.total > D2K_HOLD_PACKET ||
         (v.flags & ~0x18) || !(v.flags&0x10) || v.ack != s->head.ack) {
         if (s->count == D2K_HOLD_IDS) { h->stats.full++; }
+        h->stats.mismatched++;
         release_slot(h, s, release, ctx);
         release(ctx, id, p, v.total);
         h->stats.released++;
         return 1;
     }
+    if (s->count) { h->stats.joined++; }
     size_t k = s->count++;
     s->ids[k] = id; s->len[k] = v.total;
     memcpy(s->packets[k], p, v.total);
@@ -137,7 +145,10 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     int rc = d2k_capture_feed(&h->capture, &v.key, s->deadline, now, v.seq,
                               anchor, have_anchor,
                               p + v.header, v.payload, &hello, &hello_len, &hello_seq);
-    if (rc < 0) { release_slot(h, s, release, ctx); return 1; }
+    if (rc < 0) {
+        release_slot(h, s, release, ctx);
+        return 1;
+    }
     if (!rc) { return 1; }
     /* ЗАГОЛОВОК — У НАСТОЯЩЕЙ ГОЛОВЫ, А НЕ У ПЕРВОГО ПРИШЕДШЕГО.
        Куски приходят в любом порядке, и первым может лежать хвост. Собранное

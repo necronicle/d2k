@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "d2k_session.h"
+#include "d2k_quic.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -353,8 +354,301 @@ static void test_direction_by_hook(void) {
     }
 }
 
+/* --- ГОЛОС ДИСКОРДА: первый пакет потока — IP Discovery -------------------
+ *
+ * Ровно 74 байта: тип 0x0001, длина 70, SSRC, 64 нулевых байта адреса, порт
+ * (IsDiscordIpDiscoveryRequest в nfq2/protocol.c движка z2k). По нему боевой
+ * профиль discord_udp и узнаёт голос (--filter-l7=discord,
+ * --payload=discord_ip_discovery), и фальшивку ставит ПЕРЕД ним. */
+static size_t build_ip_discovery(uint8_t *p, uint32_t ssrc) {
+    memset(p, 0, 74);
+    p[1] = 1;
+    p[3] = 70;
+    p[4] = (uint8_t)(ssrc >> 24); p[5] = (uint8_t)(ssrc >> 16);
+    p[6] = (uint8_t)(ssrc >> 8);  p[7] = (uint8_t)ssrc;
+    return 74;
+}
+
+/* Тот же поток со стороны сервера: концы и порты меняются местами. */
+static void swap_udp_ends(uint8_t *pkt) {
+    uint8_t t[4];
+    memcpy(t, pkt + 12, 4); memcpy(pkt + 12, pkt + 16, 4); memcpy(pkt + 16, t, 4);
+    memcpy(t, pkt + 20, 2); memcpy(pkt + 20, pkt + 22, 2); memcpy(pkt + 22, t, 2);
+}
+
+static size_t count_kind_name(const d2k_session *s, uint8_t kind, const char *name) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j), c = 0;
+    for (size_t i = 0; i < n; i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (!e || e->kind != kind) { continue; }
+        if (name && (e->name_len != strlen(name) || memcmp(e->name, name, e->name_len) != 0)) {
+            continue;
+        }
+        c++;
+    }
+    return c;
+}
+
+/* Тот же план, что plan_bytes, но с объявленным протоколом голоса: REC_PROTO,
+ * транспорт 17, прикладной протокол 3 («voice» в тексте плана). Ровно такой
+ * план собирает контроллер (d2k_voice_plan). */
+static const uint8_t plan_voice_declared[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 5,
+    0x00, 0x02, 0x00, 0x02, 0x11, 0x03,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x00, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
+/* --- БЕЗЫМЯННЫЙ INITIAL: план по адресу и общий план ----------------------
+ *
+ * Поле 19.09.2026: настоящий клиент (curl/ngtcp2) разбрасывает ClientHello по
+ * множеству мелких кадров CRYPTO, идущих в разнобой, поперёк ДВУХ
+ * Initial-датаграмм. Разбор собирает CRYPTO только внутри одной датаграммы и
+ * держит восемь кусков, поэтому имя не извлекается ни из одной. Датапат при
+ * этом выходил РАНЬШЕ поиска плана — «имя не извлечено из Initial», — и к
+ * такому потоку не применялся НИКАКОЙ план, даже поставленный по адресу или
+ * общий. За прогон это дало «узнано приветствий 0» при 91 ушедшей датаграмме.
+ *
+ * Имя мы по-прежнему не выдумываем: приветствием такой пакет не считается,
+ * снимок с него не снимается, в журнал имя не идёт. Но план, который про имя
+ * не спрашивает, применить обязаны. */
+static void test_nameless_initial(void) {
+    /* Initial с испорченной нагрузкой: заголовок разбирается (клиентский
+       Initial), а расшифровка не сходится — ровно то же, что даёт разбросанный
+       по датаграммам ClientHello. */
+    static uint8_t blind[sizeof v1_initial];
+    memcpy(blind, v1_initial, sizeof blind);
+    blind[sizeof blind - 1] ^= 0xff;   /* тег AEAD не сойдётся */
+    CHECK(d2k_quic_is_initial(blind, sizeof blind),
+          "испорченная нагрузка сломала и заголовок — набор негоден");
+    {
+        char nm[256];
+        CHECK(d2k_quic_sni(blind, sizeof blind, nm, sizeof nm) != 0,
+              "имя всё-таки извлеклось — проверять нечего");
+    }
+
+    /* ОБЩИЙ план (--plan у службы) обязан достаться такому потоку. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
+              "общий план не загрузился");
+        d2k_session_set_plan(s, p);
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 51600, 443, blind, sizeof blind);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied, "общий план не применён к безымянному Initial");
+        /* Приветствием он не объявлен: имени нет, и выдумывать его нельзя. */
+        CHECK(d2k_session_hellos(s) == 0,
+              "безымянный Initial засчитан приветствием — имени у него нет");
+        d2k_session_free(s);
+    }
+
+    /* План ПО АДРЕСУ — тоже. Имя для него не нужно по построению. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
+              "план по адресу не загрузился");
+        uint32_t dst;
+        uint8_t d[4] = {1, 2, 3, 4};
+        memcpy(&dst, d, 4);
+        d2k_plantab_set_addr(d2k_session_plans(s), dst, 1, p);
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 51601, 443, blind, sizeof blind);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied, "план по адресу не применён к безымянному Initial");
+        d2k_session_free(s);
+    }
+}
+
+/* --- МОЛЧАНИЕ ПО БЕЗЫМЯННОМУ INITIAL ТОЖЕ ПОДОЗРИТЕЛЬНО ------------------
+ *
+ * Поле 19.09.2026: настоящий клиент разбрасывает ClientHello так, что имя из
+ * него не читается. Разбор такого пакета приветствием не считает — и правильно,
+ * имени нет, — но и молчание по нему никем не замечалось: развёртка требовала
+ * saw_hello. Выходило «узнано приветствий 0, подозрений 0» при 91 ушедшей
+ * датаграмме: контроллер о беде не узнавал вовсе и цель по адресу не искал. */
+static void test_nameless_silence(void) {
+    const uint64_t s_ns = 1000000000ull;
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    const uint8_t any[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
+
+    static uint8_t blind[sizeof v1_initial];
+    memcpy(blind, v1_initial, sizeof blind);
+    blind[sizeof blind - 1] ^= 0xff;   /* имя не извлечётся */
+
+    d2k_session *s = d2k_session_new(64, 64);
+    /* Крючок НЕ задаём: направление называет порт 443, как в соседних
+       проверках. С крючком POSTROUTING ответ сервера тоже стал бы
+       «исходящим», и обратная сторона осталась бы невидимой. */
+    /* Обратная сторона видна — иначе молчащим выглядит каждый поток. */
+    size_t n = build_udp_rev_pkt(pkt, 50200, any, sizeof any);
+    d2k_session_packet(s, pkt, n, 1 * s_ns, buf, sizeof buf, &r);
+
+    n = build_udp_pkt(pkt, 50201, 443, blind, sizeof blind);
+    d2k_session_packet(s, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+    CHECK(d2k_session_hellos(s) == 0,
+          "безымянный Initial засчитан приветствием — имени у него нет");
+    /* Повтор по таймеру PTO: клиент всё ещё ждёт ответа. */
+    d2k_session_packet(s, pkt, n, 3 * s_ns, buf, sizeof buf, &r);
+
+    CHECK(d2k_session_sweep(s, 3 * s_ns + 900000000ull) == 0,
+          "неполные две секунды молчания объявлены блокировкой");
+    CHECK(d2k_session_sweep(s, 4 * s_ns + 100000000ull) == 1,
+          "молчание по безымянному Initial не замечено — контроллер о беде не узнает");
+    CHECK(d2k_session_suspects(s) == 1, "подозрение не отмечено");
+    d2k_session_free(s);
+}
+
+/* --- ОТВЕТ ПО БЕЗЫМЯННОМУ ПОТОКУ — ТОЖЕ ОБМЕН ---------------------------
+ *
+ * Поле 19.09.2026, вторая половина: учёт обратной стороны и событие обмена
+ * стояли на saw_hello, которого у безымянного потока нет. Выходило сразу два
+ * вранья: успешные потоки выглядели молчащими («подозрений 8 при восьми
+ * ответах»), а подтверждать адресную цель было нечем — «обменов 0». */
+static void test_nameless_exchange(void) {
+    const uint64_t s_ns = 1000000000ull;
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    static uint8_t blind[sizeof v1_initial];
+    memcpy(blind, v1_initial, sizeof blind);
+    blind[sizeof blind - 1] ^= 0xff;
+
+    d2k_session *s = d2k_session_new(64, 64);
+    size_t n = build_udp_pkt(pkt, 50301, 443, blind, sizeof blind);
+    d2k_session_packet(s, pkt, n, 1 * s_ns, buf, sizeof buf, &r);
+    /* Сервер ответил по ЭТОМУ же потоку. */
+    const uint8_t any[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    n = build_udp_rev_pkt(pkt, 50301, any, sizeof any);
+    d2k_session_packet(s, pkt, n, 1 * s_ns + 50000000ull, buf, sizeof buf, &r);
+
+    CHECK(count_kind_name(s, D2K_JRN_EXCHANGE, NULL) == 1,
+          "ответ по безымянному потоку не дал события обмена — подтверждать нечем");
+    /* И молчащим такой поток больше не выглядит. */
+    d2k_session_packet(s, pkt, n, 2 * s_ns, buf, sizeof buf, &r);
+    CHECK(d2k_session_sweep(s, 10 * s_ns) == 0,
+          "поток, по которому пришёл ответ, объявлен молчащим");
+    CHECK(d2k_session_suspects(s) == 0, "подозрение по отвечающему потоку");
+    d2k_session_free(s);
+}
+
+static void test_discord_voice(void) {
+    /* План, объявленный голосом, датапат принимает и голосу отдаёт. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_voice_declared, sizeof plan_voice_declared, &p,
+                            err, sizeof err) == 0,
+              "план с объявленным протоколом голоса не загрузился");
+        d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)D2K_VOICE_CLASS,
+                                    strlen(D2K_VOICE_CLASS), 1, p, D2K_PLAN_SHAPE_VOICE);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64040, 50004, disc, build_ip_discovery(disc, 0x55));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied, "план, объявленный голосом, голосу не применён");
+        d2k_session_free(s);
+    }
+    /* Узнан — и назван КЛАССОМ, а не доменом. Имени у голоса нет (D2K_SPEC:
+       адресным целям домен не придумывать); «@» в DNS-имени невозможна, так
+       что за имя сайта этот ярлык не сойдёт ни при каком разборе. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64035, 50004, disc, build_ip_discovery(disc, 0x1234));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_hellos(s) == 1, "IP Discovery Дискорда не узнан как начало голоса");
+        CHECK(count_kind_name(s, D2K_JRN_HELLO_SNI, D2K_VOICE_CLASS) == 1,
+              "голос не назван своим классом в журнале");
+        d2k_session_free(s);
+    }
+    /* Похожее, но не то: адрес в запросе не нулевой. Это уже не запрос
+       IP Discovery, и голосом его объявлять нельзя. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        build_ip_discovery(disc, 0x1234);
+        disc[20] = 0x31;
+        size_t n = build_udp_pkt(pkt, 64036, 50004, disc, sizeof disc);
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(d2k_session_hellos(s) == 0, "пакет с ненулевым адресом принят за IP Discovery");
+        d2k_session_free(s);
+    }
+    /* План голоса — под СВОЕЙ формой. План той же метки под формой QUIC
+       голосу не достаётся: подтверждён он был не на нём. */
+    for (int own = 1; own >= 0; own--) {
+        d2k_session *s = d2k_session_new(64, 32);
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &p, err, sizeof err) == 0,
+              "план голоса не загрузился");
+        d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)D2K_VOICE_CLASS,
+                                    strlen(D2K_VOICE_CLASS), 1, p,
+                                    own ? D2K_PLAN_SHAPE_VOICE : D2K_PLAN_SHAPE_QUIC);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64037, 50004, disc, build_ip_discovery(disc, 0x77));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        if (own) {
+            CHECK(r.applied && r.n_out >= 2, "план голоса не применён к IP Discovery");
+        } else {
+            CHECK(!r.applied, "план формы QUIC достался голосу");
+        }
+        d2k_session_free(s);
+    }
+    /* ОТВЕТ СЕРВЕРА — СОБЫТИЕ ОБМЕНА, и приходит он на FORWARD.
+       Подтвердить приём голоса своим зондом нечем (точка молчит посторонним),
+       значит подтверждает только ответ по потоку самого клиента. На FORWARD
+       сторону не назвать ни крючком, ни портом (голос не на 443) — зато поток
+       уже знает, кто его начал: клиент показал IP Discovery. */
+    {
+        d2k_session *s = d2k_session_new(64, 32);
+        uint8_t pkt[256], buf[4096], disc[74];
+        d2k_result r;
+        size_t n = build_udp_pkt(pkt, 64038, 50004, disc, build_ip_discovery(disc, 0x99));
+        d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        uint8_t reply[74];
+        memcpy(reply, disc, sizeof reply);
+        reply[1] = 2;                   /* ответ IP Discovery */
+        n = build_udp_pkt(pkt, 64038, 50004, reply, sizeof reply);
+        swap_udp_ends(pkt);
+        d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+        d2k_session_packet(s, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(count_kind_name(s, D2K_JRN_EXCHANGE, NULL) == 1,
+              "ответ сервера по голосовому потоку не дал события обмена");
+        d2k_session_packet(s, pkt, n, 3000, buf, sizeof buf, &r);
+        CHECK(count_kind_name(s, D2K_JRN_EXCHANGE, NULL) == 1,
+              "обмен по одному потоку объявлен дважды");
+        d2k_session_free(s);
+    }
+}
+
 int main(void) {
     test_direction_by_hook();
+    test_discord_voice();
+    test_nameless_initial();
+    test_nameless_silence();
+    test_nameless_exchange();
 
     /* --- Initial узнаётся, имя уходит контроллеру ТЕМ ЖЕ событием, что и
        для TLS (Step 1, пункт 1 брифа) ------------------------------------ */

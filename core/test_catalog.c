@@ -238,6 +238,44 @@ static void check_two_shapes_of_one_target_survive(void) {
     d2k_catalog_free(&c);
 }
 
+/* ЧЕМ МЕРИЛИ — ЧАСТЬ ЗАПИСИ, А НЕ ПОДРАЗУМЕВАЕМОЕ.
+ *
+ * План выводится из замера, а замер идёт КАКИМИ-ТО байтами: либо снятыми у
+ * настоящего клиента, либо заготовкой холодного старта, когда снимка ещё
+ * нет. Это разные по силе доказательства, и привязка обязана помнить, какое
+ * у неё. Без поля обе выглядели одинаково, и слабая молча выдавалась за
+ * сильную. */
+static void check_input_completeness_survives(void) {
+    d2k_catalog c; char err[200] = {0};
+    CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0,
+          "загрузка перед проверкой полноты входа");
+    if (c.n_boxes == 0 || c.boxes[0].n_binds == 0) {
+        CHECK(0, "в снимке нет привязок — проверять нечего");
+        d2k_catalog_free(&c);
+        return;
+    }
+    /* Старый файл поля не знает — это «не записано», а не «профиль». */
+    CHECK(c.boxes[0].binds[0].input == 0,
+          "у старой записи полнота входа взялась из ниоткуда");
+    char target[256];
+    snprintf(target, sizeof target, "%s", c.boxes[0].binds[0].target);
+    c.boxes[0].binds[0].input = D2K_INPUT_CLIENT;
+    CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-input.json", err, sizeof err) == 0,
+          "запись полноты входа");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load("/tmp/d2k-cat-input.json", &c, err, sizeof err) == 0,
+          "перечитывание полноты входа");
+    int seen = 0;
+    if (c.n_boxes > 0) {
+        for (size_t j = 0; j < c.boxes[0].n_binds; j++) {
+            if (strcmp(c.boxes[0].binds[j].target, target) == 0 &&
+                c.boxes[0].binds[j].input == D2K_INPUT_CLIENT) { seen++; }
+        }
+    }
+    CHECK(seen == 1, "полнота входа не пережила круговой обход");
+    d2k_catalog_free(&c);
+}
+
 /* "Плавающей арифметики нет" (Global Constraints) — дробное число ЛЮБОГО
  * целочисленного поля обязано быть отказом с причиной, а не atof и не
  * молчаливым обрезанием до целой части. */
@@ -495,6 +533,7 @@ int main(void) {
     check_shape_default_zero_on_old_file();
     check_shape_fits_rule();
     check_two_shapes_of_one_target_survive();
+    check_input_completeness_survives();
     check_rejects_float_number();
     check_rejects_oversized_string();
     check_rejects_too_many_signals();

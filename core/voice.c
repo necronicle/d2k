@@ -22,9 +22,13 @@
 
 /* ПОРТЫ ГОЛОСА — ТЕ ЖЕ, ЧТО В БОЕВОМ ПРОФИЛЕ (lib/config_official.sh,
    discord_udp). Разъедутся — зонд начнёт мерить не тот трафик, который
-   обходит движок, и вердикт будет про чужой поток. */
+   обходит движок, и вердикт будет про чужой поток.
+
+   Верхняя граница медиапортов — 50099, как у профиля и у эталонного
+   50-discord-media bol-van (DISCORD_MEDIA_PORT_RANGE). Здесь стояло 50100, а
+   карта переноса уверяла, что диапазоны совпадают. */
 static const struct { uint16_t lo, hi; } voice_ports[] = {
-    { 50000, 50100 },
+    { 50000, 50099 },
     { 1400, 1400 },
     { 3478, 3481 },
     { 5349, 5349 },
@@ -319,20 +323,24 @@ static int voice_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
     return 0;
 }
 
-/* ЖИВ ЛИ ПОТОК К ЭТОЙ ТОЧКЕ — два снимка счётчика пакетов из той же таблицы,
-   откуда берётся цель. Второго источника не заводим: расхождение двух
-   источников про один поток было бы хуже отсутствия второго.
+/* ОТВЕЧАЕТ ЛИ ТОЧКА ЭТОМУ ПОТОКУ — по пометке [UNREPLIED] из той же таблицы,
+   откуда берётся цель (контракт и ответы — в d2k_voice.h).
 
-   Пауза короткая: голос идёт непрерывно (замер 17.09 — пакет каждые 20 мс),
-   и четверти секунды хватает, чтобы счётчик сдвинулся. -1 — потока не видно
-   или таблицы нет: опровергать молчание нечем, и выдумывать нечего. */
-static int voice_alive(const char *ct_path, uint32_t ip, uint16_t port) {
+   Признак, а не счётчик: голосовой поток уходит в железо ([FASTNAT]), и
+   conntrack перестаёт считать (замер 17.09: 5593, 5593, 5593, 5594 за три
+   секунды разговора). Счётчик ИСХОДЯЩИХ при этом годится для порога
+   «молчат»: первые пакеты ядро считает до того, как поток уйдёт в железо. */
+static int voice_alive(const char *ct_path, uint32_t ip, uint16_t port,
+                       uint32_t src_ip, uint16_t sport) {
     d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
     size_t n = d2k_voice_targets(ct_path, t, D2K_VOICE_MAX_TARGETS);
     for (size_t i = 0; i < n; i++) {
-        if (t[i].ip == ip && t[i].port == port) { return t[i].replied ? 1 : 0; }
+        if (t[i].ip != ip || t[i].port != port) { continue; }
+        if (src_ip != 0 && (t[i].src_ip != src_ip || t[i].sport != sport)) { continue; }
+        if (t[i].replied) { return D2K_VOICE_ANSWERS; }
+        return t[i].packets >= D2K_VOICE_SILENT_AFTER ? D2K_VOICE_SILENT : D2K_VOICE_YOUNG;
     }
-    return -1; /* потоков к этой точке не видно — опровергать молчание нечем */
+    return D2K_VOICE_UNSEEN;
 }
 
 d2k_voice_ask_fn d2k_voice_ask_hook = voice_ask;
@@ -385,23 +393,40 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
 
     uint32_t wait_ms = o.wait_ms ? o.wait_ms : VOICE_WAIT_DEFAULT_MS;
 
-    /* ЦЕЛЬ. Адрес задан — берём его; нет — ищем живой разговор. Выдумать
-       голосовой цели домен и померить его нельзя (D2K_SPEC): это померило бы
-       другую цель и назвало чужой результат её именем. */
+    /* КОНТРОЛЬ — ЗАРАНЕЕ, И НЕ ТОЛЬКО РАДИ КОНТРОЛЯ. Его адрес нужен ещё и
+       поиску цели: зонд контроля ходит на 3478, а 3478 входит в голосовые
+       порты профиля. Его поток ложится в таблицу соединений рядом с
+       разговором и живёт там до трёх минут, и взять его целью значило бы
+       мерить самих себя. */
+    const char *ctl = o.control ? o.control : D2K_VOICE_CONTROL_DEFAULT;
+    uint32_t cip = 0;
+    uint16_t cport = 0;
+    int ctl_resolved = (d2k_voice_resolve_hook(ctl, &cip, &cport) == 0);
+
+    /* ЦЕЛЬ — ПОТОК, А НЕ ТОЧКА. Адрес задан — ищем самый нагруженный поток к
+       нему; нет — самый нагруженный разговор вообще. Выдумать голосовой цели
+       домен и померить его нельзя (D2K_SPEC): это померило бы другую цель и
+       назвало чужой результат её именем. */
+    d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
+    size_t n = d2k_voice_targets(o.ct_path, t, D2K_VOICE_MAX_TARGETS);
+    const d2k_voice_target *flow = NULL;
+    for (size_t i = 0; i < n && !flow; i++) {
+        if (ctl_resolved && t[i].ip == cip) { continue; }   /* свой же контроль */
+        if (o.ip && o.port && (t[i].ip != o.ip || t[i].port != o.port)) { continue; }
+        flow = &t[i];
+    }
     r.ip = o.ip;
     r.port = o.port;
     if (r.ip == 0 || r.port == 0) {
-        d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
-        size_t n = d2k_voice_targets(o.ct_path, t, D2K_VOICE_MAX_TARGETS);
-        if (n == 0) {
+        if (!flow) {
             r.verdict = D2K_VOICE_NO_CALL;
             say_reason(&r, "живого разговора не видно. Начните звонок и повторите замер: "
                            "у голоса нет имени, которое можно вписать, и адрес берётся из "
                            "идущего разговора");
             return r;
         }
-        r.ip = t[0].ip;
-        r.port = t[0].port;
+        r.ip = flow->ip;
+        r.port = flow->port;
     }
 
     char addr[24];
@@ -424,21 +449,31 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
      * 0 — поток идёт, ответов нет: вот это и есть блокировка потока.
      * -1 — наблюдать нечего (задан явный адрес, таблицы нет): тогда и только
      *      тогда работает старый зондовый путь, со своей оговоркой. */
-    int obs = d2k_voice_alive_hook(o.ct_path, r.ip, r.port);
-    if (obs == 1) {
+    int obs = d2k_voice_alive_hook(o.ct_path, r.ip, r.port,
+                                   flow ? flow->src_ip : 0, flow ? flow->sport : 0);
+    if (obs == D2K_VOICE_YOUNG) {
+        /* РАНО СУДИТЬ. Ответа нет, но и ушло меньше, чем боевой профиль
+           требует для признания провала (udp_out=4): ответ мог просто не
+           успеть. Это «мало данных», а не блокировка. */
+        r.verdict = D2K_VOICE_UNMEASURED;
+        say_reason(&r, "поток к %s:%u без ответа, но ушло %d из %d пакетов, после которых "
+                       "молчание что-то значит — рано судить, повторите замер через "
+                       "несколько секунд разговора",
+                   addr, r.port, flow ? flow->packets : 0, D2K_VOICE_SILENT_AFTER);
+        return r;
+    }
+    if (obs == D2K_VOICE_ANSWERS) {
         r.verdict = D2K_VOICE_CLEAR;
         say_reason(&r, "разговор с %s:%u идёт, и сервер по нему отвечает", addr, r.port);
         return r;
     }
-    if (obs == 0) {
+    if (obs == D2K_VOICE_SILENT) {
         /* Поток без единого ответа. Контроль нужен ровно затем, чтобы
            отделить «режут этот поток» от «UDP не ходит вовсе». */
-        uint32_t cip0 = 0;
-        uint16_t cport0 = 0;
-        const char *ctl0 = o.control ? o.control : D2K_VOICE_CONTROL_DEFAULT;
+        const char *ctl0 = ctl;
         int ctl_ok = 0, asked0 = 0;
-        if (d2k_voice_resolve_hook(ctl0, &cip0, &cport0) == 0) {
-            d2k_tally c0 = d2k_voice_ask_hook(cip0, cport0, NULL, 0, 0, wait_ms, o.mark,
+        if (ctl_resolved) {
+            d2k_tally c0 = d2k_voice_ask_hook(cip, cport, NULL, 0, 0, wait_ms, o.mark,
                                               D2K_VOICE_REPEATS, NULL);
             r.probes += D2K_VOICE_REPEATS - c0.err;
             if (!c0.marked) { r.marked = 0; }

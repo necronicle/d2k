@@ -26,7 +26,11 @@
 /* Version 4 adds explicit detect/raw.c TCP wire semantics. Legacy plans
  * retain their old header semantics; learned plans are never reinterpreted. */
 /* Version 5 adds a complete TLS/SNI input guard for parametric actions. */
-#define D2K_EXEC_VERSION 5
+/* Версия 6 добавляет ВЫДЕРЖКУ ПЕРЕД ЕДИНСТВЕННОЙ ПОСЫЛКОЙ (REC_DELAY): ни
+ * pace, ни settle её не выражают (см. d2k_plan_internal.h про delay_us).
+ * Понадобилась датаграммам: приветствие QUIC настоящего клиента едет двумя
+ * Initial в 40 мкс друг от друга, и коробка складывает имя из обоих. */
+#define D2K_EXEC_VERSION 6
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_SCHEMA_MAX   1
 

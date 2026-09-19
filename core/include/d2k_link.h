@@ -95,6 +95,19 @@ typedef struct {
                                кодирована», обычный отказ применить план */
     uint32_t num;           /* EXCHANGE: сколько байт; ACK: (ok<<8)|reason */
     uint8_t  seen_types;    /* EXCHANGE: маска встреченных типов, бит (тип-20) */
+    /* SUSPECT: ПРИМЕНЯЛСЯ ЛИ ПЛАН К ПОТОКУ, о котором подозрение.
+     *
+     * 0 — не сказано (старая служба поля не шлёт), 1 — применялся, 2 — нет.
+     * Числа те же, что D2K_PLANNED_* в datapath/d2k_journal.h.
+     *
+     * Без этого поля подозрение о потоке, начатом ДО установки плана, было
+     * неотличимо от настоящей деградации подтверждённой цели: поле 18.09.2026
+     * дало «подозрение при подтверждённом плане» через две секунды после
+     * подтверждения, при том что клиент тут же получал 200. */
+    uint8_t  planned;
+#define D2K_LINK_PLANNED_UNKNOWN 0
+#define D2K_LINK_PLANNED_YES     1
+#define D2K_LINK_PLANNED_NO      2
     /* EXCHANGE: сервер прислал ServerHello — ПРИЁМКА вопроса.
      *
      * Отдельно от seen_types, потому что это другое утверждение: маска
@@ -241,6 +254,12 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
  * датаграмм, ради которых он и ставился, и молча увеличивал shape_misses. */
 #define D2K_LINK_SHAPE_QUIC 3
 
+/* Форма и ярлык голоса Дискорда — те же значения, что D2K_PLAN_SHAPE_VOICE и
+ * D2K_VOICE_CLASS в datapath/d2k_plans.h; почему ярлык класса, а не домен и не
+ * адрес, — там же. */
+#define D2K_LINK_SHAPE_VOICE 5
+#define D2K_LINK_VOICE_CLASS "@discord-voice"
+
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
                        const char *plan_text, uint8_t shape,
                        char *err, size_t errcap);
@@ -291,6 +310,10 @@ int  d2k_link_del_name(int fd, const char *name, char *err, size_t errcap);
  * их — терять подтверждённое. */
 int  d2k_link_set_addr(int fd, const uint8_t ip4[4], const char *plan_text,
                        char *err, size_t errcap);
+
+/* Снимает только адресную запись (DEL_ADDR, четыре байта сетевого порядка).
+ * Текстовый IP в DEL_NAME адресную таблицу не затрагивает. */
+int  d2k_link_del_addr(int fd, const uint8_t ip4[4], char *err, size_t errcap);
 
 /* Типы TLS-записей, встречающиеся в EXCHANGE (§8 спецификации,
  * docs/spec/2026-09-06-c-engine-design.md). Это НЕ протокол управляющего

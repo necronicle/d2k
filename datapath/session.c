@@ -9,6 +9,7 @@
  * Времена в наносекундах целыми. Плавающей арифметики на пакетном пути нет.
  */
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -279,7 +280,14 @@ static void suspect(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     }
     fl->suspected = 1;
     s->suspects++;
-    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, det, NULL, 0, NULL);
+    /* ПРИМЕНЯЛСЯ ЛИ ПЛАН К ЭТОМУ ПОТОКУ — говорим всегда (см. d_planned в
+       d2k_journal.h). Знает это только датапат, и без его слова контроллер
+       считает деградацией подтверждённой цели любое подозрение, в том числе
+       о потоке, начатом до установки плана. */
+    d2k_jrn_detail d;
+    if (det) { d = *det; } else { memset(&d, 0, sizeof d); }
+    d.planned = fl->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
+    d2k_journal_add(s->jrn, at_ns, k, D2K_JRN_SUSPECT, code, 0, &d, NULL, 0, NULL);
 }
 
 /* Зовётся при забвении потока по молчанию. Приветствие ушло, ответа с той
@@ -298,12 +306,30 @@ static void on_flow_expire(void *ctx, const d2k_flow *f) {
         return;
     }
     s->suspects++;
-    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, NULL, NULL, 0, NULL);
+    d2k_jrn_detail d;
+    memset(&d, 0, sizeof d);
+    d.planned = f->plan_done ? D2K_PLANNED_YES : D2K_PLANNED_NO;
+    d2k_journal_add(s->jrn, f->last_ns, &f->key, D2K_JRN_SUSPECT, D2K_SUSPECT_SILENT, 0, &d, NULL, 0, NULL);
 }
 
 static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
            (uint32_t)p[2] << 8 | (uint32_t)p[3];
+}
+
+/* ЗАПРОС IP DISCOVERY ГОЛОСА ДИСКОРДА — первый пакет голосового потока.
+ *
+ * Ровно 74 байта: тип 0x0001, длина 70, SSRC, 64 байта адреса и порт; в
+ * ЗАПРОСЕ адрес ещё не заполнен, и 64 байта нулевые. Правило то же, что у
+ * движка z2k (IsDiscordIpDiscoveryRequest, nfq2/protocol.c), — по нему боевой
+ * профиль discord_udp голос и узнаёт. Порт не проверяется: сигнатура строгая
+ * (74 байта и 64 нуля подряд), а порты ограничивает правило очереди. */
+static int is_discord_ip_discovery(const uint8_t *d, size_t n) {
+    if (n != 74 || d[0] != 0 || d[1] != 1 || d[2] != 0 || d[3] != 70) { return 0; }
+    for (size_t i = 8; i < 72; i++) {
+        if (d[i] != 0) { return 0; }
+    }
+    return 1;
 }
 
 /* --- QUIC/UDP: та же склейка, что и для TCP выше, для другого транспорта --
@@ -567,6 +593,16 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            обратно на порт. */
         from_client = (s->hook == D2K_HOOK_FORWARD) ? -1 : 0;
     }
+    /* FORWARD НА ЛЮБОМ ПОРТУ: ПОТОК УЖЕ ЗНАЕТ, КТО ЕГО НАЧАЛ.
+       Порт уликой работает только на 443; у голоса Дискорда его нет вовсе
+       (клиент эфемерный, сервер 50004), и ответ сервера на FORWARD уходил в
+       «направление неизвестно» — поток выглядел безответным при живом
+       разговоре. Но начинатель потока уже назван: он показал приветствие
+       (Initial или IP Discovery) на исходящем крючке. Та же улика, что у
+       TCP-ветки (init_low), и только когда она есть. */
+    if (from_client < 0 && fl->dir_known) {
+        from_client = (src_is_low == fl->init_low) ? 1 : 0;
+    }
     if (from_client == 0 || (from_client < 0 && src_is_443 && !dst_is_443)) {
         /* СЕРВЕРНАЯ СТОРОНА. Разбирать её как клиентский Initial нельзя (см.
            выше), а вот УЧЕСТЬ обязаны — и это не бухгалтерия ради полноты.
@@ -582,8 +618,23 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
            приветствий 4, подозрений 0). */
         fl->rev_pkts++;
         s->rev_seen[slot_of(17)] = 1;
-        if (fl->saw_hello) {
+        /* saw_initial — тот же поток, только имя не прочиталось (d2k_track.h).
+           Ответ по нему — такой же ответ: без этого успешный поток выглядел
+           молчащим, а подтверждать адресную цель было нечем (поле 19.09). */
+        if (fl->saw_hello || fl->saw_initial) {
             fl->rev_after_hello++;
+            /* ОБМЕН ПО UDP — ПЕРВЫЙ ОТВЕТ ПОСЛЕ ПРИВЕТСТВИЯ, один раз на поток.
+               QUIC обходился без этого события: его план подтверждает свой
+               зонд. Голосу подтверждаться нечем, кроме ответа по потоку самого
+               клиента — точка Дискорда посторонним не отвечает (поле 17.09).
+               Пустых датаграмм у UDP нет, поэтому любая оттуда — ответ; это
+               тот же критерий, что у боевого профиля (udp_in=1). */
+            if (!fl->exchange_told) {
+                fl->exchange_told = 1;
+                s->exchanges++;
+                d2k_journal_add(s->jrn, now_ns, &key, D2K_JRN_EXCHANGE, 0,
+                                (uint32_t)payload_len, NULL, NULL, 0, NULL);
+            }
         }
         out->skipped = "датаграмма едет от сервера — не клиентский Initial";
         return;
@@ -602,7 +653,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        повтор, новый Initial после Retry), а дальше разбор ничего не найдёт
        и будет чистой тратой на каждом пакете загрузки. */
     fl->fwd_pkts++; /* счётчик попыток разбора клиентской стороны потока */
-    if (fl->saw_hello) {
+    if (fl->saw_hello || fl->saw_initial) {
         /* Клиент шлёт ЕЩЁ, уже показав приветствие, — повтор Initial по
            таймеру PTO. Половина критерия «шлём, а молчат» (см. d2k_track.h).
            Считается ДО раннего выхода ниже: там поток с разобранным
@@ -642,8 +693,13 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         return;
     }
 
-    if (!d2k_quic_is_initial(pkt + payload_off, payload_len)) {
-        out->skipped = "не QUIC Initial";
+    /* ГОЛОС ИЛИ QUIC. Дальше путь общий — имя, журнал, план, исполнение, — и
+       различаются только имя и форма: у QUIC имя из Initial, у голоса —
+       ярлык класса (D2K_VOICE_CLASS в d2k_plans.h про то, почему не домен и
+       не адрес). */
+    int voice = is_discord_ip_discovery(pkt + payload_off, payload_len);
+    if (!voice && !d2k_quic_is_initial(pkt + payload_off, payload_len)) {
+        out->skipped = "не QUIC Initial и не голос Дискорда";
         return;
     }
 
@@ -657,12 +713,31 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        saw_hello и не пишет в журнал НИЧЕГО — ни узнанного имени, ни «имени
        нет»: со следующей датаграммой этого же потока попытка честно
        повторится, пока не кончится окно. */
+    /* БЕЗ ИМЕНИ — НО НЕ БЕЗ ПЛАНА.
+     *
+     * Поле 19.09.2026: настоящий клиент (curl/ngtcp2) разбрасывает ClientHello
+     * по множеству мелких кадров CRYPTO в разнобой, поперёк ДВУХ
+     * Initial-датаграмм; разбор собирает CRYPTO лишь внутри одной датаграммы и
+     * держит восемь кусков (см. d2k_quic.h), поэтому имя не извлекается ни из
+     * одной. Здесь стоял выход — и к такому потоку не применялся НИКАКОЙ план,
+     * даже поставленный ПО АДРЕСУ или общий (--plan): за прогон «узнано
+     * приветствий 0» при 91 ушедшей датаграмме.
+     *
+     * Имя при этом не выдумывается и приветствием пакет не объявляется:
+     * счётчики, журнал и снимок остаются нетронутыми (§2.4 — «не измерено» не
+     * превращается в факт). Но план, который про имя не спрашивает, обязан
+     * достаться: у плана по адресу имени нет по построению, у общего — тем
+     * более. */
     char name[256];
-    if (d2k_quic_sni(pkt + payload_off, payload_len, name, sizeof name) != 0) {
-        out->skipped = "имя не извлечено из Initial";
-        return;
+    int named = 1;
+    if (voice) {
+        snprintf(name, sizeof name, "%s", D2K_VOICE_CLASS);
+    } else if (d2k_quic_sni(pkt + payload_off, payload_len, name, sizeof name) != 0) {
+        named = 0;
+        name[0] = '\0';
     }
     size_t name_len = strlen(name);
+    uint8_t seen_shape = voice ? D2K_PLAN_SHAPE_VOICE : D2K_PLAN_SHAPE_QUIC;
 
     /* Направление уже доказано портом выше, ДО попытки разбора содержимого;
        успешный разбор здесь доказывает отдельный, независимый факт — что
@@ -678,9 +753,18 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        та же самая цель того же потока, и удваивать счётчики, событие журнала
        и снимок значило бы рассказывать контроллеру о двух обращениях там, где
        было одно. */
-    int first_hello = !fl->saw_hello;
-    fl->saw_hello = 1;
-    fl->had_sni = 1;
+    int first_hello = named && !fl->saw_hello;
+    if (named) {
+        fl->saw_hello = 1;
+        fl->had_sni = 1;
+    } else if (!fl->saw_initial) {
+        /* Имени нет — приветствием не объявляем (счётчики, журнал и снимок не
+           трогаем), но молчание по этому потоку замечать обязаны: см.
+           saw_initial в d2k_track.h. Срок молчания считается от ПЕРВОГО такого
+           Initial, как и у приветствия с именем. */
+        fl->saw_initial = 1;
+        fl->hello_ns = now_ns;
+    }
     if (first_hello) {
         fl->hello_ns = now_ns;
         /* Те же счётчики и то же событие журнала, что и для TLS
@@ -700,7 +784,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
 
        Слот свой (см. slot_of): TLS-приветствие и Initial — разные байты
        разной формы, и отдавать одно вместо другого нельзя. */
-    {
+    if (named && !voice) {
         size_t k = slot_of(17);
         if (payload_len <= sizeof s->last_hello[k]) {
             memcpy(s->last_hello[k], pkt + payload_off, payload_len);
@@ -741,9 +825,10 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        что назвал контроллер, и переворачивать по дороге нечего. */
     uint16_t sport_be;
     memcpy(&sport_be, u + 0, 2);
-    const d2k_plan *use = d2k_plantab_find_sport(s->plans, (const uint8_t *)name,
+    const d2k_plan *use = d2k_plantab_find_sport(s->plans,
+                                                 named ? (const uint8_t *)name : NULL,
                                                  name_len, dst_be, now_ns,
-                                                 D2K_PLAN_SHAPE_QUIC, sport_be);
+                                                 seen_shape, sport_be);
     if (!use) {
         use = s->plan;
     }
@@ -1107,10 +1192,13 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
        это законная отметка часов, и опираться на неё значит терять первый же
        поток, начавшийся в начале отсчёта. */
     if (syn && !ack) {
-        if (!fl->saw_syn) {
-            fl->syn_ns = now_ns;
-            fl->syn_seq = rd32(t + 4);
-        }
+        /* SYN без ACK — граница соединений на этой пятёрке, а не «первый
+           увиденный пакет». Прежде начало потока бралось только при первом
+           SYN, и следующее соединение в той же ячейке жило с чужим ISN и
+           чужими отметками (см. d2k_track_new_connection). */
+        d2k_track_new_connection(fl);
+        fl->syn_ns = now_ns;
+        fl->syn_seq = rd32(t + 4);
         fl->saw_syn = 1;
     }
     if (syn && ack) {
@@ -1617,7 +1705,8 @@ void d2k_session_note_unassembled(d2k_session *s, const uint8_t *p, size_t n,
     /* НЕ ЧАЩЕ ОДНОГО РАЗА НА ПОТОК: отпускается несколько пакетов, а событие
        про них одно. Потока может и не быть в таблице — тогда сказать нечего,
        и выдумывать ключ незачем. */
-    if (!fl || fl->noted_unassembled) { return; }
+    if (!fl) { return; }
+    if (fl->noted_unassembled) { return; }
     fl->noted_unassembled = 1;
     /* ЧИСЛА — В ЛОГ, А НЕ В ЖУРНАЛ: журнал хранит УКАЗАТЕЛЬ на текст, не
        копию, и локальный буфер там повис бы. А числа нужны: они отличают
@@ -1649,7 +1738,7 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     /* Do not retain a tail of an already-passed stream or guess direction.
        Only a first payload anchored by the observed client SYN qualifies. */
     if (!fl || !fl->saw_syn || !fl->dir_known || fl->init_low != v.src_low ||
-        fl->saw_hello || fl->stream_attempted || fl->damaged) {
+        fl->damaged) {
         return 0;
     }
 
@@ -1670,6 +1759,12 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
      * цели которого план уже есть. */
     int at_head = (v.seq == fl->syn_seq + 1);
     uint32_t off = v.seq - (fl->syn_seq + 1);
+
+    /* Пометки закрывают поток для НОВОГО удержания, и этого достаточно:
+       кусок, пришедший к УЖЕ открытому слоту, берётся самим удержанием
+       независимо от этого ответа (allow_start решает только «заводить ли
+       слот», см. d2k_hold_feed). */
+    if (fl->saw_hello || fl->stream_attempted) { return 0; }
     if (!at_head && off >= HOLD_EARLY_WINDOW) { return 0; }
     if (at_head) {
         /* Голова обязана начинать запись TLS — иначе это не приветствие, а
@@ -1684,16 +1779,38 @@ int d2k_session_hold_candidate(d2k_session *s, const uint8_t *p, size_t n) {
     /* Разбирать имеет смысл только голову: у хвоста заголовка записи нет, и
        имя из него не достать. Для него план ищется по адресу и порту — этого
        достаточно, чтобы не удерживать чужие потоки. */
-    if (at_head) { d2k_tls_parse(p + v.header, v.payload, &tls); }
+    if (at_head) {
+        d2k_tls_parse(p + v.header, v.payload, &tls);
+        /* ИМЯ УЖЕ ЗДЕСЬ — ДЕРЖАТЬ НЕЧЕГО.
+         *
+         * Удержание нужно ради одного: получить имя, которого в этом куске
+         * нет. Когда имя в нём есть, план выбирается и применяется прямо
+         * сейчас, а ожидание остатка не добавляет ничего — и стоит дорого.
+         *
+         * Замер 18.09.2026 на живой линии, три прогона подряд: пока голова
+         * лежит в очереди без вердикта, ОСТАТОК ЯДРО НЕ ВЫПУСКАЕТ. Счётчики
+         * удержания назвали это прямо — «добавлено к голове=0, несовместимых=0,
+         * с другой стороны=0» при «начато=2, таймаутов=2 (пакетов в них=2)»:
+         * второй сегмент до слота не доходил вовсе, его не отвергали. А без
+         * удержания те же два сегмента уходят на провод через 130-220 мкс
+         * друг за другом (дамп ppp0 того же прогона). Удержание головы само
+         * отрезало себе то, чего ждало: сборка не завершалась никогда, план
+         * не применялся, и каждое приветствие получало лишние 100 мс.
+         *
+         * Поле говорит и о цене этого правила: «имя уехало во второй сегмент»
+         * за все прогоны — ноль раз. Составная сборка остаётся ровно для того
+         * случая, ради которого написана. */
+        if (tls.have_sni) { return 0; }
+    }
     int candidate = d2k_plan_stream_input(s->plan) ||
         d2k_plantab_stream_candidate(s->plans,
             tls.have_sni ? p + v.header + tls.sni_off : NULL,
             tls.have_sni ? tls.sni_len : 0, v.dst_be, v.sport_be);
     /* Also mark a failed capacity attempt: its head must not be held later
-       after we have already released it unchanged.
-       ТОЛЬКО ДЛЯ ГОЛОВЫ: пометка закрывает потоку удержание навсегда, и
-       поставить её на ХВОСТ значило бы отнять у головы её же попытку —
-       ровно наоборот тому, ради чего хвост и стали удерживать. */
+       after we have already released it unchanged. */
+    /* stream_attempted — только у головы: пометка закрывает потоку удержание
+       навсегда, и ставить её на хвост значило бы отнять у головы её же
+       попытку. */
     if (candidate && at_head) { fl->stream_attempted = 1; }
     return candidate;
 }
@@ -1839,7 +1956,9 @@ static void sweep_one(void *ctx, d2k_flow *f) {
  * секунды), то есть условие про повтор к сроку выполнимо, а не мертво. */
 static void sweep_udp_one(void *ctx, d2k_flow *f) {
     struct sweep_ctx *c = ctx;
-    if (!f->saw_hello || f->silence_told || f->suspected) {
+    /* saw_initial — тот же поток, только имя из Initial не прочиталось
+       (см. d2k_track.h). Молчание по нему — наблюдение не хуже прочих. */
+    if ((!f->saw_hello && !f->saw_initial) || f->silence_told || f->suspected) {
         return;
     }
     if (f->rev_after_hello > 0) {

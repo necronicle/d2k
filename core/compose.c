@@ -1445,6 +1445,41 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
     return 0;
 }
 
+int d2k_quic_delay_plan(char *buf, size_t cap) {
+    if (!buf || cap == 0) { return -1; }
+    size_t pos = 0;
+    /* minexec=6: выдержку перед единственной посылкой старый исполнитель не
+       знает и молча выпустил бы её без паузы (см. d2k_plan.h). */
+    if (append_fmt(buf, cap, &pos,
+                   "d2k-plan 1 6\nid 00000000000000000000000000000000\n"
+                   "proto udp quic\ndelay %u\n",
+                   (unsigned)D2K_QUIC_DELAY_US) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+int d2k_voice_plan(const uint8_t *decoy, size_t dlen, char *buf, size_t cap) {
+    if (!decoy || dlen == 0 || !buf || cap == 0) { return -1; }
+    size_t pos = 0;
+    if (emit_header_proto(buf, cap, &pos, "udp voice") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
+    if (append_hex(buf, cap, &pos, decoy, dlen) != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "\npoison 1\n") != 0) { return -1; }
+    /* Та же фигура, что у плеча QUIC: перед правдой, без паузы между
+       копиями, выдержка перед правдой — pace. */
+    if (append_fmt(buf, cap, &pos,
+                   "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
+                   (unsigned)D2K_VOICE_DECOY_REPEATS) != 0) {
+        return -1;
+    }
+    if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
+    if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap, char *buf, size_t cap) {
     fb_arm a;
@@ -1507,7 +1542,28 @@ int d2k_arm_plan_measured(const d2k_arm *a, const d2k_arm_input *in,
             "split payload_start +1\nsplit sni_middle +0\norder reverse\npace 12000\n",
             (unsigned)D2K_ARM_SEGMENT_MAX);
     }
-    if (append_fmt(buf, cap, &pos,
+    /* ВХОД ПРИШПИЛИВАЕТСЯ К ДЛИНЕ ТОЛЬКО ТАМ, ГДЕ ПЛАН ОТ НЕЁ ЗАВИСИТ.
+     *
+     * От входа зависят приманка (её длина считается от n) и перестановка
+     * (разрез уезжает в план ЧИСЛОМ, снятым с этого приветствия). Плечо без
+     * них — чистое перекрытие — не содержит ни одного такого числа: длина
+     * приставки своя, порядок прямой, разрезов нет.
+     *
+     * Прежде пришпиливались все плечи кроме чистой перестановки, и цена
+     * этого измерена в поле 18.09.2026: приветствие Discord 1534 байта при
+     * MSS 1388 приходит ДВУМЯ сегментами, к первому план с пришпиленной
+     * длиной не применяется вовсе («план неприменим к этому пакету» на зонде
+     * подтверждения), а дождаться второго нельзя — пока первый лежит в
+     * очереди без вердикта, ядро остаток не выпускает. Найденный замером
+     * приём «seqovl-1» так и не доезжал до провода. */
+    int param = !fake && !between && !disorder &&
+                in->sni_off > 0 && in->sni_len > 1;
+    if (param) {
+        if (append_fmt(buf, cap, &pos,
+            "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\n"
+            "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
+            (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }
+    } else if (append_fmt(buf, cap, &pos,
         "d2k-plan 1 4\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
         n, in->sni_off, in->sni_len, (unsigned)D2K_ARM_SEGMENT_MAX)) { return -1; }

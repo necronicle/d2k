@@ -351,7 +351,74 @@ static int nat_stub(const char *path, uint8_t proto,
     return 0;
 }
 
+/* --- ПОДОЗРЕНИЕ ГОВОРИТ, ПРИМЕНЯЛСЯ ЛИ ПЛАН К ЭТОМУ ПОТОКУ ----------------
+ *
+ * Поле 18.09.2026: через две секунды после «ПОДТВЕРЖДЕНО» приходило
+ * «подозрение при подтверждённом плане — наблюдение прекращаю», хотя клиент
+ * тут же получал 200 четыре раза подряд. Подозрение было о потоке, начатом
+ * ДО того, как план доехал до датапата: такой поток шёл без обхода, и уликой
+ * против плана он не является.
+ *
+ * Отличить их может только датапат: он один знает, применялся ли план к
+ * ЭТОМУ потоку. Три состояния, а не два: «не сказано» нужно для старой
+ * службы, где поля ещё нет, — иначе её подозрения молча сменили бы смысл. */
+static const d2k_jrn_entry *last_suspect(const d2k_session *s) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = d2k_journal_count(j);
+    for (size_t i = n; i > 0; i--) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i - 1);
+        if (e && e->kind == D2K_JRN_SUSPECT) { return e; }
+    }
+    return NULL;
+}
+
+static void test_suspect_tells_planned(void) {
+    uint8_t hello[512];
+    size_t hl = build_hello(hello);
+
+    /* План стоит и применился — подозрение по ЭТОМУ потоку улика настоящая. */
+    {
+        d2k_session *s = d2k_session_new(64, 64);
+        d2k_plan *p = NULL;
+        char err[160];
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &p,
+                            err, sizeof err) == 0, "план не загрузился");
+        d2k_session_set_plan(s, p);
+        uint8_t pkt[1024], buf[8192];
+        d2k_result r;
+        size_t pn = build_pkt(pkt, 47700, 0x18, hello, hl);
+        d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
+        CHECK(r.applied, "план не применился — проверять нечего");
+        /* Два повтора того же приветствия: клиент ждёт ответа. */
+        d2k_session_packet(s, pkt, pn, 2000, buf, sizeof buf, &r);
+        d2k_session_packet(s, pkt, pn, 3000, buf, sizeof buf, &r);
+        const d2k_jrn_entry *e = last_suspect(s);
+        CHECK(e != NULL, "подозрение по повтору приветствия не записано");
+        CHECK(e && e->d_planned == D2K_PLANNED_YES,
+              "подозрение молчит о том, что план к этому потоку применялся");
+        d2k_session_free(s);
+    }
+
+    /* Плана не было вовсе — подозрение о таком потоке про план не говорит. */
+    {
+        d2k_session *s = d2k_session_new(64, 64);
+        uint8_t pkt[1024], buf[8192];
+        d2k_result r;
+        size_t pn = build_pkt(pkt, 47701, 0x18, hello, hl);
+        d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
+        CHECK(!r.applied, "план взялся ниоткуда");
+        d2k_session_packet(s, pkt, pn, 2000, buf, sizeof buf, &r);
+        d2k_session_packet(s, pkt, pn, 3000, buf, sizeof buf, &r);
+        const d2k_jrn_entry *e = last_suspect(s);
+        CHECK(e != NULL, "подозрение по повтору приветствия не записано");
+        CHECK(e && e->d_planned == D2K_PLANNED_NO,
+              "поток без плана объявлен таким, к которому план применялся");
+        d2k_session_free(s);
+    }
+}
+
 int main(void) {
+    test_suspect_tells_planned();
     d2k_session *s = d2k_session_new(64, 32);
     CHECK(s != NULL, "сессия не создалась");
     if (!s) {
@@ -1098,6 +1165,13 @@ int main(void) {
     {
         uint8_t whole[2048], part[2100], saved[2100];
         size_t whole_len = build_hello_pad(whole, 1544);
+        /* РЕЖЕМ ДО ИМЕНИ. Удержание существует ровно для куска, в котором
+           имени ещё нет: когда имя в первом сегменте, план применяется к нему
+           сразу и ждать остатка незачем (см. d2k_session_hold_candidate).
+           Сорок байт — заведомо меньше, чем смещение server_name у любого
+           приветствия: до него одних только записи, заголовка, версии и
+           random больше сорока. */
+        const uint32_t HEAD1 = 40;
         const size_t cuts[] = {1, 4, 8, 60, 64, 70, 1448, 1544};
         const uint8_t name[] = "hetzner.com";
         for (size_t j = 0; j < sizeof cuts / sizeof cuts[0]; j++) {
@@ -1161,9 +1235,9 @@ int main(void) {
             }
         }
         {
-            /* Even with an installed input-tls plan, completion on a tail
-               is NOT permission to send a reconstructed hello after its
-               original head has already passed. Whole-packet path still works. */
+            /* ПЕРВЫЙ СЕГМЕНТ ПРИВЕТСТВИЯ — ЗАКОННЫЙ ВХОД ПЛАНА, а вот сборка,
+               завершившаяся на ХВОСТЕ, разрешением послать пересобранное
+               приветствие не является: голова уже ушла на провод. */
             static const uint8_t strict_plan[] = {
                 'D','2','K','P', 0,1, 0,5, 0,0, 0,8,
                 0,2, 0,2, 6,1,                 /* TCP/TLS */
@@ -1185,8 +1259,12 @@ int main(void) {
                 gp = NULL;
                 size_t pn = build_pkt(part, 47500, 0x18, whole, 1448);
                 d2k_session_packet(g, part, pn, 1, buf, sizeof buf, &r);
-                CHECK(!r.applied && !r.n_out && r.verdict == D2K_VERDICT_ACCEPT,
-                      "strict plan consumed incomplete head");
+                /* Имя в сегменте есть — план применяется к нему, а остаток
+                   уйдёт следом сам. Ждать остаток нельзя: пока сегмент лежит
+                   в очереди без вердикта, ядро его не выпускает (поле
+                   18.09.2026). */
+                CHECK(r.applied && r.n_out > 0 && r.verdict == D2K_VERDICT_DROP,
+                      "план не применён к первому сегменту составного приветствия");
                 pn = build_pkt(part, 47500, 0x18, whole + 1448, whole_len - 1448);
                 wr32(part + 24, 2448);
                 d2k_session_packet(g, part, pn, 2, buf, sizeof buf, &r);
@@ -1222,8 +1300,8 @@ int main(void) {
                         /* Хвост. Записи TLS он не начинает (первый байт не 22)
                            и стоит не сразу за SYN — по прежнему правилу не
                            кандидат. */
-                        pn = build_pkt(part, 47503, 0x18, whole + 1448, whole_len - 1448);
-                        wr32(part + 24, 2449);
+                        pn = build_pkt(part, 47503, 0x18, whole + HEAD1, whole_len - HEAD1);
+                        wr32(part + 24, 1001 + HEAD1);
                         int a2 = d2k_session_hold_candidate(g, part, pn);
                         CHECK(a2, "хвост приветствия, пришедший первым, не удержан — "
                                   "он уйдёт голым в коробку");
@@ -1233,7 +1311,7 @@ int main(void) {
                               "хвост не взят в удержание");
 
                         /* Голова. Слот уже есть, и она обязана его дособрать. */
-                        pn = build_pkt(part, 47503, 0x18, whole, 1448);
+                        pn = build_pkt(part, 47503, 0x18, whole, HEAD1);
                         wr32(part + 24, 1001);
                         CHECK(d2k_hold_feed(h2, 91, part, pn, 9,
                                             d2k_session_plan_revision(g), 0, 1001, 1,
@@ -1313,7 +1391,9 @@ int main(void) {
                         pn = build_pkt(part, 47505, 0x02, NULL, 0);
                         d2k_session_packet(g, part, pn, 14, buf, sizeof buf, &r);
                         pn = build_pkt(part, 47505, 0x18, tricky + 1448, tw - 1448);
-                        wr32(part + 24, 2449);
+                        /* Здесь разрез свой, 1448: набор про БАЙТ 0x16 в
+                           начале хвоста, а не про место имени. */
+                        wr32(part + 24, 1001 + 1448);
                         int a4 = d2k_session_hold_candidate(g, part, pn);
                         int rc4 = d2k_hold_feed(h4, 95, part, pn, 15,
                                                 d2k_session_plan_revision(g), a4, 1001, 1,
@@ -1332,6 +1412,124 @@ int main(void) {
                     }
                 }
 
+                /* КУСКИ ПРИВЕТСТВИЯ В ЛЮБОМ ПОРЯДКЕ, И ЗАГОЛОВОК — У ГОЛОВЫ.
+                 *
+                 * Живая линия 18.09, зонд подтверждения d2k. На проводе оба
+                 * сегмента, а в датапат попадал только первый: он уходил в
+                 * удержание и ТУТ ЖЕ разбирался сессией как приветствие, на
+                 * потоке взводился saw_hello — и второй кусок отсекался
+                 * раньше всех проверок. Сборка не завершалась, удержание
+                 * отпускало взятое по таймауту, план не применялся, и рабочий
+                 * обход выбрасывался собственным подтверждением. */
+                {
+                    d2k_hold *h2 = d2k_hold_new();
+                    d2k_hold_batch b2;
+                    CHECK(h2 != NULL, "hold allocation for out-of-order case");
+                    if (h2) {
+                        pn = build_pkt(part, 47503, 0x02, NULL, 0);
+                        d2k_session_packet(g, part, pn, 7, buf, sizeof buf, &r);
+
+                        /* Голова уходит в удержание — и сессии НЕ отдаётся:
+                           d2kd на удержанном пакете обрывает обработку
+                           (hr == 1 → continue). Отдать его здесь значило бы
+                           проверять поведение, которого у службы нет. */
+                        pn = build_pkt(part, 47503, 0x18, whole, HEAD1);
+                        wr32(part + 24, 1001);
+                        int a1 = d2k_session_hold_candidate(g, part, pn);
+                        CHECK(a1, "голова составного приветствия не удержана");
+                        CHECK(d2k_hold_feed(h2, 90, part, pn, 8,
+                                            d2k_session_plan_revision(g), a1, 1001, 1,
+                                            hold_release, g, &b2) == 1,
+                              "голова не взята в удержание");
+
+                        /* Хвост. НОВОГО удержания он не открывает — попытку по
+                           этому потоку уже сделала голова, и второй слот на
+                           тот же поток был бы ошибкой. Но к УЖЕ открытому
+                           слоту он обязан попасть: allow_start решает только
+                           «заводить ли слот». */
+                        pn = build_pkt(part, 47503, 0x18, whole + HEAD1, whole_len - HEAD1);
+                        wr32(part + 24, 1001 + HEAD1);
+                        int a2 = d2k_session_hold_candidate(g, part, pn);
+                        CHECK(!a2, "хвост открыл ВТОРОЕ удержание того же потока");
+                        CHECK(d2k_hold_feed(h2, 91, part, pn, 9,
+                                            d2k_session_plan_revision(g), a2, 1001, 1,
+                                            hold_release, g, &b2) == 2,
+                              "приветствие не собралось из двух кусков");
+                        CHECK(b2.count == 2,
+                              "собраны не оба куска — один ушёл бы на провод без плана");
+                        /* Номер последовательности — ГОЛОВЫ: верные байты на
+                           неверных позициях потока сервер выбросит как уже
+                           полученные. */
+                        CHECK(rd32(b2.packet + 24) == 1001,
+                              "в собранном пакете номер последовательности не головы");
+                        d2k_hold_free(h2);
+                    }
+                }
+
+                /* Тот же поток, но куски приходят В ОБРАТНОМ ПОРЯДКЕ. */
+                {
+                    d2k_hold *h3 = d2k_hold_new();
+                    d2k_hold_batch b3;
+                    CHECK(h3 != NULL, "hold allocation for reversed case");
+                    if (h3) {
+                        pn = build_pkt(part, 47504, 0x02, NULL, 0);
+                        d2k_session_packet(g, part, pn, 10, buf, sizeof buf, &r);
+                        pn = build_pkt(part, 47504, 0x18, whole + HEAD1, whole_len - HEAD1);
+                        wr32(part + 24, 1001 + HEAD1);
+                        int a3 = d2k_session_hold_candidate(g, part, pn);
+                        CHECK(a3, "хвост, пришедший первым, не удержан — он уйдёт голым");
+                        CHECK(d2k_hold_feed(h3, 92, part, pn, 11,
+                                            d2k_session_plan_revision(g), a3, 1001, 1,
+                                            hold_release, g, &b3) == 1,
+                              "хвост не взят в удержание");
+                        pn = build_pkt(part, 47504, 0x18, whole, HEAD1);
+                        wr32(part + 24, 1001);
+                        CHECK(d2k_hold_feed(h3, 93, part, pn, 12,
+                                            d2k_session_plan_revision(g), 0, 1001, 1,
+                                            hold_release, g, &b3) == 2,
+                              "приветствие не собралось из кусков в обратном порядке");
+                        CHECK(b3.count == 2 && rd32(b3.packet + 24) == 1001,
+                              "обратный порядок: собрано не всё или номер не головы");
+                        d2k_hold_free(h3);
+                    }
+                }
+
+                /* КУСОК С ИМЕНЕМ НЕ УДЕРЖИВАЕТСЯ, ХОТЯ ЗАПИСЬ И НЕ ЦЕЛАЯ.
+                   Ждать остаток незачем: план по имени выбирается уже сейчас.
+                   А на живой линии ожидание ещё и невыполнимо — пока голова
+                   без вердикта, ядро остатка не выпускает (замер 18.09,
+                   «добавлено к голове=0»). */
+                {
+                    pn = build_pkt(part, 47511, 0x02, NULL, 0);
+                    d2k_session_packet(g, part, pn, 13, buf, sizeof buf, &r);
+                    pn = build_pkt(part, 47511, 0x18, whole, 1448);
+                    wr32(part + 24, 1001);
+                    d2k_tls_info t1;
+                    d2k_tls_parse(whole, 1448, &t1);
+                    CHECK(t1.have_sni && !t1.have_record_end,
+                          "набор испорчен: в голове 1448 байт нет имени или запись целая");
+                    CHECK(!d2k_session_hold_candidate(g, part, pn),
+                          "кусок с именем ушёл в удержание — остаток за ним не выйдет");
+                }
+
+                /* НОВОЕ СОЕДИНЕНИЕ НА ТОЙ ЖЕ ПЯТЁРКЕ — НОВОЕ НАЧАЛО ПОТОКА.
+                   Запись потока живёт дольше соединения: порт возвращается в
+                   оборот, и следующее соединение попадает в ТУ ЖЕ ячейку. Всё,
+                   что запомнено о прошлом (начало потока, приветствие было,
+                   попытку удержания уже делали), к новому отношения не имеет:
+                   якорь показывал бы на чужой ISN, а удержание было закрыто
+                   навсегда. */
+                pn = build_pkt(part, 47504, 0x02, NULL, 0);
+                wr32(part + 24, 5000);
+                d2k_session_packet(g, part, pn, 13, buf, sizeof buf, &r);
+                pn = build_pkt(part, 47504, 0x18, whole, HEAD1);
+                wr32(part + 24, 5001);
+                uint32_t anc = 0;
+                CHECK(d2k_session_stream_anchor(g, part, pn, &anc) && anc == 5001,
+                      "новое соединение взяло начало потока от прошлого");
+                CHECK(d2k_session_hold_candidate(g, part, pn),
+                      "новое соединение закрыто отметками прошлого");
+
                 /* The explicit owning path is allowed to execute the WHOLE
                    held hello, once, using its first seq/ACK and normal NAT. */
                 d2k_hold *h = d2k_hold_new();
@@ -1340,14 +1538,14 @@ int main(void) {
                 if (h) {
                     pn = build_pkt(part, 47502, 0x02, NULL, 0);
                     d2k_session_packet(g, part, pn, 4, buf, sizeof buf, &r);
-                    pn = build_pkt(part, 47502, 0x18, whole, 1448);
+                    pn = build_pkt(part, 47502, 0x18, whole, HEAD1);
                     wr32(part + 24, 1001);
                     int allow = d2k_session_hold_candidate(g, part, pn);
                     CHECK(allow, "installed measured plan did not enable hold");
                     CHECK(d2k_hold_feed(h, 80, part, pn, 5, d2k_session_plan_revision(g),
                         allow, 0, 0, hold_release, g, &batch) == 1, "first piece not owned");
-                    pn = build_pkt(part, 47502, 0x18, whole + 1448, whole_len - 1448);
-                    wr32(part + 24, 2449);
+                    pn = build_pkt(part, 47502, 0x18, whole + HEAD1, whole_len - HEAD1);
+                    wr32(part + 24, 1001 + HEAD1);
                     CHECK(d2k_hold_feed(h, 81, part, pn, 6, d2k_session_plan_revision(g),
                         0, 0, 0, hold_release, g, &batch) == 2, "held hello not completed");
                     CHECK(batch.count == 2 && batch.ids[0] == 80 && batch.ids[1] == 81,
@@ -1385,7 +1583,7 @@ int main(void) {
                        unmodified originals, no synthetic application. */
                     pn = build_pkt(part, 47503, 0x02, NULL, 0);
                     d2k_session_packet(g, part, pn, 13, buf, sizeof buf, &r);
-                    pn = build_pkt(part, 47503, 0x18, whole, 1448);
+                    pn = build_pkt(part, 47503, 0x18, whole, HEAD1);
                     wr32(part + 24, 1001);
                     allow = d2k_session_hold_candidate(g, part, pn);
                     CHECK(allow, "second hold not enabled");

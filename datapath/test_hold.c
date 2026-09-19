@@ -94,6 +94,16 @@ int main(void) {
     CHECK(nreleased==32 && d2k_hold_next(h)==0);
     d2k_hold_stats stats; d2k_hold_get_stats(h,&stats);
     CHECK(stats.pending==0 && stats.ready==2 && stats.full==2 && stats.timed_out==1);
+    /* ПРИЧИНА ОТПУСКАНИЯ НАЗЫВАЕТСЯ, А НЕ УГАДЫВАЕТСЯ. Общее «отпущено» не
+       отличает истёкший срок от смены плана и от сброса очереди, а на живой
+       линии это три разных диагноза: ждали и не дождались, план переставили
+       под носом, ядро потеряло пакеты. */
+    /* Куски, дошедшие до ОТКРЫТОГО слота, считаются отдельно от начатых. */
+    CHECK(stats.joined==12);     /* все куски, попавшие к УЖЕ открытой группе */
+    CHECK(stats.mismatched==2);  /* несовместимый ack и девятый сверх ёмкости */
+    CHECK(stats.sided==0);       /* обратной стороны в этом наборе нет */
+    CHECK(stats.plan_changed==1);   /* d2k_hold_flush(h,9,2,...) */
+    CHECK(stats.dropped_all==D2K_HOLD_SLOTS); /* завершающий flush all=1 */
     /* One failed verdict cannot stop remaining releases or become success. */
     uint32_t ids[]={1,2,3};
     CHECK(d2k_hold_verdicts(ids,3,0,verdict,NULL)==1);

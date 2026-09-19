@@ -278,6 +278,11 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             body[n++] = e->d_tos;
             body[n++] = (uint8_t)(e->d_ipid >> 8);
             body[n++] = (uint8_t)e->d_ipid;
+            /* Седьмым байтом — применялся ли план к ЭТОМУ потоку
+               (D2K_PLANNED_*, см. d2k_journal.h). Разбор у контроллера длину
+               проверяет, а не предполагает: событие без этого байта — законный
+               вход от старой службы. */
+            body[n++] = e->d_planned;
             break;
         case D2K_JRN_PLAN_APPLIED:
             /* Prepared, not yet sent. Never expose this as positive proof. */

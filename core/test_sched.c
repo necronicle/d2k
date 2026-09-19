@@ -365,6 +365,24 @@ static void drain(void) {
 
 static void forget_sent(void) { sent_len = 0; }
 
+/* Count complete commands from the real scheduler socket, not a byte pattern
+   inside a plan. Used to distinguish removal of name and address keys. */
+static size_t sent_command_count(uint16_t kind, const uint8_t *body, size_t len) {
+    size_t count = 0;
+    for (size_t off = 0; off + 6 <= sent_len;) {
+        const uint8_t *p = sentbuf + off;
+        uint32_t n = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        if (n < 2 || n > sent_len - off - 4) { break; }
+        uint16_t type = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+        if (type == kind && (!body || (n == len + 2 && memcmp(p + 6, body, len) == 0))) {
+            count++;
+        }
+        off += 4 + n;
+    }
+    return count;
+}
+
 /* Идентификатор ПОСЛЕДНЕГО отправленного плана — прямо с провода.
  *
  * Планировщик подставляет его в запись REC_ID кандидата перед отправкой
@@ -2612,8 +2630,66 @@ int main(void) {
            измеренного (§2.4). */
         CHECK(bd != NULL && bd->shape == (uint8_t)D2K_SHAPE_MODERN,
               "измеренная форма затёрта нулём от клиента, чьё приветствие не снято");
+
         d2k_sched_free(s);
         d2k_catalog_free(&cC);
+    }
+
+    /* --- ПОДОЗРЕНИЕ БЕЗ ПРИМЕНЁННОГО ПЛАНА — НЕ ДЕГРАДАЦИЯ ---------------
+     *
+     * Поле 18.09.2026: через две секунды после «ПОДТВЕРЖДЕНО» приходило
+     * «подозрение при подтверждённом плане — наблюдение прекращаю», хотя
+     * клиент тут же получал 200 четыре раза подряд. Тот поток был начат ДО
+     * того, как план доехал до датапата: он шёл без обхода и про план не
+     * говорит ничего. Различить их может только датапат — он один знает,
+     * применялся ли план к ЭТОМУ потоку (ev->planned). */
+    {
+        d2k_catalog cG;
+        memset(&cG, 0, sizeof cG);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        d2k_sched *s = d2k_sched_new(&cG, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для проверки деградации не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 40310;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(6, 40310, "деградация.цель");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40310);
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 40310);
+            d2k_sched_event(s, &ap);
+            spin(s, 40);
+            CHECK(binding_of(&cG, "деградация.цель", 6) != NULL,
+                  "цель не подтверждена — проверять деградацию не на чем");
+
+            /* Второй поток той же цели: приветствие по нему датапат прислал,
+               значит имя известно и подозрение дойдёт до задачи. */
+            d2k_ev h2 = ev_hello(6, 40311, "деградация.цель");
+            d2k_sched_event(s, &h2);
+            saidbuf[0] = '\0';
+
+            d2k_ev sn = ev_suspect(6, 40311);
+            sn.planned = D2K_LINK_PLANNED_NO;
+            d2k_sched_event(s, &sn);
+            CHECK(!said("наблюдение прекращаю"),
+                  "поток, шедший БЕЗ плана, объявлен деградацией подтверждённой цели");
+            CHECK(said("план НЕ ПРИМЕНЯЛСЯ"),
+                  "не сказано, почему подозрение уликой не считается");
+
+            d2k_ev sy = ev_suspect(6, 40311);
+            sy.planned = D2K_LINK_PLANNED_YES;
+            d2k_sched_event(s, &sy);
+            CHECK(said("наблюдение прекращаю"),
+                  "подозрение о потоке С применённым планом не признано деградацией");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cG);
     }
 
     /* --- контекст проверки записан в привязке (задача 5) ---------------- */
@@ -2746,6 +2822,531 @@ int main(void) {
               "наблюдение завело привязку — заводить её может только подтверждение");
         d2k_sched_free(s);
         d2k_catalog_free(&cE);
+    }
+
+    /* --- ЧЕМ МЕРИЛИ, ТО И ЗАПИСАНО (полнота входа, пункт 3) ------------ */
+    {
+        /* План выводится из ЗАМЕРА, а замер идёт какими-то байтами. Со
+           снимком это настоящее приветствие клиента; без снимка — заготовка
+           холодного старта: форма та же, байты не те. Коробка вправе смотреть
+           на содержимое, а не только на длину (§6), поэтому доказательства
+           разной силы, и привязка обязана помнить, какое у неё. */
+        d2k_catalog cI;
+        memset(&cI, 0, sizeof cI);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        confirm_once(&cI, sv[0], "холодная.цель", 40150);
+        const d2k_cat_binding *bd = binding_of(&cI, "холодная.цель", 6);
+        CHECK(bd != NULL && bd->input == D2K_INPUT_PROFILE,
+              "замер заготовкой записан как замер байтами клиента");
+        CHECK(said("ЗАГОТОВКОЙ холодного старта"),
+              "слабость входа не названа вслух — из отчёта её не узнать");
+        d2k_catalog_free(&cI);
+
+        d2k_catalog cJ;
+        memset(&cJ, 0, sizeof cJ);
+        saidbuf[0] = '\0';
+        d2k_sched *s = d2k_sched_new(&cJ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для замера снимком не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 40151;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "снятая.цель",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "снимок для замера не собрался");
+            d2k_sched_event(s, &sh);
+            d2k_ev h = ev_hello(6, 40151, "снятая.цель");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40151);
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 40151);
+            d2k_sched_event(s, &ap);
+            spin(s, 40);
+            const d2k_cat_binding *b2 = binding_of(&cJ, "снятая.цель", 6);
+            CHECK(b2 != NULL && b2->input == D2K_INPUT_CLIENT,
+                  "замер снятыми байтами клиента записан как замер заготовкой");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cJ);
+    }
+
+    /* --- СЛАБЫЙ ВХОД ПЕРЕМЕРЯЕТСЯ, КОГДА ПРИХОДИТ СНИМОК --------------- */
+    {
+        /* Обещание «перемеряю снимком» обязано быть механизмом, а не
+           оговоркой в отчёте: пока привязка добыта заготовкой, байты
+           настоящего клиента не проверял никто. */
+        d2k_catalog cK;
+        memset(&cK, 0, sizeof cK);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        d2k_sched *s = d2k_sched_new(&cK, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для перемера не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 40160;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(6, 40160, "перемерю.цель");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40160);
+            d2k_sched_event(s, &su);
+            settle(s);
+            d2k_ev ap = ev_applied(6, 40160);
+            d2k_sched_event(s, &ap);
+            spin(s, 40);
+            const d2k_cat_binding *bd = binding_of(&cK, "перемерю.цель", 6);
+            CHECK(bd != NULL && bd->input == D2K_INPUT_PROFILE,
+                  "холодный старт не записан заготовкой — перемерять нечего");
+
+            /* Датапат снял приветствие этой цели. */
+            ver_answer_port = 40161;
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "перемерю.цель",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "снимок для перемера не собрался");
+            d2k_sched_event(s, &sh);
+            CHECK(said("перемеряю снимком"),
+                  "снимок пришёл, а обещанного перемера не случилось");
+            settle(s);
+            d2k_ev ap2 = ev_applied(6, 40161);
+            d2k_sched_event(s, &ap2);
+            spin(s, 40);
+            bd = binding_of(&cK, "перемерю.цель", 6);
+            CHECK(bd != NULL && bd->input == D2K_INPUT_CLIENT,
+                  "перемер снимком не поднял полноту входа привязки");
+            CHECK(bindings_of(&cK, "перемерю.цель", 6) == 1,
+                  "перемер завёл вторую привязку вместо обновления прежней");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cK);
+    }
+
+    /* --- QUIC БЕЗ ЧИТАЕМОГО ИМЕНИ: ЦЕЛЬ ПО АДРЕСУ --------------------------
+     *
+     * Поле 19.09.2026: настоящий клиент разбрасывает ClientHello так, что имя
+     * из него не читается ни датапатом, ни коробкой. Подозрение о таком потоке
+     * приходит БЕЗ имени, и искать по имени нечего — но адрес известен, а
+     * приём разноса датаграмм (delay) от имени цели не зависит вовсе.
+     *
+     * Подтверждает, как и голос, следующий поток самого клиента: зонд тут не
+     * годится — он ходит своим приветствием, которое коробка как раз читает,
+     * и его судьба о судьбе клиента не говорит. */
+    {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ;
+        memset(&cQ, 0, sizeof cQ);
+        saidbuf[0] = '\0';
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для адресной цели не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_calls = vol_calls = 0;
+            ver_calls = 0;
+            forget_sent();
+            /* Приветствия по этому потоку НЕ было: имя не прочиталось. */
+            d2k_ev su = ev_suspect(17, 40400);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            CHECK(said("цель беру ПО АДРЕСУ"),
+                  "подозрение без имени по QUIC не завело адресной цели");
+            CHECK(ver_calls == 0,
+                  "по адресной цели QUIC пошёл зонд, чья судьба о клиенте не говорит");
+
+            d2k_ev ap = ev_applied(17, 40401);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 40401, 0);
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            const d2k_cat_binding *bd = binding_of(&cQ, "127.0.0.1", 17);
+            CHECK(bd != NULL, "ответ по потоку клиента не записал адресную привязку");
+            CHECK(bd != NULL && strcmp(bd->kind, "addr") == 0,
+                  "привязка записана по имени, хотя имени у цели нет");
+            CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
+                  "адресная цель подтверждена не трафиком клиента");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* Одинаковый план не делает две адресные цели одной задачей. События
+       приходят от ВТОРОЙ цели раньше первой: чужой APPLIED + её же EXCHANGE
+       не должны записать успех первой задачи, даже при равных plan_id.
+       Отдельный прогон добавляет чужой порт: один дефект не маскирует другой. */
+    for (int wrong_port = 0; wrong_port < 2; wrong_port++) {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ;
+        memset(&cQ, 0, sizeof cQ);
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик двух адресных целей не завёлся");
+        if (s) {
+            forget_sent();
+            d2k_ev a = ev_suspect(17, 40410);
+            d2k_sched_event(s, &a);
+            spin(s, 2);
+            uint8_t first_id[D2K_PLAN_ID_LEN] = {0};
+            CHECK(last_plan_id(first_id), "первая адресная цель не получила план");
+            d2k_ev b = ev_suspect(17, 40411);
+            b.low_ip[3] = 2;
+            d2k_sched_event(s, &b);
+            spin(s, 2);
+            uint8_t second_id[D2K_PLAN_ID_LEN] = {0};
+            CHECK(last_plan_id(second_id), "вторая адресная цель не получила план");
+            CHECK(memcmp(first_id, second_id, sizeof first_id) == 0,
+                  "стенд должен воспроизводить одинаковые планы разных целей");
+
+            d2k_ev ap = ev_applied(17, 40412);
+            d2k_ev ex = ev_exchange(17, 40412, 0);
+            /* Тот же IP, но другой сервис — не наш опыт. */
+            if (wrong_port) {
+                ap.low_port = ex.low_port = 8443;
+                d2k_sched_event(s, &ap);
+                d2k_sched_event(s, &ex);
+                spin(s, 2);
+                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
+                      "чужой порт подтвердил адресную цель");
+            }
+
+            ap = ev_applied(17, 40413);
+            ex = ev_exchange(17, 40413, 0);
+            ap.low_ip[3] = ex.low_ip[3] = 2;
+            d2k_sched_event(s, &ap);
+            d2k_sched_event(s, &ex);
+            spin(s, 2);
+            CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
+                  "ответ второй IP-цели подтвердил первую по общему plan_id");
+            CHECK(binding_of(&cQ, "127.0.0.2", 17) != NULL,
+                  "собственный ответ второй IP-цели потерян");
+
+            ap = ev_applied(17, 40414);
+            memcpy(ap.plan_id, first_id, sizeof first_id);
+            ex = ev_exchange(17, 40414, 0);
+            d2k_sched_event(s, &ap);
+            d2k_sched_event(s, &ex);
+            spin(s, 2);
+            CHECK(binding_of(&cQ, "127.0.0.1", 17) != NULL,
+                  "собственный ответ первой IP-цели потерян");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* Жизненный цикл адресного кандидата: срок, молчание и деградация.
+       Это проверки маршрутизации/очистки, не доказательство QUIC-handshake. */
+    for (int outcome = 0; outcome < 4; outcome++) {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 443;
+        d2k_catalog cQ = {0};
+        d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик жизненного цикла адресной цели не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            d2k_ev su = ev_suspect(17, 40420);
+            d2k_sched_event(s, &su);
+            spin(s, 2);
+            CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
+                  "адресный кандидат не установлен");
+            d2k_ev ap = ev_applied(17, 40421);
+            if (outcome) { d2k_sched_event(s, &ap); }
+            if (outcome >= 2) {
+                d2k_ev ex = ev_exchange(17, 40421, 0);
+                d2k_sched_event(s, &ex);
+                spin(s, 2);
+                CHECK(binding_of(&cQ, "127.0.0.1", 17) != NULL,
+                      "не подготовлена подтверждённая адресная задача");
+            }
+            forget_sent();
+            if (outcome == 1) {
+                /* Молчание чужого потока не завершает наш опыт. */
+                d2k_ev other = ev_suspect(17, 40422);
+                d2k_sched_event(s, &other);
+                spin(s, 2);
+                CHECK(!said("не пробил"), "чужое молчание завершило адресный опыт");
+                su = ev_suspect(17, 40421);
+                d2k_sched_event(s, &su);
+                spin(s, 2);
+                CHECK(said("не пробил"), "молчание своего адресного опыта проигнорировано");
+            } else if (outcome == 3) {
+                su.planned = D2K_LINK_PLANNED_NO;
+                d2k_sched_event(s, &su);
+                CHECK(d2k_sched_active(s) == 1,
+                      "поток без плана прекратил наблюдение адресной цели");
+                su.planned = D2K_LINK_PLANNED_YES;
+                d2k_sched_event(s, &su);
+                CHECK(d2k_sched_active(s) == 0,
+                      "адресная цель игнорирует деградацию подтверждённого плана");
+                d2k_sched_event(s, &su);
+                spin(s, 2);
+                CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
+                      "после деградации адресная цель не возобновила испытание");
+            } else {
+                skip_ahead(s, 10 * 60 * 1000 + 1);
+            }
+            drain();
+            const uint8_t addr[4] = {127, 0, 0, 1};
+            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
+                  "очистка адресной задачи отправляет DEL_NAME");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR, addr, sizeof addr) ==
+                      (size_t)(outcome < 2 ? 1 : 0),
+                  "адресный кандидат не снят либо снят подтверждённый план");
+            if (outcome < 2) {
+                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
+                      "неудачный адресный опыт создал привязку");
+            }
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cQ);
+        g_server_port = saved_port;
+    }
+
+    /* --- ГОЛОС: ИСПЫТАНИЕ НА САМОМ РАЗГОВОРЕ -------------------------------
+       Зонда у голоса нет: точка Дискорда молчит посторонним (поле 17.09), и
+       ни замер, ни подтверждение своим обращением невозможны. Единственный
+       оракул — ответ сервера по потоку САМОГО клиента. Поэтому кандидат
+       ставится на класс голоса для всех потоков, а решает следующий поток
+       разговора: пришёл ответ — подтверждено, молчание — не пробил. */
+    {
+        uint16_t saved_port = g_server_port;
+        g_server_port = 50004;
+        d2k_catalog cV;
+        memset(&cV, 0, sizeof cV);
+        saidbuf[0] = '\0';
+        d2k_sched *s = d2k_sched_new(&cV, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для голоса не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            tcp_calls = vol_calls = 0;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(17, 40200, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 40200);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            CHECK(said("на самом разговоре"),
+                  "голос не ушёл на испытание разговором");
+            CHECK(sent_has(D2K_LINK_VOICE_CLASS), "кандидат голоса не поставлен на класс");
+            CHECK(tcp_calls == 0 && ver_calls == 0,
+                  "по голосу пошёл замер или зонд, которые мерить его не могут");
+            CHECK(!said("жду форму приветствия"),
+                  "голос принят за QUIC и ждёт снимка Initial");
+            /* Следующий поток разговора: план применился, сервер ответил. */
+            d2k_ev ap = ev_applied(17, 40201);
+            d2k_sched_event(s, &ap);
+            d2k_ev ex = ev_exchange(17, 40201, 0);
+            d2k_sched_event(s, &ex);
+            spin(s, 20);
+            const d2k_cat_binding *bd = binding_of(&cV, D2K_LINK_VOICE_CLASS, 17);
+            CHECK(bd != NULL, "ответ сервера по голосу с приёмом не записал привязку");
+            CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
+                  "голос подтверждён не разговором клиента — а другого подтверждения у него нет");
+            CHECK(bd != NULL && bd->shape == (uint8_t)D2K_LINK_SHAPE_VOICE,
+                  "привязка голоса записана не под его форму");
+            CHECK(said("ПОДТВЕРЖДЕНО разговором"), "подтверждение голоса не названо");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cV);
+
+        /* Тот же путь, но поток разговора с приёмом МОЛЧИТ. */
+        d2k_catalog cW;
+        memset(&cW, 0, sizeof cW);
+        saidbuf[0] = '\0';
+        s = d2k_sched_new(&cW, sv[0], 0x2d);
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            d2k_ev h = ev_hello(17, 40210, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 40210);
+            d2k_sched_event(s, &su);
+            spin(s, 20);
+            drain();
+            d2k_ev h2 = ev_hello(17, 40211, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h2);
+            d2k_ev ap = ev_applied(17, 40211);
+            d2k_sched_event(s, &ap);
+            d2k_ev su2 = ev_suspect(17, 40211);
+            d2k_sched_event(s, &su2);
+            spin(s, 20);
+            CHECK(binding_of(&cW, D2K_LINK_VOICE_CLASS, 17) == NULL,
+                  "молчание разговора с приёмом записано подтверждением");
+            CHECK(said("не пробил"), "провал приёма голоса не назван");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cW);
+        g_server_port = saved_port;
+    }
+
+    /* --- СНИМОК, ПРИШЕДШИЙ ВО ВРЕМЯ ЗАМЕРА, НЕ ПРОПАДАЕТ ---------------
+       Поле 18.09.2026, discord.com: замер начат заготовкой в 1534 байта, а
+       снимок настоящего клиента (321 байт, одним сегментом) пришёл в ту же
+       секунду — ПОСЛЕ старта. Форма у обоих современная, поэтому повтор по
+       расхождению формы не сработал, а крючок на наблюдение ещё не
+       существовал: привязка легла заготовкой при снимке на руках. Приём тот
+       же, но доказан он не на том, что шлёт клиент. */
+    {
+        d2k_catalog cL;
+        memset(&cL, 0, sizeof cL);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        d2k_sched *s = d2k_sched_new(&cL, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для позднего снимка не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 40180;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(6, 40180, "поздний.снимок");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40180);
+            d2k_sched_event(s, &su);
+            /* Замер уже идёт заготовкой — и тут снимок. */
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "поздний.снимок",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "поздний снимок не собрался");
+            d2k_sched_event(s, &sh);
+            for (int round = 0; round < 3; round++) {
+                settle(s);
+                d2k_ev ap = ev_applied(6, 40180);
+                d2k_sched_event(s, &ap);
+                spin(s, 40);
+            }
+            const d2k_cat_binding *bd = binding_of(&cL, "поздний.снимок", 6);
+            CHECK(bd != NULL, "поздний снимок: подтверждения нет вовсе");
+            CHECK(bd != NULL && bd->input == D2K_INPUT_CLIENT,
+                  "снимок пришёл во время замера, а привязка легла заготовкой");
+            CHECK(bindings_of(&cL, "поздний.снимок", 6) == 1,
+                  "повтор завёл вторую привязку вместо обновления прежней");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cL);
+    }
+
+    /* --- СНИМОК, ПРИШЕДШИЙ ВО ВРЕМЯ ИСПЫТАНИЯ, ТОЖЕ НЕ ПРОПАДАЕТ ---------
+       Третий порядок событий: замер кончился, кандидат испытывается — и тут
+       снимок. Повтор после замера уже прошёл, крючок наблюдения ещё не
+       взведён; без отдельной проверки у подтверждения привязка легла бы
+       заготовкой при снимке на руках. */
+    {
+        d2k_catalog cM;
+        memset(&cM, 0, sizeof cM);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        d2k_sched *s = d2k_sched_new(&cM, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для снимка во время испытания не завёлся");
+        if (s) {
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 40190;
+            ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(6, 40190, "снимок.при.испытании");
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 40190);
+            d2k_sched_event(s, &su);
+            settle(s);   /* замер кончился, кандидат на испытании */
+            d2k_ev sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = D2K_EV_SHAPE;
+            sh.transport = 6;
+            CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, "снимок.при.испытании",
+                                         sh.shape, sizeof sh.shape, &sh.shape_len) == 0,
+                  "снимок при испытании не собрался");
+            d2k_sched_event(s, &sh);
+            for (int round = 0; round < 3; round++) {
+                d2k_ev ap = ev_applied(6, 40190);
+                d2k_sched_event(s, &ap);
+                spin(s, 40);
+                settle(s);
+            }
+            const d2k_cat_binding *bd = binding_of(&cM, "снимок.при.испытании", 6);
+            CHECK(bd != NULL, "снимок при испытании: подтверждения нет вовсе");
+            CHECK(bd != NULL && bd->input == D2K_INPUT_CLIENT,
+                  "снимок пришёл во время испытания, а привязка осталась заготовкой");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cM);
+    }
+
+    /* --- ДВЕ ФОРМЫ ОДНОЙ ЦЕЛИ ЕДУТ ДАТАПАТУ КАЖДАЯ СО СВОЕЙ ------------
+       Область применимости (пункт 3): успех, добытый одной формой, не
+       переносится на другую. С двумя зондами (TLS 1.3 и TLS 1.2) у одной цели
+       законно бывают две привязки — браузер и старый клиент, — и каждая
+       обязана уехать под СВОЕЙ формой. Датапат держит запись на имя+форму
+       (test_plans.c), здесь проверяется, что контроллер ему это и шлёт. */
+    {
+        d2k_catalog cF;
+        memset(&cF, 0, sizeof cF);
+        saidbuf[0] = '\0';
+        tcp_answer = D2K_V_PREFIX;
+        ver_answer = D2K_VER_APPLICATION;
+        ver_fail_first = 0;
+        confirm_once(&cF, sv[0], "две.формы", 40170);
+        d2k_cat_binding *m = binding_mut(&cF, "две.формы", 6);
+        CHECK(m != NULL && m->shape == (uint8_t)D2K_SHAPE_MODERN,
+              "первая привязка не современной формы — проверять нечего");
+        if (m && cF.n_boxes == 1) {
+            d2k_cat_box *b = &cF.boxes[0];
+            d2k_cat_binding *grown = realloc(b->binds, (b->n_binds + 1) * sizeof *grown);
+            CHECK(grown != NULL, "не хватило памяти на вторую форму");
+            if (grown) {
+                b->binds = grown;
+                b->binds[b->n_binds] = b->binds[0];
+                b->binds[b->n_binds].shape = (uint8_t)D2K_SHAPE_LEGACY;
+                b->n_binds++;
+            }
+        }
+        d2k_sched *s = d2k_sched_new(&cF, sv[0], 0x2d);
+        CHECK(s != NULL, "планировщик для двух форм не завёлся");
+        if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            forget_sent();
+            (void)d2k_sched_sync(s);
+            sync_out(s);
+            CHECK(said("поставлено планов по подтверждённым привязкам: 2"),
+                  "из двух форм одной цели поставлена не каждая");
+            /* На проводе SET_NAME: длина имени, имя, байт формы, план. */
+            char want_modern[64], want_legacy[64];
+            size_t nl = strlen("две.формы");
+            snprintf(want_modern, sizeof want_modern, "%c%s%c",
+                     (char)nl, "две.формы", (char)D2K_SHAPE_MODERN);
+            snprintf(want_legacy, sizeof want_legacy, "%c%s%c",
+                     (char)nl, "две.формы", (char)D2K_SHAPE_LEGACY);
+            CHECK(sent_has(want_modern), "современная форма цели не уехала датапату");
+            CHECK(sent_has(want_legacy),
+                  "старая форма цели не уехала датапату — её клиент останется без обхода");
+            d2k_sched_free(s);
+        }
+        d2k_catalog_free(&cF);
     }
 
     /* --- снимок приветствия не уходит на ЧУЖОЙ транспорт --------------- */

@@ -844,6 +844,8 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_u8(j, &out->shape, "binding.shape", err, errcap);
     if (strcmp(key, "verified_by") == 0)
         return jparse_u8(j, &out->verified_by, "binding.verified_by", err, errcap);
+    if (strcmp(key, "input") == 0)
+        return jparse_u8(j, &out->input, "binding.input", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
@@ -1155,7 +1157,8 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        такое же состояние записи, как измеренное, и молчать о нём значило бы
        делать вид, что поля нет вовсе. */
     wr_indent(f, depth + 1); fprintf(f, "\"shape\": %u,\n", (unsigned)bd->shape);
-    wr_indent(f, depth + 1); fprintf(f, "\"verified_by\": %u\n", (unsigned)bd->verified_by);
+    wr_indent(f, depth + 1); fprintf(f, "\"verified_by\": %u,\n", (unsigned)bd->verified_by);
+    wr_indent(f, depth + 1); fprintf(f, "\"input\": %u\n", (unsigned)bd->input);
     wr_indent(f, depth); fputc('}', f);
 }
 

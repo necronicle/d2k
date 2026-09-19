@@ -799,6 +799,45 @@ static void test_decoy_is_derived(void) {
           "цена лестницы посчитана не по её ступеням");
 }
 
+/* --- ПЛАН ГОЛОСА: приманка перед IP Discovery --------------------------
+ *
+ * Та же фигура, что у плеча QUIC, — приманка отдельными датаграммами ПЕРЕД
+ * первым пакетом потока, — только первый пакет другой: запрос IP Discovery
+ * Дискорда. Протокол объявлен своим словом, и датапат отдаёт такой план
+ * только голосу (форма D2K_PLAN_SHAPE_VOICE). Копий — десять: унаследовано у
+ * боевого профиля discord_udp (strategy=1, «рабочий референс»). */
+static void test_voice_plan(void) {
+    uint8_t decoy[1200];
+    for (size_t i = 0; i < sizeof decoy; i++) { decoy[i] = (uint8_t)(i * 7 + 1); }
+    decoy[0] = 0xc3;
+    char plan[8192], hex[16384], err[160];
+    CHECK(d2k_voice_plan(decoy, sizeof decoy, plan, sizeof plan) == 0,
+          "план голоса не собрался");
+    CHECK(strstr(plan, "proto udp voice") != NULL, "план голоса объявил не свой протокол");
+    CHECK(strstr(plan, "place=before") != NULL, "приманка голоса не перед правдой");
+    CHECK(strstr(plan, "repeats=10") != NULL,
+          "число копий не унаследовано у боевого профиля (10)");
+    CHECK(strstr(plan, "c3080f") != NULL, "байты приманки не доехали в план");
+    CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
+          "грамматика не приняла план голоса");
+    CHECK(d2k_voice_plan(NULL, 0, plan, sizeof plan) != 0,
+          "план голоса собрался без приманки");
+}
+
+/* --- ПЛАН РАЗНОСА INITIAL-ДАТАГРАММ ------------------------------------ */
+static void test_quic_delay_plan(void) {
+    char plan[2048], hex[8192], err[160];
+    CHECK(d2k_quic_delay_plan(plan, sizeof plan) == 0, "план разноса не собрался");
+    CHECK(strstr(plan, "proto udp quic") != NULL, "план разноса объявил не тот протокол");
+    CHECK(strstr(plan, "delay 15000") != NULL,
+          "выдержка не унаследована у D2K_PACE_SETTLE_US");
+    CHECK(strstr(plan, "payload") == NULL,
+          "в плане разноса завелась приманка — резать и подменять датаграмму нечем");
+    CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
+          "грамматика не приняла план разноса");
+    CHECK(d2k_quic_delay_plan(plan, 10) != 0, "план собрался в буфер на десять байт");
+}
+
 int main(void) {
     /* Сохраняем боевые крючки — они же используются другими тестами при
        линковке в один процесс (см. Makefile: test_quic_arms собирает
@@ -839,6 +878,8 @@ int main(void) {
     test_real_ttl_hook_on_wire();
 
     test_arm_to_plan();
+    test_voice_plan();
+    test_quic_delay_plan();
 
     if (fails == 0) {
         printf("плечи QUIC: все проверки прошли\n");

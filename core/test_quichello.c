@@ -17,6 +17,7 @@
 #include "d2k_hello.h"
 #include "d2k_quic.h"
 #include "d2k_quichello.h"
+#include "d2k_quicconn.h"
 #include "d2k_quicwire.h"
 #include "test_quic_vector.h"
 
@@ -445,6 +446,33 @@ int main(void) {
         CHECK(d2k_qw_hdr_parse(pkt, hlen + 1 + 100 + 16, 0, &h) == 0 &&
               h.type == D2K_QW_LT_INITIAL && h.version == D2K_QW_V2,
               "тип Initial версии 2 не пережил круг сборка-разбор");
+    }
+
+    /* ПЕРВЫЙ INITIAL СВОИМ СТЕКОМ — БАЙТЫ, А НЕ СОЕДИНЕНИЕ.
+       Нужен приманкой голоса: коробка узнаёт голос по первому пакету потока,
+       а боевой профиль z2k ставит перед ним Initial QUIC чужим блобом
+       (quic_dbankcloud). Чужих блобов d2k не берёт; настоящий Initial у него
+       свой — тот же, что уходит от зонда подтверждения QUIC. Проверяется он
+       собственным же разбором: раскрывается ключами из своего DCID и отдаёт
+       заданное имя. */
+    {
+        uint8_t ini[1500];
+        size_t il = 0;
+        CHECK(d2k_qc_first_initial("decoy.example", ini, sizeof ini, &il) == 0,
+              "первый Initial не собрался");
+        CHECK(il >= 1200, "первый Initial короче 1200 байт — сервер вправе его не обслуживать");
+        CHECK(d2k_quic_is_initial(ini, il), "собранное не похоже на Initial");
+        char name[256];
+        CHECK(d2k_quic_sni(ini, il, name, sizeof name) == 0 &&
+              strcmp(name, "decoy.example") == 0,
+              "собственный разбор не раскрыл собранный Initial или имя не то");
+        uint8_t again[1500];
+        size_t al = 0;
+        CHECK(d2k_qc_first_initial("decoy.example", again, sizeof again, &al) == 0 &&
+              (al != il || memcmp(again, ini, il) != 0),
+              "два Initial совпали байт в байт — случайности в них нет");
+        CHECK(d2k_qc_first_initial("decoy.example", ini, 100, &il) != 0,
+              "Initial «собрался» в буфер на 100 байт");
     }
 
     if (fails) {

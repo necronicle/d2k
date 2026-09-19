@@ -57,6 +57,17 @@ typedef struct {
  * 0 — готово, -1 — отказ с причиной в err. */
 int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap);
 
+/* ПЕРВЫЙ INITIAL КЛИЕНТА — БАЙТАМИ, без соединения: тот же пакет, с которого
+ * d2k_qc_connect начинает рукопожатие (ClientHello с именем sni, ALPN h3,
+ * транспортные параметры, добивка до 1200 байт по RFC 9000 §14.1), со своими
+ * случайными DCID/SCID и ключом.
+ *
+ * Нужен приманкой: коробка, узнающая протокол по первому пакету потока,
+ * принимает такой поток за QUIC. Боевой профиль голоса z2k ставит для этого
+ * чужой блоб (quic_dbankcloud); здесь пакет свой. 0 — собран, out_len — его
+ * длина; -1 — не собрался или не влез в cap. */
+int d2k_qc_first_initial(const char *sni, uint8_t *out, size_t cap, size_t *out_len);
+
 /* Шлёт данные потоком stream_id в одном пакете 1-RTT. 0 — ушло. */
 int d2k_qc_stream_send(d2k_qc *c, uint64_t stream_id, const uint8_t *data, size_t n,
                        int fin, char *err, size_t errcap);

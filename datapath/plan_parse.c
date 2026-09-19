@@ -98,6 +98,14 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
         case REC_PACE:
             if (ln != 4) { fail(err, errlen, "разнос во времени не 4 байта"); return -1; }
             break;
+        case REC_DELAY:
+            /* minexec=6: старый датапат выдержки перед единственной посылкой
+               не знает, и молча выпустить её без паузы значит исполнить не
+               тот план. Отказ громкий. */
+            if (rd16(b + 6) < 6 || ln != 4 || rd32(b + off) == 0) {
+                fail(err, errlen, "выдержка требует minexec=6 и ненулевого числа"); return -1;
+            }
+            break;
         case REC_INPUT:
             if (ln != 12 || rd32(b + off) == 0 ||
                 rd32(b + off + 4) > rd32(b + off) ||
@@ -356,6 +364,10 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
                его нечем осмысленным, а молча складывать значения было бы
                выдумкой. */
             p->pace_us = rd32(v);
+            break;
+        case REC_DELAY:
+            /* Последняя запись побеждает — та же дисциплина, что у разноса. */
+            p->delay_us = rd32(v);
             break;
         case REC_INPUT:
             p->input_len = rd32(v);

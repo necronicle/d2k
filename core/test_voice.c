@@ -93,10 +93,14 @@ static d2k_tally stub_ask(uint32_t ip, uint16_t port, const uint8_t *pre, size_t
 }
 
 static int g_alive;
-static int stub_alive(const char *ct_path, uint32_t ip, uint16_t port) {
-    (void)ct_path; (void)ip; (void)port;
+static int stub_alive(const char *ct_path, uint32_t ip, uint16_t port,
+                      uint32_t src_ip, uint16_t sport) {
+    (void)ct_path; (void)ip; (void)port; (void)src_ip; (void)sport;
     return g_alive;
 }
+/* Настоящая проверка живости — берётся у крючка до подмены: тесты таблицы
+   соединений обязаны идти через тот же разбор, что и продукт. */
+static d2k_voice_alive_fn real_alive;
 
 static uint32_t g_ctl_ip;
 static int stub_resolve(const char *hostport, uint32_t *ip, uint16_t *port) {
@@ -179,6 +183,7 @@ static void reset(void) {
 int main(void) {
     d2k_voice_ask_hook = stub_ask;
     d2k_voice_resolve_hook = stub_resolve;
+    real_alive = d2k_voice_alive_hook;
     d2k_voice_alive_hook = stub_alive;
 
     /* --- ЦЕЛЬ ИЗ ЖИВОГО РАЗГОВОРА ---------------------------------------
@@ -233,6 +238,118 @@ int main(void) {
 
         CHECK(d2k_voice_targets("/nonexistent/d2k-voice", t, D2K_VOICE_MAX_TARGETS) == 0,
               "нечитаемая таблица выдала цели");
+    }
+
+    /* --- ДИАПАЗОН ПОРТОВ — РОВНО ТОТ, ЧТО У БОЕВОГО ПРОФИЛЯ --------------
+     * discord_udp в z2k и эталонный 50-discord-media у bol-van: 50000–50099.
+     * Здесь стояло 50000–50100, а карта переноса уверяла «совпадает». */
+    {
+        const char *path = write_ct(
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50001 "
+            "dport=50099 packets=90 bytes=9000 src=35.217.0.67 dst=88.87.93.11 "
+            "sport=50099 dport=50001 packets=80 bytes=8000 use=2\n"
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.68 sport=50002 "
+            "dport=50100 packets=90 bytes=9000 src=35.217.0.68 dst=88.87.93.11 "
+            "sport=50100 dport=50002 packets=80 bytes=8000 use=2\n");
+        d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
+        size_t n = d2k_voice_targets(path, t, D2K_VOICE_MAX_TARGETS);
+        CHECK(n == 1 && t[0].port == 50099,
+              "диапазон голосовых портов разошёлся с боевым профилем (50000–50099)");
+        remove(path);
+    }
+
+    /* --- ПОТОК ОДНОГО КЛИЕНТА, А НЕ ТОЧКИ -----------------------------------
+     * Живость спрашивается про ПОТОК: ответ одному устройству не доказывает,
+     * что точка отвечает другому. Раньше пятёрка разделялась при поиске, но
+     * при вопросе «отвечает ли» снова сливалась в адрес точки (ревью, P1-3). */
+    {
+        const char *path = write_ct(
+            "ipv4     2 udp      17 29 src=192.168.1.10 dst=104.16.58.99 sport=54321 "
+            "dport=50003 packets=900 bytes=90000 src=104.16.58.99 dst=88.87.93.11 "
+            "sport=50003 dport=54321 packets=800 bytes=88000 use=2\n"
+            "ipv4     2 udp      17 29 src=192.168.1.11 dst=104.16.58.99 sport=54999 "
+            "dport=50003 packets=50 bytes=9000 [UNREPLIED] src=104.16.58.99 "
+            "dst=88.87.93.11 sport=50003 dport=54999 packets=0 bytes=0 use=2\n");
+        CHECK(real_alive(path, ip4(104, 16, 58, 99), 50003, ip4(192, 168, 1, 11), 54999)
+                  == D2K_VOICE_SILENT,
+              "ответ одному клиенту выдан за ответ другому");
+        CHECK(real_alive(path, ip4(104, 16, 58, 99), 50003, ip4(192, 168, 1, 10), 54321)
+                  == D2K_VOICE_ANSWERS,
+              "отвечающий поток не узнан отвечающим");
+        remove(path);
+    }
+
+    /* --- «МОЛЧАТ» — ТОЛЬКО ПОСЛЕ ЧЕТЫРЁХ ПОСЛАННЫХ --------------------------
+     * Боевой профиль объявляет UDP-поток проваленным при udp_out=4:udp_in=1:
+     * не меньше четырёх ушедших и ни одного пришедшего. Поток, ушедший одним
+     * пакетом, ещё НИЧЕГО не показал — ответ просто не успел. Здесь блокировка
+     * объявлялась по одной пометке [UNREPLIED], без счёта посланного. */
+    {
+        const char *path = write_ct(
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50011 "
+            "dport=50004 packets=2 bytes=148 [UNREPLIED] src=35.217.0.67 "
+            "dst=88.87.93.11 sport=50004 dport=50011 packets=0 bytes=0 use=2\n");
+        CHECK(real_alive(path, ip4(35, 217, 0, 67), 50004, 0, 0) == D2K_VOICE_YOUNG,
+              "поток из двух пакетов без ответа объявлен заглушённым");
+        remove(path);
+        path = write_ct(
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50012 "
+            "dport=50004 packets=4 bytes=296 [UNREPLIED] src=35.217.0.67 "
+            "dst=88.87.93.11 sport=50004 dport=50012 packets=0 bytes=0 use=2\n");
+        CHECK(real_alive(path, ip4(35, 217, 0, 67), 50004, 0, 0) == D2K_VOICE_SILENT,
+              "четыре ушедших без ответа не признаны молчанием");
+        remove(path);
+
+        /* И тот же молодой поток в прогоне — не вердикт, а «мало данных». */
+        reset();
+        g_answer_ip = g_ctl_ip;
+        d2k_voice_alive_hook = real_alive;
+        path = write_ct(
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50011 "
+            "dport=50004 packets=2 bytes=148 [UNREPLIED] src=35.217.0.67 "
+            "dst=88.87.93.11 sport=50004 dport=50011 packets=0 bytes=0 use=2\n");
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ct_path = path;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.verdict == D2K_VOICE_UNMEASURED,
+              "молодой поток без ответа получил вердикт вместо «мало данных»");
+        CHECK(strstr(r.reason, "из 4") != NULL, "не сказано, сколько ушло и сколько нужно");
+        d2k_voice_alive_hook = stub_alive;
+        remove(path);
+    }
+
+    /* --- СВОЙ КОНТРОЛЬ — НЕ РАЗГОВОР ----------------------------------------
+     * Контрольный зонд ходит к публичному STUN на 3478, а 3478 входит в
+     * голосовые порты профиля. Его поток ложится в таблицу соединений рядом с
+     * разговором и живёт там до трёх минут; взять его целью значит мерить
+     * самих себя. */
+    {
+        reset();
+        g_answer_ip = g_ctl_ip;
+        d2k_voice_alive_hook = real_alive;
+        char body[1024];
+        uint8_t c[4];
+        memcpy(c, &g_ctl_ip, 4);
+        snprintf(body, sizeof body,
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=%u.%u.%u.%u sport=40001 "
+            "dport=3478 packets=900 bytes=90000 src=%u.%u.%u.%u dst=88.87.93.11 "
+            "sport=3478 dport=40001 packets=900 bytes=90000 use=2\n"
+            "ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50013 "
+            "dport=50004 packets=40 bytes=4000 [UNREPLIED] src=35.217.0.67 "
+            "dst=88.87.93.11 sport=50004 dport=50013 packets=0 bytes=0 use=2\n",
+            c[0], c[1], c[2], c[3], c[0], c[1], c[2], c[3]);
+        const char *path = write_ct(body);
+        d2k_voice_opt o;
+        memset(&o, 0, sizeof o);
+        o.ct_path = path;
+        d2k_voice_res r = d2k_voice_run(&o);
+        CHECK(r.ip == ip4(35, 217, 0, 67),
+              "целью взят поток собственного контрольного зонда, а не разговор");
+        CHECK(r.verdict == D2K_VOICE_BLOCKED,
+              "разговор без ответа при живом контроле не признан заглушённым");
+        d2k_voice_alive_hook = stub_alive;
+        remove(path);
     }
 
     /* --- [UNREPLIED]: ТОЧКА НИКОМУ НЕ ОТВЕЧАЛА --------------------------
@@ -302,14 +419,6 @@ int main(void) {
         reset();
         g_answer_ip = g_ctl_ip;   /* публичный STUN отвечает — UDP на канале жив */
         g_alive = 0;              /* а голосовой поток идёт без ответа */
-        char dir[64];
-        snprintf(dir, sizeof dir, "/tmp/d2k-voice-blobs-%d", (int)getpid());
-        CHECK(mkdir(dir, 0700) == 0 || errno == EEXIST, "каталог блобов не создался");
-        char file[256];
-        snprintf(file, sizeof file, "%s/stun.bin", dir);
-        FILE *f = fopen(file, "wb");
-        for (int i = 0; i < 64; i++) { fputc(0x42, f); }
-        fclose(f);
         g_answer_with_pre = ip4(104, 16, 58, 99);
         g_need_copies = 6;
 
@@ -325,14 +434,11 @@ int main(void) {
            голосовая точка не отвечает посторонним. Испытывать приманки тем же
            отвергнутым способом и делать вывод «не пробивает» — повторять ту же
            ошибку на шаг позже (ревью, P1-4). */
-        CHECK(r.arm[0] == '\0',
-              "приём объявлен найденным по зонду, который оракулом быть не может");
         CHECK(strstr(r.reason, "не пробивает") == NULL,
               "сказано «ни одна фальшивка не пробивает» — вывод из непригодного зонда");
         CHECK(strstr(r.reason, "не подтвердить") != NULL ||
               strstr(r.reason, "не проверялись") != NULL,
               "не сказано, ПОЧЕМУ приёма нет");
-        remove(file); rmdir(dir);
     }
 
     /* --- СЛОЙ 1: голосовой сервер отвечает — резать нечего ---------------- */
@@ -399,8 +505,6 @@ int main(void) {
 
         CHECK(r.verdict == D2K_VOICE_CLEAR,
               "поток жив и сервер отвечает — резать нечего");
-        CHECK(r.arm[0] == '\0',
-              "приём подбирался там, где резать нечего");
     }
 
     /* Наблюдать нечего И зонд молчит — честное «мерить нечем», а НЕ
@@ -416,7 +520,6 @@ int main(void) {
         d2k_voice_res r = d2k_voice_run(&o);
         CHECK(r.verdict == D2K_VOICE_NO_ORACLE,
               "молчание зонда выдано за блокировку там, где наблюдать нечего");
-        CHECK(r.arm[0] == '\0', "приём подбирался там, где мерить нечем");
     }
 
     /* --- КОНТРОЛЬ НЕ ИЗМЕРЕН — ЗНАЧИТ И ВЫВОДА НЕТ --------------------------
@@ -439,8 +542,6 @@ int main(void) {
         CHECK(r.verdict == D2K_VOICE_UNMEASURED,
               "незаконченное измерение не названо незаконченным");
         CHECK(r.probes == 0, "зонды посчитаны там, где их не было");
-        CHECK(r.arm[0] == '\0' && r.strategy[0] == '\0',
-              "приём подобран там, где вывода нет");
     }
 
     /* --- ОТВЕТ ОДНОМУ КЛИЕНТУ НЕ ПРЯЧЕТ БЕДУ ДРУГОГО ----------------------
@@ -483,14 +584,6 @@ int main(void) {
         g_answer_with_pre = ip4(104, 16, 58, 99);  /* голос берётся фальшивкой */
         g_need_copies = 6;                         /* и только шестью копиями */
 
-        char dir[64];
-        snprintf(dir, sizeof dir, "/tmp/d2k-voice-blobs-%d", (int)getpid());
-        CHECK(mkdir(dir, 0700) == 0 || errno == EEXIST, "каталог блобов не создался");
-        char file[256];
-        snprintf(file, sizeof file, "%s/stun.bin", dir);
-        FILE *f = fopen(file, "wb");
-        for (int i = 0; i < 64; i++) { fputc(0x42, f); }
-        fclose(f);
 
         d2k_voice_opt o;
         memset(&o, 0, sizeof o);
@@ -500,8 +593,6 @@ int main(void) {
 
         CHECK(r.verdict == D2K_VOICE_BLOCKED,
               "контроль жив, голос молчит — режут именно этот поток");
-        remove(file);
-        rmdir(dir);
     }
 
 

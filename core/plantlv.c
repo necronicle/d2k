@@ -51,7 +51,8 @@ enum {
     REC_SETTLE  = 0x0107,
     REC_SEGMENT = 0x0108,
     REC_WIRE    = 0x0109,
-    REC_INPUT_TLS = 0x010a
+    REC_INPUT_TLS = 0x010a,
+    REC_DELAY   = 0x010b
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -97,6 +98,7 @@ typedef struct {
     uint8_t    guards;
     uint32_t   pace_us;   /* 0 — записи нет */
     uint32_t   input_len, input_sni_off, input_sni_len, settle_us, segment_size;
+    uint32_t   delay_us;
     uint8_t    wire_profile;
     uint8_t    input_tls;
 } pl_plan;
@@ -295,6 +297,8 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (strcmp(f[2], "unknown") == 0) { p->proto = 0; }
             else if (strcmp(f[2], "tls") == 0) { p->proto = 1; }
             else if (strcmp(f[2], "quic") == 0) { p->proto = 2; }
+            /* Голос Дискорда: первый пакет потока — запрос IP Discovery. */
+            else if (strcmp(f[2], "voice") == 0) { p->proto = 3; }
             else { say(err, errcap, "строка %zu: неизвестный протокол \"%s\"", lineno, f[2]); goto bad; }
         } else if (strcmp(f[0], "payload") == 0) {
             if (nf < 2 || nf > 3) { say(err, errcap, "строка %zu: payload ждёт номер и байты", lineno); goto bad; }
@@ -463,6 +467,20 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 }
                 p->pace_us = (uint32_t)u;
             }
+        } else if (strcmp(f[0], "delay") == 0) {
+            /* ВЫДЕРЖКА ПЕРЕД ПЕРВОЙ ПОСЫЛКОЙ НАГРУЗКИ, микросекунды. Ни pace,
+               ни settle её не выражают: первый задерживает посылки ПОСЛЕ
+               первой, второй — первую, но лишь когда перед ней уже что-то
+               ушло. Ноль запрещён по той же причине, что у pace. */
+            if (nf != 2) { say(err, errcap, "строка %zu: delay ждёт одно число", lineno); goto bad; }
+            {
+                unsigned long u = 0;
+                if (str_u32(f[1], &u) != 0 || u == 0) {
+                    say(err, errcap, "строка %zu: delay ждёт положительное число микросекунд", lineno);
+                    goto bad;
+                }
+                p->delay_us = (uint32_t)u;
+            }
         } else if (strcmp(f[0], "guard") == 0) {
             if (nf != 2) { say(err, errcap, "строка %zu: guard ждёт одно слово", lineno); goto bad; }
             if (strcmp(f[1], "rst_alien") == 0) { p->guards |= 1u << 0; }
@@ -483,6 +501,9 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     }
     if ((p->input_len || p->settle_us || p->segment_size) && p->minexec < 3) {
         say(err, errcap, "input/settle/segment требуют minexec=3"); goto bad;
+    }
+    if (p->delay_us && p->minexec < 6) {
+        say(err, errcap, "выдержка перед посылкой требует minexec=6"); goto bad;
     }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
@@ -532,7 +553,8 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     size_t n_records = 2 + p.n_payloads + p.n_poisons + p.n_splits +
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
-                       (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) + (p.input_tls ? 1u : 0u);
+                       (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
+                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -614,6 +636,9 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         put_u16(&w, REC_SEGMENT); put_u16(&w, 4); put_u32(&w, p.segment_size);
     }
     if (p.input_tls) { put_u16(&w, REC_INPUT_TLS); put_u16(&w, 0); }
+    if (p.delay_us) {
+        put_u16(&w, REC_DELAY); put_u16(&w, 4); put_u32(&w, p.delay_us);
+    }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);

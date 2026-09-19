@@ -207,6 +207,32 @@ d2k_flow *d2k_track_get(d2k_table *t, const d2k_key *k, uint64_t now_ns) {
     return NULL;
 }
 
+void d2k_track_new_connection(d2k_flow *f) {
+    if (!f) {
+        return;
+    }
+    d2k_flow keep = *f;
+    memset(f, 0, sizeof *f);
+    f->key = keep.key;
+    f->in_use = keep.in_use;
+    f->first_ns = keep.first_ns;
+    f->last_ns = keep.last_ns;
+    f->init_low = keep.init_low;
+    f->dir_known = keep.dir_known;
+    f->fwd_pkts = keep.fwd_pkts;
+    f->rev_pkts = keep.rev_pkts;
+    f->fwd_bytes = keep.fwd_bytes;
+    f->rev_bytes = keep.rev_bytes;
+    /* Учёт посылок переживает границу намеренно: посылки прошлого соединения
+       могут ещё стоять в очереди отправки, и обнулить их счёт значит принять
+       чужой ответ за свой. execution_id для того и хранится — он отличает
+       попытку от попытки. */
+    f->sends_left = keep.sends_left;
+    f->sends_failed = keep.sends_failed;
+    f->execution_id = keep.execution_id;
+    memcpy(f->execution_plan_id, keep.execution_plan_id, sizeof f->execution_plan_id);
+}
+
 void d2k_track_remove(d2k_table *t, const d2k_key *k) {
     if (!t || !k) {
         return;

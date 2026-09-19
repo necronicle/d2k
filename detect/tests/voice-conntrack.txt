@@ -1,0 +1,12 @@
+ipv4     2 udp      17 29 src=192.168.1.117 dst=104.29.136.177 sport=62545 dport=19331 packets=812 bytes=90000 src=104.29.136.177 dst=88.87.93.11 sport=19331 dport=62545 packets=800 bytes=88000 [ASSURED] [FASTNAT] mark=0 use=2
+ipv4     2 udp      17 29 src=192.168.1.90 dst=104.29.136.177 sport=55967 dport=19331 packets=100 bytes=9000 src=104.29.136.177 dst=88.87.93.11 sport=19331 dport=55967 packets=90 bytes=8000 mark=0 use=2
+udp      17 29 src=192.168.1.117 dst=35.217.0.67 sport=50011 dport=50004 packets=40 bytes=4000 [UNREPLIED] src=35.217.0.67 dst=88.87.93.11 sport=50004 dport=50011 packets=0 bytes=0 [FASTNAT] use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=162.159.130.234 sport=40001 dport=3478 packets=3 bytes=60 src=162.159.130.234 dst=88.87.93.11 sport=3478 dport=40001 packets=3 bytes=96 mark=0 use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.68 sport=50012 dport=50099 packets=77 bytes=7000 src=35.217.0.68 dst=88.87.93.11 sport=50099 dport=50012 packets=70 bytes=7000 use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=35.217.0.69 sport=50013 dport=50100 packets=66 bytes=6000 src=35.217.0.69 dst=88.87.93.11 sport=50100 dport=50013 packets=60 bytes=6000 use=2
+ipv6     10 udp      17 29 src=2a00:1370:8100::117 dst=2a06:98c1:3121::7 sport=50014 dport=50005 packets=55 bytes=5000 src=2a06:98c1:3121::7 dst=2a00:1370:8100::117 sport=50005 dport=50014 packets=50 bytes=5000 use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=100.64.12.34 sport=50015 dport=50006 packets=44 bytes=4000 src=100.64.12.34 dst=88.87.93.11 sport=50006 dport=50015 packets=40 bytes=4000 use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=10.171.171.171 sport=50016 dport=50007 packets=9999 bytes=90000 src=10.171.171.171 dst=192.168.1.117 sport=50007 dport=50016 packets=9999 bytes=9 use=2
+ipv4     2 tcp      6 431999 ESTABLISHED src=192.168.1.117 dst=104.16.58.7 sport=44444 dport=50004 packets=9999 bytes=90000 src=104.16.58.7 dst=88.87.93.11 sport=50004 dport=44444 packets=9999 bytes=9 [ASSURED] use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=8.8.8.8 sport=5000 dport=53 packets=9999 bytes=90000 src=8.8.8.8 dst=88.87.93.11 sport=53 dport=5000 packets=9999 bytes=90000 use=2
+ipv4     2 udp      17 29 src=192.168.1.117 dst=142.250.1.127 sport=50017 dport=19302 packets=12 bytes=1200 src=142.250.1.127 dst=88.87.93.11 sport=19302 dport=50017 packets=12 bytes=1200 use=2

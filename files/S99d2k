@@ -78,6 +78,13 @@ QUEUE_NUM=2000
 MARK=0x2d
 PORTS=443
 CONNBYTES=0:8
+# ГОЛОС ДИСКОРДА — порты боевого профиля discord_udp z2k (и эталона bol-van
+# 50-discord-media для медиадиапазона 50000–50099). Узнаётся голос по первому
+# пакету потока (IP Discovery), и в очередь идут только ПЕРВЫЕ пакеты: профиль
+# z2k ставит фальшивку в первые четыре (--out-range=-d4), а медиапоток через
+# очередь гнать нельзя вовсе — на MIPS он её захлёбывает.
+VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
+VOICE_CONNBYTES=0:4
 MODE=observe
 FLOWS=2048
 # Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
@@ -143,6 +150,18 @@ fw_up() {
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$PORTS" \
         -m connbytes --connbytes "$CONNBYTES" --connbytes-dir reply \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+
+    # Голос: первые пакеты туда (IP Discovery и повторы — по ним датапат
+    # узнаёт голос и приговаривает «молчат») и первые оттуда (ответ сервера —
+    # единственное подтверждение приёма голоса: зонда у голоса нет).
+    iptables -t mangle -A "$CHAIN_OUT" -p udp -m multiport --dports "$VOICE_PORTS" \
+        -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir original \
+        --connbytes-mode packets \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    iptables -t mangle -A "$CHAIN_IN" -p udp -m multiport --sports "$VOICE_PORTS" \
+        -m connbytes --connbytes "$VOICE_CONNBYTES" --connbytes-dir reply \
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
 
