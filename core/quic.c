@@ -42,11 +42,9 @@
  * PADDING/PING/ACK/CRYPTO/CONNECTION_CLOSE-0x1c, RFC 9000 §17.2.2) — на первом
  * непризнанном байте разбор кадров останавливается насовсем, но уже собранные
  * куски CRYPTO остаются в силе (см. collect_crypto_frames). Реассемблируются
- * куски в буфер фиксированного размера БЕЗ выделений памяти: смещение растёт,
- * пока следующий кусок примыкает встык или с перехлёстом к уже собранному —
- * первый же разрыв («с пропусками», ровно как предупреждает бриф) стопорит
- * рост и дальше уже не восстанавливается в пределах ОДНОГО пакета: продолжение
- * потока — за пределами этого вызова, а гадать, что там, нельзя.
+ * куски в буфер фиксированного размера БЕЗ выделений памяти. Карта занятых
+ * байтов учитывает все кадры независимо от порядка; наружу отдаётся только
+ * непрерывный префикс от нуля. Пропуск не заполняется догадками.
  *
  * БЕЗ ВЫДЕЛЕНИЙ ПАМЯТИ. Обе функции вызываются на каждом UDP-пакете в
  * горячем пути датапата (задача 4 этой же вертикали, ещё не написана) — вся
@@ -91,15 +89,6 @@
  * этого предела — не типичный браузерный Initial, и не в этом её отвергать
  * ЖИЗНЕННО: разбор просто честно не пытается её понять (см. parse_initial_header). */
 #define D2K_QUIC_MAX_DGRAM 1500
-
-/* Сколько кадров CRYPTO в ОДНОМ Initial-пакете готов держать разбор. Реальные
- * браузеры режут ClientHello на несколько кадров в одном пакете (донор
- * ссылается на Firefox 137 по умолчанию и на USENIX Sec'25 про GFW, который
- * такие кадры не пересобирает) — на практике это 2-3 куска. Восемь — запас
- * той же природы, что и D2K_HKDF_LABEL_MAX в d2k_crypto.h: цена лишних слотов
- * в стековом массиве нулевая, а лишний кадр сверх этого числа просто не
- * учитывается (см. collect_crypto_frames), а не роняет разбор. */
-#define D2K_QUIC_MAX_CRYPTO_CHUNKS 8
 
 /* ---------------------------------------------------------------------
  * Мелкие читалки. rd16/rd32 — big-endian, как весь QUIC (RFC 9000 §17).
@@ -238,22 +227,21 @@ static int decrypt_initial(const uint8_t *p, const quic_hdr *h, uint8_t *plain, 
  * так же, как на любом другом неразрешённом здесь типе.
  * --------------------------------------------------------------------- */
 
-typedef struct {
-    uint64_t offset; /* положение куска В ПОТОКЕ CRYPTO (не в payload!) */
-    size_t pos;       /* положение данных куска внутри plain[] */
-    size_t len;
-} crypto_chunk;
-
-/* Возвращает число собранных кусков CRYPTO (0..D2K_QUIC_MAX_CRYPTO_CHUNKS).
- * Кадры читаются строго в порядке ПЕРЕДАЧИ (как лежат в payload) — это НЕ то
- * же самое, что порядок смещений в потоке: порядок смещений восстанавливает
- * отдельно reassemble_crypto_stream. На первом нераспознанном или сломанном
+/* Собирает CRYPTO по смещениям и возвращает длину непрерывного префикса.
+ * Кадры читаются в порядке передачи, байты кладутся по смещению в потоке.
+ * На первом нераспознанном или сломанном
  * (объявленная кадром длина не помещается в payload) байте разбор кадров
  * останавливается насовсем — гадать, где начинается следующий кадр, нельзя
  * ни для неизвестного типа, ни для битого известного: оба случая одинаково
  * лишают нас точки, откуда продолжать. */
-static size_t collect_crypto_frames(const uint8_t *plain, size_t plen, crypto_chunk *chunks) {
-    size_t n_chunks = 0;
+static size_t collect_crypto_frames(const uint8_t *plain, size_t plen,
+                                     uint8_t *stream, size_t cap) {
+    /* Цена ограничена байтами, не произвольным числом кадров. Клиент вправе
+       прислать сотни однобайтовых CRYPTO в обратном порядке: прежние восемь
+       слотов теряли SNI в совершенно корректном Initial. Карта занятости
+       позволяет собрать все кадры за один проход без массива на каждый. */
+    uint8_t seen[(D2K_QUIC_MAX_DGRAM + 7) / 8] = {0};
+    if (cap > D2K_QUIC_MAX_DGRAM) { cap = D2K_QUIC_MAX_DGRAM; }
     size_t i = 0;
     while (i < plen) {
         uint8_t t = plain[i];
@@ -344,12 +332,19 @@ static size_t collect_crypto_frames(const uint8_t *plain, size_t plen, crypto_ch
             if (flen > (uint64_t)(plen - j)) {
                 break; /* кадр заявляет больше данных, чем есть в расшифрованном payload, — противоречие кадра */
             }
-            if (n_chunks < D2K_QUIC_MAX_CRYPTO_CHUNKS) {
-                chunks[n_chunks].offset = foff;
-                chunks[n_chunks].pos = j;
-                chunks[n_chunks].len = (size_t)flen;
-                n_chunks++;
-            } /* иначе кадр валиден, но слоты кончились — редкий случай, не отказ (см. константу) */
+            if (foff < (uint64_t)cap) {
+                size_t off = (size_t)foff;
+                size_t take = (size_t)flen;
+                if (take > cap - off) { take = cap - off; }
+                for (size_t k = 0; k < take; k++) {
+                    size_t pos = off + k;
+                    uint8_t bit = (uint8_t)(1u << (pos % 8));
+                    if (!(seen[pos / 8] & bit)) {
+                        stream[pos] = plain[j + k];
+                        seen[pos / 8] |= bit;
+                    }
+                }
+            }
             j += (size_t)flen;
             i = j;
             continue;
@@ -412,42 +407,8 @@ static size_t collect_crypto_frames(const uint8_t *plain, size_t plen, crypto_ch
          * проверку границ независимо от того, что случилось позже в payload. */
         break;
     }
-    return n_chunks;
-}
-
-/* Сшивает куски CRYPTO в буфер stream[0..cap) по СМЕЩЕНИЮ В ПОТОКЕ, а не по
- * порядку, в котором они лежали в payload. Растёт только непрерывно от 0:
- * первый же разрыв (кусок, начинающийся дальше уже собранного) буквально
- * "с пропуском", как предупреждает бриф, — и заполнение на нём и
- * останавливается, потому что дальше данных для ClientHello у нас нет и
- * гадать о них нельзя. O(K^2) по числу кусков (K <= D2K_QUIC_MAX_CRYPTO_CHUNKS
- * = 8) — не более 64 сравнений, для одного пакета на горячем пути бесплатно. */
-static size_t reassemble_crypto_stream(const uint8_t *plain, const crypto_chunk *chunks,
-                                        size_t n_chunks, uint8_t *stream, size_t cap) {
     size_t filled = 0;
-    int progress = 1;
-    while (progress) {
-        progress = 0;
-        for (size_t i = 0; i < n_chunks; i++) {
-            uint64_t coff = chunks[i].offset;
-            size_t clen = chunks[i].len;
-            if (coff > (uint64_t)filled) {
-                continue; /* дальше уже собранного — пропуск, пока не найдётся смежный кусок */
-            }
-            uint64_t cend = coff + (uint64_t)clen; /* clen <= D2K_QUIC_MAX_DGRAM, переполнения нет */
-            if (cend <= (uint64_t)filled) {
-                continue; /* кусок целиком уже учтён (повтор/перекрытие) */
-            }
-            size_t new_filled = (cend > (uint64_t)cap) ? cap : (size_t)cend;
-            if (new_filled <= filled) {
-                continue; /* после обрезки по потолку буфера добавить нечего */
-            }
-            size_t skip = filled - (size_t)coff; /* сколько байт куска уже перекрыто предыдущими */
-            memcpy(stream + filled, plain + chunks[i].pos + skip, new_filled - filled);
-            filled = new_filled;
-            progress = 1;
-        }
-    }
+    while (filled < cap && (seen[filled / 8] & (1u << (filled % 8)))) { filled++; }
     return filled;
 }
 
@@ -596,9 +557,7 @@ static size_t crypto_stream_of(const uint8_t *p, size_t n,
     if (decrypt_initial(p, &h, plain, &plain_len) != 0) {
         return 0;
     }
-    crypto_chunk chunks[D2K_QUIC_MAX_CRYPTO_CHUNKS];
-    size_t n_chunks = collect_crypto_frames(plain, plain_len, chunks);
-    return reassemble_crypto_stream(plain, chunks, n_chunks, stream, cap);
+    return collect_crypto_frames(plain, plain_len, stream, cap);
 }
 
 int d2k_quic_client_hello(const uint8_t *p, size_t n,

@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "d2k_quic.h"
+#include "d2k_quicwire.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -620,6 +621,60 @@ static void check_null(void) {
     CHECK(d2k_quic_sni(v1_initial, sizeof v1_initial, NULL, 64) == -1, "NULL-выход не отклонён d2k_quic_sni");
 }
 
+/* Разбиваем RFC ClientHello на >8 CRYPTO-кадров; шифрование/заголовок
+   выполняет настоящий кодировщик, проверенный отдельно RFC-векторами.
+   Проверяем именно потерю кадров парсером, не реализацию AEAD. */
+static void check_many_crypto_frames(void) {
+    uint8_t hello[1500];
+    size_t hello_len = 0;
+    CHECK(d2k_quic_client_hello(v1_initial, sizeof v1_initial,
+                                hello, sizeof hello, &hello_len) == 0,
+          "исходный RFC ClientHello не прочитан");
+    if (!hello_len) { return; }
+    const uint8_t dcid[] = {0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08};
+    const uint32_t versions[] = {D2K_QW_V1, D2K_QW_V2};
+    for (size_t v = 0; v < 2; v++) {
+        uint8_t secret[32];
+        d2k_qw_keys keys;
+        CHECK(d2k_qw_initial_secret(versions[v], dcid, sizeof dcid,
+                                    D2K_QW_CLIENT, secret) == 0 &&
+              d2k_qw_keys_from_secret(versions[v], secret, &keys) == 0,
+              "ключи тестового Initial не выведены");
+        for (int reverse = 0; reverse < 2; reverse++) {
+            uint8_t plain[1400] = {0}, hdr[64], packet[1500], restored[1500];
+            size_t used = 0;
+            /* Кадр на каждый байт: сотни кадров, всё ещё одна датаграмма. */
+            for (size_t j = 0; j < hello_len; j++) {
+                size_t off = reverse ? hello_len - j - 1 : j;
+                CHECK(used + 5 <= sizeof plain, "кадры не поместились в фикстуру");
+                if (used + 5 > sizeof plain) { return; }
+                plain[used++] = 0x06;
+                used += d2k_qw_varint_write(plain + used, sizeof plain - used, off);
+                plain[used++] = 1;
+                plain[used++] = hello[off];
+            }
+            if (used < 1200) { used = 1200; } /* PADDING */
+            size_t hn = d2k_qw_long_hdr(hdr, sizeof hdr, versions[v], D2K_QW_LT_INITIAL,
+                                       dcid, sizeof dcid, NULL, 0, 2, used);
+            size_t n = d2k_qw_seal(&keys, 1, hdr, hn, 1, 2, plain, used,
+                                    packet, sizeof packet);
+            CHECK(n > 0 && d2k_quic_is_initial(packet, n), "многокадровый Initial не собрался");
+            if (!n) { continue; }
+            char name[256] = {0};
+            CHECK(d2k_quic_sni(packet, n, name, sizeof name) == 0 &&
+                  strcmp(name, "example.com") == 0,
+                  "имя потеряно после восьмого CRYPTO-кадра");
+            size_t got = 0;
+            CHECK(d2k_quic_client_hello(packet, n, restored, sizeof restored, &got) == 0 &&
+                  got == hello_len && memcmp(restored, hello, hello_len) == 0,
+                  "ClientHello из множества CRYPTO-кадров не собран побайтно");
+            packet[n - 1] ^= 1;
+            CHECK(d2k_quic_sni(packet, n, name, sizeof name) == -1,
+                  "битый тег многокадрового Initial принят");
+        }
+    }
+}
+
 int main(void) {
     check_v1();
     check_v2();
@@ -633,6 +688,7 @@ int main(void) {
     check_ack_huge_range_count();
     check_cap();
     check_null();
+    check_many_crypto_frames();
 
     if (fails) {
         printf("ПРОВАЛОВ: %d\n", fails);
