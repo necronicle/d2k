@@ -3669,6 +3669,34 @@ int main(void) {
         d2k_catalog_free(&cNF);
     }
 
+    /* Терминальные исходы QUIC не превращаются обратно в подбор обвязкой.
+       Само получение этих исходов сверяется с Go в tests/quic-run. */
+    {
+        const d2k_verdict terminal[] = { D2K_V_CLEAR, D2K_V_ADDRESS, D2K_V_NO_QUIC };
+        for (size_t i = 0; i < sizeof terminal / sizeof terminal[0]; i++) {
+            d2k_catalog empty = {0};
+            d2k_sched *s = d2k_sched_new(&empty, sv[0], 0x2d);
+            CHECK(s != NULL, "планировщик терминального QUIC-исхода не создался");
+            if (!s) { continue; }
+            quic_answer = terminal[i];
+            quic_calls = arm_calls = ver_calls = 0;
+            forget_sent();
+            d2k_ev h = ev_hello(17, 40230, "terminal.example");
+            d2k_ev su = ev_suspect(17, 40230);
+            d2k_sched_event(s, &h);
+            d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(quic_calls == 1, "терминальный QUIC-исход не получен либо запускается повторно");
+            CHECK(arm_calls == 0 && ver_calls == 0,
+                  "обвязка начала подбор/подтверждение после CLEAR, ADDRESS или NO_QUIC");
+            CHECK(empty.n_boxes == 0 && binding_of(&empty, "terminal.example", 17) == NULL,
+                  "терминальный QUIC-исход записан найденным обходом");
+            d2k_sched_free(s);
+            d2k_catalog_free(&empty);
+        }
+        quic_answer = D2K_V_CLEAR;
+    }
+
     /* --- подтверждать нечем: перебор кандидатов не начинается ---------- */
     {
         /* У QUIC вопросник есть, а зонда подтверждения нет. Перебор в такой

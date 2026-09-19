@@ -74,9 +74,9 @@
  * форму приветствия РЕАЛЬНОГО браузера, а не любой протокольно валидный набор
  * байт — самодельное приветствие мерило бы не ту коробку (тот же класс
  * ошибки, что уже стоил проекту каталога 06.09.2026 на TCP, см. d2k_meas.h).
- * Источника настоящего снимка для QUIC в проекте сегодня нет, поэтому
- * d2k_quic_classify берёт trigger/control параметрами: у кого снимка нет,
- * тот передаёт {NULL, 0} и получает честный вердикт, а не догадку.
+ * d2k_quic_classify берёт trigger/control параметрами. При холодном старте
+ * планировщик использует d2k_quic_probe_initial — измерительный вход
+ * оригинала, проверяемый независимым Go-кодом; он не выдаётся за снимок.
  * Единственное шифрование в этом файле — расшифровка ОТВЕТА сервера
  * (qp_verify_server_response ниже); собственное AEAD-шифрование здесь не
  * нужно нигде, а d2k_ghash_for_test (см. d2k_crypto.h: "не для общего
@@ -206,12 +206,6 @@ uint32_t d2k_quic_budget_s =
  * величина, объявлена в d2k_quicprobe.h: тест сравнивает с тем же числом
  * (находка ревью 2026-09-06 круг 2 — голый литерал "3" в восьми местах не
  * "знает", что это то же самое число, что и параметр repeats). */
-
-/* Сколько ДОПОЛНИТЕЛЬНЫХ повторов задать прямому зонду перед CLEAR — тот же
- * приём и то же число, что D2K_CLEAR_CONFIRM_REPEATS в verdict.c (TCP-дерево),
- * по той же причине: ложный clear закрывает поиск словами "обходить нечего",
- * и это самая дорогая из возможных ошибок. */
-#define D2K_QUIC_CLEAR_CONFIRM_REPEATS 2
 
 /* D2K_QUIC_MAX_ADDRS теперь в d2k_quicprobe.h (перенесена оттуда сюда) —
  * задаче 6 (props.c) нужно знать тот же предел, чтобы завести пул того же
@@ -1634,35 +1628,19 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
            d2k_quic_props.server_ttl_in. */
         r.qprops.server_ttl_in = ttl_in;
 
-        /* НАХОДКА 2 РЕВЬЮ (круг 5): порог refused>0 ВЛОЖЕН внутрь pass==0, а
-           не проверяется первым независимо от pass — донор, probe.go:292-297
-           (`if base.Answered == 0 { if base.Refused > 0 {`). Круг 4 проверял
-           refused>0 ДО pass, поэтому pass=2,refused=1 (цель ответила ДВУМЯ
-           аутентичными Initial с кадром CRYPTO — доказанно жива и говорит по
-           QUIC) выносил UNREACHABLE и обрывал дерево: живое доказательство
-           перечёркивалось шумом на ОДНОЙ параллельной попытке (анкаст,
-           рейт-лимит, инъекция ICMP — не отличить). Когда pass>0, отказ на
-           части попыток ничего не отменяет — это просто "не единогласно",
-           и ветка pass>0&&pass<REPEATS ниже уже это честно говорит, без
-           обращения к refused вовсе. */
-        if (base_ctl.pass > 0 && base_ctl.pass < D2K_QUIC_REPEATS) {
-            r.verdict = D2K_V_FLAKY;
-            reason_set(&r, "базовая живость не воспроизводится: %d/%d", base_ctl.pass, D2K_QUIC_REPEATS);
-        } else if (base_ctl.pass == 0 && refused > 0) {
-            /* Донорский порог (probe.go:297) — ЛЮБОЙ сетевой отказ (ICMP
-               «порт недоступен» и подобное, см. quic_ask_ex) ПРИ ПОЛНОМ
-               ОТСУТСТВИИ ответов — но НЕ "транспорт, не решение коробки"
-               (находка 3 ревью, круг 5: эта формулировка уехала сюда из
-               ветки полной тишины круга 3 и там же неверна — инъекция ICMP
-               рабочий приём, локации по TTL у нас нет, отличить отказ ЦЕЛИ
-               от отказа С ПУТИ мы не можем). Та же честная форма, что и у
-               соседней ветки полной тишины ниже — "нельзя отличить X от Y". */
-            r.verdict = D2K_V_INCONCLUSIVE;
-            reason_set(&r, "%s отвечает сетевым отказом (%d/%d, ICMP или подобное) — нельзя "
-                           "отличить отказ цели от отказа с пути (§2.3, инъекция ICMP — "
-                           "рабочий приём)",
+        /* Run: ЛЮБОЙ ответ контроля позволяет перейти к прямому зонду.
+           Refused рассматривается только при pass==0. Локальные сбои
+           отправки без единого ответа по-прежнему не считаем молчанием сети. */
+        if (base_ctl.pass == 0 && refused > 0) {
+            /* probe.go:Run — отсутствие ответов и сетевой отказ дают
+               no_quic, не приглашение к новому подбору. Вердикт оригинала
+               не локализует источник ICMP: ограничение доказательства
+               называем отдельно, не подменяя им исход прибора. */
+            r.verdict = D2K_V_NO_QUIC;
+            reason_set(&r, "%s отвечает сетевым отказом (%d/%d, ICMP или подобное): "
+                           "исход оригинала no_quic. Источник отказа (цель или путь) не локализован",
                        pool[0], refused, D2K_QUIC_REPEATS);
-        } else if (base_ctl.err == D2K_QUIC_REPEATS) {
+        } else if (base_ctl.pass == 0 && base_ctl.err == D2K_QUIC_REPEATS) {
             /* pass == 0 и refused == 0 здесь по построению (обе ветки выше
                уже исключены) — значит НИ ОДНА из трёх попыток не была даже
                отправлена: сбой socket()/connect()/send() в qp_send_one,
@@ -1670,7 +1648,7 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
             r.verdict = D2K_V_FLAKY;
             reason_set(&r, "не отправилось ни разу (%d/%d) — наша сторона, опыт не состоялся",
                        base_ctl.err, D2K_QUIC_REPEATS);
-        } else if (base_ctl.err > 0) {
+        } else if (base_ctl.pass == 0 && base_ctl.err > 0) {
             /* pass == 0 и refused == 0 здесь ТОЖЕ по построению (обе ветки
                выше проверены раньше) — значит и здесь err весь целиком "не
                отправилось", наша сторона, не абстрактный "транспорт"
@@ -1715,44 +1693,12 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                    НЕ обязательно потеря — это может быть штатный лимит
                    сервера, поэтому текст ниже не утверждает причину
                    недостающих ответов, только факт присутствия. */
-                /* ПУТЬ ЖИВ, А КОНТРОЛЬ МОЛЧИТ — СПРАШИВАЕМ СВОИМ ИМЕНЕМ.
-                 *
-                 * Прежняя редакция здесь останавливалась: писала «наше имя не
-                 * спрашивалось, мерить нечем» и отдавала INCONCLUSIVE. Это
-                 * было честно (предыдущая редакция писала «Initial молчит на
-                 * обоих именах», хотя триггер не отправлялся вовсе — правка
-                 * ревью 2026-09-06 круг 3, находка D), но НЕПОЛНО: вердикт
-                 * «данных не хватило» пускает планировщик перебирать
-                 * кандидатов, а на хосте, который просто не обслуживает
-                 * HTTP/3, перебирать нечего. На живом роутере таких целей
-                 * десятки — браузер ходит по QUIC ко всему подряд.
-                 *
-                 * Оригинал различает этот случай отдельным вердиктом
-                 * (quicprobe: VerdictNoQUIC) и требует для него молчания
-                 * ОБОИХ имён. Значит своё имя надо спросить, а не выводить
-                 * его молчание из чужого. */
-                int own_sent = 0, own_refused = 0;
-                uint32_t own_rtt = 0;
-                d2k_tally own;
-                memset(&own, 0, sizeof own);
-                if (budget_left(&start)) {
-                    own = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger,
-                                            d2k_quic_wait_ms, mark, D2K_QUIC_REPEATS,
-                                            &own_rtt, &own_refused, &own_sent, NULL);
-                    r.probes += own_sent;
-                    if (!own.marked) { all_marked = 0; }
-                }
-                if (own_sent > 0 && own.err == 0 && own.pass == 0 && own_refused == 0) {
-                    r.verdict = D2K_V_NO_QUIC;
-                    reason_set(&r, "путь жив (согласование версии %d/%d), но на Initial молчат "
-                                   "ОБА имени — и контрольное, и наше: хост не обслуживает "
-                                   "HTTP/3, это не блокировка",
-                               vn.pass, D2K_QUIC_REPEATS);
-                    goto done;
-                }
-                r.verdict = D2K_V_INCONCLUSIVE;
-                reason_set(&r, "контрольное имя молчит (0/%d), путь при этом жив (согласование "
-                               "версии %d/%d) — наше имя не спрашивалось, мерить нечем",
+                /* Run оригинала здесь завершается. Прямой зонд НЕ
+                   отправлялся: нельзя добавлять его ради неверного текста
+                   «молчат оба имени». Сохраняем исход и называем факты. */
+                r.verdict = D2K_V_NO_QUIC;
+                reason_set(&r, "контрольное имя молчит (0/%d), путь жив (согласование "
+                               "версии %d/%d): исход оригинала no_quic; наше имя в этой ветке не спрашивалось",
                            D2K_QUIC_REPEATS, vn.pass, D2K_QUIC_REPEATS);
             } else {
                 /* vn.pass == 0 и vn.err == 0: опыты СОСТОЯЛИСЬ (отправлены,
@@ -1767,13 +1713,15 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                    Приведено к тому же честному виду, что и у соседнего
                    вывода на шаге 3 ("нельзя отличить содержимое от
                    недоступности сервера"). */
-                r.verdict = D2K_V_INCONCLUSIVE;
+                r.verdict = D2K_V_ADDRESS;
                 reason_set(&r, "молчит всё, включая согласование версии (0/%d) — нельзя отличить "
-                               "мёртвый путь от блокировки порта/протокола (§2.3)",
+                               "мёртвый путь от блокировки порта/протокола; исход оригинала address, "
+                               "подбор десинхронизации по содержимому не запускается",
                            D2K_QUIC_REPEATS);
             }
         } else {
-            /* base_ctl.pass == D2K_QUIC_REPEATS: живость подтверждена, RTT
+            /* base_ctl.pass > 0: порог контроля оригинала — ЛЮБОЙ ответ.
+               Единогласие требуется от прямого зонда, не от контроля. RTT
                измерен — потолок ожидания для всего остального дерева
                выводится из него (см. d2k_quicprobe.h). */
             uint32_t dyn_wait = rtt_ms * 3;
@@ -1798,34 +1746,20 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
                 reason_set(&r, "прямой зонд: %d/%d не состоялись — транспорт, не коробка", base.err,
                            D2K_QUIC_REPEATS);
             } else if (base.pass == D2K_QUIC_REPEATS) {
-                int confirm_sent = 0;
-                d2k_tally confirm = d2k_quic_ask_hook(pool[0], port, NULL, 0, trigger, dyn_wait, mark,
-                                                       D2K_QUIC_CLEAR_CONFIRM_REPEATS, NULL, NULL,
-                                                       &confirm_sent, NULL);
-                r.probes += confirm_sent; /* сколько реально ушло на провод (находка 4 ревью, круг 5) */
-                if (!confirm.marked) {
-                    all_marked = 0;
-                }
-                int total_pass = base.pass + confirm.pass;
-                int total_repeats = D2K_QUIC_REPEATS + D2K_QUIC_CLEAR_CONFIRM_REPEATS;
-                if (confirm.err > 0) {
-                    r.verdict = D2K_V_FLAKY;
-                    reason_set(&r, "подтверждение: %d/%d не состоялись — транспорт", confirm.err,
-                               D2K_QUIC_CLEAR_CONFIRM_REPEATS);
-                } else if (total_pass != total_repeats) {
-                    r.verdict = D2K_V_FLAKY;
-                    reason_set(&r, "не подтвердился: итого %d/%d — flaky дешевле ложного clear",
-                               total_pass, total_repeats);
-                } else if (all_marked) {
+                /* Run завершает прямой успех после исходных repeats.
+                   Дополнительные два зонда были перенесены из TCP-дерева,
+                   а не из QUIC-оригинала. Изоляция через mark остаётся
+                   самостоятельным условием достоверности опыта D2K. */
+                if (all_marked) {
                     r.verdict = D2K_V_CLEAR;
                     reason_set(&r, "триггер проходит как есть, метка подтверждена (%d/%d) — "
                                    "обходить нечего",
-                               total_pass, total_repeats);
+                               base.pass, D2K_QUIC_REPEATS);
                 } else {
                     r.verdict = D2K_V_INCONCLUSIVE;
                     reason_set(&r, "прошёл (%d/%d), но БЕЗ подтверждённой метки — clear не "
                                    "принимается",
-                               total_pass, total_repeats);
+                               base.pass, D2K_QUIC_REPEATS);
                 }
             } else if (base.pass > 0) {
                 r.verdict = D2K_V_FLAKY;
@@ -1938,7 +1872,6 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
         }
     }
 
-done:
     r.marked = (mark != 0) && all_marked;
     return r;
 }
