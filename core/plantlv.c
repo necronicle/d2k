@@ -52,7 +52,8 @@ enum {
     REC_SEGMENT = 0x0108,
     REC_WIRE    = 0x0109,
     REC_INPUT_TLS = 0x010a,
-    REC_DELAY   = 0x010b
+    REC_DELAY   = 0x010b,
+    REC_IPFRAG  = 0x010c
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -101,6 +102,7 @@ typedef struct {
     uint32_t   delay_us;
     uint8_t    wire_profile;
     uint8_t    input_tls;
+    uint8_t    ipfrag;
 } pl_plan;
 
 static int b64_value(unsigned char c) {
@@ -467,6 +469,12 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 }
                 p->pace_us = (uint32_t)u;
             }
+        } else if (strcmp(f[0], "ipfrag") == 0) {
+            unsigned long u=0;
+            if (nf != 2 || p->ipfrag || str_u32(f[1], &u) != 0 || u<1 || u>4) {
+                say(err,errcap,"ipfrag ждёт одну форму 1..4"); goto bad;
+            }
+            p->ipfrag=(uint8_t)u;
         } else if (strcmp(f[0], "delay") == 0) {
             /* ВЫДЕРЖКА ПЕРЕД ПЕРВОЙ ПОСЫЛКОЙ НАГРУЗКИ, микросекунды. Ни pace,
                ни settle её не выражают: первый задерживает посылки ПОСЛЕ
@@ -504,6 +512,11 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     }
     if (p->delay_us && p->minexec < 6) {
         say(err, errcap, "выдержка перед посылкой требует minexec=6"); goto bad;
+    }
+    if (p->ipfrag && (p->minexec<7 || p->transport!=17 || p->n_splits ||
+        p->n_seqovls || p->order || p->input_len || p->input_tls ||
+        p->settle_us || p->segment_size || p->wire_profile || p->guards)) {
+        say(err,errcap,"ipfrag требует minexec=7 и UDP без TCP-операций"); goto bad;
     }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
@@ -554,7 +567,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
-                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u);
+                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) + (p.ipfrag ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -640,6 +653,7 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         put_u16(&w, REC_DELAY); put_u16(&w, 4); put_u32(&w, p.delay_us);
     }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
+    if (p.ipfrag) { put_rec(&w, REC_IPFRAG, &p.ipfrag, 1); }
     if (p.guards) {
         put_rec(&w, REC_GUARD, &p.guards, 1);
     }

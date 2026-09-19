@@ -39,6 +39,25 @@ int main(void) {
     CHECK(loads(good, sizeof good), "правильный план не загрузился");
 
     {
+        uint8_t b[] = {'D','2','K','P',0,1,0,7,0,0,0,2,
+                       0,2,0,2,17,2, 1,12,0,1,1};
+        for (unsigned shape=1;shape<=4;shape++) {
+            b[22]=(uint8_t)shape;
+            CHECK(loads(b,sizeof b), "original IP fragment shape rejected");
+        }
+        b[22]=0; CHECK(!loads(b,sizeof b), "zero fragment shape accepted");
+        b[22]=5; CHECK(!loads(b,sizeof b), "unknown fragment shape accepted");
+        b[22]=1;b[7]=6;
+        CHECK(!loads(b,sizeof b), "fragment requires executor 7");
+        b[7]=7;b[16]=6;
+        CHECK(!loads(b,sizeof b), "UDP fragment accepted for TCP");
+        b[16]=0;
+        CHECK(!loads(b,sizeof b), "fragment without transport accepted");
+        b[16]=17;b[21]=0;
+        CHECK(!loads(b,sizeof b-1), "empty fragment record accepted");
+    }
+
+    {
         uint8_t b[] = {'D','2','K','P',0,1,0,4,0,0,0,2,
                        0,2,0,2,6,1, 1,9,0,1,D2K_WIRE_DETECT_TCP};
         CHECK(loads(b, sizeof b), "detect wire profile rejected");

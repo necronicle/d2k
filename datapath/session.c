@@ -21,6 +21,7 @@
 #include "d2k_tls.h"
 #include "d2k_capture.h"
 #include "d2k_hold.h"
+#include "d2k_ipfrag.h"
 
 /* Сколько первых пакетов потока имеет смысл разбирать в поисках приветствия.
  * ClientHello приходит первым или почти первым; после этого разбор — чистая
@@ -28,6 +29,10 @@
 #define D2K_HELLO_WINDOW 8
 
 struct d2k_session {
+    /* Event-loop owned; random initial value, nonzero counter per datagram.
+       Never derive this from the client's frequently-zero DF packet ID. */
+    uint16_t fragment_id;
+    int fragment_seeded;
     /* Крючок netfilter для ТЕКУЩЕГО пакета — см. d2k_session_set_hook.
        D2K_HOOK_UNKNOWN значит «не сказали», и тогда направление выводится
        по порту, как и раньше. */
@@ -144,6 +149,19 @@ struct d2k_session {
    транспортов у нас нет, а заводить третий слот под несуществующее значило бы
    завести неизмеренную сущность. */
 static size_t slot_of(uint8_t transport) { return transport == 17 ? 1u : 0u; }
+
+static uint16_t next_fragment_id(d2k_session *s) {
+    if (!s->fragment_seeded) {
+        FILE *f=fopen("/dev/urandom","rb");
+        if (!f) return 0;
+        size_t n=fread(&s->fragment_id,1,sizeof s->fragment_id,f);
+        fclose(f);
+        if (n!=sizeof s->fragment_id) return 0;
+        s->fragment_seeded=1;
+    }
+    if (++s->fragment_id==0) ++s->fragment_id;
+    return s->fragment_id;
+}
 
 d2k_session *d2k_session_new(size_t capacity, size_t journal) {
     d2k_session *s = calloc(1, sizeof *s);
@@ -932,10 +950,32 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     }
     c.ttl = pkt[8];
     c.ip_id = rd16(pkt + 4);
+    d2k_conn fragment_conn=c;
+    for (size_t i=0;i<acts.n;i++) if (acts.v[i].ipfrag) {
+        /* NODEFRAG sends bypass reassembly/normal UDP conntrack. Translate
+           ONLY fragments here, using the existing client's confirmed tuple.
+           Whole fakes retain the original tuple and ordinary kernel NAT.
+           No first-packet exemption: unknown mapping cannot be invented. */
+        uint32_t ext=0;uint16_t port=0;
+        int found=d2k_nat_hook(D2K_NAT_PROC,17,c.src_ip,c.src_port,
+                              c.dst_ip,c.dst_port,&ext,&port);
+        if(found!=0 || !ext || !port) {
+            /* Missing procfs is NOT evidence of no NAT. Ordinary packets
+               can leave translation to the kernel; NODEFRAG packets cannot. */
+            out->skipped="нет подтверждённого NAT-контекста для IP-фрагментов";
+            refuse(s,now_ns,&key,out->skipped);d2k_actions_free(&acts);return;
+        }
+        if(found==0){fragment_conn.src_ip=ext;fragment_conn.src_port=port;}
+        break;
+    }
     /* c.ack и c.window остаются нулями: полей TCP у UDP нет, а
        d2k_wire_build_udp их не читает (см. d2k_wire.h). */
 
-    if (acts.n > sizeof out->out / sizeof out->out[0]) {
+    size_t wire_count=acts.n;
+    for (size_t i=0;i<acts.n;i++) {
+        if (acts.v[i].ipfrag) wire_count+=acts.v[i].ipfrag<=2?1:2;
+    }
+    if (wire_count > sizeof out->out / sizeof out->out[0]) {
         /* План описывает больше посылок, чем вмещает d2k_result.out[]
            (ревью задачи 4, круг 2): repeats фальшивки приходит из TLV одним
            байтом без потолка (до 255), а out[] — фиксированные 16. Раньше n
@@ -951,9 +991,29 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         return;
     }
     size_t used = 0;
-    size_t n = acts.n;
-    for (size_t i = 0; i < n; i++) {
-        size_t made = d2k_wire_build_udp(&c, &acts.v[i], buf + used, bufcap - used);
+    size_t n = 0;
+    for (size_t i = 0; i < acts.n; i++) {
+        const d2k_emit *e=&acts.v[i];
+        d2k_ipfrag_span spans[3];
+        size_t count=0,made=0;
+        if (e->ipfrag) {
+            d2k_ipfrag_plan fp;
+            /* Copying/fragmenting IPv4 options needs its own measured path.
+               Reject unsupported context instead of silently losing options. */
+            if (ihl==20 && e->kind==D2K_EMIT_PAYLOAD && !e->pre_len &&
+                !e->seq_shift && !e->poison && !e->wire_profile &&
+                d2k_ipfrag_shape(e->ipfrag,&fp)==0) {
+                uint16_t id=next_fragment_id(s);
+                count=d2k_udpfrag_build_ex((const uint8_t *)&fragment_conn.src_ip,
+                    (const uint8_t *)&fragment_conn.dst_ip,rd16((const uint8_t *)&fragment_conn.src_port),
+                    rd16((const uint8_t *)&fragment_conn.dst_port),e->bytes,e->len,&fp,id,
+                    c.ttl,pkt[1],buf+used,bufcap-used,spans);
+                if(count)made=spans[count-1].off+spans[count-1].len;
+            }
+        } else {
+            made=d2k_wire_build_udp(&c,e,buf+used,bufcap-used);
+            if(made){count=1;spans[0]=(d2k_ipfrag_span){0,made};}
+        }
         if (made == 0) {
             /* d2k_wire_build_udp возвращает 0 в двух случаях: посылка не
                поместилась в буфер и «эту порчу для UDP честно не исполнить»
@@ -984,11 +1044,13 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
             return;
         }
         if (acts.v[i].kind == D2K_EMIT_PAYLOAD && out->first_payload == 0xFF) {
-            out->first_payload = (uint8_t)i;
+            out->first_payload = (uint8_t)n;
         }
-        out->out[i].delay_us = acts.v[i].delay_us;
-        out->out[i].off = used;
-        out->out[i].len = made;
+        for(size_t k=0;k<count;k++,n++) {
+            out->out[n].delay_us=k?0:e->delay_us;
+            out->out[n].off=used+spans[k].off;
+            out->out[n].len=spans[k].len;
+        }
         used += made;
     }
     if (acts.fate == D2K_ORIG_HOLD) {

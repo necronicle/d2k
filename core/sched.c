@@ -1962,7 +1962,7 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
         /* The result owns the EXACT fake measured by original askArms.
            Rebuilding a similar ClientHello would install another hypothesis. */
         char text[sizeof t->plans[0]];
-        if (t->arm.original && t->arm.len > 0 &&
+        if (t->arm.original && (t->arm.len > 0 || t->arm.frag_kind) &&
             d2k_quic_arm_plan(&t->arm, t->arm.bytes, t->arm.len, text, sizeof text) == 0) {
             if (t->n_plans < cap) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
@@ -1971,8 +1971,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
             say(s, "по %s (QUIC) плечо подобрано за %d %s: %s",
                 t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
         } else {
-            /* Сюда доходят только НАЙДЕННЫЕ плечи: фрагментация (языка нет
-               вовсе) и приманка, чей блоб не отдался. Это пробел
+            /* Сюда доходят только НАЙДЕННЫЕ, но неполные/невыразимые плечи:
+               неизвестная форма фрагментации или потерянный блоб. Это пробел
                РЕАЛИЗАЦИИ, а не свойство коробки (0007 п.3), и подменять его
                похожим запрещено. */
             say(s, "по %s (QUIC) плечо не выразимо сегодняшним языком плана: %s",

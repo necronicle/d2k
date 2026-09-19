@@ -24,9 +24,9 @@ MIPSEL_CC  ?= mipsel-unknown-linux-gnu-gcc
 # путь, каждый считал бы файл своим, и несовпадение mtime/флагов одного билда
 # портило бы зависимости другого молча.
 CORE_DIR = ../core
-CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/quicwire.c $(CORE_DIR)/crypto.c
-COREOBJ  = core_quic.o core_quicwire.o core_crypto.o
-COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h
+CORESRC  = $(CORE_DIR)/quic.c $(CORE_DIR)/quicwire.c $(CORE_DIR)/crypto.c $(CORE_DIR)/ipfrag.c
+COREOBJ  = core_quic.o core_quicwire.o core_crypto.o core_ipfrag.o
+COREHDR  = $(CORE_DIR)/include/d2k_quic.h $(CORE_DIR)/include/d2k_quicwire.h $(CORE_DIR)/include/d2k_crypto.h $(CORE_DIR)/include/d2k_ipfrag.h
 
 # Переносимый датапат: собирается и проверяется на любой машине.
 SRC     = plan_parse.c plan_apply.c tls.c capture.c hold.c wire.c wire_udp.c track.c session.c nat.c nl.c sched.c journal.c plans.c ctl.c ctlsrv.c
@@ -93,6 +93,9 @@ core_quicwire.o: $(CORE_DIR)/quicwire.c $(COREHDR)
 core_crypto.o: $(CORE_DIR)/crypto.c $(COREHDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+core_ipfrag.o: $(CORE_DIR)/ipfrag.c $(COREHDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 # session.c — единственный потребитель разбора QUIC в датапате (задача 4),
 # поэтому единственная новая зависимость по ссылке — здесь.
 session.o: session.c $(HDR)
@@ -115,10 +118,10 @@ ctl.o: ctl.c $(HDR)
 # файла). Тот же список объектников, что у test_session/ctlprobe.
 test_ctl: test_ctl.c ctl.o ctlsrv.o session.o hold.o capture.o nat.o journal.o track.o tls.o wire.o \
           wire_udp.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o \
-          core_crypto.o $(HDR)
+          core_crypto.o core_ipfrag.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_ctl.c ctl.o ctlsrv.o session.o hold.o capture.o nat.o journal.o \
 	    track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o \
-	    core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
+	    $(COREOBJ) $(LDFLAGS)
 
 test_plans: test_plans.c plans.o plan_parse.o plan_apply.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_plans.c plans.o plan_parse.o plan_apply.o $(LDFLAGS)
@@ -129,14 +132,14 @@ test_journal: test_journal.c journal.o track.o $(HDR)
 # wire_udp.o и core_quic.o/core_crypto.o добавлены задачей 4: session.c теперь
 # зовёт d2k_wire_build_udp и разбор QUIC на UDP-ветке пакетного пути, и без
 # них линковка падает неопределёнными ссылками.
-test_session: test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
+test_session: test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 # test_quic_session.c (задача 4) — то же самое дерево модулей, что и
 # test_session, тем же списком объектников: обе проверяют d2k_session_packet
 # целиком, только на разных транспортах.
-test_quic_session: test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o core_quic.o core_quicwire.o core_crypto.o $(LDFLAGS)
+test_quic_session: test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_quic_session.c session.o hold.o capture.o nat.o track.o tls.o wire.o wire_udp.o journal.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
 
 track.o: track.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<

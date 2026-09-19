@@ -66,6 +66,11 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             fail(err, errlen, "измеренный план требует minexec=3"); return -1;
         }
         switch (typ) {
+        case REC_IPFRAG:
+            if (rd16(b + 6) < 7 || ln != 1 || b[off] < 1 || b[off] > 4) {
+                fail(err, errlen, "ipfrag требует minexec=7 и форму 1..4"); return -1;
+            }
+            break;
         case REC_ID:
             if (ln != D2K_PLAN_ID_LEN) { fail(err, errlen, "id не 16 байт"); return -1; }
             break;
@@ -162,6 +167,12 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
 /* Ссылки обязаны разрешаться. Ноль означает «ничего» и висячей ссылкой не
  * является: фальшивка без порчи законна. */
 static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
+    if (p->ipfrag && (p->transport != 17 || p->n_splits || p->n_seqovls ||
+        p->order || p->input_len || p->input_tls || p->settle_us ||
+        p->segment_size || p->wire_profile || p->guards)) {
+        fail(err, errlen, "ipfrag требует UDP без TCP-операций/перестановки");
+        return -1;
+    }
     for (size_t i = 0; i < p->n_fakes; i++) {
         if (p->fakes[i].payload_id == 0 ||
             !d2k_find_payload(p, p->fakes[i].payload_id)) {
@@ -304,6 +315,12 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         off += 4 + ln;
 
         switch (typ) {
+        case REC_IPFRAG:
+            if (p->ipfrag) {
+                d2k_plan_free(p); fail(err, errlen, "повторная запись ipfrag"); return -1;
+            }
+            p->ipfrag = v[0];
+            break;
         case REC_ID:
             memcpy(p->id, v, D2K_PLAN_ID_LEN);
             break;

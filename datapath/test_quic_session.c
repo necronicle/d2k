@@ -17,6 +17,7 @@
 #include <string.h>
 #include "d2k_session.h"
 #include "d2k_quic.h"
+#include "d2k_nat.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -643,7 +644,126 @@ static void test_discord_voice(void) {
     }
 }
 
+static int frag_nat_missing;
+static int frag_nat(const char *path,uint8_t proto,uint32_t src,uint16_t sp,
+                    uint32_t dst,uint16_t dp,uint32_t *os,uint16_t *op) {
+    (void)path;(void)src;(void)sp;(void)dst;(void)dp;
+    CHECK(proto==17,"fragment NAT transport");
+    if(frag_nat_missing)return frag_nat_missing==2?1:-1;
+    const uint8_t ip[]={203,0,113,7},port[]={0xc3,0x50};
+    memcpy(os,ip,4);memcpy(op,port,2);return 0;
+}
+static unsigned frag_sum(const uint8_t *p,size_t n,unsigned sum) {
+    for(size_t i=0;i<n;i+=2)sum+=(unsigned)p[i]*256+(i+1<n?p[i+1]:0);
+    while(sum>>16)sum=(sum&65535)+(sum>>16);
+    return sum;
+}
+static unsigned frag_u16(const uint8_t *p) {return (unsigned)p[0]*256+p[1];}
+static void test_fragments(void) {
+    d2k_nat_fn saved=d2k_nat_hook;d2k_nat_hook=frag_nat;
+    for(int fake=0;fake<2;fake++)for(int shape=1;shape<=4;shape++) {
+        uint8_t tlv[128]={'D','2','K','P',0,1,0,7,0,0,0,2,
+                          0,2,0,2,17,2,1,12,0,1,0};
+        tlv[22]=(uint8_t)shape;size_t tn=23;
+        if(fake) {memcpy(tlv+tn,plan_bytes+12,sizeof plan_bytes-12);
+            tn+=sizeof plan_bytes-12;tlv[11]=6;}
+        d2k_plan *p=NULL;char err[160];
+        CHECK(d2k_plan_load(tlv,tn,&p,err,sizeof err)==0,"fragment session plan load");
+        if(!p)continue;
+        d2k_session *s=d2k_session_new(64,64);
+        d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"example.com",11,1,p);
+        uint8_t pkt[1300],buf[4096];d2k_result r;
+        unsigned lastid=0;
+        for(unsigned attempt=0;attempt<2;attempt++) {
+            size_t n=build_udp_pkt(pkt,(uint16_t)(51000+attempt),443,v1_initial,sizeof v1_initial);
+            pkt[8]=47;pkt[1]=0x2e;pkt[4]=pkt[5]=0; /* DF-style client ID must not be reused. */
+            d2k_session_packet(s,pkt,n,1000+attempt,buf,sizeof buf,&r);
+            size_t start=fake?2:0,frags=shape<=2?2:3;
+            CHECK(r.applied && r.n_out==start+frags && r.verdict==D2K_VERDICT_DROP,
+                  "fragment plan must emit all frames and drop whole original");
+            CHECK(r.first_payload==start,"first payload indexes actual wire fragment");
+            if(r.n_out!=start+frags)continue;
+            uint8_t reassembled[1208]={0},seen[1208]={0};
+            unsigned id=frag_u16(buf+r.out[start].off+4);
+            CHECK(id && id!=lastid,"fragment group requires distinct nonzero ID");lastid=id;
+            for(size_t i=0;i<r.n_out;i++) {
+                const uint8_t *f=buf+r.out[i].off;
+                CHECK(frag_sum(f,20,0)==65535,"fragment IPv4 checksum");
+                if(i<start) {
+                    CHECK(!memcmp(f+12,"\xc0\xa8\x01\x43",4),"whole fake retains kernel NAT path");
+                    CHECK(f[8]==3 && frag_u16(f+20)==51000+attempt &&
+                          !memcmp(f+28,"\xde\xad\xbe",3),"fake unchanged before fragments");
+                    continue;
+                }
+                CHECK(!memcmp(f+12,"\xcb\x00\x71\x07",4),"fragment NAT source");
+                unsigned off=(frag_u16(f+6)&8191)*8;
+                size_t ln=r.out[i].len-20;
+                CHECK(f[8]==47 && f[1]==0x2e,"fragment preserves client TTL/TOS");
+                CHECK(frag_u16(f+4)==id,"one IP ID per group");
+                CHECK(frag_u16(f+6)&0x3fff,"no whole unfragmented UDP emitted");
+                CHECK(off+ln<=sizeof reassembled,"fragment bounds");
+                if(off+ln>sizeof reassembled)continue;
+                memcpy(reassembled+off,f+20,ln);memset(seen+off,1,ln);
+                CHECK(r.out[i].delay_us==0,"original fragments have no invented delay");
+                if(i==start)CHECK((shape==1)==(off==0),"original fragment wire order");
+            }
+            for(size_t i=0;i<sizeof seen;i++)CHECK(seen[i],"complete UDP reassembly");
+            CHECK(frag_u16(reassembled)==50000 && frag_u16(reassembled+2)==443 &&
+                  frag_u16(reassembled+4)==1208,"translated UDP header");
+            CHECK(!memcmp(reassembled+8,v1_initial,1200),"full original QUIC bytes");
+            const uint8_t ph[]={203,0,113,7,1,2,3,4,0,17,4,184};
+            CHECK(frag_sum(reassembled,sizeof reassembled,frag_sum(ph,sizeof ph,0))==65535,
+                  "UDP checksum over translated full datagram, not individual cuts");
+            CHECK(d2k_session_done(s)==0,"prepared fragments are not DONE");
+            if(attempt==0) {
+                for(size_t i=0;i<=start;i++)d2k_session_sent(s,1200+i,&r.key,r.execution_id);
+                CHECK(d2k_session_exec_failed(s,1300,&r.key,r.plan_id,D2K_REFUSE_SEND,
+                      r.execution_id,1,0)==0,"partial fragment must not release whole original");
+                CHECK(d2k_session_done(s)==0 && d2k_session_damaged_count(s)==1,
+                      "partial fragment group is damaged, never DONE");
+            } else {
+                for(size_t i=0;i<r.n_out;i++)d2k_session_sent(s,1400+i,&r.key,r.execution_id);
+                CHECK(d2k_session_done(s)==0,"missing original verdict is not DONE");
+                d2k_session_sent(s,1500,&r.key,r.execution_id);
+                CHECK(d2k_session_done(s)==1,"all fragments and verdict complete one execution");
+            }
+        }
+        /* Failure while constructing: no raw sends, no false application. */
+        size_t n=build_udp_pkt(pkt,52000,443,v1_initial,sizeof v1_initial);
+        d2k_session_packet(s,pkt,n,2000,buf,100,&r);
+        CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT && r.skipped,
+              "short output buffer must pass untouched original without APPLIED");
+        frag_nat_missing=1;
+        n=build_udp_pkt(pkt,52001,443,v1_initial,sizeof v1_initial);
+        d2k_session_packet(s,pkt,n,2100,buf,sizeof buf,&r);
+        CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT && r.skipped,
+              "first packet cannot guess fragment NAT mapping");
+        frag_nat_missing=0;
+        frag_nat_missing=2;
+        n=build_udp_pkt(pkt,52002,443,v1_initial,sizeof v1_initial);
+        d2k_session_packet(s,pkt,n,2200,buf,sizeof buf,&r);
+        CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT,
+              "missing conntrack procfs is not evidence of untranslated fragment context");
+        frag_nat_missing=0;
+        if(fake && shape==4) {
+            /* 24 fake datagrams + 3 IP fragments exceeds the 26-frame result,
+               despite only 25 logical actions. Refuse before sending any. */
+            tlv[23+9+12+8]=24;
+            d2k_plan *large=NULL;
+            CHECK(d2k_plan_load(tlv,tn,&large,err,sizeof err)==0,"large fragment plan load");
+            if(large)d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"example.com",11,2,large);
+            n=build_udp_pkt(pkt,52003,443,v1_initial,sizeof v1_initial);
+            d2k_session_packet(s,pkt,n,2300,buf,sizeof buf,&r);
+            CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT,
+                  "expanded wire fragment count must be capacity checked");
+        }
+        d2k_session_free(s);
+    }
+    d2k_nat_hook=saved;
+}
+
 int main(void) {
+    test_fragments();
     test_direction_by_hook();
     test_discord_voice();
     test_nameless_initial();

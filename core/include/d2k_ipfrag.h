@@ -23,4 +23,10 @@ size_t d2k_udpfrag_build(const uint8_t src[4], const uint8_t dst[4],
     uint16_t sport, uint16_t dport, const uint8_t *payload, size_t len,
     const d2k_ipfrag_plan *plan, uint16_t id, uint8_t *out, size_t cap,
     d2k_ipfrag_span spans[3]);
+/* Same cuts/checksums for live packets; preserve their IPv4 TTL and TOS.
+ * The measurement wrapper above deliberately uses the donor's 64/0. */
+size_t d2k_udpfrag_build_ex(const uint8_t src[4], const uint8_t dst[4],
+    uint16_t sport, uint16_t dport, const uint8_t *payload, size_t len,
+    const d2k_ipfrag_plan *plan, uint16_t id, uint8_t ttl, uint8_t tos,
+    uint8_t *out, size_t cap, d2k_ipfrag_span spans[3]);
 #endif

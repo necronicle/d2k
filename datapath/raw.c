@@ -37,6 +37,7 @@ typedef struct {
 
 struct d2k_raw {
     int      fd;
+    int      fragment_fd;
     uint32_t limits;
     size_t   maxlen;
     uint64_t sent;
@@ -181,6 +182,7 @@ d2k_raw *d2k_raw_open(uint32_t mark, const char *ifname, char *err, size_t errca
     /* Пределы объявляются сразу и не зависят от успеха настроек: их задаёт
        сам способ отправки, а не наша конфигурация. */
     r->limits = D2K_RAW_CANT_IPID | D2K_RAW_CANT_IPSUM;
+    r->fragment_fd = -1;
     /* Один раз при старте — см. шапку в d2k_raw.h про цену этого выбора. */
     r->maxlen = pick_maxlen(ifname);
     r->mark = mark;
@@ -241,6 +243,7 @@ void d2k_raw_close(d2k_raw *r) {
     if (r->fd >= 0) {
         close(r->fd);
     }
+    if (r->fragment_fd >= 0) close(r->fragment_fd);
     free(r);
 }
 
@@ -282,6 +285,40 @@ size_t d2k_raw_route_maxlen(d2k_raw *r, const uint8_t dst[4]) {
     return blend(r, m, cap_all);
 }
 
+int d2k_raw_prepare(d2k_raw *r, const uint8_t *pkt, size_t len,
+                    char *err, size_t errcap) {
+    if (!r || !pkt || len<20) {errno=EINVAL;return -1;}
+    if (!((pkt[6]&0x3f) || pkt[7])) return 0;
+    if (pkt[0]!=0x45 || pkt[9]!=17 || !(pkt[4] || pkt[5])) {
+        say(err,errcap,"неподдержанный контекст IP-фрагмента");errno=EINVAL;return -1;
+    }
+    if (r->fragment_fd>=0) return 0;
+    /* Ordinary packets must keep normal conntrack/NAT. A separate socket
+       prevents defrag from undoing the measured order/overlaps. Fragment
+       addresses/UDP checksum were translated from the client's tuple by
+       session.c. Never fall back to the ordinary socket on failure. */
+    int fd=socket(AF_INET,SOCK_RAW,IPPROTO_RAW),one=1;
+    if(fd<0) {say(err,errcap,"fragment socket: %s",strerror(errno));return -1;}
+    if(setsockopt(fd,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)<0) goto bad;
+#ifdef IP_NODEFRAG
+    if(setsockopt(fd,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)<0) goto bad;
+#else
+    errno=ENOPROTOOPT;goto bad;
+#endif
+    if(r->mark) {
+#ifdef SO_MARK
+        if(setsockopt(fd,SOL_SOCKET,SO_MARK,&r->mark,sizeof r->mark)<0) goto bad;
+#else
+        errno=ENOPROTOOPT;goto bad;
+#endif
+    }
+    r->fragment_fd=fd;return 0;
+bad: {
+    int saved=errno;close(fd);errno=saved;
+    say(err,errcap,"fragment socket setup: %s",strerror(errno));return -1;
+    }
+}
+
 int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                  char *err, size_t errcap) {
     if (!r || !pkt || len < 20) {
@@ -294,6 +331,8 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
         errno = EAFNOSUPPORT;
         return -1;
     }
+    if(d2k_raw_prepare(r,pkt,len,err,errcap)<0) {r->errors++;return -1;}
+    int fd=((pkt[6]&0x3f) || pkt[7])?r->fragment_fd:r->fd;
 
     struct sockaddr_in to;
     memset(&to, 0, sizeof to);
@@ -302,7 +341,7 @@ int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
     memcpy(&to.sin_addr.s_addr, pkt + 16, 4);
 
     for (;;) {
-        ssize_t n = sendto(r->fd, pkt, len, 0, (struct sockaddr *)&to, sizeof to);
+        ssize_t n = sendto(fd, pkt, len, 0, (struct sockaddr *)&to, sizeof to);
         if (n >= 0) {
             if ((size_t)n != len) {
                 r->errors++;

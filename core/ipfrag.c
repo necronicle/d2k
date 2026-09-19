@@ -49,10 +49,11 @@ static uint32_t sum16(const uint8_t *p,size_t n,uint32_t sum) {
     return sum;
 }
 static uint16_t fold(uint32_t s){while(s>>16)s=(s&65535)+(s>>16);return (uint16_t)~s;}
-size_t d2k_udpfrag_build(const uint8_t src[4],const uint8_t dst[4],
+size_t d2k_udpfrag_build_ex(const uint8_t src[4],const uint8_t dst[4],
     uint16_t sport,uint16_t dport,const uint8_t *payload,size_t len,
-    const d2k_ipfrag_plan *p,uint16_t id,uint8_t *out,size_t cap,d2k_ipfrag_span spans[3]) {
-    if(!src || !dst || (!payload && len) || !out || !spans || !id || len>65507)return 0;
+    const d2k_ipfrag_plan *p,uint16_t id,uint8_t ttl,uint8_t tos,
+    uint8_t *out,size_t cap,d2k_ipfrag_span spans[3]) {
+    if(!src || !dst || (!payload && len) || !out || !spans || !id || !ttl || len>65507)return 0;
     d2k_ipfrag_span cuts[3];
     size_t n=d2k_ipfrag_cuts(len+8,p,cuts),needed=0;
     if(!n)return 0;
@@ -70,7 +71,7 @@ size_t d2k_udpfrag_build(const uint8_t src[4],const uint8_t dst[4],
         uint8_t *f=out+used;
         memset(f,0,20);f[0]=0x45;wr16(f+2,(uint16_t)(20+c.len));wr16(f+4,id);
         wr16(f+6,(uint16_t)(c.off/8 | (ci+1<n?0x2000:0)));
-        f[8]=64;f[9]=17;memcpy(f+12,src,4);memcpy(f+16,dst,4);
+        f[1]=tos;f[8]=ttl;f[9]=17;memcpy(f+12,src,4);memcpy(f+16,dst,4);
         wr16(f+10,fold(sum16(f,20,0)));
         for(size_t j=0;j<c.len;j++) {
             size_t logical=c.off+j;
@@ -79,4 +80,10 @@ size_t d2k_udpfrag_build(const uint8_t src[4],const uint8_t dst[4],
         spans[i]=(d2k_ipfrag_span){used,20+c.len};used+=20+c.len;
     }
     return n;
+}
+
+size_t d2k_udpfrag_build(const uint8_t src[4],const uint8_t dst[4],
+    uint16_t sport,uint16_t dport,const uint8_t *payload,size_t len,
+    const d2k_ipfrag_plan *p,uint16_t id,uint8_t *out,size_t cap,d2k_ipfrag_span spans[3]) {
+    return d2k_udpfrag_build_ex(src,dst,sport,dport,payload,len,p,id,64,0,out,cap,spans);
 }

@@ -164,6 +164,7 @@ static uint16_t ver_answer_port;
    тест обязан утверждать поведение планировщика, не выходя наружу. */
 static d2k_quic_arm_kind arm_kind = D2K_QA_BLOB;
 static int arm_calls;
+static int arm_fragment_shape;
 
 /* Занятие порта всегда неудачно — инъекция отказа для 0010 R1. */
 static int stub_bind_fail(uint8_t transport, int *out_fd, uint16_t *sport_be) {
@@ -186,6 +187,10 @@ static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
     a.copies = 6;
     a.ttl = 3;
     a.probes = 4;
+    if(arm_fragment_shape) {
+        a.frag_kind=arm_fragment_shape;a.frag_survives=D2K_PROP_YES;
+        if(arm_kind==D2K_QA_FRAG){a.len=0;a.copies=0;a.ttl=0;}
+    }
     snprintf(a.reason, sizeof a.reason, "подменённый подбор");
     return a;
 }
@@ -3605,6 +3610,30 @@ int main(void) {
         d2k_catalog_free(&cQ);
     }
 
+    for(int fake=0;fake<2;fake++) {
+        d2k_catalog c={0};d2k_sched *s=d2k_sched_new(&c,sv[0],0x2d);
+        quic_answer=D2K_V_OPAQUE;ver_answer=D2K_VER_APPLICATION;
+        ver_fail_first=0;ver_answer_port=(uint16_t)(40225+fake);
+        arm_kind=fake?D2K_QA_COPIES:D2K_QA_FRAG;arm_fragment_shape=4;
+        forget_sent();
+        d2k_ev h=ev_hello(17,ver_answer_port,"original.fragment");d2k_sched_event(s,&h);
+        d2k_ev su=ev_suspect(17,ver_answer_port);d2k_sched_event(s,&su);
+        d2k_ev sh;CHECK(quic_shape(&sh,"original.fragment")==0,"fragment shape fixture");
+        d2k_sched_event(s,&sh);settle(s);
+        d2k_ev ap=ev_applied(17,ver_answer_port);d2k_sched_event(s,&ap);spin(s,40);
+        CHECK(binding_of(&c,"original.fragment",17)!=NULL,"scheduler discarded fragment-only/combo result");
+        int found=0;
+        for(size_t i=0;i<c.n_boxes;i++)for(size_t j=0;j<c.boxes[i].n_plans;j++) {
+            const char *text=c.boxes[i].plans[j].text;
+            if(text && strstr(text,"ipfrag 4\n")) {
+                found=1;
+                CHECK((strstr(text,"fake ")!=NULL)==fake,"scheduler invented/lost fake in fragment plan");
+            }
+        }
+        CHECK(found,"learned catalog lost original fragment shape");
+        d2k_sched_free(s);d2k_catalog_free(&c);arm_fragment_shape=0;
+    }
+
     /* --- невыразимое плечо QUIC не подменяется похожим ------------------ */
     {
         d2k_catalog cF2;
@@ -3615,7 +3644,7 @@ int main(void) {
         quic_answer = D2K_V_OPAQUE;
         ver_answer = D2K_VER_APPLICATION;
         ver_answer_port = 40221;
-        arm_kind = D2K_QA_FRAG;     /* фрагментации язык плана не знает */
+        arm_kind = D2K_QA_FRAG;     /* нет измеренной формы/выживания */
         forget_sent();
 
         d2k_ev h = ev_hello(17, 40221, "фрагмент.квик");

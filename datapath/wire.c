@@ -78,7 +78,7 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     if (!c || !e || !out) {
         return 0;
     }
-    if (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP) { return 0; }
+    if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP)) { return 0; }
     int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
     size_t opt_len = (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
     const size_t body = e->pre_len + e->len;

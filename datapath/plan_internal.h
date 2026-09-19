@@ -37,7 +37,8 @@ enum {
     REC_SEGMENT = 0x0108,
     REC_WIRE    = 0x0109,
     REC_INPUT_TLS = 0x010a,
-    REC_DELAY     = 0x010b
+    REC_DELAY     = 0x010b,
+    REC_IPFRAG    = 0x010c
 };
 
 /* Якоря семантических позиций. */
@@ -100,6 +101,7 @@ struct d2k_plan {
     uint32_t segment_size;
     uint8_t wire_profile;
     uint8_t input_tls;
+    uint8_t ipfrag;
 
     struct d2k_payload *payloads; size_t n_payloads;
     struct d2k_poison  *poisons;  size_t n_poisons;

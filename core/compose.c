@@ -1379,18 +1379,10 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
  * внутренние приманки, число копий, TTL, фрагментация. Scheduler передаёт
  * точные байты результата; повторно выводить приманку из снимка нельзя.
  *
- * Что из плеча выразимо сегодня, и почему именно это. Датаграмма атомарна:
- * резать её нельзя (datapath/session.c: «план режет датаграмму на части — для
- * UDP это порча, не разрез»), якоря имени на UDP не определены намеренно
- * (have_sni=0), а d2k_wire_build_udp честно отказывается собирать посылку с
- * приставкой перекрытия, сдвигом номера, tcp_ts и битой суммой — полей TCP у
- * UDP нет. Остаётся ровно то, из чего плечо QUIC и состоит: приманка
- * отдельными датаграммами ПЕРЕД правдой, число копий и TTL приманки.
- *
- * D2K_QA_FRAG не выражается: IP-фрагментации язык Plan не знает. Возвращается
- * -1 — пробел РЕАЛИЗАЦИИ, а не отрицательное свойство коробки (0007 п.3), и
- * подменять его похожим запрещено (§2.5). Так же -1 на NOT_FOUND и FLAKY:
- * там нечего ставить.
+ * UDP нельзя разрезать на самостоятельные датаграммы. REC_IPFRAG (minexec=7)
+ * выражает именно IPv4-фрагменты одной целой UDP-датаграммы, с её суммой,
+ * исходными разрезами/перекрытиями/порядком. Fake идёт ПЕРЕД фрагментами,
+ * целый оригинал снимается. NOT_FOUND/FLAKY и неизвестная форма — отказ.
  * -------------------------------------------------------------------- */
 int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
                       char *buf, size_t cap) {
@@ -1407,22 +1399,33 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
         if (arm->ttl <= 0 || arm->ttl > 255) { return -1; }
         ttl = arm->ttl;
         break;
+    case D2K_QA_FRAG:
+        if (!arm->original || arm->len || blen || !arm->frag_kind) return -1;
+        break;
     default:
-        return -1;   /* FRAG не выразим; NOT_FOUND и FLAKY ставить нечего */
+        return -1;
     }
 
-    /* Original compose combines independent repeat and TTL observations.
-       A fragment combination cannot be silently reduced to fake-only. */
+    /* Original compose combines fake and fragment; no invented fake for a
+       fragment-only result. Survival on the neutral control is mandatory. */
+    int frag=arm->frag_kind;
+    int has_fake=arm->kind!=D2K_QA_FRAG;
+    if (frag && (!arm->original || frag<1 || frag>4 ||
+                 arm->frag_survives!=D2K_PROP_YES)) return -1;
     if (arm->original) {
-        if (arm->frag_kind || arm->copies <= 0 || arm->copies > 255 ||
+        if (has_fake && (arm->copies <= 0 || arm->copies > 255 ||
             arm->len == 0 || arm->len > sizeof arm->bytes || !blob ||
-            blen != arm->len || memcmp(blob, arm->bytes, blen) != 0) return -1;
+            blen != arm->len || memcmp(blob, arm->bytes, blen) != 0)) return -1;
         repeats = (unsigned)arm->copies;
     }
-    if (!blob || blen == 0) { return -1; }
+    if (has_fake && (!blob || blen == 0)) { return -1; }
 
     size_t pos = 0;
-    if (emit_header_proto(buf, cap, &pos, "udp quic") != 0) { return -1; }
+    if (frag) {
+        if (append_fmt(buf,cap,&pos,"d2k-plan 1 7\nid 00000000000000000000000000000000\n"
+                                   "proto udp quic\nipfrag %d\n",frag)!=0) return -1;
+    } else if (emit_header_proto(buf, cap, &pos, "udp quic") != 0) { return -1; }
+    if (has_fake) {
     if (append_fmt(buf, cap, &pos, "payload 1 ") != 0) { return -1; }
     if (append_hex(buf, cap, &pos, blob, blen) != 0) { return -1; }
     if (append_fmt(buf, cap, &pos, "\n") != 0) { return -1; }
@@ -1432,12 +1435,13 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
         if (append_fmt(buf, cap, &pos, "poison 1\n") != 0) { return -1; }
     }
     /* place=before и никакого «между»: между чем? Кусков у датаграммы нет.
-       gap_us нулевой — паузы МЕЖДУ копиями донор не задаёт, а выдержку перед
-       правдой задаёт pace, и это то же число, что у TCP-плеч с фальшивкой. */
+       gap_us нулевой — паузы МЕЖДУ копиями донор не задаёт. У оригинального
+       askArms нет дополнительной паузы перед правдой; pace только legacy. */
     if (append_fmt(buf, cap, &pos,
                    "fake payload=1 poison=1 repeats=%u gap_us=0 place=before\n",
                    repeats) != 0) {
         return -1;
+    }
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
     if (!arm->original && append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {

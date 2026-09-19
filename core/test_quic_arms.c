@@ -720,11 +720,30 @@ static void test_arm_to_plan(void) {
     CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
           "original plan grammar");
     original.frag_kind = 1;
+    original.frag_survives = D2K_PROP_YES;
+    CHECK(d2k_quic_arm_plan(&original, original.bytes, original.len, plan, sizeof plan) == 0,
+          "original fake and fragment must compose together");
+    CHECK(strstr(plan, "ipfrag 1\n") && strstr(plan, "repeats=6") &&
+          strstr(plan, "d2k-plan 1 7\n"), "fragment combination/version lost");
+    CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
+          "fragment text grammar");
+    original.frag_survives = D2K_PROP_UNKNOWN;
     CHECK(d2k_quic_arm_plan(&original, original.bytes, original.len, plan, sizeof plan) != 0,
-          "cannot silently omit found fragment combination");
+          "cannot use unconfirmed fragment survival");
     original.frag_kind = 0;
     CHECK(d2k_quic_arm_plan(&original, (const uint8_t *)"other", 5, plan, sizeof plan) != 0,
           "cannot replace original owned fake");
+    d2k_quic_arm frag = {0};
+    frag.original=1;frag.kind=D2K_QA_FRAG;frag.frag_survives=D2K_PROP_YES;
+    for(int shape=1;shape<=4;shape++) {
+        frag.frag_kind=shape;
+        CHECK(d2k_quic_arm_plan(&frag,NULL,0,plan,sizeof plan)==0,
+              "original fragment-only requires no fake bytes");
+        CHECK(strstr(plan,"fake ")==NULL && strstr(plan,"ipfrag "),
+              "fragment-only must not invent fake");
+        CHECK(d2k_plan_text_to_hex(plan,hex,sizeof hex,err,sizeof err)==0,
+              "fragment-only grammar");
+    }
     /* Тело приманки — выведенное, как и в бою: то же, что подбор и увидит. */
     static uint8_t decoy[2048];
     size_t blen = 0;
@@ -737,7 +756,7 @@ static void test_arm_to_plan(void) {
         { D2K_QA_BLOB,      0,  0, 1, "одиночная приманка" },
         { D2K_QA_COPIES,   11,  0, 1, "одиннадцать копий" },
         { D2K_QA_TTL,       0,  3, 1, "приманка с укороченным TTL" },
-        { D2K_QA_FRAG,      0,  0, 0, "фрагментация — не выразима" },
+        { D2K_QA_FRAG,      0,  0, 0, "legacy fragment без исходной формы — отказ" },
         { D2K_QA_NOT_FOUND, 0,  0, 0, "плечо не найдено — ставить нечего" },
         { D2K_QA_FLAKY,     0,  0, 0, "измерению верить нельзя" },
     };

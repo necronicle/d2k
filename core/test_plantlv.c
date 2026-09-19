@@ -188,6 +188,22 @@ int main(void) {
               "delay принял два значения");
     }
 
+    {
+        uint8_t out[256];size_t n=0;char err[200],text[256];
+        const char *bad[]={"ipfrag 0\n","ipfrag 5\n","ipfrag 1 2\n",
+            "ipfrag 1\nipfrag 1\n","ipfrag -1\n","ipfrag 1ms\n",
+            "ipfrag 1\nsplit payload_start +1\n","ipfrag 1\norder reverse\n"};
+        for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+            snprintf(text,sizeof text,"d2k-plan 1 7\nproto udp quic\n%s",bad[i]);
+            CHECK(d2k_plan_text_to_tlv(text,out,sizeof out,&n,err,sizeof err)!=0,
+                  "invalid/conflicting fragment text accepted");
+        }
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 6\nproto udp quic\nipfrag 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"fragment with old executor");
+        CHECK(d2k_plan_text_to_tlv("d2k-plan 1 7\nproto tcp tls\nipfrag 1\n",
+              out,sizeof out,&n,err,sizeof err)!=0,"fragment with TCP text");
+    }
+
     /* --- pace: ноль и мусор отвергаются ---------------------------------
      *
      * «pace 0» запрещён нарочно: он и отсутствие строки означали бы одно и то

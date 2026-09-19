@@ -1,7 +1,7 @@
 /* d2k_plan.h — контракт исполнителя планов.
  *
  * Исполнитель читает ТОЛЬКО каноническую форму TLV. Человеческую форму
- * порождает и разбирает Go: разборщик текста здесь был бы лишней поверхностью
+ * порождает и разбирает core/plantlv.c: разборщик текста здесь был бы лишней поверхностью
  * для ошибок в компоненте, чей вход приходит из сети, а падение кладёт весь
  * транзитный трафик.
  *
@@ -30,7 +30,8 @@
  * pace, ни settle её не выражают (см. d2k_plan_internal.h про delay_us).
  * Понадобилась датаграммам: приветствие QUIC настоящего клиента едет двумя
  * Initial в 40 мкс друг от друга, и коробка складывает имя из обоих. */
-#define D2K_EXEC_VERSION 6
+/* Version 7: original IPv4/UDP fragment shapes, independently of fake. */
+#define D2K_EXEC_VERSION 7
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_SCHEMA_MAX   1
 
@@ -88,6 +89,10 @@ typedef struct {
     uint8_t  poison;     /* биты D2K_POISON_* */
     int32_t  seq_shift;
     uint8_t  wire_profile; /* 0 legacy, D2K_WIRE_DETECT_TCP measured raw TCP */
+    /* Original QUIC IPv4 fragment shape 1..4; zero = whole datagram.
+       One PAYLOAD action owns the entire UDP datagram. Session expands it
+       into wire fragments, never independent partial UDP datagrams. */
+    uint8_t  ipfrag;
     /* Приставка перед нагрузкой — байты, которых в исходном пакете нет.
      *
      * Нужна перекрытию: сегмент выходит с номером на pre_len МЕНЬШЕ, чем

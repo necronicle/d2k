@@ -891,6 +891,18 @@ int main(int argc, char **argv) {
                         }
                     }
 
+                    if (mode==MODE_APPLY && raw && res.applied && res.n_out) {
+                        for(size_t k=0;k<res.n_out;k++) {
+                            if(d2k_raw_prepare(raw,obuf+res.out[k].off,res.out[k].len,
+                                               err,sizeof err)==0) continue;
+                            fprintf(stderr,"d2kd: план не отправлен: %s\n",err);
+                            st.send_fail++;res.n_out=0;
+                            if(d2k_session_exec_failed(sess,t,&res.key,res.plan_id,
+                                 D2K_REFUSE_SEND,res.execution_id,0,0)) verdict=D2K_NF_ACCEPT;
+                            break;
+                        }
+                    }
+
                     /* Ушла ли уже НАГРУЗКА. Берётся из факта отправки, а не
                        из арифметики по номеру: номер не отличает ушедшее от
                        положенного в очередь. */

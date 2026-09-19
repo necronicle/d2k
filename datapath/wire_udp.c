@@ -69,7 +69,7 @@ size_t d2k_wire_build_udp(const d2k_conn *c, const d2k_emit *e,
     if (!c || !e || !out) {
         return 0;
     }
-    if (e->wire_profile) { return 0; } /* TCP-only semantics, never ignore. */
+    if (e->wire_profile || e->ipfrag) { return 0; } /* Fragment expansion belongs to session. */
 
     /* Четыре просьбы, которые для UDP нельзя честно исполнить, — отказ (0),
      * а не тихая сборка без запрошенного:

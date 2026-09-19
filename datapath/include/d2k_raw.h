@@ -130,6 +130,11 @@ size_t d2k_raw_maxlen(const d2k_raw *r);
  * 0 — отправлено, -1 — ошибка (причина в err). */
 int d2k_raw_send(d2k_raw *r, const uint8_t *pkt, size_t len,
                  char *err, size_t errcap);
+/* Prepare required socket options without sending. Call for EVERY packet
+ * before starting a plan so unavailable NODEFRAG/mark cannot cause a
+ * half-executed fake+fragment combination. Whole packets keep ordinary NAT. */
+int d2k_raw_prepare(d2k_raw *r, const uint8_t *pkt, size_t len,
+                    char *err, size_t errcap);
 
 uint64_t d2k_raw_sent(const d2k_raw *r);
 uint64_t d2k_raw_errors(const d2k_raw *r);
