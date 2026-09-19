@@ -271,21 +271,12 @@ static d2k_ver_result verify_default(int use_fd, const char *ip, uint16_t port,
     return d2k_verify_probe_on(use_fd, ip, port, sni, deadline_ms, hello_wire);
 }
 
-/* Умолчание подбора плеча QUIC. Отдельным хуком по той же причине, что и
- * прочие оракулы: подбор ходит в сеть десятками опытов, и модульный тест
- * обязан утверждать поведение планировщика, не выходя наружу. */
-static d2k_quic_arm pick_arm_default(const char *ip, uint16_t port, const char *sni,
-                                     const char *decoy_sni, d2k_hello trigger, uint32_t mark) {
-    return d2k_quic_pick_arm(ip, port, sni, decoy_sni, trigger, mark);
-}
-
 static int bind_default(uint8_t transport, int *out_fd, uint16_t *sport_be) {
     return (transport == 17) ? d2k_props_bind_udp(out_fd, sport_be)
                              : d2k_props_bind(out_fd, sport_be);
 }
 
 d2k_sched_bind_fn d2k_sched_bind_hook = bind_default;
-d2k_sched_arm_fn  d2k_sched_arm_hook  = pick_arm_default;
 d2k_sched_vol_fn  d2k_sched_vol_hook  = d2k_volume_probe;
 /* Прежнее дерево вердиктов (core/verdict.c) отмены не умеет: у него нет ни
    контекста, ни проверок между зондами. Переходник это НЕ скрывает — он
@@ -302,7 +293,7 @@ static d2k_vres classify_no_cancel(const char *ip, uint16_t port,
 }
 
 d2k_sched_tcp_fn  d2k_sched_tcp_hook  = classify_no_cancel;
-d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_classify;
+d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
 
 /* --------------------------------------------------------------------
@@ -1049,23 +1040,10 @@ static void *worker_run(void *vp) {
 
     d2k_vres r;
     if (t->transport == 17) {
-        r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->mark);
-        /* ПОДБОР ПЛЕЧА — ЗДЕСЬ ЖЕ, В РАБОЧЕМ ПОТОКЕ.
-           У датаграммы нет разреза (резать её — порча, а не разрез), и
-           d2k_compose, выводящий разрезы из вектора свойств, для UDP не
-           производит НИЧЕГО применимого. Плечо QUIC подбирается своим
-           перебором: блобы-приманки, затем число копий, затем развёртка TTL —
-           донорский порядок. Без этого вызова вертикаль обрывалась посередине:
-           подбор был написан и не звался ниоткуда, кроме тестов.
-
-           Спрашиваем только когда решает СОДЕРЖИМОЕ: при «проходит как есть»
-           и «до цели нет транспорта» воздействовать не на что, и тратить
-           десятки опытов было бы тратой чужого канала. */
-        if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX ||
-            r.verdict == D2K_V_WHOLE) {
-            t->arm = d2k_sched_arm_hook(t->ip, t->port, t->name, SCHED_DECOY, trig, s->mark);
-            t->arm_ready = 1;
-        }
+        /* Original Run owns both diagnosis and askArms, BEFORE properties,
+           with one residual-aware address pool. Never restart search here. */
+        r = d2k_sched_quic_hook(t->ip, t->port, t->name, trig, ctl, s->mark, &t->arm);
+        t->arm_ready = t->arm.original;
     } else {
         /* repeats<=0 — то же умолчание (три), что у d2k_meas: второе число
            здесь развело бы два места по умолчанию (d2k_verdict.h). gap/wait
@@ -1948,6 +1926,16 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                 t->name);
             return;
         }
+        for (size_t qi=0; qi<t->arm.n_trace && qi<D2K_QUIC_ARM_STEPS; qi++) {
+            const d2k_quic_arm_step *step=&t->arm.trace[qi];
+            const char *note=step->not_measured==1 ? "не задано: адреса" :
+                step->not_measured==2 ? "не задано: бюджет" :
+                step->not_measured==3 ? "не измерено: не собрано/локальный отказ" :
+                step->answered==D2K_QUIC_REPEATS ? "прошло" :
+                step->answered>0 ? "неустойчиво, не засчитано" : "не прошло";
+            say(s, "по %s (QUIC) %s, адрес %s: %d/%d, %s", t->name,
+                step->label, step->addr[0]?step->addr:"—", step->answered,step->sent,note);
+        }
         /* ТРИ РАЗНЫХ ИСХОДА, И ИХ НЕЛЬЗЯ СЛИВАТЬ В ОДИН.
            «Не нашлось» — это про коробку и бюджет: перебор дошёл до конца и
            не нашёл, чем её взять. «Верить нельзя» — про измерение: повторы
@@ -1957,6 +1945,11 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
            отчиталась пробелом реализации там, где на деле кончился бюджет
            развёртки TTL. */
         if (t->arm.kind == D2K_QA_NOT_FOUND) {
+            if (t->arm.incomplete) {
+                say(s, "по %s (QUIC) поиск не завершён, кандидат не найден: %s",
+                    t->name,t->arm.reason);
+                return;
+            }
             say(s, "по %s (QUIC) плечо не нашлось за %d %s: %s",
                 t->name, t->arm.probes, probes_word(t->arm.probes), t->arm.reason);
             return;
@@ -1966,18 +1959,11 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                 t->name, t->arm.reason);
             return;
         }
-        /* Тело приманки выводится ТЕМ ЖЕ вызовом из ТОГО ЖЕ снимка, что и при
-           подборе: индекс чужого каталога не носится, потому что каталога
-           нет (d2k_quic_decoy_from_trigger). Свежие идентификаторы соединения
-           пересборка ставит сама — новому соединению они и положены. */
-        uint8_t decoy[2048];
-        size_t blen = 0;
-        d2k_hello trg; trg.bytes = t->trig; trg.len = t->trig_len;
-        int have_decoy = (d2k_quic_decoy_from_trigger(trg, SCHED_DECOY, decoy,
-                                                      sizeof decoy, &blen) == 0);
+        /* The result owns the EXACT fake measured by original askArms.
+           Rebuilding a similar ClientHello would install another hypothesis. */
         char text[sizeof t->plans[0]];
-        if (have_decoy && blen > 0 &&
-            d2k_quic_arm_plan(&t->arm, decoy, blen, text, sizeof text) == 0) {
+        if (t->arm.original && t->arm.len > 0 &&
+            d2k_quic_arm_plan(&t->arm, t->arm.bytes, t->arm.len, text, sizeof text) == 0) {
             if (t->n_plans < cap) {
                 memcpy(t->plans[t->n_plans], text, strlen(text) + 1);
                 t->n_plans++;

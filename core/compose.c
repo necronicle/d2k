@@ -1375,11 +1375,9 @@ static int fb_arm_at(size_t idx, fb_arm *a) {
 /* --------------------------------------------------------------------
  * ПЛАН ИЗ ПОДОБРАННОГО ПЛЕЧА QUIC.
  *
- * Плечо подбирает d2k_quic_pick_arm (core/props.c): перебор блобов-приманок,
- * затем ось числа копий, затем развёртка TTL — донорский порядок. До сих пор
- * подобранное плечо НЕКУДА было девать: планировщик его не звал, а если бы
- * позвал — переводить результат в текст плана было нечем, и вертикаль QUIC
- * обрывалась на месте.
+ * Плечо подбирает original askArms (quicarms.c) внутри d2k_quic_run:
+ * внутренние приманки, число копий, TTL, фрагментация. Scheduler передаёт
+ * точные байты результата; повторно выводить приманку из снимка нельзя.
  *
  * Что из плеча выразимо сегодня, и почему именно это. Датаграмма атомарна:
  * резать её нельзя (datapath/session.c: «план режет датаграмму на части — для
@@ -1413,11 +1411,14 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
         return -1;   /* FRAG не выразим; NOT_FOUND и FLAKY ставить нечего */
     }
 
-    /* Байты приманки приходят ОТ ВЫЗЫВАЮЩЕГО, а не берутся здесь: приманка
-       выводится из снятого приветствия цели (d2k_quic_decoy_from_trigger), и
-       тащить сетевой модуль в сборку планов ради этого незачем. Номера
-       приманки у плеча нет вовсе — набора, из которого её выбирали бы, не
-       существует. */
+    /* Original compose combines independent repeat and TTL observations.
+       A fragment combination cannot be silently reduced to fake-only. */
+    if (arm->original) {
+        if (arm->frag_kind || arm->copies <= 0 || arm->copies > 255 ||
+            arm->len == 0 || arm->len > sizeof arm->bytes || !blob ||
+            blen != arm->len || memcmp(blob, arm->bytes, blen) != 0) return -1;
+        repeats = (unsigned)arm->copies;
+    }
     if (!blob || blen == 0) { return -1; }
 
     size_t pos = 0;
@@ -1439,7 +1440,7 @@ int d2k_quic_arm_plan(const d2k_quic_arm *arm, const uint8_t *blob, size_t blen,
         return -1;
     }
     if (append_fmt(buf, cap, &pos, "order forward\n") != 0) { return -1; }
-    if (append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
+    if (!arm->original && append_fmt(buf, cap, &pos, "pace %u\n", (unsigned)D2K_PACE_SETTLE_US) != 0) {
         return -1;
     }
     return 0;

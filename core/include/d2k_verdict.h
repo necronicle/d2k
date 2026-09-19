@@ -162,6 +162,8 @@ typedef struct {
 #define D2K_PROP_YES     2
 
 typedef struct {
+    int8_t residual_blocking;
+    int8_t residual_ignores_src_port;
     int8_t junk_ahead;      /* мусорная датаграмма перед Initial */
     int8_t fake_ahead;      /* фальшивый Initial с разрешённым именем перед своим */
     int8_t split_crypto;    /* приветствие двумя кадрами CRYPTO, хвост первым */

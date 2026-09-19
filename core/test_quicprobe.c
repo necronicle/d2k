@@ -776,7 +776,7 @@ int main(void) {
         CHECK(strstr(r.reason, "ост.блокировка") != NULL,
               "причина обязана явно упомянуть наблюдение остаточной блокировки (шаг 2)");
         CHECK(r.probes == 15,
-              "3(база)+3(прямой)+3(шаг2)+3(шаг3-ротация)+3(шаг4) = 15 заданных опытов");
+              "3(база)+3(прямой)+3(остаточная)+3(мусор)+3(низкий порт); лишнего контроля нет");
     }
 
     /* --- ОДИН адрес у цели: ротировать НЕЧЕМ, но контроль ТОЛЬКО ЧТО (шаг 2)
@@ -793,8 +793,8 @@ int main(void) {
         CHECK(r.verdict == D2K_V_OPAQUE,
               "один адрес: контроль до и после триггера прошёл на нём же — доказательство есть без "
               "ротации, находка 1 ревью");
-        CHECK(strstr(r.reason, "блокировки по тройке нет") != NULL,
-              "причина обязана сказать, что блокировки по тройке нет — контроль прошёл ДО и ПОСЛЕ");
+        CHECK(r.qprops.residual_blocking == D2K_PROP_NO,
+              "original Run: контроль после триггера ответил — остаточной блокировки нет");
         /* НАХОДКА B РЕВЬЮ (круг 3): правило "адрес закреплён, пока нет
            остаточной блокировки" — ОДНО на все вопросы, включая плечо. Раньше
            плечо ротировало БЕЗУСЛОВНО и на цели с одним адресом честно
@@ -819,18 +819,17 @@ int main(void) {
         CHECK(r.probes == 15, "3(база)+3(прямой)+3(шаг2)+3(мусор)+3(низкий порт) на pool[0]");
     }
 
-    /* --- остаточная блокировка ЕСТЬ, но лишних адресов НОЛЬ: шаг 3 (ротация)
-     * обязан стать НЕЗАДАННЫМ, а не "сервер недоступен" ---------------------- */
+    /* Original Run: residual consumes spare addresses, NOT the diagnosis.
+       Independent real-socket coverage: TestD2KResidualParity/blocked. */
     {
         mock_reset();
         g_extra_n = 0;
 
         d2k_vres r = d2k_quic_classify("10.0.2.1", 443, "x.example", trig_hello(), ctl_hello(), 0);
 
-        CHECK(r.verdict == D2K_V_INCONCLUSIVE,
-              "без свежего адреса вопрос про устройство обязан остаться незаданным, а не "
-              "превратиться в вывод про сервер");
-        CHECK(strstr(r.reason, "НЕ ЗАДАН") != NULL, "причина обязана честно называть вопрос НЕЗАДАННЫМ");
+        CHECK(r.verdict == D2K_V_OPAQUE, "content diagnosis survives exhausted spare pool");
+        CHECK(r.qprops.residual_blocking == D2K_PROP_YES, "residual observation retained");
+        CHECK(strstr(r.reason, "не задано 2 (адреса)") != NULL, "questions remain unasked");
         CHECK(strstr(r.reason, "недоступен") == NULL,
               "нельзя подменять «не смогли спросить» выводом «сервер недоступен»");
         CHECK(r.probes == 9, "3(база)+3(прямой)+3(шаг2) — дальше дерево не пошло, адресов не осталось");
@@ -847,7 +846,7 @@ int main(void) {
 
         CHECK(r.verdict == D2K_V_OPAQUE, "устройство измерено — должен быть OPAQUE несмотря на "
                                           "нехватку адреса для плеча");
-        CHECK(strstr(r.reason, "не задано 2 (адреса)") != NULL,
+        CHECK(strstr(r.reason, "не задано 1 (адреса)") != NULL,
               "нехватка адресов на вопросник обязана быть названа прямо, а не проглочена");
         CHECK(r.probes == 12, "3+3+3+3 — вопросы не заданы, их опыты не считаются");
     }
@@ -862,8 +861,8 @@ int main(void) {
         CHECK(r.probes == 0, "без контроля НИ ОДНОГО опыта: базовая живость на нём и стоит");
     }
 
-    /* --- контроль молчит именно на СВЕЖЕМ адресе (сервер там сам
-     * недоступен), а не на исходном — тоже INCONCLUSIVE, другая причина ---- */
+    /* The donor does not insert another clean-address control. The spare
+       is used for the next question, whose failure does not erase content. */
     {
         mock_reset();
         strncpy(g_mock_dead_addr, "10.0.5.2", D2K_QUIC_ADDR_LEN);
@@ -872,10 +871,8 @@ int main(void) {
 
         d2k_vres r = d2k_quic_classify("10.0.5.1", 443, "x.example", trig_hello(), ctl_hello(), 0);
 
-        CHECK(r.verdict == D2K_V_INCONCLUSIVE,
-              "контроль молчит на чистом адресе — отличить содержимое от недоступности нечем");
-        CHECK(strstr(r.reason, "недоступности") != NULL,
-              "причина обязана назвать именно эту недостачу, а не содержимое");
+        CHECK(r.verdict == D2K_V_OPAQUE, "no invented clean-address control branch");
+        CHECK(r.qprops.junk_ahead == D2K_PROP_NO, "spare was used by junk question");
     }
 
     /* --- плечо "мусор перед Initial" уже помогает --------------------------- */
@@ -1089,17 +1086,19 @@ int main(void) {
         CHECK(r.marked == 0, "3/6: r.marked обязан упасть — плечо не было помечено");
     }
 
-    /* 4/6: приём "2 из 3" на шаге 2 обязан быть FLAKY. */
+    /* Original residual criterion is Answered == 0, not unanimous control.
+       Independent coverage: TestD2KResidualParity/partial. */
     {
         mock_reset();
         mock_force_push(D2K_QUIC_REPEATS, 0, 0, 1);
         mock_force_push(0, D2K_QUIC_REPEATS, 0, 1);
         mock_force_push(2, 1, 0, 1); /* шаг 2: 2 из 3 — не единогласно */
         d2k_vres r = d2k_quic_classify("10.0.8.4", 443, "x.example", trig_hello(), ctl_hello(), 0);
-        CHECK(r.verdict == D2K_V_FLAKY, "4/6: 2 из 3 на шаге 2 обязано быть FLAKY, не округлением");
+        CHECK(r.verdict == D2K_V_OPAQUE && r.qprops.residual_blocking == D2K_PROP_NO,
+              "partial residual control permits pinned search, as in original");
     }
 
-    /* 5/6: приём "2 из 3" на шаге 3 обязан быть FLAKY. */
+    /* The next question is a property, not an invented clean control. */
     {
         mock_reset();
         g_extra_n = 1;
@@ -1109,7 +1108,8 @@ int main(void) {
         mock_force_push(0, D2K_QUIC_REPEATS, 0, 1); /* шаг 2: молчит — блокировка обнаружена */
         mock_force_push(2, 1, 0, 1);                 /* шаг 3: 2 из 3 */
         d2k_vres r = d2k_quic_classify("10.0.8.5", 443, "x.example", trig_hello(), ctl_hello(), 0);
-        CHECK(r.verdict == D2K_V_FLAKY, "5/6: 2 из 3 на шаге 3 обязано быть FLAKY, не округлением");
+        CHECK(r.verdict == D2K_V_OPAQUE && r.qprops.junk_ahead != D2K_PROP_YES,
+              "partial property success does not erase diagnosis or pass the arm");
     }
 
     /* 6/6: ошибка транспорта на шаге 2 обязана быть FLAKY даже когда pass==0

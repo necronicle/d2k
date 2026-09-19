@@ -1,27 +1,8 @@
-/* props.c — задача 6: подбор исполнимого плеча QUIC из измеренного.
- *
- * ЭТОТ ФАЙЛ НЕ РЕШАЕТ, РЕЖЕТ ЛИ КОРОБКА. Это уже решено к моменту вызова
- * d2k_quic_pick_arm — вызывающий обязан дойти сюда только после того, как
- * d2k_quic_classify (quicprobe.c) вернула D2K_V_OPAQUE: коробка решает по
- * содержимому. Здесь — не "решает ли", а "чем конкретно её обойти": каким
- * блобом-приманкой, с каким TTL, нужна ли фрагментация. См. полный контракт
- * и обоснование лестницы цены в doc-комментарии d2k_quic_pick_arm
- * (d2k_quicprobe.h) — здесь только то, что относится к РЕАЛИЗАЦИИ.
- *
- * ПОЧЕМУ КАЖДОЕ ПОДТВЕРЖДЕНИЕ — НА СВЕЖЕМ АДРЕСЕ, А НЕ ЖИВАЯ ПРОВЕРКА
- * ОСТАТОЧНОЙ БЛОКИРОВКИ МЕЖДУ КАЖДЫМ ШАГОМ РАЗВЕДКИ. У дерева вопросов
- * (quicprobe.c) есть отдельный вопрос "проверка остаточной блокировки" ровно
- * потому, что там всего ОДНО событие, способное завести блокировку (прямой
- * зонд), и цена лишнего опыта на его проверку разумна. Здесь разведка — это
- * ДО 257 отдельных попыток (2 блоба + до 255 значений TTL), и каждая несёт
- * тот же trigger, который уже ИЗВЕСТНО решает коробку: живая проверка после
- * КАЖДОЙ удваивала бы стоимость всей лестницы. Асимметрия цены ошибок здесь
- * безопасная: поджог тройки во время разведки может только ЗАНИЗИТЬ шанс
- * найти рабочее плечо (ложноотрицательный, дешёвый исход по всей доктрине
- * проекта; это историческая политика, её соответствие донору ещё открыто), но не может
- * подделать ложный ПРОХОД: единогласное подтверждение всё равно проводится
- * ОТДЕЛЬНО, на адресе, которого разведка не касалась.
- */
+/* QUIC wire adapters. d2k_quic_original_measure is the runtime adapter for
+ * the original askArms control flow (quicarms.c). The legacy derived-fake
+ * picker below is retained for old transport tests, not called by sched.c.
+ * Exact donor fragment layouts still need their own raw transport; a
+ * midpoint split is not an implementation of those questions. */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE /* IP_TTL/IP_HDRINCL на macOS — см. тот же приём в quicprobe.c */
 #include <arpa/inet.h>
@@ -37,18 +18,43 @@
 #include "d2k_quicprobe.h"
 /* d2k_quic_hello_rename — единственный источник приманки (см. ниже). */
 #include "d2k_quichello.h"
+#include "d2k_quic_arms.h"
 
-/* =========================================================================
- * Каталог блобов — см. контракт в d2k_quicprobe.h.
- * ========================================================================= */
+typedef struct {
+    uint16_t port;
+    d2k_hello trigger, control;
+    uint32_t wait_ms, mark;
+} original_wire;
 
-/* =========================================================================
- * ПРИМАНКА — ВЫВЕДЕННАЯ ИЗ ЗАМЕРА. Контракт в d2k_quicprobe.h.
- *
- * Здесь стоял каталог заготовок и снятых дампов, перебираемый по очереди.
- * Он снят целиком: перебор набора — это блокчек, а не замер, и длина набора
- * влияла и на цену подбора, и на бюджет, чего быть не должно.
- * ========================================================================= */
+static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int *sent) {
+    original_wire *w=user;
+    d2k_hello msg=q->control?w->control:w->trigger;
+    if(q->frag) {
+        /* The old frag hook cuts at the midpoint, not pos=8/overlaps from
+           the donor. Do not send a different experiment under its name.
+           Explicit unsupported until the exact fragment transport is ported. */
+        d2k_tally t={0}; t.fail=t.err=D2K_QUIC_REPEATS;
+        t.marked=1; *sent=0; return t;
+    }
+    if(q->ttl) return d2k_quic_ask_ttl_hook(q->addr,w->port,q->blob,q->blob_len,q->ttl,
+        msg,w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
+    if(q->copies>1) return d2k_quic_ask_copies_hook(q->addr,w->port,q->blob,q->blob_len,
+        q->copies,msg,w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
+    return d2k_quic_ask_hook(q->addr,w->port,q->blob,q->blob_len,msg,w->wait_ms,w->mark,
+        D2K_QUIC_REPEATS,NULL,NULL,sent,NULL);
+}
+
+d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
+    d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark) {
+    original_wire wire={port,trigger,control,wait_ms,mark};
+    d2k_quic_arm_context local=*ctx;
+    local.probe=original_probe; local.user=&wire;
+    d2k_quic_arm r=d2k_quic_original_arms(&local);
+    ctx->next=local.next; ctx->marked=local.marked;
+    return r;
+}
+
+/* Legacy transport test helper. The runtime preserves original fake bytes. */
 
 int d2k_quic_decoy_from_trigger(d2k_hello trigger, const char *decoy_sni,
                                 uint8_t *out, size_t cap, size_t *out_len) {

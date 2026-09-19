@@ -138,6 +138,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
+#include "d2k_quic_arms.h"
 
 /* ---------------------------------------------------------------------
  * Умолчание и тестовый шов. См. шапку d2k_quicprobe.h про то, почему
@@ -757,7 +758,8 @@ static int qp_send_one(const char *addr, uint16_t port,
                (см. doc-комментарий d2k_quic_ask_ttl_fn). */
             (void)setsockopt(fd, IPPROTO_IP, IP_TTL, &orig_ttl, sizeof orig_ttl);
         }
-        nap_us(D2K_QUIC_GAP_US); /* §7: пауза между кусками ВНУТРИ этой попытки */
+        /* Original exchange writes prefix datagrams and Initial back-to-back.
+           An inserted settle delay changes the measured hypothesis. */
     }
     if (send(fd, msg.bytes, msg.len, 0) < 0) {
         close(fd);
@@ -1532,10 +1534,14 @@ int d2k_quic_props_findings(const d2k_quic_props *p, char *out, size_t cap) {
     return found;
 }
 
-d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
-                            d2k_hello trigger, d2k_hello control, uint32_t mark) {
+static int arm_budget_left(void *start) { return budget_left(start); }
+
+static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
+                            d2k_hello trigger, d2k_hello control, uint32_t mark,
+                            d2k_quic_arm *arm) {
     d2k_vres r;
     memset(&r, 0, sizeof r);
+    if(arm) { memset(arm,0,sizeof *arm); arm->kind=D2K_QA_NOT_FOUND; }
 
     /* ОДИН guard на весь класс "структурно непригодный вход" — было разведено
        на FLAKY и INCONCLUSIVE (находка 9 ревью, круг 2): эталон относит
@@ -1784,88 +1790,34 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
 
                     if (same.err > 0) {
                         r.verdict = D2K_V_FLAKY;
-                        reason_set(&r, "шаг 2 (та же тройка): %d/%d не состоялись — транспорт",
-                                   same.err, D2K_QUIC_REPEATS);
-                    } else if (same.pass > 0 && same.pass < D2K_QUIC_REPEATS) {
-                        r.verdict = D2K_V_FLAKY;
-                        reason_set(&r, "шаг 2 не воспроизводится: %d/%d", same.pass, D2K_QUIC_REPEATS);
-                    } else if (same.pass == D2K_QUIC_REPEATS) {
-                        /* Остаточная блокировка НЕ обнаружена: адрес дважды
-                           (база + шаг 2) подтверждён живым тем же контролем
-                           — ротация не нужна, шаг 3 избыточен (правка ревью
-                           2026-09-06 круг 2: "адрес закреплён, пока
-                           остаточная блокировка не обнаружена"). */
-                        r.verdict = D2K_V_OPAQUE;
-                        reason_set(&r, "0/%d; контр.: до=%d/%d, после=%d/%d на том же адресе — "
-                                       "блокировки по тройке нет; решает содержимое",
-                                   D2K_QUIC_REPEATS, D2K_QUIC_REPEATS, D2K_QUIC_REPEATS, same.pass,
-                                   D2K_QUIC_REPEATS);
-                        /* residual_detected=0: правило одно на все вопросы
-                           (см. qp_pinned_or_next) — плечо тоже спрашивает
-                           закреплённый pool[0], не ротирует (правка ревью
-                           2026-09-06 круг 3, находка B). */
-                        qp_questions_step(&r, pool, n_pool, &next_addr, 0, port, sni, trigger, dyn_wait, mark,
-                                    &all_marked, &start);
+                        reason_set(&r, "остаточная блокировка: локальная ошибка, опыт не завершён");
                     } else {
-                        /* same.pass == 0: остаточная блокировка ОБНАРУЖЕНА —
-                           теперь и только теперь адрес ротируется (см.
-                           qp_pinned_or_next: residual_detected=1 с этой точки
-                           и до конца этой ветки, включая плечо ниже). Бюджет
-                           проверяется ДО обращения к пулу — иначе исчерпанный
-                           бюджет всё равно "съедал" бы адрес, который потом
-                           некому было бы использовать. */
-                        if (!budget_left(&start)) {
-                            r.verdict = D2K_V_INCONCLUSIVE;
-                            reason_set(&r, "молчит (0/%d); шаг 2 тоже молчит; бюджет исчерпан до "
-                                           "шага 3 — вопрос НЕ ЗАДАН",
-                                       D2K_QUIC_REPEATS);
-                        } else {
-                            const char *fresh1 = qp_pinned_or_next(pool, n_pool, &next_addr, 1);
-                            if (!fresh1) {
-                                r.verdict = D2K_V_INCONCLUSIVE;
-                                reason_set(&r, "молчит (0/%d); шаг 2 тоже молчит; адрес для шага 3 НЕ "
-                                               "ЗАДАН — пул из %zu исчерпан",
-                                           D2K_QUIC_REPEATS, n_pool);
+                        int residual = same.pass == 0;
+                        r.qprops.residual_blocking = residual ? D2K_PROP_YES : D2K_PROP_NO;
+                        r.qprops.residual_ignores_src_port = residual ? D2K_PROP_YES : D2K_PROP_UNKNOWN;
+                        r.verdict = D2K_V_OPAQUE;
+                        reason_set(&r, "контроль ответил, имя молчит; ост.блокировка: %s",
+                                   residual ? "да" : "нет");
+                        if (arm) {
+                            d2k_quic_arm_context context = {.pool=pool, .n_pool=n_pool,
+                                .next=next_addr, .residual=residual, .marked=all_marked,
+                                .can_ask=arm_budget_left, .limit_user=&start};
+                            if (budget_left(&start)) {
+                                *arm = d2k_quic_original_measure(&context, port, trigger, control, dyn_wait, mark);
+                                next_addr = context.next;
+                                r.probes += arm->probes;
+                                if (!context.marked) all_marked = 0;
                             } else {
-                                int clean_sent = 0;
-                                d2k_tally clean = d2k_quic_ask_hook(fresh1, port, NULL, 0, control, dyn_wait,
-                                                                     mark, D2K_QUIC_REPEATS, NULL, NULL,
-                                                                     &clean_sent, NULL);
-                                r.probes += clean_sent; /* сколько реально ушло на провод (находка 4, круг 5) */
-                                if (!clean.marked) {
-                                    all_marked = 0;
-                                }
-
-                                if (clean.err > 0) {
-                                    r.verdict = D2K_V_FLAKY;
-                                    reason_set(&r, "шаг 3 на %s: %d/%d не состоялись — транспорт",
-                                               fresh1, clean.err, D2K_QUIC_REPEATS);
-                                } else if (clean.pass > 0 && clean.pass < D2K_QUIC_REPEATS) {
-                                    r.verdict = D2K_V_FLAKY;
-                                    reason_set(&r, "шаг 3 на %s не воспроизводится: %d/%d", fresh1,
-                                               clean.pass, D2K_QUIC_REPEATS);
-                                } else if (clean.pass == 0) {
-                                    r.verdict = D2K_V_INCONCLUSIVE;
-                                    reason_set(&r, "контроль молчит и на чистом %s — нельзя отличить "
-                                                   "содержимое от недоступности сервера (§2.3/§2.4)",
-                                               fresh1);
-                                } else {
-                                    /* clean.pass == D2K_QUIC_REPEATS */
-                                    r.verdict = D2K_V_OPAQUE;
-                                    reason_set(&r, "0/%d; контр.: чисто=%d/%d, здесь=0/%d — вероятна "
-                                                   "ост.блокировка; решает содержимое",
-                                               D2K_QUIC_REPEATS, D2K_QUIC_REPEATS, D2K_QUIC_REPEATS,
-                                               D2K_QUIC_REPEATS);
-                                    /* residual_detected=1: этот вопрос УЖЕ
-                                       ротировал один раз (fresh1 выше) —
-                                       плечо продолжает с того же next_addr,
-                                       забирая СЛЕДУЮЩИЙ свежий (см.
-                                       qp_pinned_or_next). */
-                                    qp_questions_step(&r, pool, n_pool, &next_addr, 1, port, sni, trigger, dyn_wait,
-                                                mark, &all_marked, &start);
-                                }
+                                arm->original = 1; arm->incomplete = 1;
+                                snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");
                             }
                         }
+                        /* Original Run uses the SAME residual policy and cursor:
+                           arm questions first, properties afterwards. No extra
+                           clean-address control consumes the first spare IP. */
+                        qp_questions_step(&r, pool, n_pool, &next_addr, residual,
+                                          port, sni, trigger, dyn_wait, mark,
+                                          &all_marked, &start);
                     }
                 }
             }
@@ -1874,4 +1826,13 @@ d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
 
     r.marked = (mark != 0) && all_marked;
     return r;
+}
+
+d2k_vres d2k_quic_classify(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark) {
+    return classify_run(ip,port,sni,trigger,control,mark,NULL);
+}
+d2k_vres d2k_quic_run(const char *ip, uint16_t port, const char *sni,
+    d2k_hello trigger, d2k_hello control, uint32_t mark, d2k_quic_arm *arm) {
+    return classify_run(ip,port,sni,trigger,control,mark,arm);
 }

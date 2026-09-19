@@ -90,19 +90,13 @@ typedef d2k_vres (*d2k_sched_tcp_fn)(const char *ip, uint16_t port,
                                      const volatile sig_atomic_t *stop);
 typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char *sni,
                                       d2k_hello trigger, d2k_hello control,
-                                      uint32_t mark);
+                                      uint32_t mark, d2k_quic_arm *arm);
 /* Проба на блокировку по объёму. Отдельным крючком по той же причине, что и
  * два оракула выше: тест обязан утверждать поведение планировщика, не выходя
  * в сеть. */
 typedef d2k_vol_result (*d2k_sched_vol_fn)(const char *ip, uint16_t port,
                                            const char *sni, int plain, uint32_t mark);
 extern d2k_sched_vol_fn  d2k_sched_vol_hook;
-
-/* Подбор плеча QUIC (d2k_quic_pick_arm). Подменяем по той же причине, что и
- * прочие оракулы: настоящий подбор ходит в сеть десятками опытов. */
-typedef d2k_quic_arm (*d2k_sched_arm_fn)(const char *ip, uint16_t port,
-                                         const char *sni, const char *decoy_sni,
-                                         d2k_hello trigger, uint32_t mark);
 
 /* ЗАНЯТЬ ПОРТ ДЛЯ ОПЫТА. Крючок, а не прямой вызов, по той же причине, что и
  * у сетевых оракулов: отказ bind обязан быть ВОСПРОИЗВОДИМ в тесте. Именно на
@@ -113,7 +107,6 @@ typedef d2k_quic_arm (*d2k_sched_arm_fn)(const char *ip, uint16_t port,
  * отрицательное — локальный отказ. */
 typedef int (*d2k_sched_bind_fn)(uint8_t transport, int *out_fd, uint16_t *sport_be);
 extern d2k_sched_bind_fn d2k_sched_bind_hook;
-extern d2k_sched_arm_fn  d2k_sched_arm_hook;
 
 /* Зонд подтверждения (d2k_verify.h). Крючок нужен по той же причине, что и
  * три выше, и ещё по одной: этот зонд ведёт НАСТОЯЩЕЕ рукопожатие TLS 1.3 с

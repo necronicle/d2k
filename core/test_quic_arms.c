@@ -708,6 +708,23 @@ static void test_real_ttl_hook_on_wire(void) {
  */
 static void test_arm_to_plan(void) {
     char plan[8192], err[200], hex[2 * D2K_PLAN_TLV_MAX + 1];
+    d2k_quic_arm original = {0};
+    original.original = 1; original.kind = D2K_QA_TTL;
+    original.copies = 6; original.ttl = 3;
+    original.len = 4; memcpy(original.bytes, "\x41\x42\x43\x44", 4);
+    CHECK(d2k_quic_arm_plan(&original, original.bytes, original.len, plan, sizeof plan) == 0,
+          "original fake must compose");
+    CHECK(strstr(plan, "payload 1 41424344\n") != NULL, "exact original fake bytes");
+    CHECK(strstr(plan, "repeats=6") != NULL, "TTL must not discard measured repeats");
+    CHECK(strstr(plan, "pace ") == NULL, "original has no extra settle delay");
+    CHECK(d2k_plan_text_to_hex(plan, hex, sizeof hex, err, sizeof err) == 0,
+          "original plan grammar");
+    original.frag_kind = 1;
+    CHECK(d2k_quic_arm_plan(&original, original.bytes, original.len, plan, sizeof plan) != 0,
+          "cannot silently omit found fragment combination");
+    original.frag_kind = 0;
+    CHECK(d2k_quic_arm_plan(&original, (const uint8_t *)"other", 5, plan, sizeof plan) != 0,
+          "cannot replace original owned fake");
     /* Тело приманки — выведенное, как и в бою: то же, что подбор и увидит. */
     static uint8_t decoy[2048];
     size_t blen = 0;

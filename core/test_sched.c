@@ -180,6 +180,9 @@ static d2k_quic_arm stub_arm(const char *ip, uint16_t port, const char *sni,
     d2k_quic_arm a;
     memset(&a, 0, sizeof a);
     a.kind = arm_kind;
+    a.original = 1;
+    a.len = 4;
+    memcpy(a.bytes, "\x41\x42\x43\x44", a.len);
     a.copies = 6;
     a.ttl = 3;
     a.probes = 4;
@@ -237,7 +240,8 @@ static char quic_last_trig[256];
 static char quic_last_ctl[256];
 
 static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
-                          d2k_hello trigger, d2k_hello control, uint32_t mark) {
+                          d2k_hello trigger, d2k_hello control, uint32_t mark,
+                          d2k_quic_arm *arm) {
     (void)ip; (void)port; (void)mark;
     quic_calls++;
     snprintf(quic_last_sni, sizeof quic_last_sni, "%s", sni ? sni : "");
@@ -257,6 +261,10 @@ static d2k_vres stub_quic(const char *ip, uint16_t port, const char *sni,
     d2k_vres r;
     memset(&r, 0, sizeof r);
     r.verdict = quic_answer;
+    memset(arm, 0, sizeof *arm);
+    arm->kind = D2K_QA_NOT_FOUND;
+    if (r.verdict == D2K_V_OPAQUE || r.verdict == D2K_V_PREFIX || r.verdict == D2K_V_WHOLE)
+        *arm = stub_arm(ip, port, sni, NULL, trigger, mark);
     snprintf(r.reason, sizeof r.reason, "подменённый вопросник QUIC");
     return r;
 }
@@ -662,7 +670,6 @@ int main(void) {
        рукопожатием TLS 1.3, а стенд этого теста TLS не умеет — тест мерил бы
        стенд. */
     d2k_sched_ver_hook = stub_ver;
-    d2k_sched_arm_hook = stub_arm;
 
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -3582,7 +3589,13 @@ int main(void) {
             for (size_t bi = 0; bi < cQ.n_boxes; bi++) {
                 for (size_t pj = 0; pj < cQ.boxes[bi].n_plans; pj++) {
                     const char *txt = cQ.boxes[bi].plans[pj].text;
-                    if (txt && strstr(txt, "proto udp quic")) { quic_text = 1; }
+                    if (txt && strstr(txt, "proto udp quic")) {
+                        quic_text = 1;
+                        CHECK(strstr(txt, "payload 1 41424344\n") != NULL,
+                              "scheduler replaced measured original fake bytes");
+                        CHECK(strstr(txt, "repeats=6") != NULL,
+                              "scheduler lost original copies");
+                    }
                 }
             }
             CHECK(quic_text,
