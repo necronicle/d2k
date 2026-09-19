@@ -29,4 +29,8 @@ d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *ctx);
 const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **name);
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark);
+/* Exact original raw-IP shapes; independent from the legacy midpoint hook. */
+typedef d2k_tally (*d2k_quic_fragment_fn)(const char *,uint16_t,int,d2k_hello,
+    uint32_t,uint32_t,int,int *);
+extern d2k_quic_fragment_fn d2k_quic_fragment_hook;
 #endif

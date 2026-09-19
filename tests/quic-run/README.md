@@ -4,6 +4,8 @@
 D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh
 # The same oracle and C classifier on Linux ARM64 (existing gcc:14 + Zig):
 D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh --linux
+# Exact raw fragments on isolated container loopback (CAP_NET_RAW only):
+D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh --linux-raw
 ```
 
 The runner copies the unchanged donor `internal/quicprobe` package, checked
@@ -55,9 +57,23 @@ Additional independent checks execute unchanged `askArms` and `blobBytes`:
 it for acceptance. The runner copies pinned donor fake files to the temporary
 module too, without depending on a router installation.
 
-Scope is still not complete Run/wire parity. Exact raw fragment transport,
-per-attempt input/control freshness, options/deadline semantics and remaining
-property questions are open. Fragment survival is deliberately `not measured`
-in the capability-free lab, never a claim that fragments cannot traverse a
-real network. C's protection against local send failure and lost bypass marks
-is separately tested by the C suite. No test here proves application access.
+The original fragment builder is also compared byte-for-byte on 96 combinations
+of sizes and plans (including short inputs, alignment, overlap clamping and
+reverse order). `--linux-raw` runs a separate privileged-to-open-raw-sockets
+test, still inside `--network none` with only CAP_NET_RAW and a read-only root:
+
+- Actual Go `measure/exchangeFragmented` and C send all four original shapes.
+- A packet socket captures the real C wire; full IPv4/UDP bytes and ordering
+  are compared to original `buildFragments` using the observed input and ID.
+- Three attempts must have different ports, CIDs and nonzero IP IDs.
+- Both two-fragment orders reassemble and obtain authenticated QUIC answers.
+  Overlap success/failure must match the original on this kernel, not an
+  invented universal outcome for every receiver.
+- Failed marks on either receiving or raw socket must yield unsent/untrusted
+  results, and packet capture must show no transmitted fragment.
+
+Scope is still not complete Run/wire parity. Fragment Plan execution,
+per-attempt TLS input/control freshness, options/deadline semantics and remaining
+property questions are open. Fragment survival is `not measured` in the
+capability-free lab, never a claim that fragments cannot traverse a real
+network. No test here proves application access or router/NAT execution.

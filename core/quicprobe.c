@@ -124,6 +124,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -139,6 +140,8 @@
 #include "d2k_quicwire.h"
 #include "d2k_quicprobe.h"
 #include "d2k_quic_arms.h"
+#include "d2k_ipfrag.h"
+#include "d2k_tls13core.h"
 
 /* ---------------------------------------------------------------------
  * Умолчание и тестовый шов. См. шапку d2k_quicprobe.h про то, почему
@@ -878,12 +881,78 @@ static ssize_t qp_recv_ttl(int fd, uint8_t *buf, size_t cap, uint8_t *ttl) {
     return n;
 }
 
+/* Original nextIPID: random start, shared monotonic counter, never zero.
+   Ports are not in the kernel's reassembly key, so they cannot serve as IDs. */
+#ifdef __linux__
+static uint16_t fragment_id(void) {
+    static pthread_mutex_t mu=PTHREAD_MUTEX_INITIALIZER;
+    static uint16_t current;
+    static int seeded;
+    uint16_t id=0;
+    pthread_mutex_lock(&mu);
+    if(!seeded) {
+        uint8_t b[2];
+        if(d2k_t13_random(b,sizeof b)!=0)goto done;
+        current=(uint16_t)((unsigned)b[0]*256+b[1]);seeded=1;
+    }
+    current=(uint16_t)(current+1);
+    if(!current)current=1;
+    id=current;
+done:
+    pthread_mutex_unlock(&mu);return id;
+}
+#endif
+
+/* Port of exchangeFragmented: the connected receive socket remains owned
+   until the common authenticated-response loop closes it. No close/rebind
+   race, no repeated packet/port/ID for independent attempts. */
+static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
+    const d2k_ipfrag_plan *plan,uint32_t mark,int *marked) {
+    *marked=1; /* an unsent/unsupported question cannot contaminate a trial */
+#ifndef __linux__
+    (void)addr;(void)port;(void)msg;(void)plan;(void)mark;
+    return -1; /* original frag_other.go: not built, not negative evidence */
+#else
+    if(!addr || !msg.bytes || !msg.len || msg.len>D2K_QW_MAX_DGRAM)return -1;
+    int rx=-1,raw=-1;
+    rx=socket(AF_INET,SOCK_DGRAM,0);
+    if(rx<0)return -1;
+    if(mark && d2k_mark_hook(rx,mark)!=0){*marked=0;goto fail;}
+    struct sockaddr_in dst,local;
+    memset(&dst,0,sizeof dst);dst.sin_family=AF_INET;dst.sin_port=htons(port);
+    if(inet_pton(AF_INET,addr,&dst.sin_addr)!=1 || connect(rx,(struct sockaddr *)&dst,sizeof dst)!=0)goto fail;
+    socklen_t local_len=sizeof local;
+    if(getsockname(rx,(struct sockaddr *)&local,&local_len)!=0)goto fail;
+    raw=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+    if(raw<0)goto fail;
+    int one=1;
+    if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto fail;
+    /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
+       raw probe through its own candidate. SPEC §7, tested explicitly. */
+    if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto fail;}
+    uint8_t wire[3*(D2K_QW_MAX_DGRAM+28)];d2k_ipfrag_span spans[3];
+    uint16_t id=fragment_id();
+    size_t n=d2k_udpfrag_build((const uint8_t *)&local.sin_addr.s_addr,
+        (const uint8_t *)&dst.sin_addr.s_addr,ntohs(local.sin_port),port,
+        msg.bytes,msg.len,plan,id,wire,sizeof wire,spans);
+    if(!n)goto fail;
+    for(size_t i=0;i<n;i++) {
+        if(sendto(raw,wire+spans[i].off,spans[i].len,0,(struct sockaddr *)&dst,sizeof dst)!=(ssize_t)spans[i].len)goto fail;
+    }
+    close(raw);return rx;
+fail:
+    if(raw>=0)close(raw);
+    close(rx);return -1;
+#endif
+}
+
 static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
                               const uint8_t *prefix, size_t prefix_len, int prefix_ttl,
                               int prefix_copies, int src_port, const char *split_sni,
                               d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                               int repeats, uint32_t *rtt_ms_out, int *refused_out,
-                              int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify) {
+                              int *sent_out, uint8_t *ttl_in_out, qp_verify_fn verify,
+                              const d2k_ipfrag_plan *fragment) {
     d2k_tally t;
     memset(&t, 0, sizeof t);
     t.marked = 1;
@@ -998,6 +1067,7 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
             sent[i].len = clen;
         } else {
             sent[i] = msg;
+            if(fragment)sent[i]=(d2k_hello){NULL,0}; /* never replay an unrefreshable input */
         }
     }
 
@@ -1006,8 +1076,9 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
            bind'ом подрались бы за него, и две упали бы с EADDRINUSE (то же
            решение у оригинала, questions.go: port-1-attempt). */
         int sp = (src_port > 0) ? src_port - i : 0;
-        fds[i] = qp_send_one(addr, port, pfx[i], pfx_len[i], prefix_ttl, prefix_copies, sp,
-                              sent[i], mark, &marked[i]);
+        fds[i] = fragment ? qp_send_fragmented(addr,port,sent[i],fragment,mark,&marked[i]) :
+            qp_send_one(addr, port, pfx[i], pfx_len[i], prefix_ttl, prefix_copies, sp,
+                        sent[i], mark, &marked[i]);
         if (!marked[i]) {
             t.marked = 0;
         }
@@ -1142,13 +1213,26 @@ static d2k_tally quic_ask_ex(const char *addr, uint16_t port,
     return t;
 }
 
+static d2k_tally quic_fragment(const char *addr,uint16_t port,int shape,d2k_hello msg,
+    uint32_t wait_ms,uint32_t mark,int repeats,int *sent_out) {
+    d2k_ipfrag_plan p;
+    if(d2k_ipfrag_shape(shape,&p)!=0) {
+        d2k_tally t={0};t.marked=1;t.fail=t.err=repeats>0?repeats:D2K_QUIC_REPEATS;
+        if(sent_out)*sent_out=0;
+        return t;
+    }
+    return quic_ask_ex(addr,port,NULL,0,0,1,0,NULL,msg,wait_ms,mark,repeats,
+        NULL,NULL,sent_out,NULL,qp_verify_aead,&p);
+}
+d2k_quic_fragment_fn d2k_quic_fragment_hook=quic_fragment;
+
 static d2k_tally quic_ask(const char *addr, uint16_t port,
                            const uint8_t *prefix, size_t prefix_len,
                            d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                            int repeats, uint32_t *rtt_ms_out, int *refused_out, int *sent_out,
                            uint8_t *ttl_in_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead);
+                        repeats, rtt_ms_out, refused_out, sent_out, ttl_in_out, qp_verify_aead, NULL);
 }
 
 /* Живость через согласование версии — та же дисциплина ПОВТОРОВ, метки и
@@ -1173,7 +1257,7 @@ static d2k_tally qp_ask_vn(const char *addr, uint16_t port, uint32_t wait_ms, ui
     msg.bytes = (tlen > 0) ? trig_buf : NULL;
     msg.len = tlen;
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, NULL, msg, wait_ms, mark,
-                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn);
+                        D2K_QUIC_REPEATS, NULL, NULL, sent_out, NULL, qp_verify_vn, NULL);
 }
 
 /* Задача 6: как quic_ask (умолчание d2k_quic_ask_hook), но с TTL приманки —
@@ -1185,7 +1269,7 @@ static d2k_tally quic_ask_ttl(const char *addr, uint16_t port, const uint8_t *pr
                                int prefix_ttl, d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, prefix_ttl, 1, 0, NULL, msg, wait_ms,
-                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
+                        mark, repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
 }
 d2k_quic_ask_ttl_fn d2k_quic_ask_ttl_hook = quic_ask_ttl;
 
@@ -1203,7 +1287,7 @@ static d2k_tally quic_ask_copies(const char *addr, uint16_t port,
                                   int copies, d2k_hello msg, uint32_t wait_ms,
                                   uint32_t mark, int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, prefix, prefix_len, 0, copies, 0, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
 }
 d2k_quic_ask_copies_fn d2k_quic_ask_copies_hook = quic_ask_copies;
 
@@ -1214,7 +1298,7 @@ static d2k_tally quic_ask_srcport(const char *addr, uint16_t port, int src_port,
                                    d2k_hello msg, uint32_t wait_ms, uint32_t mark,
                                    int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, src_port, NULL, msg, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
 }
 d2k_quic_ask_srcport_fn d2k_quic_ask_srcport_hook = quic_ask_srcport;
 
@@ -1225,7 +1309,7 @@ static d2k_tally quic_ask_split(const char *addr, uint16_t port, d2k_hello snap,
                                  const char *sni, uint32_t wait_ms, uint32_t mark,
                                  int repeats, int *sent_out) {
     return quic_ask_ex(addr, port, NULL, 0, 0, 1, 0, sni, snap, wait_ms, mark,
-                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead);
+                        repeats, NULL, NULL, sent_out, NULL, qp_verify_aead, NULL);
 }
 d2k_quic_ask_split_fn d2k_quic_ask_split_hook = quic_ask_split;
 

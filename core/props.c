@@ -1,8 +1,8 @@
 /* QUIC wire adapters. d2k_quic_original_measure is the runtime adapter for
  * the original askArms control flow (quicarms.c). The legacy derived-fake
  * picker below is retained for old transport tests, not called by sched.c.
- * Exact donor fragment layouts still need their own raw transport; a
- * midpoint split is not an implementation of those questions. */
+ * Original fragment transport is quicprobe.c + ipfrag.c. The midpoint
+ * builder below is legacy test code, not the runtime fragment question. */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE /* IP_TTL/IP_HDRINCL на macOS — см. тот же приём в quicprobe.c */
 #include <arpa/inet.h>
@@ -30,11 +30,8 @@ static d2k_tally original_probe(const d2k_quic_arm_question *q, void *user, int 
     original_wire *w=user;
     d2k_hello msg=q->control?w->control:w->trigger;
     if(q->frag) {
-        /* The old frag hook cuts at the midpoint, not pos=8/overlaps from
-           the donor. Do not send a different experiment under its name.
-           Explicit unsupported until the exact fragment transport is ported. */
-        d2k_tally t={0}; t.fail=t.err=D2K_QUIC_REPEATS;
-        t.marked=1; *sent=0; return t;
+        return d2k_quic_fragment_hook(q->addr,w->port,q->frag,msg,
+            w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);
     }
     if(q->ttl) return d2k_quic_ask_ttl_hook(q->addr,w->port,q->blob,q->blob_len,q->ttl,
         msg,w->wait_ms,w->mark,D2K_QUIC_REPEATS,sent);

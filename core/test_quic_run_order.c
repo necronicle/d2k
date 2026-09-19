@@ -2,7 +2,9 @@
 #include <string.h>
 #include "d2k_quic_arms.h"
 #include "d2k_quichello.h"
+#include "d2k_quic.h"
 static int calls, fails, lose_base_mark;
+static int fragment_calls;
 static size_t first_prefix;
 #define CHECK(x) do { if(!(x)) { printf("FAIL %d %s\n",__LINE__,#x); fails++; } } while(0)
 static size_t resolve(const char *sni,char out[][D2K_QUIC_ADDR_LEN],size_t cap) {
@@ -33,10 +35,20 @@ static d2k_tally srcport(const char *ip,uint16_t port,int sp,d2k_hello h,uint32_
 static d2k_tally split(const char *ip,uint16_t port,d2k_hello h,const char *sni,uint32_t w,uint32_t m,int n,int *sent) {
     (void)sni;return ask(ip,port,NULL,0,h,w,m,n,NULL,NULL,sent,NULL);
 }
+static d2k_tally fragment(const char *ip,uint16_t port,int shape,d2k_hello h,uint32_t w,uint32_t m,int n,int *sent) {
+    (void)ip;(void)port;(void)w;(void)m;
+    char sni[256];
+    CHECK(shape==1);
+    CHECK(d2k_quic_sni(h.bytes,h.len,sni,sizeof sni)==0);
+    CHECK(!strcmp(sni,fragment_calls%2==0?"neutral.example":"target.example"));
+    fragment_calls++;
+    d2k_tally t={0};t.pass=n;t.marked=1;*sent=n;return t;
+}
 int main(void) {
     d2k_quic_allow_local=1; d2k_quic_resolve_hook=resolve;
     d2k_quic_ask_hook=ask; d2k_quic_ask_copies_hook=copies; d2k_quic_ask_ttl_hook=copies;
     d2k_quic_ask_srcport_hook=srcport; d2k_quic_ask_split_hook=split;
+    d2k_quic_fragment_hook=fragment;
     uint8_t tb[1500],cb[1500];size_t tn=0,cn=0;
     CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
     CHECK(d2k_quic_probe_initial("neutral.example",cb,sizeof cb,&cn)==0);
@@ -46,6 +58,7 @@ int main(void) {
     CHECK(r.verdict==D2K_V_OPAQUE);
     CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
     CHECK(arm.original && arm.len==1200 && arm.ttl==3 && arm.copies==6);
+    CHECK(fragment_calls==2 && arm.frag_kind==1 && arm.frag_survives==D2K_PROP_YES);
     calls=0;first_prefix=0;lose_base_mark=1;
     r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb,tn},(d2k_hello){cb,cn},99,&arm);

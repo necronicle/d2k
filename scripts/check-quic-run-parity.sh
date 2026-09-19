@@ -5,11 +5,12 @@ D2K_REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 D2K_DONOR=${D2K_REF_ROOT:-"$D2K_REPO/../z2k"}
 D2K_GO=${D2K_REF_GO:-go}
 D2K_PIN=e9a391347671cbb07663d2bee5b3d92f016c789e
-D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Arms|Blob|Residual)Parity'}
+D2K_QUIC_TESTS=${D2K_QUIC_TESTS:-'TestD2K(RunTerminal|Arms|Blob|Residual|Fragments)Parity'}
 case "${1:-}" in
     '') D2K_LINUX=0 ;;
     --linux) D2K_LINUX=1 ;;
-    *) echo 'usage: check-quic-run-parity.sh [--linux]' >&2; exit 2 ;;
+    --linux-raw) D2K_LINUX=2; D2K_QUIC_TESTS=TestD2KRawFragments ;;
+    *) echo 'usage: check-quic-run-parity.sh [--linux|--linux-raw]' >&2; exit 2 ;;
 esac
 case "$("$D2K_GO" version)" in
     *' go1.25.12 '*) ;;
@@ -27,6 +28,8 @@ cp "$D2K_DONOR/z2k-detect/go.sum" "$D2K_TMP/go.sum"
 cp -R "$D2K_DONOR/z2k-detect/internal/quicprobe" "$D2K_TMP/quicprobe"
 cp "$D2K_REPO/tests/quic-run/compare_test.go" "$D2K_TMP/quicprobe/d2k_compare_test.go"
 cp "$D2K_REPO/tests/quic-run/arms_test.go" "$D2K_TMP/quicprobe/d2k_arms_test.go"
+cp "$D2K_REPO/tests/quic-run/fragments_test.go" "$D2K_TMP/quicprobe/d2k_fragments_test.go"
+cp "$D2K_REPO/tests/quic-run/fragments_linux_test.go" "$D2K_TMP/quicprobe/d2k_fragments_linux_test.go"
 mkdir "$D2K_TMP/blobs"
 for b in quic_5.bin quic_initial_www_google_com.bin quic_initial_rutracker_org.bin; do
     cp "$D2K_DONOR/files/fake/$b" "$D2K_TMP/blobs/$b"
@@ -35,10 +38,10 @@ cd "$D2K_REPO/core"
 make hello_profiles.inc
 build_c() {
     "$@" -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include \
-        -o "$D2K_TMP/d2k-run" ../tests/quic-run/main.c quicprobe.c quicarms.c props.c net4.c \
+        -o "$D2K_TMP/d2k-run" ../tests/quic-run/main.c quicprobe.c quicarms.c ipfrag.c props.c net4.c \
         quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread
 }
-if [ "$D2K_LINUX" = 1 ]; then
+if [ "$D2K_LINUX" != 0 ]; then
     [ "$(docker image inspect gcc:14 --format '{{.Architecture}} {{.Os}}')" = 'arm64 linux' ] || {
         echo 'Linux check requires the existing arm64 gcc:14 image; no image is pulled.' >&2; exit 1;
     }
@@ -47,11 +50,13 @@ else
     build_c ${CC:-cc}
 fi
 cd "$D2K_TMP"
-if [ "$D2K_LINUX" = 1 ]; then
+if [ "$D2K_LINUX" != 0 ]; then
     GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$D2K_GO" test -c -tags d2k_donor \
         -o "$D2K_TMP/oracle.test" ./quicprobe
+    set -- --cap-drop ALL
+    if [ "$D2K_LINUX" = 2 ]; then set -- "$@" --cap-add NET_RAW; fi
     docker run --rm --pull never --network none --read-only --tmpfs /tmp \
-        --cap-drop ALL --security-opt no-new-privileges \
+        "$@" --security-opt no-new-privileges \
         -v "$D2K_TMP:/w:ro" -e D2K_QUIC_RUN_BIN=/w/d2k-run -e D2K_QUIC_BLOBS=/w/blobs \
         gcc:14 /w/oracle.test -test.run "$D2K_QUIC_TESTS" -test.v
 else
