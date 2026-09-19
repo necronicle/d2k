@@ -6,6 +6,8 @@ D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh
 D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh --linux
 # Exact raw fragments on isolated container loopback (CAP_NET_RAW only):
 D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh --linux-raw
+# Same raw tests with real conntrack enabled (d2k-fragment-test image):
+D2K_REF_GO=/Users/mark/go/bin/go1.25.12 sh scripts/check-quic-run-parity.sh --linux-raw-conntrack
 ```
 
 The runner copies the unchanged donor `internal/quicprobe` package, checked
@@ -71,8 +73,19 @@ test, still inside `--network none` with only CAP_NET_RAW and a read-only root:
   invented universal outcome for every receiver.
 - Failed marks on either receiving or raw socket must yield unsent/untrusted
   results, and packet capture must show no transmitted fragment.
+- Failed NODEFRAG setup yields unsent results and no wire, without falling back
+  to a normal raw socket.
 
-Scope is still not complete Run/wire parity. Fragment Plan execution,
+`--linux-raw-conntrack` reproduces a limitation in the unchanged donor: conntrack
+reorders reverse fragments and locally drops overlap groups. The C measurement
+sender now uses mandatory IP_NODEFRAG, preserving the original builder's actual
+bytes/order through conntrack. The test asserts the donor limitation first,
+then verifies the corrected C wire against the original pure builder. This mode
+is therefore **not** a claim of identical donor/C transport outcomes under that
+kernel setup. The question tree and fragment shapes are unchanged.
+
+Scope is still not complete Run/wire parity. Fragment Plan execution is covered
+separately by `scripts/check-fragment-plan-linux.sh` (including NFQUEUE/NAT);
 per-attempt TLS input/control freshness, options/deadline semantics and remaining
 property questions are open. Fragment survival is `not measured` in the
 capability-free lab, never a claim that fragments cannot traverse a real

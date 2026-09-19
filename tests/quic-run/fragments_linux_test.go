@@ -72,6 +72,7 @@ func TestD2KRawFragments(t *testing.T) {
 			addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: server.port}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
+			_, originalDrain := packetCapture(t)
 			ref := measure(ctx, addr, Options{Repeats: 3, Parallel: 3}, func(int) probeSpec {
 				s := buildInitial("blocked.example", V1, 1200, 0)
 				s.frag = &p
@@ -82,6 +83,25 @@ func TestD2KRawFragments(t *testing.T) {
 			}
 			if i < 2 && ref.Answered != 3 {
 				t.Fatalf("original two-fragment path must reassemble: %+v", ref)
+			}
+			originalGroups := originalDrain()
+			if os.Getenv("D2K_CONNTRACK") == "1" {
+				// Original source stays unchanged. Its raw socket lacks NODEFRAG:
+				// distinguish a local rewrite/drop from the server's DPI behavior.
+				t.Logf("unchanged Go with conntrack: groups=%d answered=%d sent=%d", len(originalGroups), ref.Answered, ref.Sent)
+				if i == 1 {
+					if len(originalGroups) != 3 {
+						t.Fatalf("expected three reordered donor groups, got %d", len(originalGroups))
+					}
+					for _, frames := range originalGroups {
+						if binary.BigEndian.Uint16(frames[0][6:])&8191 != 0 {
+							t.Fatal("donor limitation was not reproduced: reverse order survived conntrack")
+						}
+					}
+				}
+				if i >= 2 && len(originalGroups) != 0 {
+					t.Fatal("donor limitation was not reproduced: overlapping fragments survived local defrag")
+				}
 			}
 			_, drain := packetCapture(t)
 			out, err := exec.Command(os.Getenv("D2K_QUIC_RUN_BIN"), strconv.Itoa(server.port), "fragment", strconv.Itoa(i+1)).CombinedOutput()
@@ -140,7 +160,7 @@ func TestD2KRawFragments(t *testing.T) {
 			}
 		})
 	}
-	for _, where := range []string{"mark-rx", "mark-raw"} {
+	for _, where := range []string{"mark-rx", "mark-raw", "nodefrag"} {
 		t.Run(where, func(t *testing.T) {
 			server := startScenario(t, "clear")
 			defer server.stop()
@@ -149,8 +169,12 @@ func TestD2KRawFragments(t *testing.T) {
 			if err != nil {
 				t.Fatalf("C: %v %s", err, out)
 			}
-			if strings.TrimSpace(string(out)) != "0 3 3 0 0" {
-				t.Fatalf("failed mark must remain unsent/untrusted: %s", out)
+			want := "0 3 3 0 0"
+			if where == "nodefrag" {
+				want = "0 3 3 1 0"
+			}
+			if strings.TrimSpace(string(out)) != want {
+				t.Fatalf("failed socket setup must remain unsent (mark failure also untrusted): %s", out)
 			}
 			if len(drain()) != 0 {
 				t.Fatal("unisolated fragments reached the wire")

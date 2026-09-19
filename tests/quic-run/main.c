@@ -1,5 +1,8 @@
 /* Test-only entry point: real C classifier against the local donor oracle. */
+#define _DEFAULT_SOURCE 1
 #include <stdio.h>
+#include <errno.h>
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -27,6 +30,17 @@ static size_t no_extra_addresses(const char *sni, char out[][D2K_QUIC_ADDR_LEN],
     return 0; /* Explicit loopback endpoint only: do not query external DNS. */
 }
 static int reject_mark;
+static int reject_nodefrag;
+/* Only quicprobe.c is compiled with this syscall replacement. No product
+   hook and no mutation of the donor; all other options use the real call. */
+int d2k_test_setsockopt(int fd,int level,int option,const void *value,socklen_t len) {
+#ifdef IP_NODEFRAG
+    if(reject_nodefrag && level==IPPROTO_IP && option==IP_NODEFRAG) {
+        errno=ENOPROTOOPT;return -1;
+    }
+#endif
+    return setsockopt(fd,level,option,value,len);
+}
 static int mark_failure(int fd,uint32_t mark) {
     (void)mark;
     int type=0;socklen_t n=sizeof type;
@@ -85,8 +99,9 @@ int main(int argc, char **argv) {
         if(argc==5) {
             if(!strcmp(argv[4],"mark-rx"))reject_mark=1;
             else if(!strcmp(argv[4],"mark-raw"))reject_mark=2;
+            else if(!strcmp(argv[4],"nodefrag"))reject_nodefrag=1;
             else return 2;
-            d2k_mark_hook=mark_failure;mark=45;
+            if(reject_mark){d2k_mark_hook=mark_failure;mark=45;}
         }
         int sent=0;
         d2k_tally t=d2k_quic_fragment_hook("127.0.0.1",(uint16_t)port,(int)shape,

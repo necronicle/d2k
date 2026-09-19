@@ -20,6 +20,7 @@
 
 int fragment_fixture(int shape,int fake,uint8_t *,size_t,size_t *);
 int fragment_input(uint8_t *,size_t,size_t *);
+int fragment_nfq_main(int,char **);
 static int fail_option;
 int d2k_test_setsockopt(int fd,int level,int option,const void *value,socklen_t len) {
     if((fail_option==1 && level==IPPROTO_IP && option==IP_NODEFRAG) ||
@@ -27,15 +28,6 @@ int d2k_test_setsockopt(int fd,int level,int option,const void *value,socklen_t 
         errno=EPERM;return -1;
     }
     return setsockopt(fd,level,option,value,len);
-}
-/* The runtime procfs lookup has unit tests. Here provide the tuple verified
- * by the real SNAT echo: the Docker kernel need not expose conntrack procfs. */
-static int observed_nat(const char *path,uint8_t proto,uint32_t src,uint16_t sp,
-    uint32_t dst,uint16_t dp,uint32_t *out,uint16_t *port) {
-    (void)path;
-    if(proto!=17 || src!=htonl(0x0a4e0002) || sp!=htons(54000) ||
-       dst!=htonl(0x0a4d0002) || dp!=htons(54321))return -1;
-    *out=htonl(0x0a4d0001);*port=htons(55000);return 0;
 }
 
 static int server_main(void) {
@@ -59,6 +51,7 @@ static int receive_echo(int client,const uint8_t *payload,size_t len) {
 }
 int main(int argc,char **argv) {
     if(argc==2 && !strcmp(argv[1],"server"))return server_main();
+    if(argc>=2 && (!strcmp(argv[1],"nfq") || !strcmp(argv[1],"plan")))return fragment_nfq_main(argc,argv);
     int cap=socket(AF_PACKET,SOCK_DGRAM|SOCK_NONBLOCK,htons(ETH_P_ALL));
     struct sockaddr_ll sa={0};sa.sll_family=AF_PACKET;
     sa.sll_protocol=htons(ETH_P_ALL);sa.sll_ifindex=(int)if_nametoindex("d2k-out");
@@ -98,7 +91,6 @@ int main(int argc,char **argv) {
         d2k_raw_close(fault);
         puts("NODEFRAG/mark setup failures: no send, no ordinary-socket fallback");
     }
-    d2k_nat_hook=observed_nat;
     int fails=0;
     for(int fake=0;fake<2;fake++)for(int shape=1;shape<=4;shape++) {
         uint8_t tlv[2048],input[1600],wire[8192];size_t tn=0;

@@ -927,6 +927,15 @@ static int qp_send_fragmented(const char *addr,uint16_t port,d2k_hello msg,
     if(raw<0)goto fail;
     int one=1;
     if(setsockopt(raw,IPPROTO_IP,IP_HDRINCL,&one,sizeof one)!=0)goto fail;
+    /* Proven donor/platform limitation: local conntrack can reorder pos8
+       and discard overlaps BEFORE the probe reaches the wire. Preserve the
+       donor's requested fragments, not that accidental kernel rewrite.
+       No fallback: unavailable NODEFRAG is unsent/local error (SPEC §7). */
+#ifdef IP_NODEFRAG
+    if(setsockopt(raw,IPPROTO_IP,IP_NODEFRAG,&one,sizeof one)!=0)goto fail;
+#else
+    goto fail;
+#endif
     /* Unlike the donor's EPERM fallback, D2K refuses to send an unisolated
        raw probe through its own candidate. SPEC §7, tested explicitly. */
     if(mark && d2k_mark_hook(raw,mark)!=0){*marked=0;goto fail;}

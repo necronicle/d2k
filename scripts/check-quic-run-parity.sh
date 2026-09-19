@@ -10,7 +10,8 @@ case "${1:-}" in
     '') D2K_LINUX=0 ;;
     --linux) D2K_LINUX=1 ;;
     --linux-raw) D2K_LINUX=2; D2K_QUIC_TESTS=TestD2KRawFragments ;;
-    *) echo 'usage: check-quic-run-parity.sh [--linux|--linux-raw]' >&2; exit 2 ;;
+    --linux-raw-conntrack) D2K_LINUX=3; D2K_QUIC_TESTS=TestD2KRawFragments ;;
+    *) echo 'usage: check-quic-run-parity.sh [--linux|--linux-raw|--linux-raw-conntrack]' >&2; exit 2 ;;
 esac
 case "$("$D2K_GO" version)" in
     *' go1.25.12 '*) ;;
@@ -38,7 +39,9 @@ cd "$D2K_REPO/core"
 make hello_profiles.inc
 build_c() {
     "$@" -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include \
-        -o "$D2K_TMP/d2k-run" ../tests/quic-run/main.c quicprobe.c quicarms.c ipfrag.c props.c net4.c \
+        -Dsetsockopt=d2k_test_setsockopt -c quicprobe.c -o "$D2K_TMP/quicprobe.o"
+    "$@" -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include \
+        -o "$D2K_TMP/d2k-run" ../tests/quic-run/main.c "$D2K_TMP/quicprobe.o" quicarms.c ipfrag.c props.c net4.c \
         quichello.c hello.c tls13core.c x25519.c quic.c quicwire.c crypto.c meas.c -lpthread
 }
 if [ "$D2K_LINUX" != 0 ]; then
@@ -54,7 +57,19 @@ if [ "$D2K_LINUX" != 0 ]; then
     GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$D2K_GO" test -c -tags d2k_donor \
         -o "$D2K_TMP/oracle.test" ./quicprobe
     set -- --cap-drop ALL
-    if [ "$D2K_LINUX" = 2 ]; then set -- "$@" --cap-add NET_RAW; fi
+    if [ "$D2K_LINUX" -ge 2 ]; then set -- "$@" --cap-add NET_RAW; fi
+    if [ "$D2K_LINUX" = 3 ]; then
+        # Built by tests/fragment-plan/Dockerfile. Only this disposable
+        # container's loopback/OUTPUT conntrack changes; no outside network.
+        docker run --rm --pull never --network none --read-only --tmpfs /tmp --tmpfs /run \
+            "$@" --cap-add NET_ADMIN --security-opt no-new-privileges \
+            -v "$D2K_TMP:/w:ro" -e D2K_QUIC_RUN_BIN=/w/d2k-run -e D2K_QUIC_BLOBS=/w/blobs \
+            -e D2K_CONNTRACK=1 d2k-fragment-test sh -ec '
+                iptables -A OUTPUT -m conntrack --ctstate INVALID -j ACCEPT
+                exec /w/oracle.test -test.run TestD2KRawFragments -test.v
+            '
+        exit
+    fi
     docker run --rm --pull never --network none --read-only --tmpfs /tmp \
         "$@" --security-opt no-new-privileges \
         -v "$D2K_TMP:/w:ro" -e D2K_QUIC_RUN_BIN=/w/d2k-run -e D2K_QUIC_BLOBS=/w/blobs \
