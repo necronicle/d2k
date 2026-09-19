@@ -59,7 +59,24 @@ static int fails;
         }                                                  \
     } while (0)
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* Опциональный независимый Go-оракул читает только измерительный вход.
+       Никаких соединений, даже для этого режима теста. */
+    if (argc == 3 && (strcmp(argv[1], "--dump-probe-hello") == 0 ||
+                      strcmp(argv[1], "--dump-probe") == 0)) {
+        uint8_t packet[1500], hello[1500];
+        size_t packet_len = 0, hello_len = 0;
+        if (d2k_quic_probe_initial(argv[2], packet, sizeof packet, &packet_len) != 0 ||
+            d2k_quic_client_hello(packet, packet_len, hello, sizeof hello, &hello_len) != 0) {
+            return 2;
+        }
+        const uint8_t *bytes = strcmp(argv[1], "--dump-probe") == 0 ? packet : hello;
+        size_t len = strcmp(argv[1], "--dump-probe") == 0 ? packet_len : hello_len;
+        for (size_t i = 0; i < len; i++) { printf("%02x", bytes[i]); }
+        puts("");
+        return 0;
+    }
+    if (argc != 1) { return 2; }
     uint8_t out[2048];
     size_t out_len = 0;
     char name[256];
@@ -446,6 +463,26 @@ int main(void) {
         CHECK(d2k_qw_hdr_parse(pkt, hlen + 1 + 100 + 16, 0, &h) == 0 &&
               h.type == D2K_QW_LT_INITIAL && h.version == D2K_QW_V2,
               "тип Initial версии 2 не пережил круг сборка-разбор");
+    }
+
+    /* Измерительный вход отделён от клиента подтверждения. Независимая
+       сверка ВСЕХ байтов с донором — scripts/check-quic-input-parity.sh. */
+    {
+        uint8_t first[1500], second[1500], hello[1500];
+        size_t fl = 0, sl = 0, hl = 0;
+        CHECK(d2k_quic_probe_initial("measure.example", first, sizeof first, &fl) == 0 && fl == 1200,
+              "измерительный Initial оригинала не собрался в 1200 байт");
+        CHECK(d2k_quic_sni(first, fl, name, sizeof name) == 0 && strcmp(name, "measure.example") == 0,
+              "Initial оригинала не раскрывается или потерял имя");
+        CHECK(d2k_quic_client_hello(first, fl, hello, sizeof hello, &hl) == 0 && hl > 0,
+              "Initial оригинала не содержит полного ClientHello");
+        CHECK(d2k_quic_probe_initial("measure.example", second, sizeof second, &sl) == 0 &&
+              sl == fl && memcmp(first, second, fl) != 0,
+              "измерительный Initial повторяет случайность другого опыта");
+        CHECK(d2k_quic_probe_initial("measure.example", first, 1199, &fl) != 0 && fl == 0,
+              "измерительный Initial обрезан до слишком малого буфера");
+        CHECK(d2k_quic_probe_initial("", first, sizeof first, &fl) != 0,
+              "безымянной цели выдуман именованный измерительный вход");
     }
 
     /* ПЕРВЫЙ INITIAL СВОИМ СТЕКОМ — БАЙТЫ, А НЕ СОЕДИНЕНИЕ.

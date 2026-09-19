@@ -894,7 +894,7 @@ static int fill_hellos(d2k_sched *s, task *t) {
                     return -1;
                 }
             } else {
-                if (d2k_qc_first_initial(t->name, t->trig, sizeof t->trig,
+                if (d2k_quic_probe_initial(t->name, t->trig, sizeof t->trig,
                                          &t->trig_len) != 0) { return -1; }
                 say(s, "по %s начинаю замер собственным QUIC Initial (PROFILE, не снимок клиента)",
                     t->name);

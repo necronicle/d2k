@@ -135,6 +135,8 @@ props.o: props.c $(HDR)
 hello.o: hello.c $(HDR) hello_profiles.inc
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+quichello.o: profiles/quic_probe.h
+
 # Приветствие QUIC с другим именем, собранное из снятого: контроль для дерева
 # вопросов по QUIC. Своего разбора не содержит — связывает quic.o (достать
 # открытый ClientHello), hello.o (подставить имя) и quicwire.o (собрать

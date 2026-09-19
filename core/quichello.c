@@ -14,6 +14,13 @@
 #include "d2k_quichello.h"
 #include "d2k_quicwire.h"
 #include "d2k_tls13core.h"
+#include "d2k_crypto.h"
+#include "profiles/quic_probe.h"
+
+typedef char probe_profile_fields_fit[
+    D2K_QUIC_PROFILE_RANDOM_OFF + 32 <= sizeof d2k_quic_probe_profile &&
+    D2K_QUIC_PROFILE_KEY_SHARE_OFF + 32 <= sizeof d2k_quic_probe_profile &&
+    D2K_QUIC_PROFILE_SCID_OFF + 8 <= sizeof d2k_quic_probe_profile ? 1 : -1];
 
 #define FR_CRYPTO 0x06
 /* Наименьшая датаграмма с Initial (RFC 9000 §14.1): сервер обязан отбросить
@@ -128,14 +135,14 @@ static int prepare(const uint8_t *in, size_t n, const char *sni, int want_v2,
 static int seal_one(const d2k_qw_keys *k, uint32_t ver,
                     const uint8_t *dcid, size_t dcid_len,
                     const uint8_t *scid, size_t scid_len,
-                    uint8_t *body, size_t b, uint64_t pn, size_t want,
+                    uint8_t *body, size_t b, uint64_t pn, size_t pn_len, size_t want,
                     int clear_fixed, uint8_t *out, size_t cap, size_t *out_len) {
     if (want > D2K_QW_MAX_DGRAM || want > cap) { return -1; }
 
     /* Добивка считается итерацией, а не формулой: ширина varint'а поля Length
        может подрасти на единицу, и тогда нужен ещё один проход. Четырёх
        хватает с запасом (ширина растёт максимум трижды: 1->2->4->8). */
-    size_t pn_len = d2k_qw_pn_len(pn, -1);
+    if (pn_len == 0) { pn_len = d2k_qw_pn_len(pn, -1); }
     uint8_t probe[64];
     size_t hlen = 0;
     for (int i = 0; i < 4; i++) {
@@ -170,6 +177,42 @@ static int seal_one(const d2k_qw_keys *k, uint32_t ver,
     memcpy(out, pkt, made);
     *out_len = made;
     return 0;
+}
+
+/* Измерительный вход оригинала, отдельно от полноценного клиента
+ * подтверждения. Профиль получен вызовом donor ClientHello, а не собран
+ * похожим. Случайные поля обновляем ДО переименования: длина SNI сдвигает
+ * последующие расширения. Закрытый X25519-ключ не нужен после построения
+ * вопроса — этот опыт не продолжает TLS-рукопожатие. */
+int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
+                           size_t *out_len) {
+    if (!sni || !sni[0] || strlen(sni) > 253 || !out || !out_len) { return -1; }
+    *out_len = 0;
+    if (cap < INITIAL_MIN) { return -1; }
+    uint8_t profile[sizeof d2k_quic_probe_profile], ch[D2K_QW_MAX_DGRAM];
+    uint8_t dcid[8], scid[8], priv[32], sec[32];
+    memcpy(profile, d2k_quic_probe_profile, sizeof profile);
+    if (d2k_t13_random(dcid, sizeof dcid) != 0 ||
+        d2k_t13_random(scid, sizeof scid) != 0 ||
+        d2k_t13_random(profile + D2K_QUIC_PROFILE_RANDOM_OFF, 32) != 0 ||
+        d2k_t13_random(priv, sizeof priv) != 0) { return -1; }
+    int rc = d2k_x25519_base(profile + D2K_QUIC_PROFILE_KEY_SHARE_OFF, priv);
+    memset(priv, 0, sizeof priv);
+    if (rc != 0) { return -1; }
+    memcpy(profile + D2K_QUIC_PROFILE_SCID_OFF, scid, sizeof scid);
+    size_t ch_len = 0;
+    if (d2k_hello_rename(profile, sizeof profile, sni, ch, sizeof ch, &ch_len) != 0) {
+        return -1;
+    }
+    d2k_qw_keys k;
+    if (d2k_qw_initial_secret(D2K_QW_V1, dcid, sizeof dcid, D2K_QW_CLIENT, sec) != 0 ||
+        d2k_qw_keys_from_secret(D2K_QW_V1, sec, &k) != 0) { return -1; }
+    uint8_t body[D2K_QW_MAX_DGRAM];
+    size_t b = 0;
+    if (put_crypto(body, sizeof body, &b, 0, ch, ch_len) != 0) { return -1; }
+    /* buildInitial оригинала: PN=0, PNLen=4, один CRYPTO, 1200 байт. */
+    return seal_one(&k, D2K_QW_V1, dcid, sizeof dcid, scid, sizeof scid,
+                    body, b, 0, 4, INITIAL_MIN, 0, out, cap, out_len);
 }
 
 int d2k_quic_hello_rename(const uint8_t *in, size_t n, const char *sni,
@@ -226,7 +269,7 @@ int d2k_quic_hello_ask(const uint8_t *in, size_t n, d2k_quic_ask ask,
            вопрос и назвать его тем же именем. */
         want += 100;
     }
-    return seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, want,
+    return seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, 0, want,
                     ask == D2K_QASK_CLEAR_FIXED_BIT, out, cap, out_len);
 }
 
@@ -275,13 +318,13 @@ int d2k_quic_hello_split(const uint8_t *in, size_t n, const char *sni,
     uint8_t body[D2K_QW_MAX_DGRAM];
     size_t b = 0;
     if (put_crypto(body, sizeof body, &b, cut, ch2 + cut, ch2_len - cut) != 0 ||
-        seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 1, INITIAL_MIN,
+        seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 1, 0, INITIAL_MIN,
                  0, tail, tail_cap, tail_len) != 0) {
         return -1;
     }
     b = 0;
     if (put_crypto(body, sizeof body, &b, 0, ch2, cut) != 0 ||
-        seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, INITIAL_MIN,
+        seal_one(&k, ver, dcid, dcid_len, scid, scid_len, body, b, 0, 0, INITIAL_MIN,
                  0, head, head_cap, head_len) != 0) {
         return -1;
     }

@@ -46,6 +46,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Собственный измерительный Initial оригинала quicprobe.buildInitial.
+ * Встроенный ClientHello — нормализованный выход donor crypto/tls Go 1.25.12
+ * (AES-capable профиль). Случайные поля генерируются заново. Это PROFILE,
+ * не снимок клиента; отдельный зонд подтверждения остаётся в quicconn.c. */
+int d2k_quic_probe_initial(const char *sni, uint8_t *out, size_t cap,
+                           size_t *out_len);
+
 /* ЧЕМ СПРОСИТЬ КОРОБКУ — способ пересборки снятого Initial.
  *
  * Оригинал («Поиск по домену», internal/quicprobe/questions.go) задаёт восемь
