@@ -105,10 +105,10 @@ int d2k_stun_parse_response(const uint8_t *p, size_t n,
         size_t ln = rd16(b + 2);
         if (4 + ln > left) { break; } /* длина уводит за объявленные атрибуты — дальше гадать нельзя */
         if (typ == ATTR_XOR_MAPPED_ADDR) {
-            /* Не нашли адрес в объявленном атрибуте — ответ всё равно НАШ:
-               обход прекращается, но это не отказ. */
-            (void)parse_xor_mapped(b + 4, ln, txid, ip, family, port);
-            return 0;
+            /* Как ParseBindingResponse оригинала: отсутствующий адрес
+               допустим, но ошибка присутствующего XOR-MAPPED-ADDRESS
+               должна дойти до оракула, а не стать успешным ответом. */
+            return parse_xor_mapped(b + 4, ln, txid, ip, family, port);
         }
         size_t step = 4 + ln;
         size_t pad = ln % 4;

@@ -328,6 +328,12 @@ static d2k_ev ev_exchange(uint8_t transport, uint16_t cport, int appdata) {
        acceptServerHello, trigger.go:67-70). Тот же признак, что несёт
        датапат седьмым байтом события. */
     e.server_hello = (uint8_t)(appdata ? 1 : 0);
+    if (transport == 17) {
+        /* Реальный UDP EXCHANGE не несёт TLS-типов или ServerHello. */
+        e.code = 0;
+        e.seen_types = 0;
+        e.server_hello = 0;
+    }
     return e;
 }
 
@@ -1725,6 +1731,68 @@ int main(void) {
         }
     }
 
+    /* Старый каталог записывал любой UDP EXCHANGE как CLIENT/level=3.
+       Более высокий level сам по себе не добавляет доказательства. Эти записи
+       не восстанавливаются автоматически даже при level=5. Подтверждения
+       собственным протокольным зондом это ограничение не затрагивает. */
+    for (int by_addr = 0; by_addr < 2; by_addr++) {
+        for (int proof = 0; proof < 3; proof++) {
+            d2k_catalog c = {0};
+            c.boxes = calloc(1, sizeof *c.boxes);
+            CHECK(c.boxes != NULL, "каталог UDP-доказательств не создан");
+            if (!c.boxes) { continue; }
+            c.n_boxes = 1;
+            d2k_cat_box *box = &c.boxes[0];
+            snprintf(box->id, sizeof box->id, "udp-box");
+            box->plans = calloc(1, sizeof *box->plans);
+            box->binds = calloc(1, sizeof *box->binds);
+            CHECK(box->plans && box->binds, "записи UDP-каталога не созданы");
+            if (box->plans && box->binds) {
+                box->n_plans = box->n_binds = 1;
+                d2k_cat_plan *p = &box->plans[0];
+                snprintf(p->id, sizeof p->id, "udp-plan");
+                snprintf(p->proto, sizeof p->proto, "quic");
+                p->enabled = 1;
+                p->successes = 1;
+                p->text = strdup("d2k-plan 1 6\nid 00000000000000000000000000000000\n"
+                                 "proto udp quic\ndelay 15000\n");
+                d2k_cat_binding *bd = &box->binds[0];
+                snprintf(bd->kind, sizeof bd->kind, "%s", by_addr ? "addr" : "name");
+                snprintf(bd->target, sizeof bd->target, "%s", by_addr ? "192.0.2.7" : "udp.test");
+                snprintf(bd->plan_id, sizeof bd->plan_id, "%s", p->id);
+                bd->enabled = 1;
+                bd->transport = 17;
+                bd->level = proof == 1 ? 5 : 3;
+                bd->verified_by = proof == 2 ? D2K_VERBY_PROBE : D2K_VERBY_CLIENT;
+                bd->confirmed = 42;
+                bd->successes = 1;
+                d2k_cat_binding before = *bd;
+                saidbuf[0] = '\0';
+                forget_sent();
+                d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+                CHECK(s != NULL, "планировщик UDP-каталога не создан");
+                if (s) {
+                    d2k_sched_set_say(s, collect_say, NULL);
+                    (void)d2k_sched_sync(s);
+                    int rounds = 0;
+                    while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
+                    drain();
+                    CHECK(rounds < 1000, "проход UDP-каталога не закончился");
+                    size_t sent = sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) +
+                                  sent_command_count(D2K_CMD_SET_NAME, NULL, 0);
+                    CHECK(sent == (size_t)(proof == 2),
+                          "старый UDP CLIENT восстановлен без доказательства либо потерян PROBE");
+                    CHECK(proof == 2 || said("UDP CLIENT"),
+                          "пропуск старого UDP-подтверждения не объяснён");
+                    CHECK(memcmp(bd, &before, sizeof before) == 0 && p->successes == 1,
+                          "защита восстановления переписала пользовательский каталог");
+                    d2k_sched_free(s);
+                }
+            }
+            d2k_catalog_free(&c);
+        }
+    }
+
     /* --- очередь кандидатов движется БЕЗ пользователя (задача 3) -------- */
     {
         /* Раньше поставленный кандидат ждал чужого обмена: пока цель не
@@ -2942,9 +3010,8 @@ int main(void) {
      * приходит БЕЗ имени, и искать по имени нечего — но адрес известен, а
      * приём разноса датаграмм (delay) от имени цели не зависит вовсе.
      *
-     * Подтверждает, как и голос, следующий поток самого клиента: зонд тут не
-     * годится — он ходит своим приветствием, которое коробка как раз читает,
-     * и его судьба о судьбе клиента не говорит. */
+     * Ответ следующего потока — только наблюдение. EXCHANGE у UDP не несёт
+     * протокольного доказательства и не вправе создать успех в каталоге. */
     {
         uint16_t saved_port = g_server_port;
         g_server_port = 443;
@@ -2971,14 +3038,14 @@ int main(void) {
             d2k_ev ap = ev_applied(17, 40401);
             d2k_sched_event(s, &ap);
             d2k_ev ex = ev_exchange(17, 40401, 0);
+            ex.num = 0; /* даже пустая обратная датаграмма порождает событие */
             d2k_sched_event(s, &ex);
             spin(s, 20);
             const d2k_cat_binding *bd = binding_of(&cQ, "127.0.0.1", 17);
-            CHECK(bd != NULL, "ответ по потоку клиента не записал адресную привязку");
-            CHECK(bd != NULL && strcmp(bd->kind, "addr") == 0,
-                  "привязка записана по имени, хотя имени у цели нет");
-            CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
-                  "адресная цель подтверждена не трафиком клиента");
+            CHECK(bd == NULL && cQ.n_boxes == 0,
+                  "произвольный UDP-ответ создал подтверждение/коробку адресной цели");
+            CHECK(said("UDP-ответ наблюдался") && !said("ПОДТВЕРЖДЕНО"),
+                  "UDP-наблюдение потеряно либо названо подтверждением");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cQ);
@@ -2987,7 +3054,7 @@ int main(void) {
 
     /* Одинаковый план не делает две адресные цели одной задачей. События
        приходят от ВТОРОЙ цели раньше первой: чужой APPLIED + её же EXCHANGE
-       не должны записать успех первой задачи, даже при равных plan_id.
+       не должны стать наблюдением первой задачи, даже при равных plan_id.
        Отдельный прогон добавляет чужой порт: один дефект не маскирует другой. */
     for (int wrong_port = 0; wrong_port < 2; wrong_port++) {
         uint16_t saved_port = g_server_port;
@@ -2997,6 +3064,8 @@ int main(void) {
         d2k_sched *s = d2k_sched_new(&cQ, sv[0], 0x2d);
         CHECK(s != NULL, "планировщик двух адресных целей не завёлся");
         if (s) {
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
             forget_sent();
             d2k_ev a = ev_suspect(17, 40410);
             d2k_sched_event(s, &a);
@@ -3022,6 +3091,8 @@ int main(void) {
                 spin(s, 2);
                 CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
                       "чужой порт подтвердил адресную цель");
+                CHECK(!said("UDP-ответ наблюдался"),
+                      "чужой порт принят за наблюдение адресного опыта");
             }
 
             ap = ev_applied(17, 40413);
@@ -3032,8 +3103,10 @@ int main(void) {
             spin(s, 2);
             CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
                   "ответ второй IP-цели подтвердил первую по общему plan_id");
-            CHECK(binding_of(&cQ, "127.0.0.2", 17) != NULL,
-                  "собственный ответ второй IP-цели потерян");
+            CHECK(said("по 127.0.0.2 (QUIC по адресу) UDP-ответ наблюдался") &&
+                  !said("по 127.0.0.1 (QUIC по адресу) UDP-ответ наблюдался"),
+                  "ответ второй IP-цели потерян или приписан первой");
+            CHECK(cQ.n_boxes == 0, "наблюдение второй IP-цели записало успех");
 
             ap = ev_applied(17, 40414);
             memcpy(ap.plan_id, first_id, sizeof first_id);
@@ -3041,15 +3114,16 @@ int main(void) {
             d2k_sched_event(s, &ap);
             d2k_sched_event(s, &ex);
             spin(s, 2);
-            CHECK(binding_of(&cQ, "127.0.0.1", 17) != NULL,
+            CHECK(said("по 127.0.0.1 (QUIC по адресу) UDP-ответ наблюдался"),
                   "собственный ответ первой IP-цели потерян");
+            CHECK(cQ.n_boxes == 0, "наблюдение первой IP-цели записало успех");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cQ);
         g_server_port = saved_port;
     }
 
-    /* Жизненный цикл адресного кандидата: срок, молчание и деградация.
+    /* Жизненный цикл адресного кандидата: срок, молчание, ответ без доказательства.
        Это проверки маршрутизации/очистки, не доказательство QUIC-handshake. */
     for (int outcome = 0; outcome < 4; outcome++) {
         uint16_t saved_port = g_server_port;
@@ -3072,8 +3146,8 @@ int main(void) {
                 d2k_ev ex = ev_exchange(17, 40421, 0);
                 d2k_sched_event(s, &ex);
                 spin(s, 2);
-                CHECK(binding_of(&cQ, "127.0.0.1", 17) != NULL,
-                      "не подготовлена подтверждённая адресная задача");
+                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
+                      "UDP-наблюдение превратило кандидат в подтверждённый план");
             }
             forget_sent();
             if (outcome == 1) {
@@ -3087,18 +3161,12 @@ int main(void) {
                 spin(s, 2);
                 CHECK(said("не пробил"), "молчание своего адресного опыта проигнорировано");
             } else if (outcome == 3) {
-                su.planned = D2K_LINK_PLANNED_NO;
-                d2k_sched_event(s, &su);
-                CHECK(d2k_sched_active(s) == 1,
-                      "поток без плана прекратил наблюдение адресной цели");
-                su.planned = D2K_LINK_PLANNED_YES;
-                d2k_sched_event(s, &su);
-                CHECK(d2k_sched_active(s) == 0,
-                      "адресная цель игнорирует деградацию подтверждённого плана");
+                /* Ответ без доказательства не снимает владение опытом:
+                   молчание этого же потока всё ещё должно снять кандидат. */
+                su = ev_suspect(17, 40421);
                 d2k_sched_event(s, &su);
                 spin(s, 2);
-                CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1,
-                      "после деградации адресная цель не возобновила испытание");
+                CHECK(said("не пробил"), "UDP-ответ заблокировал снятие молчащего опыта");
             } else {
                 skip_ahead(s, 10 * 60 * 1000 + 1);
             }
@@ -3106,13 +3174,10 @@ int main(void) {
             const uint8_t addr[4] = {127, 0, 0, 1};
             CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
                   "очистка адресной задачи отправляет DEL_NAME");
-            CHECK(sent_command_count(D2K_CMD_DEL_ADDR, addr, sizeof addr) ==
-                      (size_t)(outcome < 2 ? 1 : 0),
-                  "адресный кандидат не снят либо снят подтверждённый план");
-            if (outcome < 2) {
-                CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
-                      "неудачный адресный опыт создал привязку");
-            }
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR, addr, sizeof addr) == 1,
+                  "неподтверждённый адресный кандидат не снят");
+            CHECK(binding_of(&cQ, "127.0.0.1", 17) == NULL,
+                  "неподтверждённый адресный опыт создал привязку");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cQ);
@@ -3124,7 +3189,7 @@ int main(void) {
        ни замер, ни подтверждение своим обращением невозможны. Единственный
        оракул — ответ сервера по потоку САМОГО клиента. Поэтому кандидат
        ставится на класс голоса для всех потоков, а решает следующий поток
-       разговора: пришёл ответ — подтверждено, молчание — не пробил. */
+       разговора. Обычный UDP-ответ — НЕ подтверждение разговора. */
     {
         uint16_t saved_port = g_server_port;
         g_server_port = 50004;
@@ -3158,12 +3223,14 @@ int main(void) {
             d2k_sched_event(s, &ex);
             spin(s, 20);
             const d2k_cat_binding *bd = binding_of(&cV, D2K_LINK_VOICE_CLASS, 17);
-            CHECK(bd != NULL, "ответ сервера по голосу с приёмом не записал привязку");
-            CHECK(bd != NULL && bd->verified_by == D2K_VERBY_CLIENT,
-                  "голос подтверждён не разговором клиента — а другого подтверждения у него нет");
-            CHECK(bd != NULL && bd->shape == (uint8_t)D2K_LINK_SHAPE_VOICE,
-                  "привязка голоса записана не под его форму");
-            CHECK(said("ПОДТВЕРЖДЕНО разговором"), "подтверждение голоса не названо");
+            CHECK(bd == NULL && cV.n_boxes == 0,
+                  "произвольный UDP-ответ записал голос подтверждённым");
+            CHECK(said("UDP-ответ наблюдался") && !said("ПОДТВЕРЖДЕНО"),
+                  "UDP-наблюдение голоса потеряно либо названо подтверждением");
+            forget_sent();
+            skip_ahead(s, 10 * 60 * 1000 + 1);
+            CHECK(sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 1,
+                  "UDP-ответ оставил неподтверждённый голосовой кандидат навсегда");
             d2k_sched_free(s);
         }
         d2k_catalog_free(&cV);

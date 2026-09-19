@@ -151,6 +151,27 @@ int main(void) {
               "адрес «найден» за границей объявленных атрибутов");
     }
 
+    /* ParseBindingResponse оригинала возвращает ошибку parseXorMapped.
+       Отсутствующий атрибут допустим, присутствующий, но битый — нет.
+       Длины ниже укладываются в пакет: проверяется не внешний заголовок,
+       а именно распространение ошибки разбора адреса до оракула. */
+    {
+        const uint8_t lengths[] = {4, 8, 8};
+        const uint8_t families[] = {1, 2, 3};
+        for (size_t i = 0; i < sizeof lengths; i++) {
+            uint8_t bad[D2K_STUN_HDR_LEN + 4 + 8] = {0};
+            memcpy(bad, vec_v4, D2K_STUN_HDR_LEN);
+            bad[2] = 0; bad[3] = (uint8_t)(4 + lengths[i]);
+            bad[20] = 0; bad[21] = 0x20; /* XOR-MAPPED-ADDRESS */
+            bad[22] = 0; bad[23] = lengths[i];
+            bad[25] = families[i];
+            CHECK(d2k_stun_parse_response(bad, D2K_STUN_HDR_LEN + 4 + lengths[i],
+                                          vec_txid, ip, &family, &port) != 0,
+                  "битый XOR-MAPPED-ADDRESS принят вопреки оригиналу");
+            CHECK(family == 0 && port == 0, "ошибка адреса оставила ложный результат");
+        }
+    }
+
     /* --- ОТВЕТ БЕЗ АДРЕСА — ВСЁ РАВНО ОТВЕТ -----------------------------
      * Для оракула достаточно самого факта: датаграмма дошла и вернулась с
      * нашим идентификатором. Требовать адрес значило бы объявить живой путь
