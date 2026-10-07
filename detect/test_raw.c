@@ -635,6 +635,70 @@ static void test_rule_without_comment_module(void)
     d2k_raw_rule_hook = raw_rule_system;
 }
 
+/* OpenWrt без iptables (25.12, 07.10.2026): S99d2k экспортирует D2K_FW=nft,
+ * и правило — элемент множества inet d2k_rst с таймаутом. После kill -9
+ * элемент истекает сам; уборки по владельцу и запасной формы без комментария
+ * (это про xt_comment) здесь нет. */
+static int nft_del_rc, nft_get_rc;
+static int nft_hook(const char *cmd)
+{
+    test_rule_hook(cmd);
+    if (strstr(cmd, "delete element")) return nft_del_rc;
+    if (strstr(cmd, "get element")) return nft_get_rc;
+    return rule_rc;
+}
+
+static void test_rule_through_nft(void)
+{
+    static const uint8_t dst[4] = {198, 51, 100, 10};
+    raw_conn c;
+    char err[160] = "", want[96];
+    uint16_t sport;
+    pthread_once(&g_sweep_once, sweep_noop);
+    d2k_raw_rule_hook = nft_hook;
+    CHECK(setenv("D2K_FW", "nft", 1) == 0);
+
+    rule_rc = 0; nft_del_rc = 0; nft_get_rc = 1 << 8;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    sport = c.sport;
+    CHECK(c.rule_up == 1 && rule_count == 1);
+    snprintf(want, sizeof want, "nft add element inet d2k_rst rst4 { %u timeout 300s }", (unsigned)sport);
+    CHECK(strstr(rule_cmds[0], want) != NULL);
+    CHECK(strstr(rule_cmds[0], "iptables") == NULL);
+    raw_close(&c);
+    snprintf(want, sizeof want, "nft delete element inet d2k_rst rst4 { %u }", (unsigned)sport);
+    CHECK(rule_count == 2 && strstr(rule_cmds[1], want) != NULL);
+
+    /* Элемент уже истёк: delete отказал, get подтвердил отсутствие — в
+       отложенные снятия ничего не попадает. */
+    nft_del_rc = 1 << 8;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    raw_close(&c);
+    CHECK(rule_count == 3 && strstr(rule_cmds[2], "nft get element inet d2k_rst rst4 { ") != NULL);
+    CHECK(d2k_raw_pending_count() == 0);
+
+    /* Вставка отвергнута (нет таблицы): одна попытка, зонд идёт дальше. */
+    unsigned long fails0 = d2k_raw_rst_fail_count();
+    rule_rc = 1 << 8;
+    rule_count = 0; outgoing_count = 0; dial_recv_fd = -1;
+    CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
+    CHECK(c.rule_up == 0 && rule_count == 1);
+    raw_close(&c);
+    CHECK(rule_count == 1);
+    CHECK(d2k_raw_rst_fail_count() == fails0 + 1);
+    rule_rc = 0;
+
+    /* IPv6 — своё множество. */
+    rule_count = 0;
+    CHECK(rst_rule_cmd_form("-I", 31000, 6, 1) == 0);
+    CHECK(strstr(rule_cmds[0], "nft add element inet d2k_rst rst6 { 31000 timeout 300s }") != NULL);
+
+    CHECK(unsetenv("D2K_FW") == 0);
+    d2k_raw_rule_hook = raw_rule_system;
+}
+
 int main(void)
 {
     {
@@ -681,6 +745,7 @@ int main(void)
     test_failed_release_is_retried();
     test_rule_command_is_bounded();
     test_rule_without_comment_module();
+    test_rule_through_nft();
     test_rule_lifecycle_has_no_leaks();
     test_rst_failures_are_per_thread();
     test_clock_survives_long_uptime();

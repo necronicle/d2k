@@ -285,10 +285,24 @@ static uint16_t next_source_port(void)
 /* sweepStaleRSTRules снимает правила подавления, оставшиеся от прошлых
  * прогонов: уборщик не выполнится, если процесс убили сигналом KILL — а
  * панель именно так и добивает замер, не уложившийся в отведённое время. */
+/* OpenWrt без iptables (25.12, 07.10.2026): S99d2k ставит правила в nftables
+ * и экспортирует D2K_FW=nft. Тогда правило подавления — элемент множества
+ * inet d2k_rst (rst4/rst6) с таймаутом: после kill -9 он истекает сам, и ни
+ * уборки по владельцу, ни комментария не нужно. Таймаут с запасом больше
+ * жизни зонда (шаги по timeout_ms, секунды). */
+#define RST_NFT_TIMEOUT "300s"
+static int rst_nft(void)
+{
+    const char *fw = getenv("D2K_FW");
+    return fw && strcmp(fw, "nft") == 0;
+}
+
 static void sweep_stale_rst_rules(void)
 {
     FILE *f;
     char line[512];
+
+    if (rst_nft()) return;
 
     const char *tables[] = {"iptables", "ip6tables"};
     for (size_t family = 0; family < 2; family++) {
@@ -349,6 +363,14 @@ static int g_rst_comment = 1;
 static int rst_rule_cmd_form(const char *op, uint16_t sport, uint8_t family, int comment)
 {
     char cmd[224], tag[64] = "";
+    if (rst_nft()) {
+        /* -I/-D/-C той же семантики: get отвечает 1, если элемента нет. */
+        const char *verb = strcmp(op, "-I") == 0 ? "add" : strcmp(op, "-D") == 0 ? "delete" : "get";
+        snprintf(cmd, sizeof(cmd), "nft %s element inet d2k_rst rst%c { %u%s } >/dev/null 2>&1",
+                 verb, family == 6 ? '6' : '4', (unsigned)sport,
+                 strcmp(verb, "add") == 0 ? " timeout " RST_NFT_TIMEOUT : "");
+        return d2k_raw_rule_hook(cmd);
+    }
     if (comment) snprintf(tag, sizeof tag, " -m comment --comment %s%ld", RST_OWNED_TAG, (long)getpid());
     snprintf(cmd, sizeof(cmd),
              "%s -w %s OUTPUT -p tcp --sport %u --tcp-flags RST RST%s -j DROP >/dev/null 2>&1",
@@ -467,7 +489,7 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
     pthread_mutex_lock(&g_raw_state);
     retry_pending_releases(0);
     rc = rst_rule_cmd("-I", sport, family);
-    if (rc > 0 && g_rst_comment && WIFEXITED(rc) && WEXITSTATUS(rc) <= 2 &&
+    if (rc > 0 && g_rst_comment && !rst_nft() && WIFEXITED(rc) && WEXITSTATUS(rc) <= 2 &&
         rst_rule_cmd_form("-I", sport, family, 0) == 0) {
         g_rst_comment = 0;
         fprintf(stderr, "d2k: в прошивке нет xt_comment — правила подавления RST "
