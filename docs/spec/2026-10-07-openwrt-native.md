@@ -56,8 +56,9 @@ iptables; таблицы nft, если есть nft) — миграция без
   (только IPv4, как сейчас);
 - правила по порядку и смыслу совпадают с iptables-версией; `multiport` →
   множество портов (`a:b` → `a-b`), `connbytes A:B` → `ct <dir> packets A-B`
-  (открытая граница `A:` → `A-18446744073709551615`), `addrtype BROADCAST` →
-  `fib daddr type broadcast`.
+  (открытая граница `A:` → `A-18446744073709551615`; нижняя 0 → 1: поток без
+  расширения учёта nft читает как 0, connbytes его не берёт), `addrtype
+  BROADCAST` → `fib daddr type broadcast`.
 
 Ставится одной транзакцией `nft -f` (сначала `delete table`, если есть): либо
 весь набор, либо ничего. `fw_installed` проверяет таблицу, все базовые цепочки и
@@ -70,14 +71,25 @@ IPv6 в nft отдельно не отключается: таблица `inet`.
 
 Отдельная таблица, чтобы пересборка `inet d2k` (heal/reapply) не снимала
 подавление у идущего зонда. Множества `rst4`/`rst6` (`inet_service`, `flags
-timeout`), цепочка `hook output priority filter - 1`:
-`meta nfproto ipv4 tcp sport @rst4 tcp flags & rst == rst drop` (и ipv6).
+timeout`) с ключом-кортежем зонда `inet_service . адрес . inet_service`,
+цепочка `hook output priority filter - 1`:
+`tcp flags & rst == rst tcp sport . ip daddr . tcp dport @rst4 drop` (и ipv6).
+Ключ — весь кортеж: элемент один на ключ, и порт одного процесса не должен
+снимать подавление у зонда другого процесса (у iptables — правило на владельца).
 Создаётся в `fw_up`, только если её нет; снимается `stop`/удалением.
 
 `detect/raw.c` при `D2K_FW=nft` (S99d2k экспортирует его для d2kc): вставка
-`nft add element inet d2k_rst rst4 { P timeout 300s }`, снятие `delete element`,
+`nft add element inet d2k_rst rst4 { P . ЦЕЛЬ . DPORT timeout 300s }`, снятие `delete element`,
 проверка `get element`. Таймаут — страховка после `kill -9`: элемент исчезает
 сам (зонд живёт секунды, `timeout_ms` на шаг). Уборка `-S OUTPUT` в nft не нужна.
+
+### Flow offloading fw4
+
+С `firewall.@defaults[0].flow_offloading=1` поток после рукопожатия уходит в
+flowtable мимо цепочек (замер 07.10: в очередь 4–5 пакетов вместо 17–18). Как
+ускоритель NAT Keenetic (`fastnat_off`): S99d2k выключает его на время работы
+движка, значение владельца хранит в `run/flow-offloading.saved` и возвращает
+при остановке; удаление без init тоже возвращает.
 
 ### Telegram — множества nft вместо ipset
 
