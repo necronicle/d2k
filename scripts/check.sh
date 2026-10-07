@@ -64,6 +64,7 @@ node scripts/test-log-maintenance.cjs
 node scripts/test-log-maintenance-process.cjs
 node scripts/test-update.cjs
 node scripts/test-runtime-install.cjs
+node scripts/test-install-openwrt.cjs
 node scripts/test-openwrt-init.cjs
 sh scripts/test-readme-commands.sh
 sh scripts/test-architecture.sh

@@ -157,6 +157,15 @@ for ch in D2K_OUT D2K_IN D2K; do
     fi
 done
 done
+# OpenWrt на nftables: свои таблицы снимаются целиком — движок, подавление
+# RST зондами, Telegram. Чужие (fw4) не трогаются.
+if command -v nft >/dev/null 2>&1; then
+    for t in d2k d2k_rst d2k_tg; do
+        if nft list table inet "$t" >/dev/null 2>&1; then
+            nft delete table inet "$t" || say "не снять таблицу nft inet $t"
+        fi
+    done
+fi
 say "правила сняты"
 
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
@@ -172,6 +181,8 @@ rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dn
     "$DIR/release-id" "$DIR/release-arch" \
     "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel" "$DIR/.update"
+# Рабочий каталог обновления на OpenWrt без USB — в RAM (d2k-update.sh).
+rm -rf /tmp/d2k-update
 # Свои файлы в /tmp: отметки сторожа и планировщика, брошенные замки.
 rm -f /tmp/d2k-fw-heal.last /tmp/d2k-instagram-dns-last-attempt
 for lock in /tmp/d2k-fw-heal.lock /tmp/d2k-fw-operation.lock; do

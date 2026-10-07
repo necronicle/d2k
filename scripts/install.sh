@@ -20,8 +20,12 @@ DIR=/opt/d2k
 SBIN=/opt/sbin
 INIT=/opt/etc/init.d/S99d2k
 OPENWRT_INIT=/etc/init.d/d2k
-# Признак OpenWrt — один на весь установщик: хук автозапуска и модули ядра.
+# Признак OpenWrt — один на весь установщик: хук автозапуска, пакеты, правила.
 OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
+# Штатный менеджер пакетов OpenWrt: apk с 25.12, opkg до неё. Entware-opkg
+# для системных пакетов не годится никогда — у него свои пакеты и своя арка.
+OPENWRT_APK=${D2K_OPENWRT_APK:-/usr/bin/apk}
+OPENWRT_OPKG=${D2K_OPENWRT_OPKG:-/bin/opkg}
 OPENWRT_STAGE=
 openwrt_check() {
     [ -f "$OPENWRT_RELEASE" ] || return 0
@@ -55,7 +59,7 @@ install_openwrt_hook() (
     openwrt_check || exit 0
     mv -f "$OPENWRT_STAGE" "$OPENWRT_INIT" || exit 1
     sh /etc/rc.common "$OPENWRT_INIT" enable || exit 1
-    echo 'd2k: автозапуск OpenWrt включён (ожидание Entware, затем D2K)'
+    echo 'd2k: автозапуск OpenWrt включён (ожидание /opt, затем D2K)'
 )
 TMP=
 
@@ -73,13 +77,65 @@ trap cleanup EXIT INT TERM
 # Отказ на неподдерживаемой арке ЯВНЫЙ. Поставить бинарник не той арки значит
 # получить «не запускается» без объяснения.
 
+# --- правила: nftables или iptables --------------------------------------
+#
+# OpenWrt с fw4 (22.03+) — nftables: в 25.12 пакетов iptables нет вовсе, и
+# Entware для них не нужен. Keenetic и старый OpenWrt (fw3) — iptables. Тот же
+# выбор делает S99d2k; FW_BACKEND=iptables в конфигурации оставляет iptables.
+FW=iptables
+if [ -f "$OPENWRT_RELEASE" ] && command -v nft >/dev/null 2>&1; then
+    cfg_fw=$(sed -n 's/^[[:space:]]*FW_BACKEND=//p' "$DIR/config" 2>/dev/null | tail -n 1 | tr -d "\"'")
+    [ "$cfg_fw" = iptables ] || FW=nft
+fi
+
+# Штатные пакеты OpenWrt. Ставятся только недостающие.
+openwrt_pm() {
+    if [ -x "$OPENWRT_APK" ]; then echo apk
+    elif [ -x "$OPENWRT_OPKG" ]; then echo opkg
+    fi
+}
+openwrt_has() {
+    case "$(openwrt_pm)" in
+        apk) "$OPENWRT_APK" info -e "$1" >/dev/null 2>&1 ;;
+        opkg) "$OPENWRT_OPKG" list-installed 2>/dev/null | cut -d' ' -f1 | grep -qx "$1" ;;
+        *) return 1 ;;
+    esac
+}
+# $* — пакеты словами.
+openwrt_add() {
+    # shellcheck disable=SC2048,SC2086  # список пакетов, нарочно словами
+    case "$(openwrt_pm)" in
+        apk) "$OPENWRT_APK" add $* >/dev/null 2>&1 ||
+             { "$OPENWRT_APK" update >/dev/null 2>&1 && "$OPENWRT_APK" add $* >/dev/null 2>&1; } ;;
+        opkg) "$OPENWRT_OPKG" install $* >/dev/null 2>&1 ||
+              { "$OPENWRT_OPKG" update >/dev/null 2>&1 && "$OPENWRT_OPKG" install $* >/dev/null 2>&1; } ;;
+        *) return 1 ;;
+    esac
+}
+# Команда для человека: та же установка руками.
+openwrt_add_cmd() {
+    case "$(openwrt_pm)" in
+        apk) echo "apk update && apk add $*" ;;
+        *) echo "opkg update && opkg install $*" ;;
+    esac
+}
+
 # --- что нужно от системы ------------------------------------------------
-for t in curl ip iptables ip6tables start-stop-daemon; do
-    command -v "$t" >/dev/null 2>&1 || die "нет $t — поставьте пакет и повторите"
-done
-for t in ipset openssl; do
-    command -v "$t" >/dev/null 2>&1 || die "нет $t — нужен для Telegram/Instagram; поставьте зависимости из README"
-done
+if [ "$FW" = nft ]; then
+    # curl и openssl может ещё не быть: их ставит штатный менеджер ниже, после
+    # загрузки (загрузка без curl идёт через wget = uclient-fetch из образа).
+    for t in ip nft start-stop-daemon; do
+        command -v "$t" >/dev/null 2>&1 || die "нет $t — он есть в обычном образе OpenWrt; проверьте прошивку"
+    done
+    [ -n "$(openwrt_pm)" ] || die "нет штатного менеджера пакетов OpenWrt ($OPENWRT_APK или $OPENWRT_OPKG)"
+else
+    for t in curl ip iptables ip6tables start-stop-daemon; do
+        command -v "$t" >/dev/null 2>&1 || die "нет $t — поставьте пакет и повторите"
+    done
+    for t in ipset openssl; do
+        command -v "$t" >/dev/null 2>&1 || die "нет $t — нужен для Telegram/Instagram; поставьте зависимости из README"
+    done
+fi
 # Модули netfilter прошивка часто держит файлами, но не загружает: в /proc
 # видны только загруженные (Keenetic; Netis N6 04.10 — xt_connbytes ожил от
 # modprobe). Установщик загружает их сам тем же способом, что S99d2k при
@@ -99,38 +155,40 @@ load_kmod() {
     return 0
 }
 NF_HINT="модуль не найден в прошивке; на Keenetic установите компонент «Модули ядра подсистемы Netfilter»"
-# OpenWrt: модули netfilter — отдельные пакеты штатного opkg (/bin/opkg, не
-# Entware). Лаборатория 06.10, OpenWrt 24.10.8: без них нет NFQUEUE, без
-# kmod-ipt-nat — таблицы nat (MASQUERADE для QUIC и перенаправление Telegram).
-OPENWRT_OPKG=${D2K_OPENWRT_OPKG:-/bin/opkg}
+# OpenWrt с iptables (fw3 или FW_BACKEND=iptables): модули netfilter —
+# отдельные пакеты штатного менеджера, не Entware. Лаборатория 06.10, OpenWrt
+# 24.10.8: без них нет NFQUEUE, без kmod-ipt-nat — таблицы nat (MASQUERADE для
+# QUIC и перенаправление Telegram). Для nftables пакеты ставятся ниже, после
+# загрузки, вместе с curl и openssl.
 OPENWRT_KMODS="kmod-nfnetlink-queue kmod-ipt-nfqueue kmod-ipt-conntrack kmod-ipt-conntrack-extra kmod-ipt-ipset kmod-ipt-extra kmod-ip6tables kmod-ipt-nat kmod-ipt-nat6"
-if [ -f "$OPENWRT_RELEASE" ]; then
-    NF_HINT="модуль не найден; на OpenWrt поставьте пакеты: $OPENWRT_OPKG install $OPENWRT_KMODS"
-    if [ -x "$OPENWRT_OPKG" ]; then
-        kmods_have=$("$OPENWRT_OPKG" list-installed 2>/dev/null | cut -d' ' -f1)
-        kmods_missing=
-        for p in $OPENWRT_KMODS; do
-            printf '%s\n' "$kmods_have" | grep -qx "$p" || kmods_missing="$kmods_missing $p"
-        done
-        if [ -n "$kmods_missing" ]; then
-            say "OpenWrt: ставлю модули ядра:$kmods_missing"
-            # shellcheck disable=SC2086  # список пакетов, нарочно словами
-            "$OPENWRT_OPKG" install $kmods_missing >/dev/null 2>&1 ||
-                { "$OPENWRT_OPKG" update >/dev/null 2>&1 &&
-                  "$OPENWRT_OPKG" install $kmods_missing >/dev/null 2>&1; } ||
-                say "OpenWrt: модули не поставились — проверьте интернет и место, затем: $OPENWRT_OPKG install$kmods_missing"
+if [ "$FW" = iptables ]; then
+    if [ -f "$OPENWRT_RELEASE" ]; then
+        NF_HINT="модуль не найден; на OpenWrt поставьте пакеты: $(openwrt_add_cmd "$OPENWRT_KMODS")"
+        if [ -n "$(openwrt_pm)" ]; then
+            kmods_missing=
+            for p in $OPENWRT_KMODS; do
+                openwrt_has "$p" || kmods_missing="$kmods_missing $p"
+            done
+            if [ -n "$kmods_missing" ]; then
+                say "OpenWrt: ставлю модули ядра:$kmods_missing"
+                # shellcheck disable=SC2086  # список пакетов, нарочно словами
+                kmods_cmd=$(openwrt_add_cmd $kmods_missing)
+                # shellcheck disable=SC2086  # список пакетов, нарочно словами
+                openwrt_add $kmods_missing ||
+                    say "OpenWrt: модули не поставились — проверьте интернет и место, затем: $kmods_cmd"
+            fi
         fi
     fi
+    [ -e /proc/net/netfilter/nfnetlink_queue ] || { load_kmod nfnetlink; load_kmod nfnetlink_queue; }
+    [ -e /proc/net/netfilter/nfnetlink_queue ] || \
+        die "ядро без nfnetlink_queue — $NF_HINT"
+    grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || load_kmod xt_NFQUEUE
+    grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || \
+        die "в iptables нет цели NFQUEUE — $NF_HINT"
+    grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || load_kmod xt_connbytes
+    grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || \
+        die "в iptables нет совпадения connbytes — $NF_HINT"
 fi
-[ -e /proc/net/netfilter/nfnetlink_queue ] || { load_kmod nfnetlink; load_kmod nfnetlink_queue; }
-[ -e /proc/net/netfilter/nfnetlink_queue ] || \
-    die "ядро без nfnetlink_queue — $NF_HINT"
-grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || load_kmod xt_NFQUEUE
-grep -qw NFQUEUE /proc/net/ip_tables_targets 2>/dev/null || \
-    die "в iptables нет цели NFQUEUE — $NF_HINT"
-grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || load_kmod xt_connbytes
-grep -qw connbytes /proc/net/ip_tables_matches 2>/dev/null || \
-    die "в iptables нет совпадения connbytes — $NF_HINT"
 
 # --- загрузка во временное место -----------------------------------------
 #
@@ -147,8 +205,12 @@ fetch() {
     # сборки: обещать рабочую установку, ни разу её не пройдя, нельзя (§9).
     if [ -n "${D2K_LOCAL:-}" ]; then
         cp "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
-    else
+    elif command -v curl >/dev/null 2>&1; then
         curl -fsSL --max-time 120 -o "$2" "$BASE/$1" || die "не скачать $1"
+    else
+        # OpenWrt без curl: wget образа (uclient-fetch, HTTPS с ca-bundle);
+        # curl поставит ниже штатный менеджер.
+        wget -q -T 120 -O "$2" "$BASE/$1" || die "не скачать $1"
     fi
     [ -s "$2" ] || die "$1 оказался пустым"
 }
@@ -156,16 +218,22 @@ fetch() {
 fetch "scripts/architecture.sh" "$TMP/architecture.sh"
 fetch "scripts/check-cpu.sh" "$TMP/check-cpu.sh"
 SYS_ARCH=$(uname -m)
-ENTWARE_ARCH=
-if command -v opkg >/dev/null 2>&1; then
-    ENTWARE_ARCH=$(opkg print-architecture 2>/dev/null | awk '
+# ABI пользовательского пространства: на OpenWrt — сама система (DISTRIB_ARCH
+# есть и в 24.10, и в 25.12; apk --print-arch даёт лишь «aarch64»), иначе —
+# Entware.
+ABI_ARCH=
+if [ -f "$OPENWRT_RELEASE" ]; then
+    ABI_ARCH=$(sed -n "s/^DISTRIB_ARCH=[\"']\{0,1\}\([^\"']*\).*/\1/p" "$OPENWRT_RELEASE" | head -n 1)
+fi
+if [ -z "$ABI_ARCH" ] && command -v opkg >/dev/null 2>&1; then
+    ABI_ARCH=$(opkg print-architecture 2>/dev/null | awk '
         $1 == "arch" && $2 != "all" && $2 != "noarch" {
             if ($3 + 0 >= priority) { priority = $3 + 0; arch = $2 }
         } END { print arch }')
 fi
-ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ENTWARE_ARCH") || die "неподдерживаемая архитектура"
+ARCH=$(sh "$TMP/architecture.sh" "$SYS_ARCH" "$ABI_ARCH") || die "неподдерживаемая архитектура"
 sh "$TMP/check-cpu.sh" "$ARCH" || die "CPU не соответствует требованиям сборки"
-say "архитектура: $SYS_ARCH / ${ENTWARE_ARCH:-без Entware ABI} -> $ARCH"
+say "архитектура: $SYS_ARCH / ${ABI_ARCH:-ABI не указан} -> $ARCH"
 say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
@@ -237,6 +305,64 @@ rc=0
 "$TMP/d2kc" >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || die "скачанный d2kc не запускается на этой системе (код $rc)"
 say "проверено: $("$TMP/d2kpanel" --version | head -1)"
+
+# --- OpenWrt на nftables: место, пакеты, ядро ----------------------------
+#
+# Всё до остановки прежней версии: отказ здесь оставляет работающую установку.
+if [ "$FW" = nft ]; then
+    # Место под свои файлы. Без USB /opt — каталог корневой ФС (флеш). Пакеты
+    # меряет и отвергает сам менеджер. Нужно: новое минус заменяемое старое
+    # плюс самый большой файл (он лежит дважды, пока .new не встал на место).
+    opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
+    avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
+    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
+        awk '{ s += $1 } END { print s + 0 }')
+    big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
+    need_kb=$((new_kb - old_kb + big_kb))
+    case "$avail_kb" in
+        ''|*[!0-9]*) say "не узнать свободное место на $opt_fs — продолжаю" ;;
+        *) [ "$avail_kb" -ge "$need_kb" ] ||
+               die "мало места на $opt_fs: свободно $avail_kb КиБ, нужно $need_kb КиБ — подключите USB-накопитель под /opt" ;;
+    esac
+    OPENWRT_NEED="kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle"
+    command -v curl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED curl"
+    command -v openssl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED openssl-util"
+    pkgs_missing=
+    for p in $OPENWRT_NEED; do
+        openwrt_has "$p" || pkgs_missing="$pkgs_missing $p"
+    done
+    if [ -n "$pkgs_missing" ]; then
+        say "OpenWrt: ставлю пакеты:$pkgs_missing"
+        # shellcheck disable=SC2086  # список пакетов, нарочно словами
+        pkgs_cmd=$(openwrt_add_cmd $pkgs_missing)
+        # shellcheck disable=SC2086  # список пакетов, нарочно словами
+        openwrt_add $pkgs_missing ||
+            die "пакеты не поставились — проверьте интернет и место, затем: $pkgs_cmd"
+    fi
+    for t in curl openssl; do
+        command -v "$t" >/dev/null 2>&1 || die "нет $t и после установки пакетов"
+    done
+    # Ядро: те же выражения, что в правилах S99d2k, — проверкой без применения.
+    {
+        echo 'table inet d2k_preflight {'
+        echo '	chain c {'
+        echo '		type filter hook postrouting priority mangle; policy accept;'
+        echo '		meta l4proto tcp ct direction original th dport { 443 } ct original packets 0-8 queue num 65000 bypass'
+        echo '		meta nfproto ipv4 fib daddr type broadcast return'
+        echo '	}'
+        echo '	chain n {'
+        echo '		type nat hook postrouting priority srcnat; policy accept;'
+        echo '		meta nfproto ipv4 meta l4proto udp meta mark 0x2d masquerade'
+        echo '	}'
+        echo '}'
+    } > "$TMP/preflight.nft"
+    nft -c -f "$TMP/preflight.nft" >/dev/null 2>&1 ||
+        die "nftables не принимает правила D2K (queue, ct, fib, masquerade) — $(openwrt_add_cmd kmod-nft-queue kmod-nfnetlink-queue kmod-nft-nat kmod-nft-fib)"
+    [ -e /proc/net/netfilter/nfnetlink_queue ] || { load_kmod nfnetlink; load_kmod nfnetlink_queue; }
+    [ -e /proc/net/netfilter/nfnetlink_queue ] ||
+        die "ядро без nfnetlink_queue — $(openwrt_add_cmd kmod-nfnetlink-queue)"
+fi
 prepare_openwrt_hook
 
 # --- остановка прежней версии --------------------------------------------

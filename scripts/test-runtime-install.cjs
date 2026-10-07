@@ -134,18 +134,21 @@ exit 1
   fs.writeFileSync(matches, 'connbytes\n');
   // OpenWrt (лаборатория 06.10, 24.10.8): модули netfilter ставятся штатным
   // opkg, а не Entware; без них отказ называет пакеты OpenWrt, не Keenetic.
+  // Это путь iptables (fw3 или FW_BACKEND=iptables) — явно, чтобы nft на
+  // машине прогона не уводил на nftables (тот — scripts/test-install-openwrt.cjs).
+  fs.appendFileSync(path.join(tmp, 'opt/d2k/config'), 'FW_BACKEND=iptables\n');
   {
     const release = path.join(tmp, 'openwrt_release');
     fs.writeFileSync(release, "DISTRIB_ID='OpenWrt'\n");
     const opkgLog = path.join(tmp, 'opkg.log');
     const opkg = path.join(tmp, 'sysopkg');
     fs.writeFileSync(opkg, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${opkgLog}'\n[ "$1" = list-installed ] && { echo 'kmod-ipt-core - 6.6'; echo 'kmod-nfnetlink-queue - 6.6'; exit 0; }\nexit 0\n`, { mode: 0o755 });
-    run('install', { D2K_OPENWRT_RELEASE: release, D2K_OPENWRT_OPKG: opkg });
+    run('install', { D2K_OPENWRT_RELEASE: release, D2K_OPENWRT_OPKG: opkg, D2K_OPENWRT_APK: path.join(tmp, 'no-apk') });
     const log = fs.readFileSync(opkgLog, 'utf8');
     assert.match(log, /^install kmod-ipt-nfqueue .*kmod-ipt-nat kmod-ipt-nat6$/m, 'OpenWrt: missing kmods must be installed by the system opkg');
     assert.doesNotMatch(log, /install .*kmod-nfnetlink-queue/, 'OpenWrt: installed kmods must not be reinstalled');
     fs.writeFileSync(matches, '');
-    const owrtNo = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env: { ...env, D2K_OPENWRT_RELEASE: release, D2K_OPENWRT_OPKG: opkg, D2K_MODULES_DIR: modsDir }, encoding: 'utf8', timeout: 10000 });
+    const owrtNo = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env: { ...env, D2K_OPENWRT_RELEASE: release, D2K_OPENWRT_OPKG: opkg, D2K_OPENWRT_APK: path.join(tmp, 'no-apk'), D2K_MODULES_DIR: modsDir }, encoding: 'utf8', timeout: 10000 });
     assert.notEqual(owrtNo.status, 0);
     assert.match(owrtNo.stdout + owrtNo.stderr, /на OpenWrt поставьте пакеты: .*kmod-ipt-conntrack-extra/, 'OpenWrt refusal must name OpenWrt packages');
     assert.doesNotMatch(owrtNo.stdout + owrtNo.stderr, /Keenetic/);

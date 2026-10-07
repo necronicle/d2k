@@ -31,6 +31,13 @@ NDM_HOOK=${D2K_NDM_HOOK:-/opt/etc/ndm/netfilter.d/001-d2k.sh}
 ROOT=${D2K_FS_ROOT:-}
 STATE=$DIR/state/update.json
 WORK=$DIR/.update
+# OpenWrt без USB-накопителя: /opt — каталог корневой ФС, то есть флеш.
+# Архив, распаковка и копия прежней версии (~20 МБ) туда не помещаются или
+# зря его изнашивают — они живут в RAM. Копия нужна только этому запуску.
+if [ -f "${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}" ] &&
+   [ "$(df -P "$DIR" 2>/dev/null | awk 'NR == 2 { print $6 }')" = / ]; then
+    WORK=${D2K_UPDATE_RAM:-/tmp/d2k-update}
+fi
 LOG=$DIR/log/update.log
 HEALTH_WAIT=${D2K_UPDATE_HEALTH_WAIT:-60}
 RUN_EVERY=${D2K_UPDATE_TICK:-60}

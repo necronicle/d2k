@@ -46,6 +46,7 @@ function release(id, { installOk = true, pid = live } = {}) {
   const src = path.join(tmp, 'src-' + id);
   fs.mkdirSync(path.join(src, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(src, 'scripts/install.sh'), `#!/bin/sh
+printf '%s\\n' "$0" > "${tmp}/installer-path"
 printf '%s\\n' "$D2K_RELEASE_ID" > "${dir}/release-id"
 printf 'binary ${id}\\n' > "${sbin}/d2kd"
 printf 'panel ${id}\\n' > "${dir}/panel/index.html"
@@ -99,6 +100,8 @@ try {
   assert(!fs.existsSync(path.join(dir, '.update/previous.tar')), 'копия прежней версии осталась');
   assert(!fs.existsSync(path.join(dir, '.update/release')), 'распакованный выпуск остался');
   assert.equal(run('install').status, 0, 'повтор того же выпуска не сводится к «уже установлен»');
+  assert(read(path.join(tmp, 'installer-path')).startsWith(path.join(dir, '.update') + '/'), 'Keenetic: рабочий каталог — /opt/d2k/.update');
+
 
   // Отказ установщика: прежняя версия возвращается целиком.
   release('r3', { installOk: false });
@@ -130,6 +133,24 @@ try {
   assert.equal(run('auto', 'on').status, 0);
   assert.equal(read(path.join(dir, 'config')), 'MODE=apply\nAUTOUPDATE=1\n');
   assert.equal(state().auto, true);
+  // OpenWrt без USB (07.10.2026): /opt — флеш корня. Архив, распаковка и
+  // копия прежней версии (~20 МБ) — в RAM, а не на флеш.
+  {
+    const ram = path.join(tmp, 'ram');
+    const owrtRelease = path.join(tmp, 'openwrt_release'); fs.writeFileSync(owrtRelease, "DISTRIB_ID='OpenWrt'\n");
+    const dfStub = path.join(tmp, 'dfstub'); fs.mkdirSync(dfStub);
+    const df = (mnt) => fs.writeFileSync(path.join(dfStub, 'df'), `#!/bin/sh\necho 'Filesystem 1024-blocks Used Available Capacity Mounted on'\necho "/dev/root 100 10 90 10% ${mnt}"\n`, { mode: 0o755 });
+    const owrt = { ...env, D2K_STUB_PATH: `${dfStub}:${stub}`, D2K_OPENWRT_RELEASE: owrtRelease, D2K_UPDATE_RAM: ram };
+    df('/');
+    release('r5');
+    assert.equal(spawnSync('/bin/sh', [updater, 'install'], { env: owrt, encoding: 'utf8' }).status, 0);
+    assert(read(path.join(tmp, 'installer-path')).startsWith(ram + '/'), 'OpenWrt без USB: выпуск должен распаковываться в RAM');
+    assert(!fs.existsSync(path.join(ram, 'previous.tar')) && !fs.existsSync(path.join(ram, 'release')), 'в RAM не осталось копий');
+    df('/opt');
+    release('r6');
+    assert.equal(spawnSync('/bin/sh', [updater, 'install'], { env: owrt, encoding: 'utf8' }).status, 0);
+    assert(read(path.join(tmp, 'installer-path')).startsWith(path.join(dir, '.update') + '/'), 'OpenWrt с USB под /opt: рабочий каталог на USB');
+  }
   console.log('d2k-update: signature, install, health rollback, bad release, toggle: PASS');
 } finally {
   try { process.kill(Number(live)); } catch (_) {}

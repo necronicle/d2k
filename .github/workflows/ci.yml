@@ -91,6 +91,7 @@ jobs:
         run: |
           node scripts/test-openwrt-init.cjs
           node scripts/test-runtime-install.cjs
+          node scripts/test-install-openwrt.cjs
           sh scripts/test-architecture.sh
           sh scripts/test-s99-nft.sh
           sh scripts/test-tg-firewall-nft.sh
