@@ -548,7 +548,10 @@ fw_iptables_down() {
 # Подавление RST зондами d2kc — ОТДЕЛЬНАЯ таблица inet d2k_rst: пересборка
 # inet d2k (сторож, reapply) не должна снимать его у идущего зонда. Элементы
 # с таймаутом ставит и снимает сам d2kc (detect/raw.c); после kill -9 элемент
-# истекает сам, уборка по владельцу не нужна.
+# истекает сам, уборка по владельцу не нужна. Ключ — кортеж зонда (свой порт .
+# адрес цели . порт цели): у iptables у каждого процесса было своё правило с
+# владельцем, здесь два процесса с одним портом к разным целям не мешают друг
+# другу, а один и тот же кортеж у двух зондов сразу невозможен.
 NFT_TABLE=d2k
 NFT_RST_TABLE=d2k_rst
 NFT_PACKETS_MAX=18446744073709551615
@@ -633,12 +636,12 @@ EOF
 nft_rst_ruleset() {
     cat <<EOF
 table inet $NFT_RST_TABLE {
-	set rst4 { type inet_service; flags timeout; }
-	set rst6 { type inet_service; flags timeout; }
+	set rst4 { type inet_service . ipv4_addr . inet_service; flags timeout; }
+	set rst6 { type inet_service . ipv6_addr . inet_service; flags timeout; }
 	chain out {
 		type filter hook output priority filter - 1; policy accept;
-		meta nfproto ipv4 tcp sport @rst4 tcp flags & rst == rst drop
-		meta nfproto ipv6 tcp sport @rst6 tcp flags & rst == rst drop
+		meta nfproto ipv4 tcp flags & rst == rst tcp sport . ip daddr . tcp dport @rst4 drop
+		meta nfproto ipv6 tcp flags & rst == rst tcp sport . ip6 daddr . tcp dport @rst6 drop
 	}
 }
 EOF

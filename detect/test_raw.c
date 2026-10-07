@@ -663,11 +663,13 @@ static void test_rule_through_nft(void)
     CHECK(raw_dial(&c, dst, 4, 443, 200, 0x2d, NULL, err, sizeof err) == 0);
     sport = c.sport;
     CHECK(c.rule_up == 1 && rule_count == 1);
-    snprintf(want, sizeof want, "nft add element inet d2k_rst rst4 { %u timeout 300s }", (unsigned)sport);
+    /* Ключ — кортеж зонда, а не один порт (ревью 07.10): элемент другого
+       процесса с тем же портом к другой цели не задевается. */
+    snprintf(want, sizeof want, "nft add element inet d2k_rst rst4 { %u . 198.51.100.10 . 443 timeout 300s }", (unsigned)sport);
     CHECK(strstr(rule_cmds[0], want) != NULL);
     CHECK(strstr(rule_cmds[0], "iptables") == NULL);
     raw_close(&c);
-    snprintf(want, sizeof want, "nft delete element inet d2k_rst rst4 { %u }", (unsigned)sport);
+    snprintf(want, sizeof want, "nft delete element inet d2k_rst rst4 { %u . 198.51.100.10 . 443 }", (unsigned)sport);
     CHECK(rule_count == 2 && strstr(rule_cmds[1], want) != NULL);
 
     /* Элемент уже истёк: delete отказал, get подтвердил отсутствие — в
@@ -690,10 +692,14 @@ static void test_rule_through_nft(void)
     CHECK(d2k_raw_rst_fail_count() == fails0 + 1);
     rule_rc = 0;
 
-    /* IPv6 — своё множество. */
-    rule_count = 0;
-    CHECK(rst_rule_cmd_form("-I", 31000, 6, 1) == 0);
-    CHECK(strstr(rule_cmds[0], "nft add element inet d2k_rst rst6 { 31000 timeout 300s }") != NULL);
+    /* IPv6 — своё множество, адрес в нотации nft. */
+    {
+        rst_key k6 = { .sport = 31000, .dport = 443, .family = 6,
+                       .dst = {0x20, 0x01, 0x0d, 0xb8, [15] = 1} };
+        rule_count = 0;
+        CHECK(rst_rule_cmd_form("-I", &k6, 1) == 0);
+        CHECK(strstr(rule_cmds[0], "nft add element inet d2k_rst rst6 { 31000 . 2001:db8::1 . 443 timeout 300s }") != NULL);
+    }
 
     CHECK(unsetenv("D2K_FW") == 0);
     d2k_raw_rule_hook = raw_rule_system;

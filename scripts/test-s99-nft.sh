@@ -150,11 +150,12 @@ last_return=$(printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | grep -n 'retu
 printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | awk '/queue num/{q=1} q && /return/{bad=1} END{exit bad}' \
     || fail "a RETURN after a queue rule in chain out"
 rst=$(table d2k_rst)
-printf '%s\n' "$rst" | grep -qF 'set rst4 {' || fail "inet d2k_rst has no rst4 set"
-printf '%s\n' "$rst" | grep -qF 'set rst6 {' || fail "inet d2k_rst has no rst6 set"
+# Ключ — кортеж зонда (порт . цель . порт цели), не один порт (ревью 07.10).
+printf '%s\n' "$rst" | grep -qF 'set rst4 { type inet_service . ipv4_addr . inet_service; flags timeout; }' || fail "inet d2k_rst rst4 set"
+printf '%s\n' "$rst" | grep -qF 'set rst6 { type inet_service . ipv6_addr . inet_service; flags timeout; }' || fail "inet d2k_rst rst6 set"
 printf '%s\n' "$rst" | grep -qF 'type filter hook output priority filter - 1; policy accept;' || fail "rst chain hook"
-printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv4 tcp sport @rst4 tcp flags & rst == rst drop' || fail "rst4 drop rule"
-printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv6 tcp sport @rst6 tcp flags & rst == rst drop' || fail "rst6 drop rule"
+printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv4 tcp flags & rst == rst tcp sport . ip daddr . tcp dport @rst4 drop' || fail "rst4 drop rule"
+printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv6 tcp flags & rst == rst tcp sport . ip6 daddr . tcp dport @rst6 drop' || fail "rst6 drop rule"
 # Окно с 1, а не с 0: у потока без расширения учёта (создан при
 # nf_conntrack_acct=0, до загрузки таблицы) nft читает счётчик как 0, и окно
 # 0-N держало бы его в очереди всю жизнь; connbytes такой поток не берёт.

@@ -291,6 +291,16 @@ static uint16_t next_source_port(void)
  * уборки по владельцу, ни комментария не нужно. Таймаут с запасом больше
  * жизни зонда (шаги по timeout_ms, секунды). */
 #define RST_NFT_TIMEOUT "300s"
+/* Ключ правила подавления. iptables берёт только порт (у каждого процесса —
+ * своё правило с меткой владельца). Элемент nft один на ключ, поэтому ключ —
+ * весь кортеж зонда: тот же порт другого процесса к другой цели — другой
+ * элемент, а один кортеж у двух зондов сразу невозможен (ревью 07.10). */
+typedef struct {
+    uint16_t sport;
+    uint16_t dport;
+    uint8_t  family; /* 0/4 IPv4, 6 IPv6 */
+    uint8_t  dst[16];
+} rst_key;
 static int rst_nft(void)
 {
     const char *fw = getenv("D2K_FW");
@@ -349,7 +359,7 @@ static void sweep_stale_rst_rules(void)
  * останется — снимет уборка следующего запуска (владелец уже мёртв). Пока
  * процесс жив, чужая уборка правило не тронет: владелец жив. */
 #define RST_RELEASE_ATTEMPTS 5
-static struct { uint16_t sport; uint8_t family; int attempts; } g_rst_pending[RST_PENDING_MAX];
+static struct { rst_key key; int attempts; } g_rst_pending[RST_PENDING_MAX];
 static size_t g_rst_pending_n;
 static int g_rst_abandon_said;
 static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
@@ -360,27 +370,29 @@ static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
  * уборка старта узнаёт её по форме (владельца нет — снимается как чужая). */
 static int g_rst_comment = 1;
 
-static int rst_rule_cmd_form(const char *op, uint16_t sport, uint8_t family, int comment)
+static int rst_rule_cmd_form(const char *op, const rst_key *k, int comment)
 {
-    char cmd[224], tag[64] = "";
+    char cmd[256], tag[64] = "";
     if (rst_nft()) {
         /* -I/-D/-C той же семантики: get отвечает 1, если элемента нет. */
         const char *verb = strcmp(op, "-I") == 0 ? "add" : strcmp(op, "-D") == 0 ? "delete" : "get";
-        snprintf(cmd, sizeof(cmd), "nft %s element inet d2k_rst rst%c { %u%s } >/dev/null 2>&1",
-                 verb, family == 6 ? '6' : '4', (unsigned)sport,
+        char addr[INET6_ADDRSTRLEN];
+        if (!inet_ntop(k->family == 6 ? AF_INET6 : AF_INET, k->dst, addr, sizeof addr)) return -1;
+        snprintf(cmd, sizeof(cmd), "nft %s element inet d2k_rst rst%c { %u . %s . %u%s } >/dev/null 2>&1",
+                 verb, k->family == 6 ? '6' : '4', (unsigned)k->sport, addr, (unsigned)k->dport,
                  strcmp(verb, "add") == 0 ? " timeout " RST_NFT_TIMEOUT : "");
         return d2k_raw_rule_hook(cmd);
     }
     if (comment) snprintf(tag, sizeof tag, " -m comment --comment %s%ld", RST_OWNED_TAG, (long)getpid());
     snprintf(cmd, sizeof(cmd),
              "%s -w %s OUTPUT -p tcp --sport %u --tcp-flags RST RST%s -j DROP >/dev/null 2>&1",
-             family == 6 ? "ip6tables" : "iptables", op, (unsigned)sport, tag);
+             k->family == 6 ? "ip6tables" : "iptables", op, (unsigned)k->sport, tag);
     return d2k_raw_rule_hook(cmd);
 }
 
-static int rst_rule_cmd(const char *op, uint16_t sport, uint8_t family)
+static int rst_rule_cmd(const char *op, const rst_key *k)
 {
-    return rst_rule_cmd_form(op, sport, family, g_rst_comment);
+    return rst_rule_cmd_form(op, k, g_rst_comment);
 }
 
 static int rc_exit1(int rc)
@@ -392,16 +404,18 @@ static int rc_exit1(int rc)
  * и «правила нет» (NDM перестроил netfilter), и общий OTHER_PROBLEM (ENOMEM,
  * сбой фиксации), поэтому на слово -D не верим: отсутствие подтверждает -C
  * (exit 1 — правила нет; 0 — правило ещё стоит; прочее — не знаем). */
-static int rst_delete_once(uint16_t sport, uint8_t family)
+static int rst_delete_once(const rst_key *k)
 {
-    int rc = rst_rule_cmd("-D", sport, family);
+    int rc = rst_rule_cmd("-D", k);
     if (rc == 0) return 1;
     if (!rc_exit1(rc)) return 0;
-    return rc_exit1(rst_rule_cmd("-C", sport, family));
+    return rc_exit1(rst_rule_cmd("-C", k));
 }
 
-static void rst_abandon(uint16_t sport, uint8_t family)
+static void rst_abandon(const rst_key *k)
 {
+    uint16_t sport = k->sport;
+    uint8_t family = k->family;
     if (g_rst_abandon_said) return;
     g_rst_abandon_said = 1;
     fprintf(stderr, "d2k: правило подавления RST (%s, порт %u) не снято за %d попыток — "
@@ -414,16 +428,15 @@ static void raw_atexit(void);
 static void register_atexit(void) { (void)atexit(raw_atexit); }
 
 /* Под g_raw_state. Запомнить правило, которое снять не удалось. */
-static void rst_remember(uint16_t sport, uint8_t family, int attempts)
+static void rst_remember(const rst_key *k, int attempts)
 {
     pthread_once(&g_atexit_once, register_atexit);
     if (g_rst_pending_n < RST_PENDING_MAX) {
-        g_rst_pending[g_rst_pending_n].sport = sport;
-        g_rst_pending[g_rst_pending_n].family = family;
+        g_rst_pending[g_rst_pending_n].key = *k;
         g_rst_pending[g_rst_pending_n].attempts = attempts;
         g_rst_pending_n++;
     } else {
-        rst_abandon(sport, family);
+        rst_abandon(k);
     }
 }
 
@@ -434,22 +447,22 @@ static void retry_pending_releases(int final)
     size_t k = 0;
     while (k < g_rst_pending_n) {
         if (!final && g_rst_pending[k].attempts >= RST_RELEASE_ATTEMPTS) { k++; continue; }
-        if (rst_delete_once(g_rst_pending[k].sport, g_rst_pending[k].family)) {
+        if (rst_delete_once(&g_rst_pending[k].key)) {
             g_rst_pending[k] = g_rst_pending[--g_rst_pending_n];
             continue;
         }
         if (++g_rst_pending[k].attempts >= RST_RELEASE_ATTEMPTS && !final) {
-            rst_abandon(g_rst_pending[k].sport, g_rst_pending[k].family);
+            rst_abandon(&g_rst_pending[k].key);
         }
         k++;
     }
 }
 
 /* Под g_raw_state. Снять правило: сразу дважды, иначе запомнить. */
-static void rst_release_locked(uint16_t sport, uint8_t family)
+static void rst_release_locked(const rst_key *k)
 {
-    if (!rst_delete_once(sport, family) && !rst_delete_once(sport, family)) {
-        rst_remember(sport, family, 2);
+    if (!rst_delete_once(k) && !rst_delete_once(k)) {
+        rst_remember(k, 2);
     }
 }
 
@@ -481,16 +494,29 @@ static void raw_atexit(void)
     pthread_mutex_unlock(&g_raw_state);
 }
 
-static int suppress_kernel_rst(uint16_t sport, uint8_t family)
+static rst_key rst_key_of(const raw_conn *c)
+{
+    rst_key k;
+    memset(&k, 0, sizeof k);
+    k.sport = c->sport;
+    k.dport = c->dport;
+    k.family = c->family;
+    memcpy(k.dst, c->dst, c->family == 6 ? 16 : 4);
+    return k;
+}
+
+static int suppress_kernel_rst(const raw_conn *c)
 {
     int rc;
+    rst_key key = rst_key_of(c);
+    const rst_key *k = &key;
     /* Old router iptables cannot be relied on to serialize our commands.
      * Protect only rule edits, not the network lifetime of the probe. */
     pthread_mutex_lock(&g_raw_state);
     retry_pending_releases(0);
-    rc = rst_rule_cmd("-I", sport, family);
+    rc = rst_rule_cmd("-I", k);
     if (rc > 0 && g_rst_comment && !rst_nft() && WIFEXITED(rc) && WEXITSTATUS(rc) <= 2 &&
-        rst_rule_cmd_form("-I", sport, family, 0) == 0) {
+        rst_rule_cmd_form("-I", k, 0) == 0) {
         g_rst_comment = 0;
         fprintf(stderr, "d2k: в прошивке нет xt_comment — правила подавления RST "
                         "ставлю без метки владельца\n");
@@ -503,16 +529,17 @@ static int suppress_kernel_rst(uint16_t sport, uint8_t family)
          * знаем, не снимет никто, пока процесс жив, — снимаем его сами (ревью
          * detect, I2). Ненулевой код самого iptables означает, что фиксации
          * не было: снимать нечего. */
-        if (rc == D2K_RAW_RULE_KILLED) rst_release_locked(sport, family);
+        if (rc == D2K_RAW_RULE_KILLED) rst_release_locked(k);
     }
     pthread_mutex_unlock(&g_raw_state);
     return rc == 0;
 }
 
-static void release_kernel_rst(uint16_t sport, uint8_t family)
+static void release_kernel_rst(const raw_conn *c)
 {
+    rst_key k = rst_key_of(c);
     pthread_mutex_lock(&g_raw_state);
-    rst_release_locked(sport, family);
+    rst_release_locked(&k);
     pthread_mutex_unlock(&g_raw_state);
 }
 
@@ -939,7 +966,7 @@ static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *
 static void raw_close(raw_conn *c)
 {
     if (c->rule_up) {
-        release_kernel_rst(c->sport, c->family);
+        release_kernel_rst(c);
         c->rule_up = 0;
     }
     if (c->send_fd >= 0) {
@@ -1079,7 +1106,7 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
      * он считается в t_rst_rule_failures потока (трасса вердикта и адаптер
      * планировщика сравнивают d2k_raw_rst_fail_count со стартом прогона). */
     t_raw_dials++;
-    c->rule_up = suppress_kernel_rst(c->sport, family);
+    c->rule_up = suppress_kernel_rst(c);
 
     if (raw_handshake(c, timeout_ms, cancel, err, errcap) != 0) {
         raw_close(c);
