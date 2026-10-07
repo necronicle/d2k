@@ -8,7 +8,7 @@ STOP=10
 # shellcheck disable=SC2034
 USE_PROCD=1
 
-extra_command boot_wait 'Wait for Entware and boot D2K'
+extra_command boot_wait 'Wait for /opt (USB, Entware) and boot D2K'
 extra_command detach 'Cancel the boot waiter without stopping D2K'
 
 start_service() {
