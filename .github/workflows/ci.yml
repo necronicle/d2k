@@ -84,13 +84,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck busybox
           find scripts spike -name '*.sh' -print0 | xargs -0 -r shellcheck -s sh
-          shellcheck -s sh files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init
+          shellcheck -s sh files/d2k-instagram-dns.sh files/d2k-update.sh files/d2k-openwrt-init files/d2k-tg-firewall.sh
       - name: Автообновление — подпись, установка, возврат
         run: node scripts/test-update.cjs
       - name: OpenWrt boot bridge and installer lifecycle
         run: |
           node scripts/test-openwrt-init.cjs
           node scripts/test-runtime-install.cjs
+          sh scripts/test-architecture.sh
+          sh scripts/test-s99-nft.sh
+          sh scripts/test-tg-firewall-nft.sh
           sh scripts/test-install-manifest.sh
       - name: Instagram resolver DNS lifecycle
         run: sh scripts/test-instagram-dns.sh

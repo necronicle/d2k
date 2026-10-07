@@ -55,6 +55,8 @@ sh scripts/test-instagram-dns.sh
 sh scripts/test-ppe-deoffload.sh
 sh scripts/test-instagram-dns-scheduler.sh
 sh scripts/test-s99-firewall-stub.sh
+sh scripts/test-s99-nft.sh
+sh scripts/test-tg-firewall-nft.sh
 sh scripts/test-s99-running.sh
 sh scripts/test-install-manifest.sh
 node scripts/test-runtime-files.cjs
@@ -79,6 +81,7 @@ shellcheck -s sh files/d2k-instagram-dns-scheduler.sh
 shellcheck -s sh files/d2k-log-maintenance.sh
 shellcheck -s sh files/d2k-ppe-deoffload.sh
 shellcheck -s sh files/d2k-update.sh
+shellcheck -s sh files/d2k-tg-firewall.sh
 
 # Синтаксис files/S99d2k проверен строкой выше; ПОВЕДЕНИЕ его правил firewall
 # (что для UDP есть обе стороны, что на них --queue-bypass, что RETURN по
