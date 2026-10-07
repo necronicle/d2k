@@ -310,21 +310,6 @@ say "проверено: $("$TMP/d2kpanel" --version | head -1)"
 #
 # Всё до остановки прежней версии: отказ здесь оставляет работающую установку.
 if [ "$FW" = nft ]; then
-    # Место под свои файлы. Без USB /opt — каталог корневой ФС (флеш). Пакеты
-    # меряет и отвергает сам менеджер. Нужно: новое минус заменяемое старое
-    # плюс самый большой файл (он лежит дважды, пока .new не встал на место).
-    opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
-    avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
-    new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
-    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
-        awk '{ s += $1 } END { print s + 0 }')
-    big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
-    need_kb=$((new_kb - old_kb + big_kb))
-    case "$avail_kb" in
-        ''|*[!0-9]*) say "не узнать свободное место на $opt_fs — продолжаю" ;;
-        *) [ "$avail_kb" -ge "$need_kb" ] ||
-               die "мало места на $opt_fs: свободно $avail_kb КиБ, нужно $need_kb КиБ — подключите USB-накопитель под /opt" ;;
-    esac
     OPENWRT_NEED="kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle"
     command -v curl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED curl"
     command -v openssl >/dev/null 2>&1 || OPENWRT_NEED="$OPENWRT_NEED openssl-util"
@@ -343,6 +328,23 @@ if [ "$FW" = nft ]; then
     for t in curl openssl; do
         command -v "$t" >/dev/null 2>&1 || die "нет $t и после установки пакетов"
     done
+    # Место под свои файлы — ПОСЛЕ пакетов: без USB /opt — каталог той же
+    # корневой ФС (флеш), и пакеты (~7 МБ) берут из того же места (ревью
+    # 07.10). Нехватку на сами пакеты отвергает менеджер. Нужно: новое минус
+    # заменяемое старое плюс самый большой файл (он лежит дважды, пока .new не
+    # встал на место).
+    opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
+    avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
+    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
+        awk '{ s += $1 } END { print s + 0 }')
+    big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
+    need_kb=$((new_kb - old_kb + big_kb))
+    case "$avail_kb" in
+        ''|*[!0-9]*) say "не узнать свободное место на $opt_fs — продолжаю" ;;
+        *) [ "$avail_kb" -ge "$need_kb" ] ||
+               die "мало места на $opt_fs: свободно $avail_kb КиБ, нужно $need_kb КиБ — подключите USB-накопитель под /opt" ;;
+    esac
     # Ядро: те же выражения, что в правилах S99d2k, — проверкой без применения.
     {
         echo 'table inet d2k_preflight {'

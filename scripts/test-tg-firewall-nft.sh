@@ -84,8 +84,12 @@ tg "$TMP/nftonly" sh "$TGFW" stop || fail "stop"
 tg "$TMP/nftonly" sh "$TGFW" stop || fail "stop without the table must succeed"
 ok "stop removes only inet d2k_tg and is idempotent"
 
-if tg "$TMP/nftonly" STUB_NFT_FAIL=1 sh "$TGFW" start 2>/dev/null; then fail "start ignored an nft failure"; fi
-ok "a refused nft load fails start"
+mkdir -p "$TMP/t"
+if tg "$TMP/nftonly" STUB_NFT_FAIL=1 TMPDIR="$TMP/t" sh "$TGFW" start 2>/dev/null; then fail "start ignored an nft failure"; fi
+# heal под set -e (ревью 07.10): отказ nft не обрывает скрипт до уборки.
+if tg "$TMP/nftonly" STUB_NFT_FAIL=1 TMPDIR="$TMP/t" sh "$TGFW" heal 2>/dev/null; then fail "heal ignored an nft failure"; fi
+[ -z "$(ls -A "$TMP/t")" ] || fail "a refused load left its temp file: $(ls "$TMP/t")"
+ok "a refused nft load fails start and heal and leaves no temp file"
 
 # An Entware-era install had iptables rules: start under nft removes them,
 # and stop without D2K_FW (uninstall) removes both kinds.

@@ -45,6 +45,8 @@ case "$1" in
   info) shift; [ "$1" = -e ] && shift
         case " \${APK_HAVE:-} " in *" $1 "*) exit 0 ;; esac; exit 1 ;;
   add) [ "\${APK_ADD_RC:-0}" = 0 ] || exit "$APK_ADD_RC"
+       # Packages take room on the same filesystem as /opt.
+       [ ! -f '${path.join(tmp, 'df_avail')}' ] || echo $(( $(cat '${path.join(tmp, 'df_avail')}') - 7000 )) > '${path.join(tmp, 'df_avail')}'
        shift
        for p in "$@"; do
          case "$p" in
@@ -77,7 +79,9 @@ while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; --max-time|--connect-
 printf '%s\\n' "$url" >> '${log('curl')}'
 cp "$SRC/\${url#http://fixture.test/}" "$out"`));
   put(path.join(bin, 'df'), sh(`echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
-echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
+avail=\${DF_AVAIL:-80020}
+[ ! -f '${path.join(tmp, 'df_avail')}' ] || avail=$(cat '${path.join(tmp, 'df_avail')}')
+echo "/dev/root 100692 18544 $avail 19% /"`));
 
   const src = path.join(tmp, 'source');
   const fixture = (name, contents, mode = 0o755) => put(path.join(src, name), contents, mode);
@@ -170,7 +174,12 @@ echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
   refuse({ APK_HAVE: have, NFT_CHECK_RC: '1' }, /nftables не принимает правила D2K/, 'kernel without nft queue');
   reset();
   refuse({ APK_HAVE: have, DF_AVAIL: '10' }, /мало места .* USB/, 'no room for the runtime');
-  assert.doesNotMatch(read(log('apk')), /^add/m, 'space is checked before packages are added');
+  // Room is measured after the packages took theirs (ревью 07.10): 7005 KiB
+  // free, packages take 7000 — the runtime no longer fits.
+  reset();
+  fs.writeFileSync(path.join(tmp, 'df_avail'), '7005');
+  refuse({ APK_HAVE: 'curl openssl-util' }, /мало места .* USB/, 'packages ate the room');
+  fs.rmSync(path.join(tmp, 'df_avail'));
 
   // 6. 24.10: the same through opkg (openssl missing again).
   fs.rmSync(path.join(bin, 'openssl'));

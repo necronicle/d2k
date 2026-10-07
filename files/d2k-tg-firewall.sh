@@ -59,12 +59,18 @@ nft_installed() {
 }
 
 nft_up() {
-    f=$(mktemp /tmp/d2k-tg-nft.XXXXXX) || return 1
-    {
+    f=$(mktemp "${TMPDIR:-/tmp}/d2k-tg-nft.XXXXXX") || return 1
+    # Под set -e отказ nft не должен обрывать скрипт до уборки: heal зовёт
+    # nft_up последней командой списка ||, где set -e действует.
+    rc=0
+    if {
         ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || echo "delete table inet $NFT_TABLE"
         nft_ruleset
-    } > "$f" && nft -f "$f"
-    rc=$?
+    } > "$f"; then
+        nft -f "$f" || rc=$?
+    else
+        rc=1
+    fi
     rm -f "$f"
     return "$rc"
 }

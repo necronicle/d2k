@@ -132,12 +132,12 @@ want 'meta mark 0x2d return'
 want 'meta mark 0x2f return'
 want 'meta l4proto { tcp, udp } th dport { 53, 853 } return'
 want 'meta l4proto { tcp, udp } th sport { 53, 853 } return'
-want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original packets 0-8 queue num 2000 bypass'
+want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original packets 1-8 queue num 2000 bypass'
 want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original packets 9-18446744073709551615 tcp flags & rst == rst queue num 2000 bypass'
 want 'meta l4proto tcp ct direction reply th sport { 0-65535 } ct reply packets 9-18446744073709551615 tcp flags & fin == fin queue num 2000 bypass'
 want 'meta l4proto tcp ct direction original th dport { 80 } ct original packets 9-18446744073709551615 tcp flags & psh == psh queue num 2000 bypass'
-want 'meta l4proto udp ct direction reply th sport { 0-65535 } ct reply packets 0-8 queue num 2000 bypass'
-want 'meta l4proto udp ct direction original th dport { 50000-50099, 1400, 3478-3481, 5349, 19294-19344 } ct original packets 0-4 queue num 2000 bypass'
+want 'meta l4proto udp ct direction reply th sport { 0-65535 } ct reply packets 1-8 queue num 2000 bypass'
+want 'meta l4proto udp ct direction original th dport { 50000-50099, 1400, 3478-3481, 5349, 19294-19344 } ct original packets 1-4 queue num 2000 bypass'
 want 'icmp type time-exceeded icmp code 0 queue num 2000 bypass'
 want 'icmpv6 type time-exceeded icmpv6 code 0 queue num 2000 bypass'
 want 'meta nfproto ipv4 meta l4proto udp meta mark 0x2d masquerade'
@@ -155,11 +155,15 @@ printf '%s\n' "$rst" | grep -qF 'set rst6 {' || fail "inet d2k_rst has no rst6 s
 printf '%s\n' "$rst" | grep -qF 'type filter hook output priority filter - 1; policy accept;' || fail "rst chain hook"
 printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv4 tcp sport @rst4 tcp flags & rst == rst drop' || fail "rst4 drop rule"
 printf '%s\n' "$rst" | grep -qF 'meta nfproto ipv6 tcp sport @rst6 tcp flags & rst == rst drop' || fail "rst6 drop rule"
+# Окно с 1, а не с 0: у потока без расширения учёта (создан при
+# nf_conntrack_acct=0, до загрузки таблицы) nft читает счётчик как 0, и окно
+# 0-N держало бы его в очереди всю жизнь; connbytes такой поток не берёт.
+! printf '%s\n' "$r" | grep -q 'packets 0-' || fail "a window starts at 0: uncounted flows would be queued whole"
 ok "inet d2k mirrors the iptables rules; inet d2k_rst holds the probe RST sets"
 
 # Custom ports from the config reach nft syntax.
 S99_SNIPPET='PORTS=443,8443:8445; CONNBYTES=0:5; fw_up' s99 "$TMP/nftonly" || fail "custom ports"
-table d2k | grep -qF 'th dport { 443, 8443-8445 } ct original packets 0-5 queue' || fail "PORTS/CONNBYTES not converted"
+table d2k | grep -qF 'th dport { 443, 8443-8445 } ct original packets 1-5 queue' || fail "PORTS/CONNBYTES not converted"
 table d2k | grep -qF 'ct original packets 6-18446744073709551615 tcp flags & rst' || fail "late window from CONNBYTES"
 S99_SNIPPET='fw_up' s99 "$TMP/nftonly"
 ok "PORTS and CONNBYTES from the config are converted to nft ranges"
