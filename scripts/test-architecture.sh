@@ -22,9 +22,26 @@ check x86_64 i686 x86
 check i686 '' x86
 check ppc64 '' ppc64
 check riscv64 '' riscv64
+# OpenWrt без Entware: имя архитектуры даёт системный apk/opkg (07.10.2026).
+check aarch64 aarch64_generic arm64
+check aarch64 aarch64_cortex-a53 arm64
+check armv7l arm_cortex-a7_neon-vfpv4 arm
+check armv7l arm_cortex-a9_vfpv3-d16 arm
+check mips mipsel_24kc mipsel
+check mips mips_24kc mips
+check mips64 mips64el_mips64r2 mips64el
+check x86_64 x86_64 amd64
+check i686 i386_pentium4 x86
+check riscv64 riscv64_riscv64 riscv64
 for arch in armv5tel armv6l armv7b i386 i486 i586 lexra ppc ppc64le mips mips64 sparc unknown; do
     if sh "$ROOT/scripts/architecture.sh" "$arch" '' >/dev/null 2>&1; then
         echo "unsupported $arch accepted" >&2; exit 1
+    fi
+done
+# OpenWrt ARMv5/ARMv6, i586 и 32-битный PPC: сборок нет.
+for arch in arm_arm926ej-s arm_arm1176jzf-s_vfp arm_fa526 arm_xscale arm_mpcore i386_pentium-mmx powerpc_464fp mips64_octeonplus; do
+    if sh "$ROOT/scripts/architecture.sh" armv7l "$arch" >/dev/null 2>&1; then
+        echo "unsupported OpenWrt $arch accepted" >&2; exit 1
     fi
 done
 if sh "$ROOT/scripts/architecture.sh" mips strange-feed >/dev/null 2>&1; then

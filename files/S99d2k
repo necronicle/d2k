@@ -121,6 +121,26 @@ STATS_SEC=900
 
 # shellcheck disable=SC1090  # путь к конфигурации задан выше и постоянен
 [ -r "$CONF" ] && . "$CONF"
+
+# ПРАВИЛА — nftables НА OpenWrt, iptables НА Keenetic. В OpenWrt 25.12 пакетов
+# iptables нет вовсе (07.10.2026: ни iptables-nft, ни -zz-legacy для aarch64,
+# arm, mipsel, x86_64), а штатный firewall там — fw4 на nftables. Поэтому на
+# OpenWrt правила ставятся своими таблицами nft, и Entware не нужен; прежняя
+# установка с iptables из Entware при первом fw_up переходит на них же.
+# FW_BACKEND=iptables|nft в конфигурации выбирает явно.
+OPENWRT_RELEASE=${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}
+case "${FW_BACKEND:-auto}" in
+    nft|iptables) ;;
+    *)
+        if [ -f "$OPENWRT_RELEASE" ] && command -v nft >/dev/null 2>&1; then
+            FW_BACKEND=nft
+        else
+            FW_BACKEND=iptables
+        fi ;;
+esac
+# d2kc ставит правило подавления RST сам (detect/raw.c) — тем же способом.
+D2K_FW=$FW_BACKEND
+export D2K_FW
 # Frequent live snapshots are volatile. The learned catalog stays on /opt.
 RUNTIME_DIR=${D2K_RUNTIME_DIR:-/tmp/d2k}
 LIVE=$RUNTIME_DIR/live.json
@@ -501,7 +521,155 @@ fw_family_down() (
     done
 )
 
-fw_down_unlocked() { ppe_down; fw_family_down iptables; fw_family_down ip6tables; rm -f "$FW_V4ONLY"; }
+fw_iptables_down() {
+    ppe_down
+    for fw_tool in iptables ip6tables; do
+        command -v "$fw_tool" >/dev/null 2>&1 && fw_family_down "$fw_tool"
+    done
+    rm -f "$FW_V4ONLY"
+}
+
+# --- nftables (OpenWrt) ----------------------------------------------------
+#
+# Те же правила, что у iptables выше, тем же порядком — в СВОЕЙ таблице inet
+# d2k: оба семейства сразу, и снимается она целиком, без разбора по правилу.
+# fw4 чужие таблицы не трогает: таблица переживает firewall restart и fw4
+# reload (проверено 07.10.2026 на 25.12.5). Всё проверено nft -f на 25.12.5.
+#
+#   out      ← mangle POSTROUTING  (hook postrouting priority mangle)
+#   in_rules ← D2K_IN, в неё переходят in_forward и in_input
+#   nat_post ← nat POSTROUTING: MASQUERADE своих UDP, только IPv4, как выше
+#
+# multiport → множество портов, connbytes → ct <направление> packets,
+# addrtype BROADCAST → fib daddr type broadcast. Таблица ставится одной
+# транзакцией nft -f: прежняя удаляется в той же транзакции — окна без правил
+# нет, и при отказе остаётся прежняя.
+#
+# Подавление RST зондами d2kc — ОТДЕЛЬНАЯ таблица inet d2k_rst: пересборка
+# inet d2k (сторож, reapply) не должна снимать его у идущего зонда. Элементы
+# с таймаутом ставит и снимает сам d2kc (detect/raw.c); после kill -9 элемент
+# истекает сам, уборка по владельцу не нужна.
+NFT_TABLE=d2k
+NFT_RST_TABLE=d2k_rst
+NFT_PACKETS_MAX=18446744073709551615
+
+# "a:b,c" (порты iptables) → "a-b, c".
+nft_list() { printf '%s' "$1" | sed -e 's/:/-/g' -e 's/,/, /g'; }
+# connbytes "A:B" → "A-B", открытое "A:" → "A-<максимум счётчика>".
+nft_count() {
+    case "$1" in
+        *:) printf '%s-%s' "${1%:}" "$NFT_PACKETS_MAX" ;;
+        *) printf '%s' "$1" | tr ':' '-' ;;
+    esac
+}
+
+nft_ruleset() (
+    late=$(late_rst_from) || exit 1
+    late=$(nft_count "$late:")
+    win=$(nft_count "$CONNBYTES")
+    ports=$(nft_list "$PORTS")
+    dns=$(nft_list "$DNS_PORTS")
+    voice=$(nft_list "$VOICE_PORTS")
+    voicewin=$(nft_count "$VOICE_CONNBYTES")
+    q="queue num $QUEUE_NUM bypass"
+    cat <<EOF
+table inet $NFT_TABLE {
+	chain out {
+		type filter hook postrouting priority mangle; policy accept;
+		ip saddr 127.0.0.0/8 return
+		ip daddr 127.0.0.0/8 return
+		ip6 saddr ::1 return
+		ip6 daddr ::1 return
+		meta nfproto ipv4 fib daddr type broadcast return
+		ip daddr 224.0.0.0/4 return
+		ip6 daddr ff00::/8 return
+		meta mark $MARK return
+		meta mark $MEASURE_MARK return
+		meta l4proto { tcp, udp } th dport { $dns } return
+		meta l4proto tcp ct direction original th dport { $ports } ct original packets $win $q
+		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & rst == rst $q
+		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & fin == fin $q
+		meta l4proto tcp ct direction original th dport { $(nft_list "$HTTP_KEEPALIVE_PORTS") } ct original packets $late tcp flags & psh == psh $q
+		meta l4proto udp ct direction original th dport { $ports } ct original packets $win $q
+		meta l4proto udp ct direction original th dport { $voice } ct original packets $voicewin $q
+	}
+	chain in_rules {
+		ip saddr 127.0.0.0/8 return
+		ip daddr 127.0.0.0/8 return
+		ip6 saddr ::1 return
+		ip6 daddr ::1 return
+		meta l4proto { tcp, udp } th sport { $dns } return
+		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & rst == rst $q
+		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & fin == fin $q
+		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $win $q
+		meta l4proto udp ct direction reply th sport { $ports } ct reply packets $win $q
+		meta l4proto udp ct direction reply th sport { $voice } ct reply packets $voicewin $q
+		icmp type time-exceeded icmp code 0 $q
+		icmpv6 type time-exceeded icmpv6 code 0 $q
+	}
+	chain in_forward {
+		type filter hook forward priority mangle; policy accept;
+		jump in_rules
+	}
+	chain in_input {
+		type filter hook input priority mangle; policy accept;
+		jump in_rules
+	}
+	chain nat_post {
+		type nat hook postrouting priority srcnat - 1; policy accept;
+		meta nfproto ipv4 meta l4proto udp meta mark $MARK masquerade
+	}
+}
+EOF
+)
+
+nft_rst_ruleset() {
+    cat <<EOF
+table inet $NFT_RST_TABLE {
+	set rst4 { type inet_service; flags timeout; }
+	set rst6 { type inet_service; flags timeout; }
+	chain out {
+		type filter hook output priority filter - 1; policy accept;
+		meta nfproto ipv4 tcp sport @rst4 tcp flags & rst == rst drop
+		meta nfproto ipv6 tcp sport @rst6 tcp flags & rst == rst drop
+	}
+}
+EOF
+}
+
+nft_has() { nft list table inet "$1" >/dev/null 2>&1; }
+
+fw_nft_up() {
+    mkdir -p "$RUN" || return 1
+    (
+        ! nft_has "$NFT_TABLE" || echo "delete table inet $NFT_TABLE"
+        nft_ruleset || exit 1
+        nft_has "$NFT_RST_TABLE" || nft_rst_ruleset
+    ) > "$RUN/fw.nft" || return 1
+    nft -f "$RUN/fw.nft"
+}
+
+fw_nft_installed() (
+    listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
+    nft_has "$NFT_RST_TABLE" || return 1
+    for chain in out in_rules in_forward in_input nat_post; do
+        printf '%s\n' "$listed" | grep -q "chain $chain {" || return 1
+    done
+    printf '%s\n' "$listed" | grep -q masquerade || return 1
+    # nft печатает правило по-своему («queue flags bypass to 2000»), поэтому
+    # сверяется число правил очереди с bypass и своим номером очереди.
+    want=$(nft_ruleset | grep -c queue) || return 1
+    got=$(printf '%s\n' "$listed" | grep queue | grep bypass | grep -cw -- "$QUEUE_NUM")
+    [ "$got" -eq "$want" ]
+)
+
+fw_down_unlocked() {
+    fw_iptables_down
+    if command -v nft >/dev/null 2>&1 && nft_has "$NFT_TABLE"; then
+        nft delete table inet "$NFT_TABLE" || return 1
+    fi
+    return 0
+}
 
 # ПРАВИЛА ПОДАВЛЕНИЯ RST. d2kc и d2k-detect на время зонда ставят в filter
 # OUTPUT правило «-p tcp --sport P --tcp-flags RST RST -m comment --comment
@@ -518,6 +686,11 @@ rst_owner_removable() {
 }
 
 rst_rules_down() {
+    # nft: элементы зондов истекают сами; при остановке службы таблица
+    # снимается целиком, при остановке движка живой поиск сохраняет своё.
+    if [ "$1" = all ] && command -v nft >/dev/null 2>&1 && nft_has "$NFT_RST_TABLE"; then
+        nft delete table inet "$NFT_RST_TABLE" 2>/dev/null || true
+    fi
     for fw_tool in iptables ip6tables; do
         command -v "$fw_tool" >/dev/null 2>&1 || continue
         rules=$("$fw_tool" -w -S OUTPUT 2>/dev/null || "$fw_tool" -S OUTPUT 2>/dev/null) || continue
@@ -537,6 +710,7 @@ rst_rules_down() {
 # Сторож: вернуть снесённую разгрузку, не трогая правил очереди. Под тем же
 # замком, что fw_up, — иначе вставка может лечь между снятием и постановкой.
 ppe_ensure() {
+    [ "$FW_BACKEND" = iptables ] || return 0
     command -v d2k_ppe_ensure >/dev/null 2>&1 || return 0
     running "$DP_PID" || return 0
     fw_lock_acquire || return 1
@@ -576,12 +750,25 @@ fw_lock_release() {
 fw_up() {
     local rc
     fw_lock_acquire || return 1
-    fw_down_unlocked
-    if fw_up_unlocked; then
-        rc=0
+    if [ "$FW_BACKEND" = nft ]; then
+        # Остатки iptables (установка времён Entware) снимаются; таблица nft
+        # заменяется своей транзакцией, без окна без правил.
+        fw_iptables_down
+        if fw_nft_up; then
+            rc=0
+        else
+            say "nft не принял правила — см. $RUN/fw.nft"
+            fw_down_unlocked
+            rc=1
+        fi
     else
         fw_down_unlocked
-        rc=1
+        if fw_up_unlocked; then
+            rc=0
+        else
+            fw_down_unlocked
+            rc=1
+        fi
     fi
     fw_lock_release || return 1
     return "$rc"
@@ -665,6 +852,7 @@ fw_family_installed() (
 )
 
 fw_installed() {
+    [ "$FW_BACKEND" != nft ] || { fw_nft_installed; return; }
     fw_family_installed iptables || return 1
     [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables
 }
@@ -734,6 +922,8 @@ MODULES_DIR=${D2K_MODULES_DIR:-/lib/modules}
 # (d2kd); без него детектор выключен, остальное работает.
 SYS_MODULE_DIR=${D2K_SYS_MODULE_DIR:-/sys/module}
 D2K_MODULES="nfnetlink_queue xt_NFQUEUE xt_conntrack xt_connbytes xt_multiport xt_mark xt_connmark xt_CONNMARK xt_addrtype xt_comment ip6table_mangle nf_conntrack_netlink"
+# nft сам подгружает модули выражений; очередь и ctnetlink — отдельные модули.
+[ "$FW_BACKEND" != nft ] || D2K_MODULES="nfnetlink_queue nft_queue nf_conntrack_netlink"
 module_present() {
     case "$1" in
         xt_NFQUEUE|xt_CONNMARK)
