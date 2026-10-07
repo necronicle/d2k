@@ -202,6 +202,12 @@ echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
   ok(run('install', { APK_HAVE: have }));
   ok(run('uninstall', { D2K_KEEP_STATE: '0' }));
   assert(!fs.existsSync(path.join(tmp, 'opt')), 'full uninstall must remove the empty /opt tree D2K created');
+  // With Entware (/opt/bin/opkg) its directories stay even when empty.
+  reset();
+  ok(run('install', { APK_HAVE: have }));
+  put(path.join(tmp, 'opt/bin/opkg'), sh('exit 0'));
+  ok(run('uninstall', { D2K_KEEP_STATE: '0' }));
+  assert(fs.existsSync(path.join(tmp, 'opt/etc/init.d')) && fs.existsSync(path.join(tmp, 'opt/sbin')), 'uninstall must not remove Entware directories');
   console.log('OpenWrt without Entware: wget bootstrap, apk/opkg packages, nft preflight, space, uninstall: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });

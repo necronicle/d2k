@@ -239,11 +239,13 @@ if [ "$KEEP" = "1" ]; then
     rm -f "$DIR/config.new"
 else
     rm -rf "$DIR"
-    # OpenWrt без Entware: /opt создал D2K. Пустые каталоги убираются; с
-    # Entware они не пусты, и rmdir их не тронет.
-    for d in "$SBIN" "$PREFIX/etc/init.d" "$PREFIX/etc" "$PREFIX"; do
-        rmdir "$d" 2>/dev/null || true
-    done
+    # OpenWrt без Entware: /opt создал D2K, пустые каталоги убираются.
+    # Каталоги Entware (Keenetic, OpenWrt с Entware) не трогаются и пустыми.
+    if [ -f /etc/openwrt_release ] && [ ! -e "$PREFIX/bin/opkg" ]; then
+        for d in "$SBIN" "$PREFIX/etc/init.d" "$PREFIX/etc" "$PREFIX"; do
+            rmdir "$d" 2>/dev/null || true
+        done
+    fi
     say "удалено всё, включая каталог коробок"
 fi
 
