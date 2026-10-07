@@ -1230,7 +1230,7 @@ status() {
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
     [ ! -f "$FW_V4ONLY" ] || echo "  IPv6: не обслуживается — нет ip6tables mangle, работа только по IPv4"
-    if command -v d2k_ppe_status >/dev/null 2>&1; then
+    if [ "$FW_BACKEND" = iptables ] && command -v d2k_ppe_status >/dev/null 2>&1; then
         d2k_ppe_status
     fi
     bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \

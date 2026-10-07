@@ -217,4 +217,11 @@ printf '%s\n' "$out" | grep -q INSTALLED || fail "migrated rules not recognised"
 ! printf '%s\n' "$out" | grep -q PPE || fail "PPE (KeeneticOS) touched under nft: $out"
 ok "switching an Entware install to nft removes its iptables rules"
 
+# status: the KeeneticOS PPE accelerator lines do not belong on OpenWrt.
+out=$(S99_SNIPPET='d2k_ppe_status() { echo PPE-LINE; }; status' s99 "$TMP/nftonly" 2>&1 || true)
+! printf '%s\n' "$out" | grep -q PPE-LINE || fail "status prints PPE lines under nft"
+out=$(S99_SNIPPET='d2k_ppe_status() { echo PPE-LINE; }; status' s99 "$TMP/bin" FW_BACKEND=iptables 2>&1 || true)
+printf '%s\n' "$out" | grep -q PPE-LINE || fail "status lost the PPE lines on Keenetic"
+ok "status shows PPE only on the iptables (Keenetic) path"
+
 echo "S99d2k nftables (stub): all checks passed"

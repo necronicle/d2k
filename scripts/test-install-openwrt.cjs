@@ -144,6 +144,7 @@ echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
   assert(read(calls).includes('service-start'), 'service must be started');
   assert(fs.existsSync(path.join(tmp, 'etc/init.d/d2k')) && read(calls).includes('host-enable'), 'boot bridge must be installed and enabled');
   assert.doesNotMatch(fresh, /Entware/, 'nothing may ask for Entware');
+  assert.doesNotMatch(fresh, /ndm/, 'KeeneticOS NDM hook is not an OpenWrt concern');
 
   // 2. Upgrade with everything in place: no package changes.
   const have = 'kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle curl openssl-util';
@@ -196,6 +197,11 @@ echo "/dev/root 100692 18544 \${DF_AVAIL:-80020} 19% /"`));
   const nftLog = read(log('nft'));
   for (const t of ['d2k', 'd2k_rst', 'd2k_tg']) assert.match(nftLog, new RegExp(`^delete table inet ${t}$`, 'm'), `uninstall must delete inet ${t}`);
   assert(!fs.existsSync(path.join(tmp, 'etc/init.d/d2k')), 'uninstall must remove the boot bridge');
+  // Without Entware /opt was created by D2K: a full uninstall leaves no empty tree.
+  reset();
+  ok(run('install', { APK_HAVE: have }));
+  ok(run('uninstall', { D2K_KEEP_STATE: '0' }));
+  assert(!fs.existsSync(path.join(tmp, 'opt')), 'full uninstall must remove the empty /opt tree D2K created');
   console.log('OpenWrt without Entware: wget bootstrap, apk/opkg packages, nft preflight, space, uninstall: PASS');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });

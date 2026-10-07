@@ -435,7 +435,8 @@ install_atomic "$TMP/quic_initial_dbankcloud_ru.bin" "$DIR/files/fake/quic_initi
 # ухудшение страховки, а не отказ установки.
 if [ -d /opt/etc/ndm/netfilter.d ]; then
     install_atomic "$TMP/001-d2k.sh" "/opt/etc/ndm/netfilter.d/001-d2k.sh"
-else
+elif [ ! -f "$OPENWRT_RELEASE" ]; then
+    # На OpenWrt NDM нет; fw4 своих таблиц D2K не трогает, сторож — страховка.
     say "нет /opt/etc/ndm/netfilter.d — событийного восстановления правил не будет"
 fi
 
