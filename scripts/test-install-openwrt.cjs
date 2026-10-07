@@ -202,7 +202,13 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   // 8. Uninstall removes the three nft tables even without init.
   reset();
   fs.rmSync(path.join(tmp, 'opt/etc/init.d/S99d2k'));
+  // Init is gone: the fallback still returns the owner's fw4 flow offloading.
+  put(path.join(tmp, 'opt/d2k/run/flow-offloading.saved'), '1\n', 0o644);
+  put(path.join(bin, 'uci'), sh(`printf 'uci %s\\n' "$*" >> '${log('nft')}'`));
+  put(path.join(bin, 'fw4'), sh(`printf 'fw4 %s\\n' "$*" >> '${log('nft')}'`));
   ok(run('uninstall', { NFT_TABLES: '1' }));
+  assert.match(read(log('nft')), /^uci set firewall\.@defaults\[0\]\.flow_offloading=1$/m, 'uninstall must restore flow offloading');
+  assert.match(read(log('nft')), /^fw4 reload$/m, 'uninstall must reload fw4 after restoring');
   const nftLog = read(log('nft'));
   for (const t of ['d2k', 'd2k_rst', 'd2k_tg']) assert.match(nftLog, new RegExp(`^delete table inet ${t}$`, 'm'), `uninstall must delete inet ${t}`);
   assert(!fs.existsSync(path.join(tmp, 'etc/init.d/d2k')), 'uninstall must remove the boot bridge');

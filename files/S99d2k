@@ -901,6 +901,39 @@ fastnat_restore() {
     rm -f "$FASTNAT_SAVED"
 }
 
+# УСКОРЕНИЕ ПОТОКОВ fw4 (OpenWrt) — тот же случай, что ускоритель NAT выше.
+# С flow_offloading поток после рукопожатия уходит в flowtable мимо всех
+# цепочек: лаборатория 07.10.2026 (25.12.5, клиент LAN, HTTPS) — в очередь 4-5
+# пакетов вместо 17-18, ClientHello D2K не видел. Выключается на время работы
+# (вместе с ним и аппаратное: flow_offloading_hw без него не действует),
+# прежнее значение запоминается и возвращается при остановке.
+flowoffload_saved() { echo "$RUN/flow-offloading.saved"; }
+flowoffload_off() {
+    [ "$FW_BACKEND" = nft ] || return 0
+    command -v uci >/dev/null 2>&1 || return 0
+    [ "$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null)" = 1 ] || return 0
+    mkdir -p "$RUN" || return 0
+    # Сохранённое не перезаписывается: после сбоя без остановки там значение
+    # владельца, а сейчас в настройке уже наше 0.
+    [ -f "$(flowoffload_saved)" ] || echo 1 > "$(flowoffload_saved)"
+    if uci set firewall.@defaults[0].flow_offloading=0 && uci commit firewall; then
+        fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
+        say "ускорение потоков fw4 (flow offloading) выключено на время работы: с ним D2K не видит потоков клиентов; при остановке вернётся"
+    else
+        say "не выключить flow offloading fw4 — потоки клиентов D2K видеть не будет"
+    fi
+}
+
+flowoffload_restore() {
+    [ -f "$(flowoffload_saved)" ] || return 0
+    command -v uci >/dev/null 2>&1 || return 0
+    if [ "$(cat "$(flowoffload_saved)" 2>/dev/null)" = 1 ] &&
+       uci set firewall.@defaults[0].flow_offloading=1 && uci commit firewall; then
+        fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+    rm -f "$(flowoffload_saved)"
+}
+
 prepare_runtime() {
     [ ! -L "$RUNTIME_DIR" ] || die "runtime directory must not be a symlink"
     if ! (umask 077; mkdir -p "$RUNTIME_DIR") || ! chmod 0700 "$RUNTIME_DIR"; then
@@ -1023,6 +1056,7 @@ start_engine() {
     # После правил, но до контроллера: к моменту первого приветствия таблица
     # соединений уже обязана вестись.
     fastnat_off
+    flowoffload_off
 
     # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
     # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
@@ -1203,6 +1237,7 @@ engine_stop() {
     fw_down
     legacy_http_stop
     fastnat_restore
+    flowoffload_restore
     stop_pidfile "$CT_PID" || return 1
     stop_pidfile "$DP_PID" || return 1
     rst_rules_down dead

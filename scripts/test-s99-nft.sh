@@ -229,4 +229,45 @@ out=$(S99_SNIPPET='d2k_ppe_status() { echo PPE-LINE; }; status' s99 "$TMP/bin" F
 printf '%s\n' "$out" | grep -q PPE-LINE || fail "status lost the PPE lines on Keenetic"
 ok "status shows PPE only on the iptables (Keenetic) path"
 
+# --- fw4 flow offloading (лаборатория 07.10, 25.12.5) ------------------------
+# С ним поток уходит в flowtable после рукопожатия: в очередь попадало 4-5
+# пакетов вместо 17-18, ClientHello клиента D2K не видел. Как ускоритель NAT
+# Keenetic: выключается на время работы, прежнее значение возвращается.
+cat > "$TMP/nftonly/uci" <<'EOF'
+#!/bin/sh
+printf 'uci %s\n' "$*" >> "$NFT_STATE/calls"
+f=$NFT_STATE/uci-flow
+case "$*" in
+    "-q get firewall.@defaults[0].flow_offloading") cat "$f" 2>/dev/null || exit 1 ;;
+    "set firewall.@defaults[0].flow_offloading="*) echo "${2#*=}" > "$f" ;;
+    "commit firewall") ;;
+    *) exit 1 ;;
+esac
+EOF
+# shellcheck disable=SC2016  # expanded by the double, not here
+printf '#!/bin/sh\nprintf "fw4 %%s\\n" "$*" >> "$NFT_STATE/calls"\n' > "$TMP/nftonly/fw4"
+chmod +x "$TMP/nftonly/uci" "$TMP/nftonly/fw4"
+echo 1 > "$TMP/nft/uci-flow"
+: > "$TMP/nft/calls"
+out=$(S99_SNIPPET='flowoffload_off' s99 "$TMP/nftonly" 2>&1)
+[ "$(cat "$TMP/nft/uci-flow")" = 0 ] || fail "flow offloading left on"
+grep -q '^fw4 reload' "$TMP/nft/calls" || fail "fw4 not reloaded after the change"
+printf '%s\n' "$out" | grep -q 'flow offloading' || fail "the change is not reported: $out"
+S99_SNIPPET='flowoffload_off' s99 "$TMP/nftonly" >/dev/null 2>&1
+S99_SNIPPET='flowoffload_restore' s99 "$TMP/nftonly"
+[ "$(cat "$TMP/nft/uci-flow")" = 1 ] || fail "owner's flow offloading not restored (a second start must not overwrite the saved value)"
+[ ! -e "$TMP/run/flow-offloading.saved" ] || fail "saved value kept after restore"
+# Выключенное владельцем не трогается и не «возвращается» включённым.
+echo 0 > "$TMP/nft/uci-flow"; : > "$TMP/nft/calls"
+S99_SNIPPET='flowoffload_off; flowoffload_restore' s99 "$TMP/nftonly"
+[ "$(cat "$TMP/nft/uci-flow")" = 0 ] || fail "flow offloading switched on by D2K"
+! grep -q 'set\|fw4' "$TMP/nft/calls" || fail "untouched setting was rewritten"
+# Keenetic (iptables): uci не трогается.
+echo 1 > "$TMP/nft/uci-flow"; : > "$TMP/nft/calls"
+S99_SNIPPET='flowoffload_off' s99 "$TMP/nftonly" FW_BACKEND=iptables
+[ "$(cat "$TMP/nft/uci-flow")" = 1 ] || fail "iptables path changed fw4 settings"
+grep -q 'flowoffload_off' "$S99" || fail "engine start does not switch flow offloading off"
+grep -q 'flowoffload_restore' "$S99" || fail "engine stop does not restore flow offloading"
+ok "fw4 flow offloading is off while D2K runs and the owner's value comes back"
+
 echo "S99d2k nftables (stub): all checks passed"

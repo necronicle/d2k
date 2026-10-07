@@ -85,6 +85,18 @@ if [ -f "$DIR/run/fastnat.saved" ] && [ -w "$FASTNAT" ]; then
     esac
 fi
 
+# Ускорение потоков fw4 (OpenWrt): init выключал его на время работы и
+# запомнил в run/flow-offloading.saved. Без init вернуть его некому, кроме нас.
+if [ -f "$DIR/run/flow-offloading.saved" ] && command -v uci >/dev/null 2>&1; then
+    if [ "$(cat "$DIR/run/flow-offloading.saved" 2>/dev/null)" = 1 ] &&
+       uci set firewall.@defaults[0].flow_offloading=1 && uci commit firewall; then
+        fw4 reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1 ||
+            say "flow offloading возвращён в настройку; перезапустите firewall"
+    else
+        say "не удалось вернуть flow offloading fw4 — включите его в настройках firewall"
+    fi
+fi
+
 # Правила подавления RST (filter OUTPUT, «-m comment --comment d2k-rst:PID»)
 # ставят d2kc и d2k-detect на время зонда; убитый процесс оставляет их висеть.
 # Снимаются только правила этой точной формы с портом зонда и владельцем —
