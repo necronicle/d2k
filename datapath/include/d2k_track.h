@@ -290,6 +290,11 @@ struct d2k_flow {
     uint64_t ct_reply_ns;
     uint64_t ct_orig_mark;
     uint8_t  ct_known;
+    uint8_t voice_requests; /* real queued Discovery/STUN requests, not generic media */
+    uint8_t voice_media_dirs; /* RTP-shaped packets seen, 1 client / 2 server */
+    uint8_t voice_media_told, voice_stable_told;
+    uint64_t voice_stable_since_ns;
+    uint64_t voice_ct_orig; /* latest original count, reset/activity detection */
     /* TCP ВСТАЛ НА БЮДЖЕТЕ (задача 56): пакеты С ДАННЫМИ, которые видела
        очередь (по сторонам), и все пакеты сервера ЭТОГО соединения в очереди
        — чтобы из обратного счётчика conntrack вычесть увиденное (rev_pkts

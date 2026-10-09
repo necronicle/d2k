@@ -49,6 +49,7 @@
    обеих сторон к началу тишины — в полосе бюджета коробки (num записи и
    события). Только RX-замер, с повторяемостью — как у позднего закрытия. */
 #define D2K_SUSPECT_TCP_STALL 8
+#define D2K_SUSPECT_VOICE_STALL 9 /* observed voice tuple stopped replying after initial replies */
 
 /* Бюджет потока коробки по умолчанию — поле 04.10 (task-55-facts §1.2: 25–27
    пакетов с данными обеих сторон в 18/18 оборванных потоках). Измеренные
@@ -98,6 +99,9 @@ const char *d2k_suspect_text(uint8_t code);
 #define D2K_UDP_PROOF_NONE            0
 #define D2K_UDP_PROOF_VOICE_DISCOVERY 1
 #define D2K_UDP_PROOF_STUN            2
+/* Observations only: RTP-shaped traffic and counter stability are not audio proof. */
+#define D2K_UDP_OBS_MEDIA_FLOW         3
+#define D2K_UDP_OBS_STABLE             4
 
 const char *d2k_refuse_text(uint8_t code);
 

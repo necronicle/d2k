@@ -274,6 +274,46 @@ int main(void) {
               "нечитаемая таблица выдала цели");
     }
 
+    /* A busy call may be beyond the first eight conntrack rows. */
+    {
+        char body[8192]; size_t used = 0;
+        for (unsigned i = 0; i < 12; i++)
+            used += (size_t)snprintf(body + used, sizeof body - used,
+                "ipv4 2 udp 17 29 src=192.168.1.10 dst=104.16.58.99 sport=%u "
+                "dport=50003 packets=%u src=104.16.58.99 dst=88.87.93.11 "
+                "sport=50003 dport=%u packets=1 mark=0\n",
+                54000+i, i == 11 ? 9000 : i+1, 54000+i);
+        const char *path = write_ct(body);
+        d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
+        size_t n = d2k_voice_targets(path, t, D2K_VOICE_MAX_TARGETS);
+        CHECK(n == 8 && t[0].sport == 54011 && t[7].sport == 54004,
+              "top-K must consider every conntrack row, not the first eight");
+        CHECK(real_alive(path, ip4(104,16,58,99), 50003, ip4(192,168,1,10), 54000)
+                  == D2K_VOICE_ANSWERS,
+              "exact flow lookup cannot be truncated by top-K selection");
+        remove(path);
+    }
+
+    {
+        const char *path = write_ct(
+            "ipv4 2 udp 17 29 src=127.0.0.1 dst=104.16.58.99 sport=50001 dport=50003 packets=9000\n"
+            "ipv4 2 udp 17 29 src=192.168.1.10 dst=104.16.58.99 sport=0 dport=50003 packets=9000\n"
+            "ipv4 2 udp 17 29 src=192.168.1.10 dst=104.16.58.99 sport=54321x dport=50003 packets=9000\n");
+        d2k_voice_target t[8];
+        CHECK(d2k_voice_targets(path,t,8)==0, "local probes and invalid client ports are not calls");
+        remove(path);
+    }
+
+    {
+        const char *path=write_ct(
+            "ipv4 2 udp 17 1 src=192.168.1.10 dst=104.16.58.99 sport=54001 dport=50003 packets=9000\n"
+            "ipv4 2 udp 17 179 src=192.168.1.11 dst=104.16.58.99 sport=54002 dport=50003 packets=20\n");
+        d2k_voice_target t[1];
+        CHECK(d2k_voice_targets(path,t,1)==1 && t[0].sport==54002,
+              "recent kernel activity outranks historical packet totals");
+        remove(path);
+    }
+
     /* --- ДИАПАЗОН ПОРТОВ — РОВНО ТОТ, ЧТО У БОЕВОГО ПРОФИЛЯ --------------
      * discord_udp в z2k и эталонный 50-discord-media у bol-van: 50000–50099.
      * Здесь стояло 50000–50100, а карта переноса уверяла «совпадает». */

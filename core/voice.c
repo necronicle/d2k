@@ -2,6 +2,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
+#include <ifaddrs.h>
 #include <stdio.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -79,11 +81,27 @@ static const char *field_val(char *line, const char *name, char **next, char *en
     return NULL;
 }
 
-size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
+static unsigned voice_timeout(const char *path, unsigned fallback) {
+    FILE *f=fopen(path,"r");unsigned v=0;
+    if(f){if(fscanf(f,"%u",&v)!=1)v=0;fclose(f);}
+    return v?v:fallback;
+}
+static int voice_target_before(const d2k_voice_target *a,const d2k_voice_target *b) {
+    if(a->idle_seconds!=b->idle_seconds)return a->idle_seconds<b->idle_seconds;
+    return a->packets>b->packets;
+}
+
+static size_t voice_targets_select(const char *path, d2k_voice_target *out, size_t cap,
+                                   uint32_t dst, uint16_t port,
+                                   uint32_t src, uint16_t wanted_sport) {
     if (!out || cap == 0) { return 0; }
     FILE *f = fopen(path ? path : "/proc/net/nf_conntrack", "r");
     if (!f) { return 0; }
 
+    struct ifaddrs *local = NULL;
+    if (!path) (void)getifaddrs(&local);
+    unsigned udp_timeout=voice_timeout("/proc/sys/net/netfilter/nf_conntrack_udp_timeout",30);
+    unsigned stream_timeout=voice_timeout("/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream",180);
     size_t n = 0;
     char line[2048];
     while (fgets(line, sizeof line, f)) {
@@ -103,17 +121,27 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
         char pbuf[64];
         v = field_val(line, "dport", &next, pbuf);
         if (!v) { continue; }
-        unsigned long dport = strtoul(v, NULL, 10);
+        char *number_end;
+        unsigned long dport = strtoul(v, &number_end, 10);
+        if (*number_end) continue;
         if (dport == 0 || dport > 65535 || !is_voice_port((unsigned)dport)) { continue; }
 
         char kbuf[64];
         v = field_val(line, "packets", &next, kbuf);
         long packets = v ? strtol(v, NULL, 10) : 0;
+        if (packets < 0) continue;
+        if (packets > INT_MAX) packets = INT_MAX;
         /* Пометку ставит ядро, пока ОБРАТНОГО трафика по потоку не было
            (RFC-ничего, это состояние conntrack). Её отсутствие и значит
            «точка кому-то отвечает» — см. d2k_voice_target.replied про то,
            почему признак надёжнее счётчика на этом роутере. */
         int replied = (strstr(line, "[UNREPLIED]") == NULL);
+        unsigned protocol=0,remaining=0;uint32_t idle=UINT32_MAX;
+        const char *udp=strstr(line,"udp");
+        if(udp && sscanf(udp,"udp %u %u",&protocol,&remaining)==2 && protocol==17) {
+            unsigned maximum=replied?stream_timeout:udp_timeout;
+            idle=remaining>=maximum?0:maximum-remaining;
+        }
 
         /* ПОТОК — ПЯТЁРКА, А НЕ АДРЕС СЕРВЕРА. Записи разных клиентов к одной
            точке раньше складывались, и признак «отвечает» брался ИЛИ по всем:
@@ -127,41 +155,60 @@ size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
         if (!sv || d2k_ip4_parse(sv, &src_ip) != 0) { continue; }
         next2 = NULL;
         sv = field_val(line, "sport", &next2, spbuf);
-        unsigned long sport = sv ? strtoul(sv, NULL, 10) : 0;
+        unsigned long sport = sv ? strtoul(sv, &number_end, 10) : 0;
+        if (!sv || *number_end || !sport || sport > 65535) continue;
+        const uint8_t *sb = (const uint8_t *)&src_ip;
+        if (!src_ip || sb[0] == 127) continue;
+        int ours = 0;
+        for (struct ifaddrs *a = local; a; a = a->ifa_next) {
+            if (a->ifa_addr && a->ifa_addr->sa_family == AF_INET &&
+                ((const struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr == src_ip) {
+                ours = 1; break;
+            }
+        }
+        if (ours) continue; /* own WAN/LAN sockets are diagnostics, not transit calls */
 
+        if ((dst && ip != dst) || (port && dport != port) ||
+            (src && src_ip != src) || (wanted_sport && sport != wanted_sport)) { continue; }
         size_t i = 0;
         for (; i < n; i++) {
             if (out[i].ip == ip && out[i].port == (uint16_t)dport &&
                 out[i].src_ip == src_ip && out[i].sport == (uint16_t)sport) {
-                out[i].packets += (int)packets;
+                out[i].packets = packets > INT_MAX - out[i].packets
+                               ? INT_MAX : out[i].packets + (int)packets;
                 out[i].replied |= replied;
+                if(idle<out[i].idle_seconds)out[i].idle_seconds=idle;
                 break;
             }
         }
-        if (i == n && n < cap) {
-            out[n].ip = ip;
-            out[n].port = (uint16_t)dport;
-            out[n].src_ip = src_ip;
-            out[n].sport = (uint16_t)sport;
-            out[n].packets = (int)packets;
-            out[n].replied = replied;
-            n++;
+        if (i == n) {
+            d2k_voice_target t = {0};
+            t.ip = ip; t.port = (uint16_t)dport;
+            t.src_ip = src_ip; t.sport = (uint16_t)sport;
+            t.packets = (int)packets; t.replied = replied; t.idle_seconds=idle;
+            /* Bounded top-K: never stop reading when the output fills. */
+            if (n < cap) { out[n++] = t; }
+            else if (voice_target_before(&t,&out[n-1])) { out[n-1] = t; }
+            else { continue; }
+        }
+        /* Keep the retained set sorted, including a duplicate update. */
+        for (size_t k = 1; k < n; k++) {
+            d2k_voice_target t = out[k];
+            size_t j = k;
+            while (j > 0 && voice_target_before(&t,&out[j-1])) {
+                out[j] = out[j-1]; j--;
+            }
+            out[j] = t;
         }
     }
     fclose(f);
+    if (local) freeifaddrs(local);
 
-    /* По убыванию пакетов: первым обязан идти тот разговор, который человек
-       прямо сейчас и ведёт. Вставками — список не длиннее восьми. */
-    for (size_t i = 1; i < n; i++) {
-        d2k_voice_target t = out[i];
-        size_t j = i;
-        while (j > 0 && out[j - 1].packets < t.packets) {
-            out[j] = out[j - 1];
-            j--;
-        }
-        out[j] = t;
-    }
     return n;
+}
+
+size_t d2k_voice_targets(const char *path, d2k_voice_target *out, size_t cap) {
+    return voice_targets_select(path, out, cap, 0, 0, 0, 0);
 }
 
 /* --- настоящий оракул ---------------------------------------------------- */
@@ -356,7 +403,7 @@ static int voice_blob_load(const char *dir, const char *file,
 static int voice_alive(const char *ct_path, uint32_t ip, uint16_t port,
                        uint32_t src_ip, uint16_t sport) {
     d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
-    size_t n = d2k_voice_targets(ct_path, t, D2K_VOICE_MAX_TARGETS);
+    size_t n = voice_targets_select(ct_path, t, 1, ip, port, src_ip, sport);
     for (size_t i = 0; i < n; i++) {
         if (t[i].ip != ip || t[i].port != port) { continue; }
         if (src_ip != 0 && (t[i].src_ip != src_ip || t[i].sport != sport)) { continue; }
@@ -467,7 +514,20 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
        домен и померить его нельзя (D2K_SPEC): это померило бы другую цель и
        назвало чужой результат её именем. */
     d2k_voice_target t[D2K_VOICE_MAX_TARGETS];
-    size_t n = d2k_voice_targets(o.ct_path, t, D2K_VOICE_MAX_TARGETS);
+    uint32_t target = o.ip, client = 0;
+    uint16_t target_port = o.port, client_port = 0;
+    if (o.flow_port_a && o.flow_port_b) {
+        /* Scheduler gives the canonical tuple; the server matches its
+         * explicit endpoint, or the public side opposite a private client. */
+        int a_server = target ? (o.flow_ip_a == target && o.flow_port_a == target_port)
+                             : !d2k_ip4_private(o.flow_ip_a);
+        target = a_server ? o.flow_ip_a : o.flow_ip_b;
+        target_port = a_server ? o.flow_port_a : o.flow_port_b;
+        client = a_server ? o.flow_ip_b : o.flow_ip_a;
+        client_port = a_server ? o.flow_port_b : o.flow_port_a;
+    }
+    size_t n = voice_targets_select(o.ct_path, t, D2K_VOICE_MAX_TARGETS,
+                                   target, target_port, client, client_port);
     const d2k_voice_target *flow = NULL;
     for (size_t i = 0; i < n && !flow; i++) {
         if (ctl_resolved && t[i].ip == cip) { continue; }   /* свой же контроль */
@@ -503,7 +563,12 @@ d2k_voice_res d2k_voice_run(const d2k_voice_opt *opt) {
     d2k_ip4_text(r.ip, addr, sizeof addr);
 
     /* conntrack's replied bit records history, not current progress. */
-    if (o.discovery && d2k_voice_discovery_search(&o, &r)) return r;
+    if (o.discovery) {
+        if (d2k_voice_discovery_search(&o,&r)) return r;
+        r.verdict=D2K_VOICE_NO_ORACLE;
+        say_reason(&r,"Discord Discovery не подтвердил диагностический обход; исторический conntrack reply и молчание STUN не подтверждают медиасессию — UNVERIFIED");
+        return r;
+    }
 
     /* ===== СЛОЙ 0: ОТВЕЧАЕТ ЛИ ТОЧКА НАСТОЯЩЕМУ КЛИЕНТУ =====
      *
