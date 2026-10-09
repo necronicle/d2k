@@ -4888,7 +4888,7 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
         fputs(",\"client\":",f);json_str(f,client);
         fputs(",\"evidence\":",f);
         json_str(f,t->voice_stable_seen?"STABLE":t->voice_media_seen?"MEDIA_FLOW_OBSERVED":
-                   t->voice_discovery_verified || (t->voice_known_prefix_valid && vr.verdict==D2K_VOICE_CLEAR)
+                   t->voice_discovery_verified || (t->voice_known_prefix_valid && !vr.known_prefix_failed && vr.verdict==D2K_VOICE_CLEAR)
                    ?"BYPASS_PROBE_PASSED":t->voice_proven?"DISCOVERY_RESPONDED":"UNVERIFIED");
         fputs(",\"two_way\":",f);fputs(t->voice_exchange_seen?"true":"null",f);
         fputs(",\"late_cut\":",f);fputs(t->trigger_code==D2K_SUSPECT_VOICE_STALL?"true":"null",f);
@@ -6041,7 +6041,7 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
 
 
     if (r.verdict != D2K_VOICE_BLOCKED) {
-        if (t->voice_known_prefix_valid && r.verdict == D2K_VOICE_CLEAR) {
+        if (t->voice_known_prefix_valid && !r.known_prefix_failed && r.verdict == D2K_VOICE_CLEAR) {
             say(s, "по %s (голос) сохраняю подтверждённый приём: %s", t->name, r.reason);
         } else say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
                "блокировку (%s)", t->name, r.reason[0] ? r.reason : "нет причины");

@@ -115,7 +115,7 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     if(opt){voice_target_ip=opt->ip;voice_target_port=opt->port;voice_target_wait=opt->wait_ms;voice_candidate_seen=opt->candidate_discovery_prefix!=NULL;}
     if (opt && opt->known_discovery_prefix) {
         voice_seen_known=1;
-        if (voice_known_fails) { r.verdict=D2K_VOICE_UNMEASURED; r.known_prefix_failed=1; }
+        if (voice_known_fails) { r.verdict=voice_known_fails==2?D2K_VOICE_CLEAR:D2K_VOICE_UNMEASURED; r.known_prefix_failed=1; }
         return r;
     }
     if (!opt || opt->mark != 0x2d || !opt->flow_port_a || !opt->flow_port_b ||
@@ -10595,7 +10595,8 @@ voice_only_run:
         }
         s = d2k_sched_new(&cS, sv[0], 0x2d);
         if (s) {
-            forget_sent(); voice_known_fails=1;
+            forget_sent(); voice_known_fails=2;saidbuf[0]=0;
+            d2k_sched_set_say(s,collect_say,NULL);
             d2k_ev h=ev_hello(17,52005,D2K_LINK_VOICE_CLASS);
             d2k_sched_event(s,&h);
             d2k_ev su=ev_suspect(17,52005);
@@ -10606,6 +10607,15 @@ voice_only_run:
             CHECK(sent_command_count(D2K_CMD_DEL_ADDR,NULL,0)==1 &&
                   sent_command_count(D2K_CMD_DEL_NAME,NULL,0)==0,
                   "failed known voice binding does not retire only address/voice scope");
+            CHECK(!said("сохраняю подтверждённый приём"),
+                  "direct CLEAR after a failed prefix is falsely reported as a passing bypass");
+            char vp[128];snprintf(vp,sizeof vp,"/tmp/d2k-direct-clear-%ld.json",(long)getpid());
+            CHECK(!d2k_sched_write_live(s,vp,NULL),"direct CLEAR diagnostic write");
+            FILE *vf=fopen(vp,"rb");char vb[32768]={0};
+            if(vf){(void)!fread(vb,1,sizeof vb-1,vf);fclose(vf);}unlink(vp);
+            CHECK(!strstr(vb,"BYPASS_PROBE_PASSED"),
+                  "direct CLEAR falsely labels a rejected prefix as BYPASS_PROBE_PASSED");
+
             voice_known_fails=0;d2k_sched_free(s);
         }
         d2k_catalog_free(&cS);
