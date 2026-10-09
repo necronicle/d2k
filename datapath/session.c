@@ -329,6 +329,12 @@ static void suspect_num(d2k_session *s, uint64_t at_ns, const d2k_key *k,
     if (fl->controller_probe || fl->suspected) {
         return;
     }
+    /* The controller may have restarted or evicted its name ring since the
+     * startup packet. Replay only the class actually observed on this flow;
+     * this is context delivery, not another counted client hello. */
+    if(k->proto==17 && fl->had_sni && (fl->voice_ssrc_valid || fl->stun_txid_valid))
+        d2k_journal_add(s->jrn,at_ns,k,D2K_JRN_HELLO_SNI,0,0,NULL,
+                        (const uint8_t *)D2K_VOICE_CLASS,strlen(D2K_VOICE_CLASS),NULL);
     fl->suspected = 1;
     s->suspects++;
     /* ПРИМЕНЯЛСЯ ЛИ ПЛАН К ЭТОМУ ПОТОКУ — говорим всегда (см. d_planned в
@@ -618,6 +624,21 @@ static int flow_tracked(d2k_flow *fl, const d2k_conn *c, uint8_t proto,
     return 0;
 }
 
+/* RTP header observation only; encrypted payload never proves audible audio.
+ * Diagnostic STUN/Discovery datagrams do not have this framing. */
+static void voice_media_sample(d2k_session *s, d2k_flow *f, const d2k_key *key,
+                               const uint8_t *p, size_t n, int client, uint64_t now_ns) {
+    if (f->controller_probe || (!f->voice_ssrc_valid && !f->stun_txid_valid) ||
+        n < 12 || (p[0] & 0xc0) != 0x80 || 12u + 4u*(p[0]&15u) > n ||
+        (p[1] >= 192 && p[1] <= 223)) return;
+    f->voice_media_dirs |= client ? 1 : 2;
+    if (f->voice_media_dirs == 3 && !f->voice_media_told) {
+        f->voice_media_told = 1;
+        d2k_journal_add(s->jrn, now_ns, key, D2K_JRN_EXCHANGE,
+                        D2K_UDP_OBS_MEDIA_FLOW, 0, NULL, NULL, 0, NULL);
+    }
+}
+
 static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
                        const d2k_packet_view *ip, uint64_t now_ns,
                        uint8_t *buf, size_t bufcap, d2k_result *out,
@@ -718,6 +739,8 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     if (from_client < 0 && fl->dir_known) {
         from_client = (src_is_low == fl->init_low) ? 1 : 0;
     }
+    if (from_client >= 0)
+        voice_media_sample(s, fl, &key, pkt + payload_off, payload_len, from_client, now_ns);
     if (from_client == 0 || (from_client < 0 && src_is_443 && !dst_is_443)) {
         /* СЕРВЕРНАЯ СТОРОНА. Разбирать её как клиентский Initial нельзя (см.
            выше), а вот УЧЕСТЬ обязаны — и это не бухгалтерия ради полноты.
@@ -796,6 +819,10 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     int held_first_replay = fl->udp_hold_replay_first != 0;
     fl->udp_hold_replay_first = 0;
     fl->fwd_pkts++; /* счётчик попыток разбора клиентской стороны потока */
+    if ((is_discord_ip_discovery(pkt+payload_off,payload_len) ||
+         is_stun_request(pkt+payload_off,payload_len)) && fl->voice_requests<255)
+        fl->voice_requests++;
+
     if (fl->saw_hello || fl->saw_initial) {
         /* Клиент шлёт ЕЩЁ, уже показав приветствие, — повтор Initial по
            таймеру PTO. Половина критерия «шлём, а молчат» (см. d2k_track.h).
@@ -868,6 +895,14 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
     if (stun_voice && !fl->stun_txid_valid) {
         memcpy(fl->stun_txid, pkt + payload_off + 8, sizeof fl->stun_txid);
         fl->stun_txid_valid = 1;
+    }
+    if(discord_voice && !fl->controller_probe && fl->fwd_pkts>1) {
+        /* Discovery comparison primes a NEW socket before its first byte.
+         * Installing the trial after three failed client requests must not
+         * inject the prefix into that already exposed tuple and then judge
+         * the remedy by its failure. Keep the lease for the next fresh flow. */
+        out->skipped="Discord prefix ждёт нового потока: первый Discovery уже ушёл";
+        return;
     }
     if (!voice && !d2k_quic_is_initial(pkt + payload_off, payload_len)) {
         out->skipped = "не QUIC Initial и не голос Дискорда";
@@ -2753,6 +2788,19 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
         f->quic_deny) {
         return;
     }
+    if(f->voice_ssrc_valid || f->stun_txid_valid) {
+        /* The limited queue is not a clock for a continuing media session.
+         * With counters, ct_voice_flow owns both startup and late silence.
+         * Without counters, only three real unanswered protocol requests
+         * inside the visible startup window provide a suspicion. */
+        if(!c->s->ct_query && f->voice_requests>=3 && !f->rev_pkts &&
+           (c->s->udp_reverse_hook || c->s->rev_seen[shape_slot(17,f->key.family)]) &&
+           c->now_ns>=f->hello_ns && c->now_ns-f->hello_ns>=5*NS_PER_S) {
+            f->silence_told=1;c->told++;
+            suspect(c->s,c->now_ns,&f->key,f,D2K_SUSPECT_SILENT,NULL);
+        }
+        return;
+    }
     /* Один ответ не закрывает наблюдение навсегда: цензор может пропустить
        первый Initial, а затем съесть повтор PTO. Считаем поток отвечающим,
        только если после последней клиентской повторной посылки уже был ответ. */
@@ -2854,6 +2902,66 @@ static void ct_flow(void *ctx, d2k_flow *f) {
     if (c->now_ns < f->ct_reply_ns || c->now_ns - f->ct_reply_ns < pto) { return; }
     c->told++;
     suspect(c->s, c->now_ns, &f->key, f, D2K_SUSPECT_QUIC_STALL, NULL);
+}
+
+/* Voice uses the same bounded ctnetlink path as QUIC. A historical
+ * Discovery/STUN answer cannot hide a later cut. This is suspicion only:
+ * the controller must reproduce it with its protocol oracle. Missing
+ * counters, reset counters and a quiet caller never prove a cut. */
+static void ct_voice_flow(void *ctx, d2k_flow *f) {
+    struct ct_ctx *c = ctx;
+    if (f->key.proto != 17 || (!f->voice_ssrc_valid && !f->stun_txid_valid) ||
+        f->suspected || f->controller_probe) return;
+    d2k_ct_tuple t;
+    flow_tuple(f, &t);
+    d2k_ct_info ci = {0};
+    if (c->s->ct_query(c->s->ct_query_ctx, &t, &ci) != 0) {
+        f->ct_known = 0;
+        f->voice_stable_since_ns = 0;
+        return;
+    }
+    if (f->ct_known && (ci.orig_pkts > f->voice_ct_orig || ci.reply_pkts > f->ct_reply))
+        f->last_ns = c->now_ns;
+    int reset=f->ct_known && (ci.orig_pkts<f->voice_ct_orig || ci.reply_pkts<f->ct_reply);
+    if(reset) {
+        f->voice_requests=0;f->voice_media_dirs=0;f->voice_media_told=0;f->voice_stable_told=0;
+    }
+    if(!reset && !ci.reply_pkts && ci.orig_pkts>=3 && f->voice_requests>=3 &&
+       c->now_ns>=f->hello_ns && c->now_ns-f->hello_ns>=5*NS_PER_S) {
+        c->told++;
+        suspect(c->s,c->now_ns,&f->key,f,D2K_SUSPECT_SILENT,NULL);
+        return;
+    }
+
+    int advancing = f->ct_known && ci.orig_pkts > f->voice_ct_orig && ci.reply_pkts > f->ct_reply;
+    if (reset || !f->ct_known || ci.reply_pkts < f->ct_reply || c->now_ns < f->ct_reply_ns ||
+        (ci.reply_pkts == f->ct_reply && c->now_ns - f->ct_reply_ns >= 5*NS_PER_S))
+        f->voice_stable_since_ns = 0;
+    if (advancing && f->voice_media_dirs == 3) {
+        if (!f->voice_stable_since_ns) f->voice_stable_since_ns = c->now_ns;
+        if (!f->voice_stable_told && c->now_ns >= f->voice_stable_since_ns &&
+            c->now_ns - f->voice_stable_since_ns >= 30*NS_PER_S) {
+            f->voice_stable_told = 1;
+            d2k_journal_add(c->s->jrn,c->now_ns,&f->key,D2K_JRN_EXCHANGE,
+                            D2K_UDP_OBS_STABLE,0,NULL,NULL,0,NULL);
+        }
+    }
+
+    f->voice_ct_orig = ci.orig_pkts;
+    if (!f->ct_known || reset || ci.reply_pkts != f->ct_reply ||
+        ci.orig_pkts < f->ct_orig_mark || c->now_ns < f->ct_reply_ns) {
+        f->ct_known = 1;
+        f->ct_reply = ci.reply_pkts;
+        f->ct_reply_ns = c->now_ns;
+        f->ct_orig_mark = ci.orig_pkts;
+        return;
+    }
+    /* Five seconds plus five actual client packets tolerates startup,
+     * isolated loss and normal channel teardown. No queued packet is needed. */
+    if (ci.orig_pkts - f->ct_orig_mark < 5 ||
+        c->now_ns - f->ct_reply_ns < 5 * NS_PER_S) return;
+    c->told++;
+    suspect(c->s, c->now_ns, &f->key, f, ci.reply_pkts ? D2K_SUSPECT_VOICE_STALL : D2K_SUSPECT_SILENT, NULL);
 }
 
 /* TCP ВСТАЛ НА БЮДЖЕТЕ КОРОБКИ (задача 56; поле 04.10, Safari: mailsuite.com
@@ -2999,6 +3107,7 @@ size_t d2k_session_sweep(d2k_session *s, uint64_t now_ns) {
     if (s->ct_query) {
         struct ct_ctx cc = { s, now_ns, 0 };
         d2k_track_walk(s->uflows, ct_flow, &cc);
+        d2k_track_walk(s->uflows, ct_voice_flow, &cc);
         d2k_track_walk(s->flows, ct_tcp_flow, &cc);
         c.told += cc.told;
     }

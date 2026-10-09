@@ -17,7 +17,7 @@ static int resolve(const char *h,uint32_t *ip,uint16_t *p) {(void)h;(void)ip;(vo
 typedef struct { int fd, kind; } server;
 static void *respond(void *arg) {
     server *s=arg;
-    unsigned count=s->kind==1?13:s->kind==2?1:D2K_DISCOVERY_EXCHANGES;
+    unsigned count=s->kind==1?13:s->kind==2?1:D2K_DISCOVERY_EXCHANGES + (s->kind==5 ? 1 : 0);
     uint8_t previous[4]={0};
     for(unsigned i=0;i<count;i++) {
         struct pollfd p={s->fd,POLLIN,0};
@@ -29,6 +29,7 @@ static void *respond(void *arg) {
         if(i)CHECK(memcmp(previous,b+4,4)!=0);
         memcpy(previous,b+4,4);
         if(s->kind==1 && i==12)break;
+        if(s->kind==5 && i==7)continue;
         b[1]=2;memcpy(b+8,"127.0.0.1",10);b[72]=0x12;b[73]=0x34;
         if(s->kind==2)b[4]^=1;
         (void)sendto(s->fd,b,74,0,(void*)&a,alen);
@@ -45,6 +46,9 @@ static d2k_discovery_result probe(uint32_t ip, uint16_t port,
     r.received = prefix || mode == 1 ? D2K_DISCOVERY_EXCHANGES : 12;
     if (prefix) CHECK(len == 20 && prefix[0] == 0 && prefix[1] == 1 && prefix[4] == 0x21);
     if (mode == 2) r.received = 0;
+    if (mode == 7 && !prefix) { r.received = 0; r.sent = 3; }
+    if (mode == 9 && prefix && calls == 1) r.received = 12;
+    if (mode == 8 && !prefix) { r.received = calls == 1 ? 1 : 0; r.sent = r.received + 3; }
     if (mode == 3 && calls == 2) r.received = 11;
     if (mode == 4) r.error = 1;
     if (mode == 5) r.marked = 0;
@@ -70,8 +74,34 @@ int main(void) {
     mode=0;calls=0;o.known_discovery_prefix=known;
     memset(&r,0,sizeof r);r.marked=1;
     CHECK(d2k_voice_discovery_search(&o,&r));
-    CHECK(r.verdict==D2K_VOICE_CLEAR && !r.arm_len && calls==1);
+    CHECK(r.verdict==D2K_VOICE_CLEAR && !r.arm_len && calls==3);
     o.known_discovery_prefix=NULL;
+    mode=0;calls=0;known[19]=0x77;o.candidate_discovery_prefix=known;
+    memset(&r,0,sizeof r);r.marked=1;
+    CHECK(d2k_voice_discovery_search(&o,&r));
+    CHECK(r.verdict==D2K_VOICE_BLOCKED && calls==6 &&
+          r.discovery_verified && !memcmp(r.arm_bytes,known,20));
+    mode=7;calls=0;
+    memset(&r,0,sizeof r);r.marked=1;
+    CHECK(d2k_voice_discovery_search(&o,&r));
+    CHECK(r.verdict==D2K_VOICE_BLOCKED && r.discovery_verified && calls==6 &&
+          !memcmp(r.arm_bytes,known,20));
+    mode=8;calls=0;
+    memset(&r,0,sizeof r);r.marked=1;
+    CHECK(d2k_voice_discovery_search(&o,&r));
+    CHECK(r.verdict==D2K_VOICE_BLOCKED && r.discovery_verified && calls==6);
+    o.candidate_discovery_prefix=NULL;
+    mode=6;calls=0;o.known_discovery_prefix=known;
+    memset(&r,0,sizeof r);r.marked=1;
+    CHECK(d2k_voice_discovery_search(&o,&r));
+    CHECK(r.known_prefix_failed && !r.arm_len);
+    mode=9;calls=0;
+    memset(&r,0,sizeof r);r.marked=1;
+    CHECK(d2k_voice_discovery_search(&o,&r));
+    CHECK(r.verdict==D2K_VOICE_FLAKY && !r.known_prefix_failed && !r.arm_len);
+
+    o.known_discovery_prefix=NULL;
+
     char plan[512]="d2k-plan 1 1\nid 00000000000000000000000000000000\nproto udp voice\npayload 1 000100002112a44265d1f10b0547ecf2025dafb8\npoison 1\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\npace 15000\n";
     CHECK(d2k_voice_discovery_prefix(plan,known));
     CHECK(!memcmp(known,"\x00\x01\x00\x00\x21\x12\xa4\x42",8));
@@ -92,8 +122,11 @@ int main(void) {
     r=d2k_voice_run(&o);
     CHECK(r.verdict==D2K_VOICE_BLOCKED && r.discovery_verified && r.arm_len==20);
     CHECK(calls==6);
+    mode=2;calls=0;r=d2k_voice_run(&o);
+    CHECK(r.verdict==D2K_VOICE_NO_ORACLE && !r.arm_len);
     /* Real UDP socket and strict response correlation, not just hooks. */
-    for(int kind=0;kind<3;kind++) {
+    for(int ix=0;ix<4;ix++) {
+        int kind = ix == 3 ? 5 : ix;
         server s={socket(AF_INET,SOCK_DGRAM,0),kind}; CHECK(s.fd>=0);
         struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=inet_addr("127.0.0.1");
         CHECK(bind(s.fd,(void*)&a,sizeof a)==0);socklen_t len=sizeof a;
@@ -102,7 +135,7 @@ int main(void) {
         d2k_discovery_result q=real(a.sin_addr.s_addr,ntohs(a.sin_port),NULL,0,150,0);
         pthread_join(th,NULL);close(s.fd);
         CHECK(!q.error && !q.marked);
-        CHECK(q.received==(kind==0?D2K_DISCOVERY_EXCHANGES:kind==1?12u:0u));
+        CHECK(q.received==((kind==0 || kind==5)?D2K_DISCOVERY_EXCHANGES:kind==1?12u:0u));
     }
     return fail != 0;
 }

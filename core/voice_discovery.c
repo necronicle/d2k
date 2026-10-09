@@ -67,7 +67,11 @@ static d2k_discovery_result discovery_probe(uint32_t ip, uint16_t port,
         struct timespec pause = {0,15000000};
         while (nanosleep(&pause,&pause) && errno == EINTR) {}
     }
-    for (unsigned i=0; i<D2K_DISCOVERY_EXCHANGES; i++) {
+    unsigned misses = 0;
+    uint32_t per_request = wait ? wait : 3000;
+    int64_t series_end = milliseconds() + 15000;
+    for (unsigned i = 0; r.received < D2K_DISCOVERY_EXCHANGES &&
+         i < D2K_DISCOVERY_EXCHANGES + 6 && milliseconds() < series_end; i++) {
         uint8_t req[74] = {0,1,0,70}, seed[20], txid[12], reply[2048];
         if (!d2k_stun_request(seed,sizeof seed,txid)) { r.error=1; break; }
         /* Each request has a fresh SSRC, so delayed duplicates cannot
@@ -75,7 +79,8 @@ static d2k_discovery_result discovery_probe(uint32_t ip, uint16_t port,
         memcpy(req+4,txid,4);
         if (send(fd,req,sizeof req,0) != sizeof req) { r.error=1; break; }
         r.sent++;
-        int64_t end = milliseconds() + (wait ? wait : 3000);
+        int64_t end = milliseconds() + per_request;
+        if (end > series_end) end = series_end;
         int answered = 0;
         while (milliseconds() < end) {
             struct pollfd p = {fd,POLLIN,0};
@@ -89,7 +94,12 @@ static d2k_discovery_result discovery_probe(uint32_t ip, uint16_t port,
             if (n < 0) { if(errno==EINTR)continue; r.error=1; break; }
             if (d2k_discovery_response(reply,(size_t)n,req+4)) { answered=1; break; }
         }
-        if (!answered) break;
+        if (r.error) break;
+        if (!answered) {
+            if (++misses >= 3) break;
+            continue;
+        }
+        misses = 0;
         r.received++;
     }
 done:
@@ -107,13 +117,26 @@ static int local_failure(d2k_voice_res *r, d2k_discovery_result q) {
     return 1;
 }
 int d2k_voice_discovery_search(const d2k_voice_opt *o, d2k_voice_res *r) {
-    if(o->known_discovery_prefix) {
-        d2k_discovery_result q=d2k_discovery_probe_hook(r->ip,r->port,
-            o->known_discovery_prefix,20,o->wait_ms,o->mark);
-        if(local_failure(r,q))return 1;
-        if(q.received==D2K_DISCOVERY_EXCHANGES){
-            r->verdict=D2K_VOICE_CLEAR;
-            snprintf(r->reason,sizeof r->reason,"собственный подтверждённый STUN-префикс перепроверен: %u/%u Discovery-ответов; повторный подбор не нужен (звук отдельно)",q.received,q.sent);
+    if (o->known_discovery_prefix) {
+        int failures = 0;
+        for (int i = 0; i < D2K_VOICE_REPEATS; i++) {
+            d2k_discovery_result q = d2k_discovery_probe_hook(r->ip, r->port,
+                o->known_discovery_prefix, 20, o->wait_ms, o->mark);
+            if (local_failure(r, q)) return 1;
+            if (q.received != D2K_DISCOVERY_EXCHANGES) {
+                failures++;
+            }
+        }
+        if (failures > 0 && failures < D2K_VOICE_REPEATS) {
+            r->verdict = D2K_VOICE_FLAKY;
+            snprintf(r->reason, sizeof r->reason, "сохранённый STUN-префикс: серии разошлись; привязку не инвалидирую");
+            return 1;
+        }
+        if (failures == D2K_VOICE_REPEATS) r->known_prefix_failed = 1;
+        if (!failures) {
+            r->verdict = D2K_VOICE_CLEAR;
+            snprintf(r->reason, sizeof r->reason,
+                "сохранённый STUN-префикс: 3/3 серии Discovery; BYPASS_PROBE_PASSED, звук не проверен");
             return 1;
         }
     }
@@ -121,21 +144,27 @@ int d2k_voice_discovery_search(const d2k_voice_opt *o, d2k_voice_res *r) {
     for (int i=0;i<D2K_VOICE_REPEATS;i++) {
         d2k_discovery_result q=d2k_discovery_probe_hook(r->ip,r->port,NULL,0,o->wait_ms,o->mark);
         if (local_failure(r,q)) return 1;
-        if (!i && !q.received) return 0;
         if (!i && q.received == D2K_DISCOVERY_EXCHANGES) {
             r->verdict=D2K_VOICE_CLEAR;
             snprintf(r->reason,sizeof r->reason,"Discord IP Discovery напрямую: %u/%u ответов на одном потоке; поздний обрыв не воспроизведён (не проверка звука)",q.received,q.sent);
             return 1;
         }
         if (!i) cutoff=q.received;
-        if (!cutoff || q.received!=cutoff || q.sent!=cutoff+1) {
+        /* Finland field 09.10: zero or one initial answer, then silence.
+         * This startup band is not normal packet loss: all three independent
+         * direct flows stop here, and the remedy must sustain 75 replies. */
+        int startup = cutoff <= 1 && q.received <= 1;
+        if ((!startup && q.received != cutoff) || q.sent <= q.received) {
             r->verdict=D2K_VOICE_FLAKY;
             snprintf(r->reason,sizeof r->reason,"Discord IP Discovery: граница прекращения ответов не повторилась; кандидат не ставлю");
             return 1;
         }
     }
     uint8_t prefix[20], txid[12];
-    if (!d2k_stun_request(prefix,sizeof prefix,txid)) {
+    /* Reuse the measured bytes, but never install on a new endpoint
+     * merely because it belongs to Discord. The direct cut above is a gate. */
+    if (o->candidate_discovery_prefix) memcpy(prefix, o->candidate_discovery_prefix, sizeof prefix);
+    else if (!d2k_stun_request(prefix,sizeof prefix,txid)) {
         r->verdict=D2K_VOICE_UNMEASURED;
         snprintf(r->reason,sizeof r->reason,"не удалось сформировать STUN-префикс");
         return 1;
@@ -144,6 +173,7 @@ int d2k_voice_discovery_search(const d2k_voice_opt *o, d2k_voice_res *r) {
         d2k_discovery_result q=d2k_discovery_probe_hook(r->ip,r->port,prefix,sizeof prefix,o->wait_ms,o->mark);
         if (local_failure(r,q)) return 1;
         if (q.received!=D2K_DISCOVERY_EXCHANGES) {
+            if (!cutoff) return 0; /* no oracle or no measurable remedy; never infer from STUN silence */
             r->verdict=D2K_VOICE_UNMEASURED;
             snprintf(r->reason,sizeof r->reason,"Discord IP Discovery: прямой обрыв после %u ответов повторяется, STUN-префикс его устойчиво не снял",cutoff);
             return 1;

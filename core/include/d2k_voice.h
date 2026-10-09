@@ -111,8 +111,8 @@ typedef enum {
     D2K_VOICE_UNMEASURED
 } d2k_voice_verdict;
 
-/* Куда слать зонд. packets — сколько пакетов ядро насчитало в потоке: по нему
- * выбирается самый живой разговор, если их несколько. */
+/* Куда слать зонд. packets — исторический счётчик ядра; приоритет выбора учитывает также
+ * недавнее обновление kernel timeout (это не доказательство аудио). */
 typedef struct {
     uint32_t ip;   /* сетевой порядок, как в пакете */
     uint16_t port;
@@ -122,6 +122,7 @@ typedef struct {
     uint32_t src_ip;
     uint16_t sport;
     int      packets;
+    uint32_t idle_seconds; /* kernel timeout refresh age estimate, selection only */
     /* ОТВЕЧАЛ ЛИ КТО-НИБУДЬ С ЭТОЙ ТОЧКИ. 1 — у ядра есть поток к ней, по
      * которому шёл ОБРАТНЫЙ трафик (строка без пометки [UNREPLIED]).
      *
@@ -134,7 +135,7 @@ typedef struct {
 
 /* Ищет живые голосовые потоки в таблице соединений (path; NULL — штатная).
  *
- * Возвращает сколько нашёл, не больше cap, по УБЫВАНИЮ числа пакетов: первым
+ * Возвращает сколько нашёл, не больше cap, по недавнему обновлению kernel timeout, затем числу пакетов: первым
  * идёт тот разговор, который человек прямо сейчас и ведёт.
  *
  * Смотрит только UDP и только на порты боевого профиля discord_udp: если
@@ -159,6 +160,7 @@ typedef struct {
     uint32_t    wait_ms;      /* 0 — 3000 */
     uint32_t    mark;
     int         discovery; /* check sustained Discord replies after suspicion */
+    const uint8_t *candidate_discovery_prefix; /* saved remedy from another endpoint; test after direct cut */
     const uint8_t *known_discovery_prefix; /* exact verified 20-byte prefix */
 } d2k_voice_opt;
 
@@ -175,6 +177,7 @@ typedef struct {
     uint8_t  arm_bytes[D2K_VOICE_ARM_MAX];
     size_t   arm_len;
     int      arm_copies;
+    int      known_prefix_failed; /* protocol measurement failed, not a local error */
     int      discovery_verified; /* own-ID series, not audio proof */
 } d2k_voice_res;
 

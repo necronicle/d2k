@@ -79,6 +79,11 @@ static int tcp_calls, quic_calls;
 static int voice_calls;
 static int voice_discovery_fixture;
 static int voice_seen_known;
+static int voice_known_fails;
+static uint32_t voice_target_ip;
+static uint16_t voice_target_port;
+static uint32_t voice_target_wait;
+static int voice_candidate_seen;
 static d2k_verdict tcp_answer = D2K_V_OPAQUE;
 static int tcp_owns_search;
 static int tcp_found_arm;
@@ -107,7 +112,12 @@ static d2k_voice_res stub_voice(const d2k_voice_opt *opt) {
     d2k_voice_res r;
     memset(&r, 0, sizeof r);
     voice_calls++;
-    if (opt && opt->known_discovery_prefix) { voice_seen_known=1; return r; }
+    if(opt){voice_target_ip=opt->ip;voice_target_port=opt->port;voice_target_wait=opt->wait_ms;voice_candidate_seen=opt->candidate_discovery_prefix!=NULL;}
+    if (opt && opt->known_discovery_prefix) {
+        voice_seen_known=1;
+        if (voice_known_fails) { r.verdict=voice_known_fails==2?D2K_VOICE_CLEAR:D2K_VOICE_UNMEASURED; r.known_prefix_failed=1; }
+        return r;
+    }
     if (!opt || opt->mark != 0x2d || !opt->flow_port_a || !opt->flow_port_b ||
         (voice_discovery_fixture && !opt->discovery)) { return r; }
     r.verdict = D2K_VOICE_BLOCKED;
@@ -10461,6 +10471,10 @@ voice_only_run:
                   "произвольный UDP-ответ записал голос подтверждённым");
             CHECK(said("UDP-ответ наблюдался") && !said("ПОДТВЕРЖДЕНО"),
                   "UDP-наблюдение голоса потеряно либо названо подтверждением");
+            ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
+            d2k_sched_event(s, &ex); spin(s,20);
+            CHECK(cV.n_boxes == 0 && !said("ПОДТВЕРЖДЕНО"),
+                  "one Discovery answer without sustained bypass probes creates global voice policy");
             forget_sent();
             skip_ahead(s, 10 * 60 * 1000 + 1);
             CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
@@ -10538,6 +10552,14 @@ voice_only_run:
                   "sustained Discovery did not retain address scope");
             CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 0,
                   "one Discovery endpoint became a global voice policy");
+            char live_path[128];snprintf(live_path,sizeof live_path,"/tmp/d2k-voice-live-%ld.json",(long)getpid());
+            CHECK(d2k_sched_write_live(s,live_path,NULL)==0,"voice live diagnostic write");
+            FILE *vf=fopen(live_path,"rb");char vb[32768]={0};
+            if(vf){(void)!fread(vb,1,sizeof vb-1,vf);fclose(vf);}
+            CHECK(strstr(vb,"BYPASS_PROBE_PASSED") && strstr(vb,"audio_verified") &&
+                  strstr(vb,"192.168.1.67"),"voice diagnostics lose probe scope or client identity");
+            unlink(live_path);
+
             d2k_sched_free(s);
         }
         s = d2k_sched_new(&cS, sv[0], 0x2d);
@@ -10558,6 +10580,43 @@ voice_only_run:
             CHECK(voice_seen_known && sent_command_count(D2K_CMD_SET_ADDR_PROBE,NULL,0)==0,
                   "working saved Discovery remedy restarted candidate search");
             d2k_sched_free(s);
+        }
+        s = d2k_sched_new(&cS, sv[0], 0x2d);
+        if (s) {
+            forget_sent();voice_candidate_seen=0;
+            d2k_ev h=ev_hello(17,52005,D2K_LINK_VOICE_CLASS);
+            memcpy(h.low_ip,"\x23\xd9\x38\xc3",4);d2k_sched_event(s,&h);
+            d2k_ev su=ev_suspect(17,52005);memcpy(su.low_ip,h.low_ip,4);
+            d2k_sched_event(s,&su);spin(s,20);drain();
+            CHECK(voice_candidate_seen && voice_target_wait>0 && voice_target_wait<=500 &&
+                  sent_command_count(D2K_CMD_SET_ADDR_PROBE,NULL,0)==1,
+                  "saved remedy on a new endpoint waits through full cold-start timeout");
+            d2k_sched_free(s);
+        }
+        s = d2k_sched_new(&cS, sv[0], 0x2d);
+        if (s) {
+            forget_sent(); voice_known_fails=2;saidbuf[0]=0;
+            d2k_sched_set_say(s,collect_say,NULL);
+            d2k_ev h=ev_hello(17,52005,D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s,&h);
+            d2k_ev su=ev_suspect(17,52005);
+            d2k_sched_event(s,&su);spin(s,20);drain();
+            const d2k_cat_binding *b=binding_of(&cS,"127.0.0.1",17);
+            CHECK(b && b->recheck_since && b->confirmed && b->enabled,
+                  "failed known prefix does not mark only its address binding for recheck");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR,NULL,0)==1 &&
+                  sent_command_count(D2K_CMD_DEL_NAME,NULL,0)==0,
+                  "failed known voice binding does not retire only address/voice scope");
+            CHECK(!said("сохраняю подтверждённый приём"),
+                  "direct CLEAR after a failed prefix is falsely reported as a passing bypass");
+            char vp[128];snprintf(vp,sizeof vp,"/tmp/d2k-direct-clear-%ld.json",(long)getpid());
+            CHECK(!d2k_sched_write_live(s,vp,NULL),"direct CLEAR diagnostic write");
+            FILE *vf=fopen(vp,"rb");char vb[32768]={0};
+            if(vf){(void)!fread(vb,1,sizeof vb-1,vf);fclose(vf);}unlink(vp);
+            CHECK(!strstr(vb,"BYPASS_PROBE_PASSED"),
+                  "direct CLEAR falsely labels a rejected prefix as BYPASS_PROBE_PASSED");
+
+            voice_known_fails=0;d2k_sched_free(s);
         }
         d2k_catalog_free(&cS);
         voice_discovery_fixture = 0;
@@ -10704,6 +10763,7 @@ voice_only_run:
         /* Задача 15, сквозной путь Дискорда: опыт на пятёрке разговора →
            APPLIED с trial ID → настоящий IP Discovery response → постоянная
            привязка класса; временный опыт снят точно, своим trial ID. */
+        voice_discovery_fixture = 1;
         d2k_catalog cD;
         memset(&cD, 0, sizeof cD);
         saidbuf[0] = '\0';
@@ -10729,8 +10789,8 @@ voice_only_run:
             ex.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
             d2k_sched_event(s, &ex);
             spin(s, 20);
-            const d2k_cat_binding *bd = binding_of(&cD, D2K_LINK_VOICE_CLASS, 17);
-            CHECK(bd != NULL && strcmp(bd->kind, "name") == 0 && said("ПОДТВЕРЖДЕНО"),
+            const d2k_cat_binding *bd = binding_of(&cD, "127.0.0.1", 17);
+            CHECK(bd != NULL && strcmp(bd->kind, "addr") == 0 && said("ПОДТВЕРЖДЕНО"),
                   "IP Discovery response после APPLIED опыта не подтвердил голос");
             CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1 &&
                   sent_command_count(D2K_CMD_DEL_NAME, NULL, 0) == 0,
@@ -10750,13 +10810,14 @@ voice_only_run:
                 int rounds = 0;
                 while (d2k_sched_sync_step(s) && rounds++ < 1000) { drain(); }
                 drain();
-                CHECK(sent_command_count(D2K_CMD_SET_NAME, NULL, 0) == 1 &&
+                CHECK(sent_command_count(D2K_CMD_SET_ADDR, NULL, 0) == 1 &&
                       !said("UDP CLIENT без протокольного"),
                       "после перезапуска подтверждённый IP Discovery голос не поставлен на провод");
                 d2k_sched_free(s);
             }
         }
         d2k_catalog_free(&cD);
+        voice_discovery_fixture = 0;
 
         /* Финальное ревью, п.1: пока единственная задача @discord-voice ждёт
            следующего разговора (T_VOICE_TRIAL) к точке A, подозрение голоса
@@ -10798,8 +10859,8 @@ voice_only_run:
             size_t nb = collect_addr_probes(bdst, btrial, bsport, 2);
             CHECK(voice_calls == 2,
                   "подозрение голоса к другой точке сервера потеряно, пока опыт ждал разговора");
-            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 1,
-                  "опыт точки A не снят при переходе к точке B");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 0,
+                  "independent endpoint B must not retire endpoint A trial");
             CHECK(nb == 1 && bsport[0] == 0 &&
                   memcmp(btrial[0], atrial[0], D2K_TRIAL_ID_LEN) != 0,
                   "точка B не получила собственного опыта с новым trial ID");
@@ -10825,6 +10886,55 @@ voice_only_run:
                   "истёкший «не проверено» голосовой опыт заморозил голос на 10 мин");
             d2k_sched_free(s);
             g_server_port = 50004;
+        }
+        d2k_catalog_free(&cR);
+
+        /* A WATCH must neither absorb nor block another client's endpoint. */
+        memset(&cR, 0, sizeof cR);
+        s = d2k_sched_new(&cR, sv[0], 0x2d);
+        if (s) {
+            forget_sent(); voice_calls = 0;
+            g_server_port = 50004;
+            d2k_ev h = ev_hello(17, 52100, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(17, 52100);
+            d2k_sched_event(s, &su); spin(s, 20); drain();
+            uint8_t src[4], trial[D2K_TRIAL_ID_LEN]; uint16_t port;
+            CHECK(last_addr_probe_endpoint(src, &port, trial), "client A trial");
+            d2k_ev ap = ev_applied(17, 52100);
+            memcpy(ap.trial_id, trial, sizeof trial);
+            d2k_sched_event(s, &ap);
+            h = ev_hello(17, 52102, D2K_LINK_VOICE_CLASS);
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52102);
+            d2k_sched_event(s, &su); spin(s, 400); drain();
+            CHECK(voice_calls == 1, "same endpoint reconnect creates competing wildcard trials");
+            forget_sent();
+            g_server_port = 50008;
+            h = ev_hello(17, 52101, D2K_LINK_VOICE_CLASS);
+            h.high_ip[3] = 68;
+            d2k_sched_event(s, &h);
+            su = ev_suspect(17, 52101); su.high_ip[3] = 68;
+            d2k_sched_event(s, &su); spin(s, 400); drain();
+            CHECK(voice_calls == 2, "client B is blocked by client A WATCH");
+            CHECK(sent_command_count(D2K_CMD_DEL_ADDR_PROBE, NULL, 0) == 0,
+                  "client B removes active client A trial");
+            d2k_sched_free(s); g_server_port = 50004;
+        }
+        d2k_catalog_free(&cR);
+
+        memset(&cR,0,sizeof cR);
+        s=d2k_sched_new(&cR,sv[0],0x2d);
+        if(s) {
+            forget_sent();g_server_port=50008;
+            d2k_ev h=ev_hello(17,40005,D2K_LINK_VOICE_CLASS);
+            memcpy(h.low_ip,"\x23\xd9\x3f\x89",4);d2k_sched_event(s,&h);
+            d2k_ev su=ev_suspect(17,40005);memcpy(su.low_ip,h.low_ip,4);
+            su.client_shape=D2K_LINK_SHAPE_VOICE;d2k_sched_event(s,&su);spin(s,20);drain();
+            uint32_t expected;memcpy(&expected,h.low_ip,4);
+            CHECK(voice_target_ip==expected && voice_target_port==50008,
+                  "lower ephemeral client port is misidentified as voice server");
+            d2k_sched_free(s);g_server_port=50004;
         }
         d2k_catalog_free(&cR);
 

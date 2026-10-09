@@ -65,6 +65,7 @@
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
 #include "d2k_voice_discovery.h"
+#include "d2k_net4.h"
 #include "d2k_verify.h"
 #include "d2k_volume.h"
 #include "d2k_domain.h"
@@ -632,8 +633,14 @@ typedef struct {
     int         voice_discovery_verified;
     uint8_t     voice_known_prefix[20];
     int         voice_known_prefix_valid;
+    char        voice_known_plan_id[40];
+    int         voice_candidate_prefix_valid;
+    uint8_t     voice_candidate_prefix[20];
     uint8_t     voice_proof_code;
     int         voice_silent;
+    int         voice_exchange_seen, voice_media_seen, voice_stable_seen;
+    int64_t     voice_checked_ms;
+    char        voice_plan_id[40];
     int64_t     voice_watch_ms;
 
     /* Приветствия. trigger — снятое датапатом, если уже поймано; иначе
@@ -1572,6 +1579,26 @@ static int box_volume_bucket_agrees(const d2k_cat_fp *box, const d2k_cat_fp *fp)
  * serverOf) — то есть зашитым номером порта. Повторять это здесь нельзя:
  * охват d2k — весь IP-трафик, все порты всегда, а не 443. */
 static void server_of(const d2k_ev *ev, char *ip, size_t ipcap, uint16_t *port) {
+    /* Voice servers also use ephemeral-range ports. On routed UDP a
+     * private LAN peer and public peer provide stronger direction evidence
+     * than port ordering (Finland field: client 49528, server 50007). */
+    if(ev->transport==17 && (ev->client_shape==D2K_LINK_SHAPE_VOICE ||
+                            !strcmp(ev->name,D2K_LINK_VOICE_CLASS))) {
+        int low_private,high_private;
+        if(ev->family==6) {
+            low_private=d2k_ip6_private(ev->low_ip);
+            high_private=d2k_ip6_private(ev->high_ip);
+        } else {
+            uint32_t lo,hi;memcpy(&lo,ev->low_ip,4);memcpy(&hi,ev->high_ip,4);
+            low_private=d2k_ip4_private(lo);high_private=d2k_ip4_private(hi);
+        }
+        if(low_private!=high_private) {
+            (void)inet_ntop(ev->family==6?AF_INET6:AF_INET,
+                           low_private?ev->high_ip:ev->low_ip,ip,(socklen_t)ipcap);
+            *port=low_private?ev->high_port:ev->low_port;
+            return;
+        }
+    }
     int low_eph  = ev->low_port  >= EPHEMERAL_FROM;
     int high_eph = ev->high_port >= EPHEMERAL_FROM;
     int server_is_low;
@@ -1795,6 +1822,7 @@ static void cooldown_record(d2k_sched *s, const task *t, int kind) {
 /* Какое позднее закрытие пришло — для журнала; порог у них общий. */
 static const char *late_close_what(uint8_t code) {
     return code == D2K_SUSPECT_FIN_RETRY ? "повтор FIN без ответа после ответа сервера"
+         : code == D2K_SUSPECT_VOICE_STALL ? "позднее прекращение ответов Voice UDP"
          : code == D2K_SUSPECT_TCP_STALL ? "поток TCP встал на бюджете коробки, соединение открыто"
                                          : "поздний RST после app-data";
 }
@@ -2278,6 +2306,15 @@ static void *worker_run(void *vp) {
         memset(&opt, 0, sizeof opt);
         opt.mark = s->measure_mark;
         opt.discovery = strcmp(t->name, "@discord-voice") == 0;
+        (void)inet_pton(AF_INET, t->ip, &opt.ip);
+        opt.port = t->port;
+        opt.candidate_discovery_prefix = t->voice_candidate_prefix_valid ? t->voice_candidate_prefix : NULL;
+        /* Field 09.10: reusable prefix sustained 75 replies per endpoint
+         * with a 400 ms request deadline. A 500 ms comparison window avoids
+         * waiting 27 seconds while Discord rotates a failing endpoint.
+         * Exact known-bind rechecks retain the normal conservative deadline. */
+        if(t->voice_candidate_prefix_valid && !t->voice_known_prefix_valid) opt.wait_ms=500;
+
         opt.known_discovery_prefix = t->voice_known_prefix_valid ? t->voice_known_prefix : NULL;
         memcpy(&opt.flow_ip_a, t->voice_flow.a_ip, sizeof opt.flow_ip_a);
         opt.flow_port_a = t->voice_flow.a_port;
@@ -4830,6 +4867,39 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
     }
     fputs(s->cat->n_boxes ? "\n  ],\n" : "],\n", f);
 
+    /* Observational/probe levels are explicit; no audio telemetry exists. */
+    fputs("  \"voice\": [",f);
+    int voice_first=1;
+    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
+        const task *t=&s->tasks[i];
+        if(t->state==T_FREE || !is_voice_class(t->name,t->transport))continue;
+        d2k_voice_res vr;
+        pthread_mutex_lock(&s->mu);vr=t->voice_res;pthread_mutex_unlock(&s->mu);
+        fputs(voice_first?"{":",{",f);voice_first=0;
+        fputs("\"ip\":",f);json_str(f,t->ip);
+        fprintf(f,",\"port\":%u,\"family\":%u,\"audio_verified\":false",(unsigned)t->port,(unsigned)t->family);
+        uint8_t ip[16]={0};char client[INET6_ADDRSTRLEN]="?";
+        if(inet_pton(t->family==6?AF_INET6:AF_INET,t->ip,ip)==1) {
+            size_t al=t->family==6?16:4;
+            const uint8_t *src= !memcmp(t->voice_flow.a_ip,ip,al) && t->voice_flow.a_port==t->port
+                               ? t->voice_flow.b_ip : t->voice_flow.a_ip;
+            (void)inet_ntop(t->family==6?AF_INET6:AF_INET,src,client,sizeof client);
+        }
+        fputs(",\"client\":",f);json_str(f,client);
+        fputs(",\"evidence\":",f);
+        json_str(f,t->voice_stable_seen?"STABLE":t->voice_media_seen?"MEDIA_FLOW_OBSERVED":
+                   t->voice_discovery_verified || (t->voice_known_prefix_valid && !vr.known_prefix_failed && vr.verdict==D2K_VOICE_CLEAR)
+                   ?"BYPASS_PROBE_PASSED":t->voice_proven?"DISCOVERY_RESPONDED":"UNVERIFIED");
+        fputs(",\"two_way\":",f);fputs(t->voice_exchange_seen?"true":"null",f);
+        fputs(",\"late_cut\":",f);fputs(t->trigger_code==D2K_SUSPECT_VOICE_STALL?"true":"null",f);
+        fputs(",\"phase\":",f);json_str(f,task_phase(t));
+        fputs(",\"reason\":",f);json_str(f,vr.reason);
+        fputs(",\"plan\":",f);json_str(f,t->voice_known_plan_id[0]?t->voice_known_plan_id:t->voice_plan_id);
+        fputs(",\"last_check\":",f);
+        if(t->voice_checked_ms)json_time(f,wall_s(s,t->voice_checked_ms));else fputs("null",f);
+        fputs("}",f);
+    }
+    fputs("],\n",f);
     write_live_groups(f, s);
     fputs("  \"searches\": [", f);
     int first = 1;
@@ -5871,21 +5941,59 @@ static int voice_trial_same_context(const task *t, const d2k_ev *ev) {
     return 0;
 }
 
+/* Voice tasks belong to a client/endpoint, never the shared class label.
+ * A pending trial accepts a new client port; an applied trial is watched
+ * by its exact flow. Other devices and channels keep independent leases. */
+static task *voice_task_of_event(d2k_sched *s, const d2k_ev *ev) {
+    char endpoint[INET6_ADDRSTRLEN]; uint16_t port = 0;
+    d2k_ev voice_ev=*ev;voice_ev.client_shape=D2K_LINK_SHAPE_VOICE;
+    server_of(&voice_ev, endpoint, sizeof endpoint, &port);
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = &s->tasks[i];
+        if (t->state == T_FREE || !is_voice_class(t->name, t->transport) ||
+            t->family != (ev->family ? ev->family : 4)) continue;
+        if (voice_trial_owned(t) && voice_trial_same_context(t, ev)) return t;
+        if (strcmp(t->ip, endpoint) || t->port != port) continue;
+        uint8_t ip[16] = {0};
+        size_t al = t->family == 6 ? 16 : 4;
+        if (inet_pton(t->family == 6 ? AF_INET6 : AF_INET, endpoint, ip) != 1) continue;
+        const uint8_t *client = !memcmp(ev->low_ip, ip, al) && ev->low_port == port
+                              ? ev->high_ip : ev->low_ip;
+        const uint8_t *old_client = !memcmp(t->trigger_flow.a_ip, ip, al) &&
+                                     t->trigger_flow.a_port == port
+                                  ? t->trigger_flow.b_ip : t->trigger_flow.a_ip;
+        if (!memcmp(client, old_client, al)) return t;
+    }
+    return NULL;
+}
+
 static void voice_start(d2k_sched *s, task *t) {
-    t->voice_known_prefix_valid=0;
-    for(size_t i=0;i<s->cat->n_boxes && !t->voice_known_prefix_valid;i++) {
-        const d2k_cat_box *box=&s->cat->boxes[i];
-        for(size_t j=0;j<box->n_binds && !t->voice_known_prefix_valid;j++) {
-            const d2k_cat_binding *b=&box->binds[j];
-            if(!b->enabled || !b->confirmed || b->recheck_since || b->level<3 || b->transport!=17 ||
-               b->family!=4 || b->shape!=D2K_LINK_SHAPE_VOICE ||
-               b->verified_by!=D2K_VERBY_VOICE_DISCOVERY ||
-               strcmp(b->kind,"addr") || strcmp(b->target,t->ip))continue;
-            for(size_t k=0;k<box->n_plans;k++) {
-                const d2k_cat_plan *p=&box->plans[k];
-                if(p->enabled && !strcmp(p->id,b->plan_id) &&
-                   d2k_voice_discovery_prefix(p->text,t->voice_known_prefix)){
-                    t->voice_known_prefix_valid=1;break;
+    if (t->family != 4) {
+        say(s, "по %s (голос) IPv6: UNVERIFIED — IPv4 Discovery не проверяет эту сессию", t->name);
+        task_fail(s, t, s->now_ms);
+        return;
+    }
+    t->voice_known_prefix_valid = 0;
+    t->voice_candidate_prefix_valid = 0;
+    for (size_t i = 0; s->cat && i < s->cat->n_boxes; i++) {
+        const d2k_cat_box *box = &s->cat->boxes[i];
+        for (size_t j = 0; j < box->n_binds; j++) {
+            const d2k_cat_binding *b = &box->binds[j];
+            if (!b->enabled || !b->confirmed || b->recheck_since || b->level < 3 ||
+                b->transport != 17 || b->family != 4 || b->shape != D2K_LINK_SHAPE_VOICE ||
+                b->verified_by != D2K_VERBY_VOICE_DISCOVERY || strcmp(b->kind, "addr")) continue;
+            for (size_t k = 0; k < box->n_plans; k++) {
+                const d2k_cat_plan *p = &box->plans[k];
+                uint8_t prefix[20];
+                if (!p->enabled || strcmp(p->id, b->plan_id) ||
+                    !d2k_voice_discovery_prefix(p->text, prefix)) continue;
+                if (!strcmp(b->target, t->ip)) {
+                    memcpy(t->voice_known_prefix, prefix, sizeof prefix);
+                    t->voice_known_prefix_valid = 1;
+                    snprintf(t->voice_known_plan_id, sizeof t->voice_known_plan_id, "%s", p->id);
+                } else if (!t->voice_candidate_prefix_valid) {
+                    memcpy(t->voice_candidate_prefix, prefix, sizeof prefix);
+                    t->voice_candidate_prefix_valid = 1;
                 }
             }
         }
@@ -5909,9 +6017,31 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
     pthread_mutex_unlock(&s->mu);
     join_worker(t);
     t->voice_discovery_verified = r.discovery_verified;
+    t->voice_checked_ms = now_ms;
+    if (t->voice_known_prefix_valid && r.known_prefix_failed) {
+        for (size_t i=0; s->cat && i<s->cat->n_boxes; i++) {
+            d2k_cat_box *box=&s->cat->boxes[i];
+            for (size_t j=0;j<box->n_binds;j++) {
+                d2k_cat_binding *b=&box->binds[j];
+                if (strcmp(b->kind,"addr") || strcmp(b->target,t->ip) ||
+                    strcmp(b->plan_id,t->voice_known_plan_id) || b->transport!=17 ||
+                    b->family!=4 || b->shape!=D2K_LINK_SHAPE_VOICE ||
+                    b->verified_by!=D2K_VERBY_VOICE_DISCOVERY || b->recheck_since) continue;
+                b->recheck_since=wall_s(s,now_ms);
+                b->recheck_mono_ms=now_ms?now_ms:1;
+                box->updated=wall_s(s,now_ms);
+                s->cat->revision++;s->sync_pending=1;
+                uint8_t ip[4];char err[160];
+                if (inet_pton(AF_INET,t->ip,ip)==1)
+                    (void)d2k_link_del_addr(s->link_fd,ip,D2K_LINK_SHAPE_VOICE,err,sizeof err);
+                say(s,"по %s:%u сохранённый голосовой Plan не прошёл 3 серии — только эта адресная привязка ожидает перепроверки; сам план и остальные цели сохранены",t->ip,(unsigned)t->port);
+            }
+        }
+    }
+
 
     if (r.verdict != D2K_VOICE_BLOCKED) {
-        if (t->voice_known_prefix_valid && r.verdict == D2K_VOICE_CLEAR) {
+        if (t->voice_known_prefix_valid && !r.known_prefix_failed && r.verdict == D2K_VOICE_CLEAR) {
             say(s, "по %s (голос) сохраняю подтверждённый приём: %s", t->name, r.reason);
         } else say(s, "по %s (голос) временный Plan не ставлю: измерение не подтвердило "
                "блокировку (%s)", t->name, r.reason[0] ? r.reason : "нет причины");
@@ -5961,7 +6091,7 @@ static void voice_finish_measure(d2k_sched *s, task *t, int64_t now_ms) {
        того же клиента к той же точке (повторный вход, новый звонок): его
        первый запрос голоса получает план, APPLIED несёт trial ID (on_applied).
        Другим клиентам и другим точкам опыт не достаётся. */
-    (void)cat_id;
+    snprintf(t->voice_plan_id,sizeof t->voice_plan_id,"%s",cat_id);
     if (t->family != 4 || fresh_trial_id(t->addr_probe_trial_id) != 0) {
         say(s, "по %s (голос) опыт не завести", t->name);
         task_fail(s, t, now_ms);
@@ -6422,9 +6552,17 @@ static void voice_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     box_id_for(s, t, text, box_id, sizeof box_id);
     snprintf(wire, sizeof wire, "%s", text);
     err[0] = '\0';
+    snprintf(t->voice_plan_id,sizeof t->voice_plan_id,"%s",plan_id);
     int is_stun = t->voice_proof_code == D2K_UDP_PROOF_STUN;
+    if (!is_stun && !t->voice_discovery_verified) {
+        t->voice_proven = 0;
+        say(s, "по %s Discovery ответил один раз; устойчивое диагностическое испытание не пройдено — UNVERIFIED", t->name);
+        voice_observe(s, t);
+        return;
+    }
+
     /* This measured remedy belongs to the endpoint, not all voice hosts. */
-    int by_address = is_stun || t->voice_discovery_verified;
+    int by_address = 1; /* never promote an endpoint into a global Discord UDP plan */
     int install_rc = -1;
     if (stamp_plan_id(wire, wire_id) == 0 &&
         d2k_plan_text_to_hex(wire, hex, sizeof hex, err, sizeof err) == 0) {
@@ -6554,6 +6692,10 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             name);
         return 0;
     }
+    d2k_ev voice_event;
+    if(is_voice_class(name,ev->transport)) {
+        voice_event=*ev;voice_event.client_shape=D2K_LINK_SHAPE_VOICE;ev=&voice_event;
+    }
     int64_t cooldown_left_ms = 0;
     if (ev->transport == 6) {
         /* Мёртвый адрес мёртв для любого симптома; другие адреса имени — своё
@@ -6570,7 +6712,8 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             return 0;
         }
     }
-    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
+    if (!is_voice_class(name, ev->transport) &&
+        cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
         target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
         const char *reason = cool && cool->challenge ? "антибот-ответа" :
                              cool && cool->exhausted ? "неподтверждённого прошлого замера" :
@@ -6585,28 +6728,11 @@ static int on_suspect(d2k_sched *s, const d2k_ev *ev) {
             (long long)((cooldown_left_ms + 59999) / 60000));
         return 0;
     }
-    task *t = task_of(s, name, ev->transport, ev->family);
+    task *t = is_voice_class(name, ev->transport) ? voice_task_of_event(s, ev)
+                : task_of(s, name, ev->transport, ev->family);
     int ordinary_tcp_rst = ev->transport == 6 && ev->code == D2K_SUSPECT_RST;
     const int late_app_rst = ev->code == D2K_SUSPECT_RST_AFTER_APP ||
         ev->code == D2K_SUSPECT_FIN_RETRY || ev->code == D2K_SUSPECT_TCP_STALL;
-    if (t && t->state == T_VOICE_TRIAL && voice_trial_owned(t) &&
-        is_voice_class(t->name, t->transport) && !voice_trial_same_context(t, ev)) {
-        /* ОПЫТ ЖДЁТ РАЗГОВОРА К ДРУГОЙ ТОЧКЕ (финальное ревью, п.1). Задача
-           голоса одна на класс, и раньше подозрение к новой точке сервера
-           молча терялось на всё время ожидания (до 10 мин) — голос замирал.
-           Ждущий опыт снимается точно (свой trial ID, кандидат не судим), и
-           новая точка получает свой замер. Подозрение к той же точке и тому
-           же клиенту ниже по-прежнему не дублирует замер. */
-        char srv[INET6_ADDRSTRLEN];
-        uint16_t sport = 0;
-        server_of(ev, srv, sizeof srv, &sport);
-        say(s, "по %s (голос) подозрение к другой точке %s:%u, пока опыт ждал "
-               "разговора — снимаю ждущий опыт (не проверено, кандидат не судим) "
-               "и меряю новую точку", t->name, srv, (unsigned)sport);
-        trial_retire(s, t);
-        task_done(t);
-        t = NULL;
-    }
     if (t && t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
         /* Поток разговора, к которому применился приём, остался без ответа —
            решает тик (записи и снятию нужны часы). */
@@ -7624,6 +7750,7 @@ static void on_applied(d2k_sched *s, const d2k_ev *ev) {
                 t->voice_flow.transport = ev->transport;
             }
             t->voice_answered = 0;
+            t->voice_exchange_seen = t->voice_media_seen = t->voice_stable_seen = 0;
             t->voice_silent = 0;
             t->voice_watch_ms = 0;
             t->state = T_VOICE_WATCH;
@@ -7888,6 +8015,12 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
        прикладные данные ниже отбросила бы его. */
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = &s->tasks[i];
+        if (t->state != T_FREE && is_voice_class(t->name,t->transport) &&
+            t->voice_flow_bound && ev_matches_flow(ev,&t->voice_flow)) {
+            t->voice_exchange_seen=1;
+            if(ev->code==D2K_UDP_OBS_MEDIA_FLOW) t->voice_media_seen=1;
+            if(ev->code==D2K_UDP_OBS_STABLE) t->voice_stable_seen=1;
+        }
         if (t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
             t->voice_answered = 1;
             if (ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY ||
