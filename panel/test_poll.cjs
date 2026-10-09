@@ -45,12 +45,17 @@ async function main() {
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(aborted, 1, 'deadline must abort the request');
+  const updatePoll = intervals.filter(i => i.ms === 2000)[1];
+  assert.ok(updatePoll, 'update polling has its own scheduler');
+  updatePoll.fn();
+  assert.equal(updateCalls, 1, 'scheduled update tick skips idle state');
   document.hidden = true;
   poll.fn();
   assert.equal(calls, 1, 'a hidden page must not poll');
   document.hidden = false;
   visibility();
   assert.equal(calls, 2, 'returning to the panel resumes polling at once');
+  assert.equal(updateCalls, 2, 'returning to the panel refreshes updates at once');
   console.log('panel polling: overlap, timeout and visibility passed');
 }
 main().catch(e => { console.error(e); process.exitCode = 1; });

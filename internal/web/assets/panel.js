@@ -5,6 +5,7 @@
 
   var POLL_MS = 2000;
   var IDLE_POLL_MS = 6000;
+  var UPDATE_IDLE_POLL_MS = 60000;
   var STALE_MS = 9000;
 
   /* ─── Словарь ─── */
@@ -301,6 +302,7 @@
     this.status = null;
     this.catalogRevision = null;
     this.lastPoll = 0;
+    this.lastUpdatePoll = null;
     this.received = 0;
     this.lastOk = 0;
     this.failed = false;
@@ -365,7 +367,7 @@
     this.initUpdates();
     this.checkUpdates(false);
     win.setInterval(function () { if (!doc.hidden) self.poll(true); }, POLL_MS);
-    win.setInterval(function () { if (!doc.hidden) self.pollUpdates(); }, POLL_MS);
+    win.setInterval(function () { if (!doc.hidden) self.pollUpdates(true); }, POLL_MS);
     win.setInterval(function () { self.tick(); }, 1000);
   };
 
@@ -472,17 +474,20 @@
     if (node) { node.textContent = text; node.hidden = !text; }
   };
 
-  App.prototype.pollUpdates = function () {
+  App.prototype.pollUpdates = function (scheduled) {
     var self = this;
     if (this.doc.hidden || this.updateInflight || !this.$("updates-body")) return Promise.resolve();
-    /* Без автообновления опрашивать раз в минуту, а не на каждом шаге панели. */
-    if (this.updaterAbsent && !this.updatePending && Date.now() - (this.updaterAbsentAt || 0) < 60000) return Promise.resolve();
+    /* В простое достаточно минуты; команды, работа службы и восстановление
+       связи требуют быстрого опроса. Явное обновление не ждёт таймера. */
+    var idle = !this.updatePending && !this.updateFailed &&
+      !(this.updateStatus && this.updateStatus.busy);
+    if (scheduled && idle && this.lastUpdatePoll !== null &&
+        Date.now() - this.lastUpdatePoll < UPDATE_IDLE_POLL_MS) return Promise.resolve();
+    this.lastUpdatePoll = Date.now();
     this.updateInflight = true;
     return this.updateRequest("/api/update").then(function (reply) {
       if (!reply.ok) throw new Error("HTTP " + reply.code);
       var s = reply.data, pending = self.updatePending;
-      self.updaterAbsent = !!s.absent;
-      if (self.updaterAbsent) self.updaterAbsentAt = Date.now();
       self.updateFailed = false;
       self.updateStatus = s;
       /* Команда завершена, когда служба снова свободна и состояние новее нажатия
