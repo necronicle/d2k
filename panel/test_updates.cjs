@@ -22,6 +22,56 @@ function state(over={}) {
 const json = (data, status=200) => ({ok:status<300,status,json:async()=>data});
 
 (async () => {
+  // В простое — один запрос в минуту; действия и восстановление остаются быстрыми.
+  {
+    const realNow = Date.now;
+    let clock = 100000, busy = '', down = false;
+    Date.now = () => clock;
+    try {
+      const {app,requests} = fixture(() => {
+        if (down) throw Error('panel unavailable');
+        return json(state({busy}));
+      });
+      await app.pollUpdates();
+      for (let i = 0; i < 29; i++) { clock += 2000; await app.pollUpdates(true); }
+      assert.equal(requests.length, 1, 'idle ticks must not fetch unchanged update state');
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 2, 'idle state refreshes after sixty seconds');
+      await app.pollUpdates();
+      assert.equal(requests.length, 3, 'explicit refresh bypasses the idle interval');
+      busy = 'checking'; await app.pollUpdates();
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 5, 'background check retains fast polling');
+      busy = 'installing'; await app.pollUpdates();
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 7, 'installation retains fast polling');
+      busy = ''; await app.pollUpdates();
+      app.updatePending = {action:'check',at:clock};
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 9, 'pending command retains fast polling before busy is visible');
+      app.updatePending = null;
+      down = true; await app.pollUpdates();
+      down = false; clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'failed fetch recovers on the next fast tick');
+      clock += 2000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'successful recovery returns to idle polling');
+      app.doc.hidden = true; clock += 60000; await app.pollUpdates(true);
+      assert.equal(requests.length, 11, 'hidden tab does not poll');
+      app.doc.hidden = false; await app.pollUpdates();
+      assert.equal(requests.length, 12, 'visible tab can refresh immediately');
+      app.updateInflight = true; await app.pollUpdates();
+      assert.equal(requests.length, 12, 'inflight request cannot be duplicated');
+    } finally { Date.now = realNow; }
+  }
+  // Отсутствующая утилита и ещё не проверявшееся состояние тоже не требуют частого опроса.
+  for (const reply of [{absent:true}, {never:true}]) {
+    const {app,requests} = fixture(() => json(reply));
+    await app.pollUpdates();
+    await app.pollUpdates(true);
+    assert.equal(requests.length, 1, 'absent/never state remains idle');
+    await app.pollUpdates();
+    assert.equal(requests.length, 2, 'explicit refresh also works without update history');
+  }
   // Новый выпуск: кнопка, заметки как текст, тумблер по состоянию.
   {
     const {app,nodes} = fixture(() => json(state()));
