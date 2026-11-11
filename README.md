@@ -40,8 +40,7 @@ D2K не использует список заблокированных сай
 12. [Instagram и WhatsApp](#instagram-и-whatsapp)
 13. [Telegram](#telegram)
 14. [Архитектуры](#архитектуры)
-15. [Разработка](#разработка)
-16. [Поддержка проекта](#поддержка-проекта)
+15. [Поддержка проекта](#поддержка-проекта)
 
 ---
 
@@ -271,7 +270,7 @@ fi; rm -f $f
 идёт через VPS проекта (`85.192.60.175:9444`), а если он не отвечает —
 напрямую.
 
-- На VPS работает отдельный сервис D2K: [relay-gate](relay-gate/README.md).
+- На VPS работает отдельный сервис D2K: relay-gate.
   Он пропускает загрузки только с GitHub, Entware и сервера пакетов
   OpenWrt.
 - Соединение с GitHub шифруется на всём пути до GitHub, и роутер проверяет
@@ -542,58 +541,10 @@ D2K не работает на этих процессорах:
 
 ---
 
-## Разработка
-
-### Документы
-
-| Документ | Содержание |
-| --- | --- |
-| [D2K_SPEC.md](D2K_SPEC.md) | требования. Начните с §0 |
-| [D2K_HANDOFF.md](D2K_HANDOFF.md) | история и ограничения |
-| [RELEASING.md](RELEASING.md) | выпуск |
-| [CHANGELOG.md](CHANGELOG.md) | история изменений |
-
-### Проверки
-
-```sh
-sh scripts/check.sh
-make -C telegram test
-make -C panel test
-make -C relay-enroll test
-```
-
-### Сборка
-
-Нужны make, Perl, git и Zig 0.16.0. Для MIPS64EL нужен Zig 0.14.1.
-
-```sh
-ZIG_MIPS64EL=/path/to/zig-0.14.1 sh scripts/build-router.sh
-```
-
-Одна архитектура:
-
-```sh
-ARCHES="arm64" sh scripts/build-router.sh
-```
-
-### Процессы на роутере
-
-| Процесс | Задача |
-| --- | --- |
-| `d2kd` | датапат: видит трафик и применяет обходы |
-| `d2kc` | контроллер: измеряет и подбирает обходы |
-| `d2kpanel` | панель |
-| `d2ktg` | Telegram-туннель |
-
-D2K вырос из «Поиска по домену» проекта z2k. С 03.10.2026 D2K — отдельный
-проект.
-
----
-
 ## Поддержка проекта
 
 - TON: `UQA6Y6Mf1Qge2dVSl3_vSqb29SKrhI8VgJtoRBjgp08oB8QY`
 - USDT (ERC20): `0xA1D6d7d339f05C1560ecAF0c5CB8c4dc80Dc46A9`
 - USDT (TRC20): `TVtWDryrowtb4MYGGtA8Q2yCAei4VFh5g5`
 
-Донор: [z2k](https://github.com/necronicle/z2k). Лицензия: MIT.
+Донор: [z2k](https://github.com/necronicle/z2k).
