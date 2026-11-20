@@ -46,6 +46,7 @@ RELEASE=$DIR
 # Контроллер и панель — независимые процессы на C. Управление панелью
 # ограничено локальной loopback-привязкой и командами из фиксированного списка.
 BIN=/opt/sbin/d2kc
+SHADOWBIN=/opt/sbin/d2kshadow
 PANELBIN=/opt/sbin/d2kpanel
 PANEL_ASSETS=$RELEASE/panel
 DPBIN=/opt/sbin/d2kd
@@ -55,6 +56,7 @@ LOG=$DIR/log
 
 DP_PID=$RUN/d2kd.pid
 CT_PID=$RUN/d2k.pid
+SH_PID=$RUN/d2kshadow.pid
 PN_PID=$RUN/d2k-panel.pid
 # Прежний прокси открытого HTTP (d2khttp, до задачи 51): его pid-файл и
 # правила снимаются при остановке и запуске — миграция со старой версии.
@@ -66,6 +68,9 @@ LOG_MAINTENANCE=$RELEASE/d2k-log-maintenance.sh
 UPDATER=$RELEASE/d2k-update.sh
 UPD_PID=$RUN/d2k-update.pid
 SOCK=$RUN/d2kd.sock
+# Вход опытов новой цепочки (ТЗ §16): только пробный план на свой порт.
+# Включается строкой EXP_CONTROL=1 в config; по умолчанию выключен.
+EXP_SOCK=$RUN/d2kd-exp.sock
 
 # Собственные цепочки, по одной на направление. Не одна на оба: правило,
 # лежащее в цепочке, вызываемой из двух мест, оценивается ДВАЖДЫ для одного
@@ -79,6 +84,12 @@ SOCK=$RUN/d2kd.sock
 #              INPUT       — ответы собственным зондам: они идут не транзитом.
 CHAIN_OUT=D2K_OUT
 CHAIN_IN=D2K_IN
+CHAIN_WCLR=D2K_WCLR
+# Свои цепочки d2kd для запасного способа поздней доставки (этап 53): правила
+# точного кортежа conntrack в них ставит и снимает сам d2kd, служба только
+# создаёт цепочки и переход в них — после исключений, перед очередью.
+CHAIN_LATE_OUT=D2K_LATE_OUT
+CHAIN_LATE_IN=D2K_LATE_IN
 
 # Значения по умолчанию; конфигурация их перекрывает.
 QUEUE_NUM=2000
@@ -96,6 +107,14 @@ MEASURE_MARK=0x2f
 # обновлении. Открытый HTTP теперь идёт ядром; вставку провайдера в первые
 # пакеты HTTP-потока узнаёт и заменяет d2kd (задача 51).
 HTTPUP_MARK=0x30
+# Fixed contract with d2k_preflight.h; separate from ordinary fake packets.
+D2K_PREFLIGHT=1
+PF_MARK=0x31
+PF_RELEASE_MARK=0x32
+PF_TOKEN_MARK=0x33
+PF_CONN_BIT=0x08000000
+PF_RELEASE_BIT=0x04000000
+CHAIN_PFCLR=D2K_PFCLR
 # Наблюдаем весь TCP/UDP трафик, а не только привычный HTTPS-порт. Протокол
 # определяется разбором первых пакетов в d2kd; ограничение портом 443 теряло
 # QUIC/DoT/нестандартные TLS и адресные потоки до того, как ядро могло выбрать
@@ -103,6 +122,8 @@ HTTPUP_MARK=0x30
 # потока, а не охват портов.
 PORTS=0:65535
 CONNBYTES=0:8
+# Opt-in until full field parity. Reserves connmark 0x40000000 and nfmark 0x20000000.
+TCP_WATCH=0
 # ГОЛОС ДИСКОРДА — порты боевого профиля discord_udp z2k (и эталона bol-van
 # 50-discord-media для медиадиапазона 50000–50099). Узнаётся голос по первому
 # пакету потока (IP Discovery), и в очередь идут только ПЕРВЫЕ пакеты: профиль
@@ -110,6 +131,36 @@ CONNBYTES=0:8
 # очередь гнать нельзя вовсе — на MIPS он её захлёбывает.
 VOICE_PORTS=50000:50099,1400,3478:3481,5349,19294:19344
 VOICE_CONNBYTES=0:4
+# ПОЗДНИЕ STUN-ЗАПРОСЫ (этап 13, 28.10.2026, opt-in): за окном VOICE_CONNBYTES
+# в очередь идут только датаграммы со STUN magic cookie (0x2112A442 на 4-м
+# байте нагрузки) — запросы и ответы, не медиапоток. Нужен xt_u32; без него
+# правило не ставится и об этом говорится в журнале (видимость — только окно).
+# По умолчанию auto (этап 33): включено, где есть xt_u32 под iptables; ядро
+# отвергло правило — выключение с меткой, без шторма reapply.
+VOICE_LATE=auto
+# ПОЗДНЯЯ ДОСТАВКА (этап 17, 28.10.2026, opt-in): опыт на УЖЕ ИДУЩЕМ потоке.
+# Пакеты потока за окном CONNBYTES в очередь не попадают, и повтор клиента под
+# пробой контроллера невидим («опыта не было»). При LATE_WATCH=1 d2kd ставит
+# через ctnetlink бит 0x40000000 в connmark ЗАПИСИ ТОЧНОГО потока опыта
+# (--late-watch-mark) на время опыта и снимает его по снятию/сроку; правило
+# ниже ставит в очередь только пакеты записей с этим битом — ни перехвата всего
+# трафика, ни отключения ускорителя. Бит тот же, что у TCP_WATCH (xt_connmark,
+# xt_CONNMARK уже в D2K_MODULES); нужен nf_conntrack_netlink с меткой записей
+# (CONFIG_NF_CONNTRACK_MARK) — иначе d2kd скажет об этом в журнале, опыт пойдёт
+# без поздней доставки. Поток, уже уведённый в аппаратный ускоритель (PPE,
+# после connskip), меткой не возвращается: d2kd называет это «без пакетов».
+LATE_WATCH=auto
+# ПО УМОЛЧАНИЮ — auto (этап 33, 29.10.2026). Замер на Linux (lab-udp-raw.sh,
+# D2K_LAB_RESIDUE=1, окно 0:8 как на роутере): без поздней доставки опыт на
+# продолжении клиента для UDP без протокола подтверждается при повторах раз в
+# 1000 и 500 мс и НЕ состоится при повторах раз в 200 мс — повтор под пробой
+# уходит за окно очереди. auto включает её там, где она выполнима (iptables,
+# MODE=apply, служебные биты свободны, есть xt_connmark), и молча выключает в
+# остальных случаях — запуск не срывается; ядро отвергло правило — тоже
+# выключение с меткой, без шторма reapply. Метка ставится чтением-записью
+# (d2kd: mark | бит), чужие биты записи не трогаются; NDM Keenetic помечает
+# свои соединения отдельным полем ndmmark (CONNNDMMARK), не connmark. 0 —
+# выключить, 1 — требовать (отказ при невыполнимости, как прежде).
 # ОТКРЫТЫЙ HTTP, KEEP-ALIVE (поле 04.10.2026, www.fast-torrent.ru): коробка
 # смотрит КАЖДЫЙ запрос соединения, а второй запрос браузера лежит далеко за
 # окном CONNBYTES. После окна наблюдаем оба направления целиком: PSH не
@@ -118,6 +169,17 @@ VOICE_CONNBYTES=0:4
 HTTP_KEEPALIVE_PORTS=80
 MODE=apply
 FLOWS=2048
+# ВОССТАНОВЛЕНИЕ УПАВШЕГО ДЕМОНА (этап 29, 29.10.2026). d2kc выходит, как
+# только рвётся связь с датапатом, а d2kd держит планы только в памяти: до
+# этого этапа упавший демон не поднимал никто, и обход стоял до ручного
+# запуска. Сторож (d2k-fw-heal.sh) зовёт `recover`; тот поднимает движок,
+# только если его запустили штатно и штатно не останавливали (метка
+# ENGINE_WANT в tmpfs), и не чаще, чем позволяет пауза: первая попытка сразу,
+# дальше пауза от RECOVER_BASE_S, удваиваясь до RECOVER_MAX_S; после
+# RECOVER_RESET_S спокойной работы счёт попыток обнуляется. Секунды.
+RECOVER_BASE_S=30
+RECOVER_MAX_S=900
+RECOVER_RESET_S=600
 # Период сводки датапата в журнал. Ноль выключает; без сводки нечем понять,
 # видит ли служба трафик вообще.
 STATS_SEC=900
@@ -167,6 +229,7 @@ iptables() { xt_wait iptables "$@"; }
 ip6tables() { xt_wait ip6tables "$@"; }
 # Frequent live snapshots are volatile. The learned catalog stays on /opt.
 RUNTIME_DIR=${D2K_RUNTIME_DIR:-/tmp/d2k}
+SHADOW_QUEUE=$RUNTIME_DIR/shadow.queue
 LIVE=$RUNTIME_DIR/live.json
 # DNS and encrypted DNS are transport infrastructure, not strategy candidates.
 # Keep standard DNS/DoT/DoQ ports out of the packet classifier even when PORTS
@@ -198,6 +261,16 @@ DNS_SCHED_PID=$RUN/d2k-instagram-dns-scheduler.pid
 TG_STATUS=${TG_STATUS:-$STATE_DIR/telegram.status}
 unset TG_RELAY_SECRET TG_RELAY_URL TG_IDENTITY TG_CA_BUNDLE
 FW_LOCK=${FW_LOCK:-/tmp/d2k-fw-operation.lock}
+# Один замок на все переходы движка (start/stop/restart/reapply/recover):
+# сторож, панель, обновлятор и человек не должны поднимать и гасить движок
+# одновременно. Отдельный от FW_LOCK: тот берётся ВНУТРИ этих переходов.
+ENGINE_LOCK=${ENGINE_LOCK:-/tmp/d2k-engine.lock}
+# Намерение «движок должен работать» — в tmpfs: переживает падение демона,
+# но не перезагрузку и не штатную остановку. Ставит его только успешный
+# start_engine, снимают stop и engine-stop.
+ENGINE_WANT=$RUNTIME_DIR/engine.want
+RECOVER_STATE=$RUNTIME_DIR/recover.state
+SERVICE_LOG=$LOG/service.log
 # Метка «IPv6 не обслуживается»: ip6tables mangle на этой прошивке нет
 # (без компонента IPv6 или без ip6table_mangle). fw_installed тогда не ждёт
 # IPv6-правил, а fw_down метку снимает.
@@ -278,7 +351,65 @@ running() {
     # супервизор; пока он не собрал завершившегося потомка, тот висит зомби,
     # и остановка ждала бы его, добивала KILL и объявляла себя сорванной.
     [ "$(sed -n 's/^.*) \([A-Za-z]\).*/\1/p' "$PROC_DIR/$pid/stat" 2>/dev/null)" != Z ] || return 1
-    return 0
+    pid_is_ours "$1" "$pid"
+}
+
+# ЧЕЙ НОМЕР В PID-ФАЙЛЕ. Файл переживает падение процесса, а номер за это
+# время может достаться чужому: тогда «работает» было бы ложью, восстановление
+# не началось бы, а остановка убила бы чужой процесс. Для процессов движка
+# номер принимается, только если процесс тот самый: у d2kd и d2kc — имя в
+# ядре (comm задаётся именем исполняемого файла, а не argv[0], и не зависит
+# от сборки start-stop-daemon), у цикла сторожа (comm — sh) — путь сторожа в
+# его командной строке. Остальные pid-файлы — как прежде.
+pid_is_ours() {
+    case "$1" in
+        "$DP_PID") _comm=d2kd; _exe=$DPBIN ;;
+        "$CT_PID") _comm=d2kc; _exe=$BIN ;;
+        "${SH_PID:-}") _comm=d2kshadow; _exe=$SHADOWBIN ;;
+        "$HL_PID")
+            tr '\0' '\n' < "$PROC_DIR/$2/cmdline" 2>/dev/null | grep -qF -- "$HEAL" || return 1
+            [ ! -r "$1.start" ] || [ "$(cat "$1.start" 2>/dev/null)" = "$(pid_start "$2")" ]
+            return ;;
+        *) return 0 ;;
+    esac
+    [ "$(cat "$PROC_DIR/$2/comm" 2>/dev/null)" = "$_comm" ] || return 1
+    # Имя совпадает и у чужого процесса с тем же именем, получившего номер
+    # упавшего. Экземпляр различает время старта в ядре (поле 22 stat): его
+    # записывает pid_stamp сразу после запуска.
+    if [ -r "$1.start" ]; then
+        [ "$(cat "$1.start" 2>/dev/null)" = "$(pid_start "$2")" ]
+        return
+    fi
+    # Отметки нет — процесс поднят прежней версией службы (миграция), и
+    # pid-файл мог давно устареть. Тогда экземпляр подтверждают настоящий
+    # исполняемый файл (не argv[0]; «(deleted)» — файл заменён обновлением) и
+    # точный управляющий сокет этой службы в аргументах.
+    case "$(readlink "$PROC_DIR/$2/exe" 2>/dev/null)" in
+        "$_exe"|"$_exe (deleted)") ;;
+        *) return 1 ;;
+    esac
+    if [ "$1" = "${SH_PID:-}" ]; then
+        tr '\0' '\n' < "$PROC_DIR/$2/cmdline" 2>/dev/null |
+            awk -v s="$SHADOW_QUEUE" 'p && $0 == s { f = 1 } { p = ($0 == "--queue") } END { exit !f }'
+        return
+    fi
+    tr '\0' '\n' < "$PROC_DIR/$2/cmdline" 2>/dev/null |
+        awk -v s="$SOCK" 'p && $0 == s { f = 1 } { p = ($0 == "--control") } END { exit !f }'
+}
+
+# Время старта процесса в тактах с загрузки (поле 22 /proc/PID/stat). Имя
+# процесса может содержать пробелы и скобки — отсчёт после последней «) ».
+pid_start() {
+    sed -n 's/^.*) //p' "$PROC_DIR/$1/stat" 2>/dev/null | cut -d' ' -f20
+}
+
+# Отметка экземпляра рядом с pid-файлом: номер и время старта вместе.
+pid_stamp() {
+    _sp=$(cat "$1" 2>/dev/null)
+    case "$_sp" in ''|*[!0-9]*) rm -f "$1.start"; return 1 ;; esac
+    _st=$(pid_start "$_sp")
+    [ -n "$_st" ] || { rm -f "$1.start"; return 1; }
+    printf '%s\n' "$_st" > "$1.start"
 }
 
 # НОМЕР ЖИВОГО ПРОЦЕССА ПО ИМЕНИ. Тот же приём, что у legacy_http_pid ниже:
@@ -383,6 +514,292 @@ fw_icmp_te_rule() {
     fi
 }
 
+# auto → 0/1 по выполнимости (этап 33). Явные 0/1 не трогаются. Идемпотентно:
+# повторный вызов после разрешения ничего не меняет.
+LATE_WATCH_WHY=
+watch_auto_resolve() {
+    if [ "${LATE_WATCH:-0}" = auto ]; then
+        LATE_WATCH=0
+        if [ "$FW_BACKEND" != iptables ]; then
+            LATE_WATCH_WHY="правила поздней доставки есть только для iptables"
+        elif [ "$MODE" != apply ]; then
+            LATE_WATCH_WHY="режим $MODE"
+        elif [ "$(( (MARK | PROBE_MARK | MEASURE_MARK | HTTPUP_MARK) & 0x60000000 ))" != 0 ]; then
+            LATE_WATCH_WHY="служебные биты 0x60000000 заняты метками службы"
+        elif ! iptables -m connmark --help >/dev/null 2>&1; then
+            LATE_WATCH_WHY="нет расширения xt_connmark"
+        else
+            LATE_WATCH=1
+            LATE_WATCH_AUTO=1
+        fi
+        if [ "$LATE_WATCH" = 1 ] && [ -n "${KEENETIC_POLICY:-}" ]; then
+            wp=$(policy_mark "$KEENETIC_POLICY")
+            case "$wp" in
+                ''|*[!0-9a-fA-F]*) LATE_WATCH=0; LATE_WATCH_WHY="метка политики Keenetic не найдена" ;;
+                *) [ "$((0x$wp & 0x60000000))" = 0 ] || { LATE_WATCH=0; LATE_WATCH_WHY="метка политики использует служебные биты"; } ;;
+            esac
+        fi
+    fi
+    if [ "${VOICE_LATE:-0}" = auto ]; then
+        VOICE_LATE=0
+        [ "$FW_BACKEND" = iptables ] && VOICE_LATE=1
+    fi
+    return 0
+}
+
+watch_validate() {
+    watch_auto_resolve
+    case "${LATE_WATCH:-0}" in 0|1) ;; *) say "LATE_WATCH должен быть 0, 1 или auto"; return 1 ;; esac
+    case "${TCP_WATCH:-0}" in 0) [ "${LATE_WATCH:-0}" = 1 ] || return 0 ;; 1) ;; *) say "TCP_WATCH должен быть 0 или 1"; return 1 ;; esac
+    # Оба наблюдения делят служебные биты 0x60000000 (connmark 0x40000000,
+    # nfmark 0x20000000): проверка меток общая.
+    [ "$FW_BACKEND" = iptables ] && [ "$MODE" = apply ] || {
+        say "TCP_WATCH/LATE_WATCH пока требуют iptables и MODE=apply"; return 1;
+    }
+    for wm in "$MARK" "$PROBE_MARK" "$MEASURE_MARK" "$HTTPUP_MARK"; do
+        [ "$((wm & 0x60000000))" = 0 ] || {
+            say "TCP_WATCH/LATE_WATCH: служебные биты пересекаются с меткой $wm"; return 1;
+        }
+    done
+    if [ -n "${KEENETIC_POLICY:-}" ]; then
+        wp=$(policy_mark "$KEENETIC_POLICY")
+        case "$wp" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+        [ "$((0x$wp & 0x60000000))" = 0 ] || {
+            say "TCP_WATCH: метка политики использует служебные биты"; return 1;
+        }
+    fi
+}
+
+# The daemon and rules are a single contract. A change requires a restart.
+watch_contract_matches() {
+    wa=0
+    [ ! -f "$RUN/tcp-watch-active" ] || wa=1
+    [ "${TCP_WATCH:-0}" = "$wa" ]
+}
+
+# Used for both installation and completeness checking; never broaden DNS,
+# loopback, policy or own-raw-packet exclusions that precede these rules.
+watch_rules() {
+    wt=$1; op=$2
+    [ "${TCP_WATCH:-0}" = 1 ] || return 0
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$PORTS" --tcp-flags SYN,ACK SYN \
+        -j CONNMARK --set-xmark 0x40000000/0x40000000 || return 1
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
+        -m multiport --dports "$PORTS" -m connmark --mark 0x40000000/0x40000000 \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    "$wt" -t mangle "$op" "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
+        -m multiport --sports "$PORTS" -m connmark --mark 0x40000000/0x40000000 \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+}
+
+# Поздние STUN-транзакции долгого голосового потока (этап 13): запрос и ответ
+# по magic cookie, с пакета за окном VOICE_CONNBYTES. Медиа в очередь не идёт.
+# Без xt_u32 (iptables -m u32 --help) правила не ставятся — видимость остаётся
+# окном, и это называется в журнале один раз на подъём правил.
+voice_late_rules() {
+    wt=$1; op=$2
+    [ "${VOICE_LATE:-0}" = 1 ] || return 0
+    # Ядро уже отвергло правило при постановке — проверка полноты его не ждёт.
+    [ "$op" != -C ] || [ ! -f "$RUN/voice-late-off.$wt" ] || return 0
+    if ! "$wt" -m u32 --help >/dev/null 2>&1; then
+        [ "$op" != -A ] || say "VOICE_LATE: модуля xt_u32 нет — поздние STUN-запросы в очередь не идут, видимость только окно $VOICE_CONNBYTES"
+        return 0
+    fi
+    # IPv6 has no IPv4 IHL. The fixed offset is valid only with UDP directly
+    # after the base header; extension-header traffic stays on the normal path.
+    late_cookie='0>>22&0x3C@12=0x2112A442'
+    case "$wt" in *ip6tables*) late_cookie='4>>8&0xFF=17&&52=0x2112A442' ;; esac
+    late_from=$(( ${VOICE_CONNBYTES#0:} + 1 ))
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL -m multiport --dports "$VOICE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+        -m u32 --u32 "$late_cookie" \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || {
+            [ "$op" = -A ] || return 1
+            say "VOICE_LATE: ядро не приняло правило xt_u32 — видимость только окно $VOICE_CONNBYTES"
+            { mkdir -p "$RUN" && : > "$RUN/voice-late-off.$wt"; } 2>/dev/null
+            return 0
+        }
+    "$wt" -t mangle "$op" "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY -m multiport --sports "$VOICE_PORTS" \
+        -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
+        -m u32 --u32 "$late_cookie" \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || {
+            [ "$op" = -A ] || return 1
+            # Do not leave only one direction active after optional setup fails.
+            "$wt" -t mangle -D "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL -m multiport --dports "$VOICE_PORTS" \
+                -m connbytes --connbytes "$late_from": --connbytes-dir original --connbytes-mode packets \
+                -m u32 --u32 "$late_cookie" \
+                -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+            say "VOICE_LATE: ядро не приняло обратное правило xt_u32 — видимость только окно $VOICE_CONNBYTES"
+            { mkdir -p "$RUN" && : > "$RUN/voice-late-off.$wt"; } 2>/dev/null
+            return 0
+        }
+}
+
+# Поздняя доставка (этап 17): пакеты записей с битом 0x40000000 — в очередь,
+# TCP и UDP, обе стороны. При TCP_WATCH=1 TCP-правила уже стоят (watch_rules),
+# ставятся только UDP. Перед connbytes-правилами: те пакеты за окном не видят.
+late_watch_rules() {
+    wt=$1; op=$2
+    [ "${LATE_WATCH:-0}" = 1 ] || return 0
+    [ "$op" != -C ] || [ ! -f "$RUN/late-watch-off.$wt" ] || return 0
+    if late_watch_rules_do "$wt" "$op"; then return 0; fi
+    # Явное LATE_WATCH=1 — договор: отказ громкий, как прежде. auto — выключение
+    # без срыва запуска: частично поставленное снимается, метка говорит
+    # проверке полноты не ждать этих правил.
+    [ "$op" = -A ] && [ "${LATE_WATCH_AUTO:-0}" = 1 ] || return 1
+    late_watch_rules_do "$wt" -D >/dev/null 2>&1
+    { mkdir -p "$RUN" && : > "$RUN/late-watch-off.$wt"; } 2>/dev/null
+    say "LATE_WATCH=auto: ядро не приняло правило поздней доставки ($wt) — опыт на продолжении клиента только в окне очереди"
+    return 0
+}
+
+late_watch_rules_do() {
+    wt=$1; op=$2
+    if [ "${TCP_WATCH:-0}" != 1 ]; then
+        "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL \
+            -m multiport --dports "$PORTS" -m connmark --mark 0x40000000/0x40000000 \
+            -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+        "$wt" -t mangle "$op" "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY \
+            -m multiport --sports "$PORTS" -m connmark --mark 0x40000000/0x40000000 \
+            -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    fi
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p udp -m conntrack --ctdir ORIGINAL \
+        -m connmark --mark 0x40000000/0x40000000 \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    "$wt" -t mangle "$op" "$CHAIN_IN" -p udp -m conntrack --ctdir REPLY \
+        -m connmark --mark 0x40000000/0x40000000 \
+        -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    # Ядро без маски метки (4.9): d2kd кладёт правила точного кортежа в свои
+    # цепочки; переход — здесь же, после исключений и RETURN меток службы.
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -j "$CHAIN_LATE_OUT" || return 1
+    "$wt" -t mangle "$op" "$CHAIN_IN" -j "$CHAIN_LATE_IN" || return 1
+}
+
+watch_release_rules() {
+    wt=$1; op=$2
+    [ "${TCP_WATCH:-0}" = 1 ] || return 0
+    "$wt" -t mangle "$op" "$CHAIN_WCLR" -j CONNMARK --set-xmark 0/0x40000000 || return 1
+    "$wt" -t mangle "$op" "$CHAIN_WCLR" -j MARK --set-xmark 0/0x20000000 || return 1
+    "$wt" -t mangle "$op" "$CHAIN_WCLR" -j ACCEPT || return 1
+    for wc in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$wt" -t mangle "$op" "$wc" -m mark --mark 0x20000000/0x20000000 -j "$CHAIN_WCLR" || return 1
+    done
+}
+
+# The probe and released SYN enter POSTROUTING with the same original tuple
+# and packet mark, including on the native NETMAP path. Forced port changes
+# can break that handover, and unreadable rules stay unsupported.
+preflight_ipv6_available() (
+    [ "${D2K_PREFLIGHT:-0}" = 1 ] || exit 1
+    [ -r "$PROC_DIR/net/if_inet6" ] || exit 1
+    if [ "$FW_BACKEND" = iptables ]; then
+        ip6tables -t mangle -S POSTROUTING >/dev/null 2>&1 || exit 1
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        if rules=$(ip6tables -t nat -S 2>/dev/null); then
+            printf '%s\n' "$rules" | awk '
+                $1 == "-A" {
+                    for (i=2; i<NF; i++) {
+                        if ($i != "-j" || $(i+1) !~ /^(SNAT|MASQUERADE)$/) continue
+                        for (j=i+2; j<=NF; j++) {
+                            if ($j ~ /^(--to-ports|--random|--random-fully)$/ ||
+                                ($j == "--to-source" && $(j+1) ~ /^\[[^]]+\]:/))
+                                unsupported = 1
+                        }
+                    }
+                }
+                END { exit unsupported ? 1 : 0 }
+            ' || exit 1
+        else
+            [ -r "$PROC_DIR/net/ip6_tables_names" ] || exit 1
+            ! grep -qx nat "$PROC_DIR/net/ip6_tables_names" || exit 1
+        fi
+    elif [ -r "$PROC_DIR/net/ip6_tables_names" ]; then
+        ! grep -qx nat "$PROC_DIR/net/ip6_tables_names" || exit 1
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        rules=$(nft list ruleset 2>/dev/null) || exit 1
+        printf '%s\n' "$rules" | awk -v own="$NFT_TABLE" '
+            $1 == "table" { v6 = $2 == "ip6" || ($2 == "inet" && $3 != own); family = $2 }
+            v6 && /(^|[[:space:]])(snat|masquerade)([[:space:]]|$)/ &&
+                /(^|[[:space:],])(prefix|random|fully-random)([[:space:],;}]|$)|\]:[0-9]|[[:space:]]:[0-9]/ {
+                if (family == "ip6" || $0 !~ /(^|[[:space:]])meta nfproto ipv4([[:space:]]|$)/) unsupported = 1
+            }
+            END { exit unsupported ? 1 : 0 }
+        ' || exit 1
+    elif [ "$FW_BACKEND" = nft ] || [ -d /sys/module/nf_tables ]; then
+        exit 1
+    fi
+    exit 0
+)
+preflight_family() {
+    [ "${D2K_PREFLIGHT:-0}" = 1 ] || return 1
+    [ "$1" = iptables ] || { [ "$1" = ip6tables ] && [ "${D2K_PREFLIGHT_V6:-0}" = 1 ]; }
+}
+
+# Raw release SYN/control token first enters the queue, then NF_REPEAT clears
+# only our connmark bit. Tokens are consumed; a released SYN keeps its NAT mark.
+preflight_control_rules() {
+    local wt op pc tag repeat_release repeat_token
+    wt=$1; op=$2
+    preflight_family "$wt" || return 0
+    repeat_release=$(printf '0x%x' "$((PF_RELEASE_BIT | PF_RELEASE_MARK))")
+    repeat_token=$(printf '0x%x' "$((PF_RELEASE_BIT | PF_TOKEN_MARK))")
+    "$wt" -t mangle "$op" "$CHAIN_PFCLR" -j CONNMARK --set-xmark "0/$PF_CONN_BIT" || return 1
+    "$wt" -t mangle "$op" "$CHAIN_PFCLR" -m mark --mark "$repeat_token" -j DROP || return 1
+    "$wt" -t mangle "$op" "$CHAIN_PFCLR" -j MARK --set-xmark "$PF_MARK/0xffffffff" || return 1
+    "$wt" -t mangle "$op" "$CHAIN_PFCLR" -j ACCEPT || return 1
+    for pc in "$CHAIN_OUT" "$CHAIN_IN"; do
+        for tag in "$repeat_release" "$repeat_token"; do
+            "$wt" -t mangle "$op" "$pc" -m mark --mark "$tag" -j "$CHAIN_PFCLR" || return 1
+        done
+    done
+    for pc in "$PF_RELEASE_MARK" "$PF_TOKEN_MARK"; do
+        "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m mark --mark "$pc" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    done
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m mark --mark "$PF_MARK" -j CONNMARK --set-xmark "$PF_CONN_BIT/$PF_CONN_BIT" || return 1
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -m mark --mark "$PF_MARK" -j RETURN || return 1
+}
+preflight_queue_rules() {
+    local wt op
+    wt=$1; op=$2
+    preflight_family "$wt" || return 0
+    "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+    "$wt" -t mangle "$op" "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
+}
+preflight_nat_rule() {
+    [ "${D2K_PREFLIGHT:-0}" = 1 ] && [ "$1" = iptables ] || return 0
+    "$1" -t nat "$2" POSTROUTING -p tcp -m mark --mark "$PF_MARK" -j MASQUERADE
+}
+preflight_validate() {
+    [ "${D2K_PREFLIGHT:-0}" = 1 ] || return 0
+    local pm
+    [ "$((PF_MARK))" = 49 ] && [ "$((PF_RELEASE_MARK))" = 50 ] &&
+        [ "$((PF_TOKEN_MARK))" = 51 ] && [ "$((PF_CONN_BIT))" = 134217728 ] &&
+        [ "$((PF_RELEASE_BIT))" = 67108864 ] || {
+            say "preflight: метки должны совпадать с контрактом датапата"; return 1;
+        }
+    for pm in "$MARK" "$PROBE_MARK" "$MEASURE_MARK" "$HTTPUP_MARK"; do
+        [ "$((pm))" -ne "$((PF_MARK))" ] && [ "$((pm))" -ne "$((PF_RELEASE_MARK))" ] && [ "$((pm))" -ne "$((PF_TOKEN_MARK))" ] &&
+            [ "$((pm & (PF_CONN_BIT | PF_RELEASE_BIT)))" = 0 ] || {
+                say "preflight: конфликт служебных меток"; return 1;
+            }
+    done
+    if [ -n "${KEENETIC_POLICY:-}" ]; then
+        pm=$(policy_mark "$KEENETIC_POLICY")
+        case "$pm" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+        pm=$((0x$pm))
+        if [ "$((pm & PF_CONN_BIT))" != 0 ] || [ "$pm" = "$((PF_MARK))" ] ||
+            [ "$pm" = "$((PF_RELEASE_MARK))" ] || [ "$pm" = "$((PF_TOKEN_MARK))" ] ||
+            [ "$pm" = "$((PF_RELEASE_BIT | PF_RELEASE_MARK))" ] ||
+            [ "$pm" = "$((PF_RELEASE_BIT | PF_TOKEN_MARK))" ]; then
+            D2K_PREFLIGHT=0
+            preflight_policy_conflict=1
+        fi
+    fi
+}
+
 fw_family_up() (
     fw_tool=$1
     loopback=127.0.0.0/8
@@ -400,6 +817,41 @@ fw_family_up() (
         return 3
     fi
     "$fw_tool" -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
+    if [ "${LATE_WATCH:-0}" = 1 ]; then
+        # d2kd мог создать их сам (уборка на старте) — уже есть, ладно.
+        "$fw_tool" -t mangle -N "$CHAIN_LATE_OUT" 2>/dev/null || "$fw_tool" -t mangle -n -L "$CHAIN_LATE_OUT" >/dev/null 2>&1 || return 1
+        "$fw_tool" -t mangle -N "$CHAIN_LATE_IN" 2>/dev/null || "$fw_tool" -t mangle -n -L "$CHAIN_LATE_IN" >/dev/null 2>&1 || return 1
+    fi
+    if [ "${TCP_WATCH:-0}" = 1 ]; then
+        "$fw_tool" -t mangle -N "$CHAIN_WCLR" || return 1
+        watch_release_rules "$fw_tool" -A || return 1
+    fi
+
+    # ПРОБРОС ПОРТОВ — НЕ НАШ ТРАФИК (issue #23, Keenetic + NAS). Соединение,
+    # которое открыл узел С WAN на проброшенный порт, для conntrack идёт в
+    # направлении ORIGINAL и проходит POSTROUTING. Правило очереди ниже
+    # («--ctdir ORIGINAL», все порты) брало его как исходящее из LAN, а ответы
+    # NAS — как ответы сервера, и проброс переставал работать. После
+    # engine-stop работал. У такого соединения есть признак DNAT, и он стоит в
+    # ОБОИХ направлениях. Под него же попадают сопоставления UPnP (входящие
+    # пиры торрент-клиента). Исходящий трафик LAN признака DNAT не несёт: его
+    # NAT — SNAT. Перехват Telegram (REDIRECT на d2ktg) уходит в INPUT, и
+    # правила очереди его не брали и раньше. --ctstate DNAT есть в
+    # iptables 1.4.21 (в отличие от --ctstatus DNAT, который issue пробовал).
+    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+        "$fw_tool" -t mangle -A "$chain" -m conntrack --ctstate DNAT -j RETURN || return 1
+    done
+    # Канал самого D2K — проводник установки на VPS (GATE_IP выше).
+    if [ -n "$GATE_IP" ] && [ "$fw_tool" = iptables ]; then
+        "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -d "$GATE_IP" --dport "$GATE_PORT" -j RETURN || return 1
+        "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -s "$GATE_IP" --sport "$GATE_PORT" -j RETURN || return 1
+    fi
+
+
+    if preflight_family "$fw_tool"; then
+        "$fw_tool" -t mangle -N "$CHAIN_PFCLR" || return 1
+        preflight_control_rules "$fw_tool" -A || return 1
+    fi
 
     # Keenetic's DNS proxy talks to local encrypted-DNS helpers on dynamic
     # loopback ports. That IPC is not internet traffic and must not be queued.
@@ -427,34 +879,18 @@ fw_family_up() (
     # порождает из них новое обнаружение.
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN || return 1
     "$fw_tool" -t mangle -A "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN || return 1
-    # Never queue DNS (UDP/TCP 53) or encrypted DNS (DoT/DoQ, 853). These
-    # packets are required for ordinary connectivity and are not useful
-    # strategy inputs. Place exclusions before the broad TCP/UDP NFQUEUE rules.
+    # Keep ordinary DNS protected. Only the controller's own verifier mark
+    # and exact admitted local DNS flows may traverse a selected program.
     for proto in tcp udp; do
         "$fw_tool" -t mangle -A "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
-            -j RETURN || return 1
+            -m mark ! --mark "$PROBE_MARK" -j RETURN || return 1
         "$fw_tool" -t mangle -A "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
             -j RETURN || return 1
     done
-    # ПРОБРОС ПОРТОВ — НЕ НАШ ТРАФИК (issue #23, Keenetic + NAS). Соединение,
-    # которое открыл узел С WAN на проброшенный порт, для conntrack идёт в
-    # направлении ORIGINAL и проходит POSTROUTING. Правило очереди ниже
-    # («--ctdir ORIGINAL», все порты) брало его как исходящее из LAN, а ответы
-    # NAS — как ответы сервера, и проброс переставал работать. После
-    # engine-stop работал. У такого соединения есть признак DNAT, и он стоит в
-    # ОБОИХ направлениях. Под него же попадают сопоставления UPnP (входящие
-    # пиры торрент-клиента). Исходящий трафик LAN признака DNAT не несёт: его
-    # NAT — SNAT. Перехват Telegram (REDIRECT на d2ktg) уходит в INPUT, и
-    # правила очереди его не брали и раньше. --ctstate DNAT есть в
-    # iptables 1.4.21 (в отличие от --ctstatus DNAT, который issue пробовал).
-    for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
-        "$fw_tool" -t mangle -A "$chain" -m conntrack --ctstate DNAT -j RETURN || return 1
-    done
-    # Канал самого D2K — проводник установки на VPS (GATE_IP выше).
-    if [ -n "$GATE_IP" ] && [ "$fw_tool" = iptables ]; then
-        "$fw_tool" -t mangle -A "$CHAIN_OUT" -p tcp -d "$GATE_IP" --dport "$GATE_PORT" -j RETURN || return 1
-        "$fw_tool" -t mangle -A "$CHAIN_IN" -p tcp -s "$GATE_IP" --sport "$GATE_PORT" -j RETURN || return 1
-    fi
+
+    preflight_queue_rules "$fw_tool" -A || return 1
+    watch_rules "$fw_tool" -A || return 1
+    late_watch_rules "$fw_tool" -A || return 1
 
     # --queue-bypass обязателен: смерть службы должна ПРОПУСКАТЬ трафик, а не
     # останавливать его (§10). Это касается и UDP-правил ниже в той же мере,
@@ -529,7 +965,11 @@ fw_family_up() (
         --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
 
+    voice_late_rules "$fw_tool" -A || return 1
+
     fw_icmp_te_rule "$fw_tool" -A || return 1
+
+    preflight_nat_rule "$fw_tool" -A || return 1
 
     # СВОИ ПОСЫЛКИ ПО UDP — ЧЕРЕЗ MASQUERADE, и это не симметрия ради
     # симметрии, а разница между TCP и QUIC, замеренная на живом роутере
@@ -611,6 +1051,9 @@ fw_up_unlocked() {
 
 fw_family_down() (
     fw_tool=$1
+    if [ "$fw_tool" = iptables ]; then
+        while "$fw_tool" -t nat -D POSTROUTING -p tcp -m mark --mark "$PF_MARK" -j MASQUERADE 2>/dev/null; do :; done
+    fi
     while "$fw_tool" -t nat -D PREROUTING -j D2K_HTTP 2>/dev/null; do :; done
     if "$fw_tool" -t nat -n -L D2K_HTTP >/dev/null 2>&1; then
         "$fw_tool" -t nat -F D2K_HTTP 2>/dev/null
@@ -637,14 +1080,114 @@ fw_family_down() (
             "$fw_tool" -t mangle -X "$ch" 2>/dev/null
         fi
     done
+    if "$fw_tool" -t mangle -n -L "$CHAIN_WCLR" >/dev/null 2>&1; then
+        "$fw_tool" -t mangle -F "$CHAIN_WCLR" 2>/dev/null
+        "$fw_tool" -t mangle -X "$CHAIN_WCLR" 2>/dev/null
+    fi
+    # Содержимое цепочек поздней доставки — живое состояние d2kd: правила
+    # его наблюдений, готовность которых он уже подтвердил. Пересборка при
+    # живом d2kd (reapply, его откат) их не трогает; снимает остановка после
+    # d2kd (engine_stop) или пересборка без него (остатки упавшего).
+    if "$fw_tool" -t mangle -n -L "$CHAIN_PFCLR" >/dev/null 2>&1; then
+        "$fw_tool" -t mangle -F "$CHAIN_PFCLR" 2>/dev/null
+        "$fw_tool" -t mangle -X "$CHAIN_PFCLR" 2>/dev/null
+    fi
+    running "$DP_PID" || late_chains_drop "$fw_tool"
 )
 
+late_chains_drop() {
+    for ch in "$CHAIN_LATE_OUT" "$CHAIN_LATE_IN"; do
+        if "$1" -t mangle -n -L "$ch" >/dev/null 2>&1; then
+            "$1" -t mangle -F "$ch" 2>/dev/null
+            "$1" -t mangle -X "$ch" 2>/dev/null
+        fi
+    done
+
+}
+
+# Цепочки d2kd после его остановки (переход в них снят вместе с D2K_OUT/IN).
+late_chains_down() {
+    fw_lock_acquire || return 1
+    for fw_tool in iptables ip6tables; do
+        command -v "$fw_tool" >/dev/null 2>&1 && late_chains_drop "$fw_tool"
+    done
+    fw_lock_release
+}
+
+# ИСКЛЮЧЕНИЯ ВЛАДЕЛЬЦА В ЦЕПОЧКАХ D2K. Свои правила служба ставит в D2K_OUT и
+# D2K_IN без комментария; правило с комментарием (-m comment) добавил человек
+# — например, RETURN для устройства, которое не должно идти через очередь.
+# Пересборка цепочек (reapply, полный перезапуск, TCP_WATCH, stop/start,
+# перезагрузка) их прежде молча стирала. Теперь перед снятием они
+# сохраняются в $USER_RULES, после постановки своих — возвращаются в начало
+# цепочки тем же порядком. Семейство, у которого цепочек нет (после
+# перезагрузки, IPv4-only), свой прежний снимок сохраняет; удалённое
+# человеком при работающей службе правило не воскресает. Только iptables: на
+# nft таблица d2k своя и снимается целиком.
+USER_RULES=$STATE_DIR/user-rules
+user_rules_save() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    _new=$USER_RULES.new.$$
+    : > "$_new" || return 0
+    for fw_tool in iptables ip6tables; do
+        # Each chain can disappear independently during a partial firewall
+        # failure. Preserve its saved rules only when that chain cannot be
+        # read; a readable empty chain means the owner removed its rules.
+        for _save_chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+            if command -v "$fw_tool" >/dev/null 2>&1 &&
+               _saved_rules=$("$fw_tool" -t mangle -S "$_save_chain" 2>/dev/null); then
+                printf '%s\n' "$_saved_rules" |
+                    grep "^-A $_save_chain " | grep -F ' -m comment ' |
+                    grep -vE ' --comment (\"?d2k-dns-route\"?)( |$)' |
+                    sed "s/^/$fw_tool /" >> "$_new" || :
+            elif [ -r "$USER_RULES" ]; then
+                grep "^$fw_tool -A $_save_chain " "$USER_RULES" |
+                    grep -vE ' --comment ("?d2k-dns-route"?)( |$)' >> "$_new" || :
+            fi
+        done
+    done
+    mv -f "$_new" "$USER_RULES" || rm -f "$_new"
+    return 0
+}
+
+# set -- ниже разбирает сохранённое правило в слова, аргументов функция не
+# принимает.
+# shellcheck disable=SC2120
+user_rules_restore() {
+    [ -s "$USER_RULES" ] || return 0
+    _ok=0; _bad=0
+    # Обратный порядок с вставкой в позицию 1 даёт исходный порядок сверху.
+    sed '1!G;h;$!d' "$USER_RULES" | while IFS= read -r _line; do
+        case "$_line" in *' --comment d2k-dns-route '*|*' --comment "d2k-dns-route" '*) continue ;; esac
+        _tool=${_line%% *}; _rule=${_line#* }
+        case "$_tool" in iptables|ip6tables) ;; *) continue ;; esac
+        command -v "$_tool" >/dev/null 2>&1 || continue
+        "$_tool" -t mangle -S "$CHAIN_OUT" >/dev/null 2>&1 || continue
+        # Строка — вывод iptables -S. Ничего, кроме слов и кавычек: строка с
+        # подстановкой или управляющим символом не исполняется.
+        case "$_rule" in *[\`\$\;\&\|\<\>\(\)\\]*) say "исключение владельца не возвращено (недопустимые символы): $_rule"; continue ;; esac
+        case "$_rule" in "-A $CHAIN_OUT "*|"-A $CHAIN_IN "*) ;; *) continue ;; esac
+        _chain=${_rule#-A }; _chain=${_chain%% *}
+        _args=${_rule#-A "$_chain" }
+        eval "set -- $_args" 2>/dev/null || { say "исключение владельца не разобралось: $_rule"; continue; }
+        "$_tool" -t mangle -C "$_chain" "$@" 2>/dev/null && continue
+        "$_tool" -t mangle -I "$_chain" 1 "$@" 2>/dev/null ||
+            say "исключение владельца не возвращено ($_tool): $_rule"
+    done
+}
+
 fw_iptables_down() {
+    local dns_shutdown_rc=0
+    dns_local_routes_down || dns_shutdown_rc=1
+    rm -f "$RUN/dns-routes.applied" "$RUN/dns-routes.reconciled"
+    user_rules_save
+    rm -f "$RUN"/late-watch-off.* "$RUN"/voice-late-off.* 2>/dev/null
     ppe_down
     for fw_tool in iptables ip6tables; do
         command -v "$fw_tool" >/dev/null 2>&1 && fw_family_down "$fw_tool"
     done
     rm -f "$FW_V4ONLY"
+    return "$dns_shutdown_rc"
 }
 
 # --- nftables (OpenWrt) ----------------------------------------------------
@@ -700,6 +1243,27 @@ nft_ruleset() (
     voice=$(nft_list "$VOICE_PORTS")
     voicewin=$(nft_count "$VOICE_CONNBYTES")
     q="queue num $QUEUE_NUM bypass"
+    pf_clear='' pf_out='' pf_in='' pf_nat=''
+    pf_family='meta nfproto ipv4 '
+    [ "${D2K_PREFLIGHT_V6:-0}" != 1 ] || pf_family=''
+    if [ "${D2K_PREFLIGHT:-0}" = 1 ]; then
+        pf_repeat_release=$(printf '0x%x' "$((PF_RELEASE_BIT | PF_RELEASE_MARK))")
+        pf_repeat_token=$(printf '0x%x' "$((PF_RELEASE_BIT | PF_TOKEN_MARK))")
+        pf_clear="chain pf_clear {
+            ct mark set ct mark & 0xf7ffffff
+            meta mark $pf_repeat_token drop
+            meta mark set $PF_MARK
+            accept
+        }"
+        pf_in="${pf_family}meta mark $pf_repeat_release jump pf_clear
+            ${pf_family}meta mark $pf_repeat_token jump pf_clear"
+        pf_out="$pf_in
+            ${pf_family}meta l4proto tcp meta mark $PF_RELEASE_MARK $q
+            ${pf_family}meta l4proto tcp meta mark $PF_TOKEN_MARK $q
+            ${pf_family}meta l4proto tcp meta mark $PF_MARK ct mark set ct mark | $PF_CONN_BIT
+            ${pf_family}meta mark $PF_MARK return"
+        pf_nat="meta nfproto ipv4 meta l4proto tcp meta mark $PF_MARK masquerade"
+    fi
     # Канал самого D2K — проводник установки на VPS (GATE_IP выше).
     gate_out=
     gate_in=
@@ -709,8 +1273,10 @@ nft_ruleset() (
     fi
     cat <<EOF
 table inet $NFT_TABLE {
+    $pf_clear
 	chain out {
 		type filter hook postrouting priority mangle; policy accept;
+        $pf_out
 		ip saddr 127.0.0.0/8 return
 		ip daddr 127.0.0.0/8 return
 		ip6 saddr ::1 return
@@ -720,9 +1286,10 @@ table inet $NFT_TABLE {
 		ip6 daddr ff00::/8 return
 		meta mark $MARK return
 		meta mark $MEASURE_MARK return
-		meta l4proto { tcp, udp } th dport { $dns } return
+		meta mark != $PROBE_MARK meta l4proto { tcp, udp } th dport { $dns } return
 		ct status dnat return
 		$gate_out
+$( [ "${D2K_PREFLIGHT:-0}" != 1 ] || printf '        %smeta l4proto tcp ct direction original ct mark & %s != 0 %s\n' "$pf_family" "$PF_CONN_BIT" "$q" )
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $win $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction original th dport { $ports } ct original packets $late tcp flags & fin == fin $q
@@ -731,6 +1298,7 @@ table inet $NFT_TABLE {
 		meta l4proto udp ct direction original th dport { $voice } ct original packets $voicewin $q
 	}
 	chain in_rules {
+        $pf_in
 		ip saddr 127.0.0.0/8 return
 		ip daddr 127.0.0.0/8 return
 		ip6 saddr ::1 return
@@ -738,6 +1306,7 @@ table inet $NFT_TABLE {
 		meta l4proto { tcp, udp } th sport { $dns } return
 		ct status dnat return
 		$gate_in
+$( [ "${D2K_PREFLIGHT:-0}" != 1 ] || printf '        %smeta l4proto tcp ct direction reply ct mark & %s != 0 %s\n' "$pf_family" "$PF_CONN_BIT" "$q" )
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & rst == rst $q
 		meta l4proto tcp ct direction reply th sport { $ports } ct reply packets $late tcp flags & fin == fin $q
 		meta l4proto tcp ct direction reply th sport { $(nft_list "$HTTP_KEEPALIVE_PORTS") } ct reply packets $late $q
@@ -757,6 +1326,7 @@ table inet $NFT_TABLE {
 	}
 	chain nat_post {
 		type nat hook postrouting priority srcnat - 1; policy accept;
+        $pf_nat
 		meta nfproto ipv4 meta l4proto udp meta mark $MARK masquerade
 	}
 }
@@ -789,6 +1359,22 @@ fw_nft_up() {
     nft -f "$RUN/fw.nft"
 }
 
+# Normalize only our preflight contract, preserving order within each chain.
+# nft pads hexadecimal marks and prints queues differently from input syntax.
+nft_preflight_contract() {
+    sed -e 's/0x0*\([1-9a-f][0-9a-f]*\)/0x\1/g' -e 's/0x00*/0/g' \
+        -e "s/queue num $QUEUE_NUM bypass/QUEUE/g" \
+        -e "s/queue flags bypass to $QUEUE_NUM/QUEUE/g" \
+        -e 's/[();]//g' |
+    awk '
+        $1 == "chain" { chain = $2; next }
+        $1 == "}" { chain = ""; next }
+        chain == "pf_clear" || (chain != "" && (/jump pf_clear/ || /0x(31|32|33|4000000|8000000)([^0-9a-f]|$)/)) {
+            gsub(/[ \t]+/, " "); sub(/^ /, ""); sub(/ $/, "");
+            if (length($0)) print chain ":" $0
+        }'
+}
+
 fw_nft_installed() (
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
     nft_has "$NFT_RST_TABLE" || return 1
@@ -796,6 +1382,11 @@ fw_nft_installed() (
         printf '%s\n' "$listed" | grep -q "chain $chain {" || return 1
     done
     printf '%s\n' "$listed" | grep -q masquerade || return 1
+    if [ "${D2K_PREFLIGHT:-0}" = 1 ]; then
+        pf_want=$(nft_ruleset | nft_preflight_contract) || return 1
+        pf_got=$(printf '%s\n' "$listed" | nft_preflight_contract) || return 1
+        [ "$pf_got" = "$pf_want" ] || return 1
+    fi
     # nft печатает правило по-своему («queue flags bypass to 2000»), поэтому
     # сверяется число правил очереди с bypass и своим номером очереди.
     want=$(nft_ruleset | grep -c queue) || return 1
@@ -804,11 +1395,12 @@ fw_nft_installed() (
 )
 
 fw_down_unlocked() {
-    fw_iptables_down
+    local fw_remove_rc=0
+    fw_iptables_down || fw_remove_rc=1
     if command -v nft >/dev/null 2>&1 && nft_has "$NFT_TABLE"; then
-        nft delete table inet "$NFT_TABLE" || return 1
+        nft delete table inet "$NFT_TABLE" || fw_remove_rc=1
     fi
-    return 0
+    return "$fw_remove_rc"
 }
 
 # ПРАВИЛА ПОДАВЛЕНИЯ RST. d2kc и d2k-detect на время зонда ставят в filter
@@ -860,47 +1452,89 @@ ppe_ensure() {
     case $rc in 0|2|3) return 0 ;; *) return 1 ;; esac
 }
 
-fw_lock_acquire() {
+# Замок-каталог: mkdir атомарен. Замок умершего владельца снимается.
+dir_lock_acquire() { # <каталог> <попыток по 0,1 с; 0 — не ждать>
     local attempt owner
     attempt=0
-    while ! mkdir "$FW_LOCK" 2>/dev/null; do
-        owner=$(cat "$FW_LOCK/pid" 2>/dev/null)
+    while ! mkdir "$1" 2>/dev/null; do
+        owner=$(cat "$1/pid" 2>/dev/null)
         case "$owner" in
-            ''|*[!0-9]*) ;;
+            ''|*[!0-9]*)
+                # Владелец упал между mkdir и записью номера: замок без
+                # номера старше LOCK_EMPTY_STALE с — ничей. Живой владелец
+                # пишет номер сразу после mkdir.
+                _lt=$(date -r "$1" +%s 2>/dev/null)
+                case "$_lt" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        if [ $(($(date +%s) - _lt)) -gt "${LOCK_EMPTY_STALE:-5}" ] &&
+                           [ ! -s "$1/pid" ]; then
+                            rm -f "$1/pid" 2>/dev/null
+                            rmdir "$1" 2>/dev/null
+                            continue
+                        fi ;;
+                esac ;;
             *)
                 if ! kill -0 "$owner" 2>/dev/null; then
-                    rm -f "$FW_LOCK/pid" 2>/dev/null
-                    rmdir "$FW_LOCK" 2>/dev/null
+                    rm -f "$1/pid" 2>/dev/null
+                    rmdir "$1" 2>/dev/null
                     continue
                 fi ;;
         esac
-        [ "$attempt" -lt 300 ] || return 1
+        [ "$attempt" -lt "$2" ] || return 1
         attempt=$((attempt + 1))
         sleep 0.1 2>/dev/null || sleep 1
     done
-    printf '%s\n' "$$" > "$FW_LOCK/pid" || { rmdir "$FW_LOCK"; return 1; }
+    printf '%s\n' "$$" > "$1/pid" || { rmdir "$1"; return 1; }
 }
 
-fw_lock_release() {
-    [ "$(cat "$FW_LOCK/pid" 2>/dev/null)" = "$$" ] || return 1
-    rm -f "$FW_LOCK/pid"
-    rmdir "$FW_LOCK"
+dir_lock_release() {
+    [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] || return 1
+    rm -f "$1/pid"
+    rmdir "$1"
 }
 
-# DNS РОУТЕРА — НЕ ЦЕЛЬ. Поле 15.10.2026: Keenetic резолвит через DoH
-# (https-dns-proxy → geohide.ru:443), и этот поток шёл через очередь D2K как
-# обычный TLS; прокси при всплесках запросов копил зависшие и падал («too
-# many», 2275 ошибок за утро). DNS роутера, какой бы ни был заведён — DoH, DoT
-# или обычный на нестандартном порту, — исключается по адресу и порту: RETURN
-# в обе стороны раньше очереди, по TCP и по UDP (DoH поверх HTTP/3, DoQ).
-# Источник — `ndmc show dns-proxy`: строки dns_server, где после «#» стоит
-# настоящий сервер, а до «#» — локальный прокси (127.0.0.1, не исключается)
-# или сам сервер. Имена DoH разрешаются через DNS роутера на каждом круге
-# сторожа; неразрешившееся имя прежних правил не снимает. Без ndmc (OpenWrt)
-# исключать нечего — список пуст.
+fw_lock_acquire() { dir_lock_acquire "$FW_LOCK" 300; }
+fw_lock_release() { dir_lock_release "$FW_LOCK"; }
+
+# Замок переходов движка держится до выхода этого процесса, в том числе по
+# die: снимает его ловушка EXIT.
+engine_lock() { # <попыток по 0,1 с>
+    dir_lock_acquire "$ENGINE_LOCK" "$1" || return 1
+    trap 'dir_lock_release "$ENGINE_LOCK" 2>/dev/null' EXIT
+    trap 'exit 130' INT TERM HUP
+}
+locked() {
+    engine_lock 1200 || die "другая операция со службой не закончилась за 2 мин — повторите позже"
+}
+
+# Настроенные DNS защищены от обычного подбора. Собственный проверочный
+# поток проходит через выбранный опыт; при измеренном отказе контроллер
+# разрешает восстановление точного апстрима. Остальные DNS и UDP сохраняют
+# защиту. Источник — фактическая конфигурация, без списка провайдеров.
+# Неразрешившееся имя сохраняет прежние собственные адресные наблюдения.
+dns_config_snapshot() (
+    command -v ndmc >/dev/null 2>&1 || return 0
+    umask 077
+    dns_raw=$(mktemp "$RUN/.dns-upstreams.raw.XXXXXX") || return 1
+    dns_clean=
+    if ndmc -c "show dns-proxy" > "$dns_raw" 2>/dev/null; then
+        dns_clean=$(mktemp "$RUN/.dns-upstreams.clean.XXXXXX") || { rm -f "$dns_raw"; return 1; }
+        if tr -d '\033\r' < "$dns_raw" > "$dns_clean" && chmod 600 "$dns_clean"; then
+            mv -f "$dns_clean" "$RUN/dns-upstreams" || { rm -f "$dns_raw" "$dns_clean"; return 1; }
+        else
+            rm -f "$dns_raw" "$dns_clean";return 1
+        fi
+    fi
+    rm -f "$dns_raw"
+    # A failed read retains the last complete private configuration snapshot.
+    [ ! -r "$RUN/dns-upstreams" ] || cat "$RUN/dns-upstreams"
+)
 dns_upstreams() {
     command -v ndmc >/dev/null 2>&1 || return 0
-    ndmc -c "show dns-proxy" 2>/dev/null | tr -d '\033\r' | awk '
+    [ -r "$RUN/dns-upstreams" ] || dns_config_snapshot >/dev/null || return 1
+    [ -r "$RUN/dns-upstreams" ] || return 0
+    awk '
         function emit(s, def,    host, port, t) {
             host = s; port = def; t = s
             if (s ~ /^\[/) {
@@ -920,27 +1554,139 @@ dns_upstreams() {
             sub(/@.*/, "", c)
             if (c ~ /^https:\/\//) { sub(/^https:\/\//, "", c); sub(/\/.*/, "", c); emit(c, 443) }
             else { sub(/^tls:\/\//, "", c); emit(c, 853) }
-        }'
+        }' "$RUN/dns-upstreams"
 }
+# Only locally originated, unmarked traffic to an admitted DNS endpoint receives
+# the own-verifier mark. Client policy selection remains in effect for LAN
+# clients, and existing routing-policy marks are never overwritten.
+dns_local_route_rule() (
+    dns_local_action=$1 dns_local_address=$2 dns_local_port=$3 dns_local_proto=${4:-tcp}
+    case "$dns_local_proto" in tcp|udp) ;; *) exit 1 ;; esac
+    dns_local_tool=iptables
+    case $dns_local_address in *:*) dns_local_tool=ip6tables; [ ! -f "$FW_V4ONLY" ] || return 0 ;; esac
+    set -- OUTPUT -p "$dns_local_proto" -d "$dns_local_address" --dport "$dns_local_port" \
+        -m mark --mark 0 -m comment --comment d2k-dns-route -j MARK --set-xmark "$PROBE_MARK/0xffffffff"
+    if [ "$dns_local_action" = -A ]; then
+        "$dns_local_tool" -t mangle -C "$@" 2>/dev/null || "$dns_local_tool" -t mangle -I "$@" || return 1
+    else
+        while "$dns_local_tool" -t mangle -C "$@" 2>/dev/null; do
+            "$dns_local_tool" -t mangle -D "$@" || return 1
+        done
+    fi
+    # INPUT is local to the router. Keep the shared chain's exclusions even
+    # when this exact resolver and transport are admitted for local traffic.
+    set -- INPUT -p "$dns_local_proto" -s "$dns_local_address" --sport "$dns_local_port" \
+        -m comment --comment d2k-dns-route -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass
+    if [ "$dns_local_action" = -A ]; then
+        "$dns_local_tool" -t mangle -C "$@" 2>/dev/null || "$dns_local_tool" -t mangle -I "$@" || return 1
+    else
+        while "$dns_local_tool" -t mangle -C "$@" 2>/dev/null; do
+            "$dns_local_tool" -t mangle -D "$@" || return 1
+        done
+    fi
+)
+dns_local_routes_down() (
+    set -f
+    for dns_cleanup_tool in iptables ip6tables; do
+        command -v "$dns_cleanup_tool" >/dev/null 2>&1 || continue
+        for dns_cleanup_chain in OUTPUT INPUT "$CHAIN_IN"; do
+            if ! dns_cleanup_rules=$("$dns_cleanup_tool" -t mangle -S "$dns_cleanup_chain" 2>/dev/null); then
+                [ "$dns_cleanup_chain" != "$CHAIN_IN" ] || continue
+                # An unavailable family/table cannot contain an owned rule.
+                "$dns_cleanup_tool" -t mangle -n -L POSTROUTING >/dev/null 2>&1 || continue
+                exit 1
+            fi
+            printf '%s\n' "$dns_cleanup_rules" |
+            sed 's/"d2k-dns-route"/d2k-dns-route/g' |
+            while IFS= read -r dns_cleanup_line; do
+                case "$dns_cleanup_line" in
+                    "-A $dns_cleanup_chain "*' --comment d2k-dns-route '*)
+                        set -- $dns_cleanup_line;shift
+                        "$dns_cleanup_tool" -t mangle -D "$@" || exit 1 ;;
+                esac
+            done || exit 1
+        done
+    done
+)
+
 dns_excl_rule() { # <-D|-A> <адрес> <порт>
+    dns_rule_action=$1 dns_rule_address=$2 dns_rule_port=$3
     dx_tool=iptables
-    case $2 in *:*) dx_tool=ip6tables; [ ! -f "$FW_V4ONLY" ] || return 0 ;; esac
+    case $dns_rule_address in *:*) dx_tool=ip6tables; [ ! -f "$FW_V4ONLY" ] || return 0 ;; esac
     for dx_pr in tcp udp; do
+        dns_route_action=-D
+        if [ "$dns_rule_action" = -A ] && [ -r "${DNS_ROUTES_INPUT:-${RUN:-/tmp/d2k}/dns-routes}" ] &&
+           awk -v a="$dns_rule_address" -v p="$dns_rule_port" -v protocol="$dx_pr" \
+               'NF==4 && $2==a && $3==p && $4==protocol {f=1} END {exit !f}' "${DNS_ROUTES_INPUT:-${RUN:-/tmp/d2k}/dns-routes}"; then
+            dns_route_action=-A
+        fi
+        dns_local_route_rule "$dns_route_action" "$dns_rule_address" "$dns_rule_port" "$dx_pr" || return 1
         for dx_dir in out in; do
-            if [ "$dx_dir" = out ]; then set -- "$1" "$2" "$3" "$CHAIN_OUT" -d --dport
-            else set -- "$1" "$2" "$3" "$CHAIN_IN" -s --sport; fi
-            if [ "$1" = -D ]; then
-                while "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null; do
-                    "$dx_tool" -t mangle -D "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN || break
+            if [ "$dx_dir" = out ]; then
+                set -- "$CHAIN_OUT" -p "$dx_pr" -d "$dns_rule_address" --dport "$dns_rule_port"
+                # Retire the older unqualified rule; otherwise it would still
+                # hide this own verifier after the qualified rule was skipped.
+                while "$dx_tool" -t mangle -C "$@" -j RETURN 2>/dev/null; do
+                    "$dx_tool" -t mangle -D "$@" -j RETURN || return 1
+                done
+                set -- "$@" -m mark ! --mark "$PROBE_MARK"
+            else
+                set -- "$CHAIN_IN" -p "$dx_pr" -s "$dns_rule_address" --sport "$dns_rule_port"
+            fi
+            if [ "$dns_rule_action" = -D ]; then
+                while "$dx_tool" -t mangle -C "$@" -j RETURN 2>/dev/null; do
+                    "$dx_tool" -t mangle -D "$@" -j RETURN || return 1
                 done
             else
-                "$dx_tool" -t mangle -C "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN 2>/dev/null ||
-                    "$dx_tool" -t mangle -I "$4" -p "$dx_pr" "$5" "$2" "$6" "$3" -j RETURN
+                "$dx_tool" -t mangle -C "$@" -j RETURN 2>/dev/null ||
+                    "$dx_tool" -t mangle -I "$@" -j RETURN || return 1
             fi
         done
     done
 }
-dns_excl_sync_unlocked() { # [fresh] — цепочки только что собраны заново
+# Reconcile owned rules against actual kernel state as well as the cache:
+# a partially failed earlier addition must still be revocable after a later
+# configuration change. Foreign rules are not part of this namespace.
+dns_local_routes_prune() (
+    set -f
+    dns_prune_targets=$1
+    for dns_prune_tool in iptables ip6tables; do
+        command -v "$dns_prune_tool" >/dev/null 2>&1 || continue
+        for dns_prune_chain in OUTPUT INPUT "$CHAIN_IN"; do
+            if ! dns_prune_rules=$("$dns_prune_tool" -t mangle -S "$dns_prune_chain" 2>/dev/null); then
+                [ "$dns_prune_chain" != "$CHAIN_IN" ] || continue
+                # An unavailable family/table cannot contain an owned rule.
+                "$dns_prune_tool" -t mangle -n -L POSTROUTING >/dev/null 2>&1 || continue
+                exit 1
+            fi
+            printf '%s\n' "$dns_prune_rules" |
+            sed 's/"d2k-dns-route"/d2k-dns-route/g' |
+            while IFS= read -r dns_prune_line; do
+                case "$dns_prune_line" in "-A $dns_prune_chain "*' --comment d2k-dns-route '*) ;; *) continue ;; esac
+                dns_prune_ip= dns_prune_port= dns_prune_proto= dns_prune_prev=
+                for dns_prune_word in $dns_prune_line; do
+                    case "$dns_prune_prev" in
+                        -s|-d) dns_prune_ip=$dns_prune_word ;;
+                        --sport|--dport) dns_prune_port=$dns_prune_word ;;
+                        -p) dns_prune_proto=$dns_prune_word ;;
+                    esac
+                    dns_prune_prev=$dns_prune_word
+                done
+                case "$dns_prune_ip" in *:*/128) dns_prune_ip=${dns_prune_ip%/128} ;; */32) dns_prune_ip=${dns_prune_ip%/32} ;; esac
+                if [ "$dns_prune_chain" != "$CHAIN_IN" ] && [ -r "${DNS_ROUTES_INPUT:-$RUN/dns-routes}" ] &&
+                   awk -v a="$dns_prune_ip" -v p="$dns_prune_port" '$2==a && $3==p {f=1} END {exit !f}' "$dns_prune_targets" &&
+                   awk -v a="$dns_prune_ip" -v p="$dns_prune_port" -v protocol="$dns_prune_proto" \
+                       'NF==4 && $2==a && $3==p && $4==protocol {f=1} END {exit !f}' "${DNS_ROUTES_INPUT:-$RUN/dns-routes}"; then
+                    continue
+                fi
+                set -- $dns_prune_line;shift
+                "$dns_prune_tool" -t mangle -D "$@" || exit 1
+            done || exit 1
+        done
+    done
+)
+dns_excl_apply() { # [fresh] — цепочки только что собраны заново
+    dns_config_snapshot >/dev/null || return 1
     [ "$FW_BACKEND" = iptables ] || return 0
     dx_state=$RUN/dns-excl
     dx_new=$dx_state.new
@@ -954,33 +1700,84 @@ dns_excl_sync_unlocked() { # [fresh] — цепочки только что со
             awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
         if [ -n "$dx_ips" ]; then
             for dx_ip in $dx_ips; do echo "$dx_h $dx_ip $dx_p"; done
-        elif [ -f "$dx_state" ]; then
-            awk -v h="$dx_h" '$1 == h' "$dx_state"
+        else
+            if [ -f "$dx_state" ]; then
+                awk -v h="$dx_h" -v p="$dx_p" '$1 == h && $3 == p' "$dx_state"
+            fi
+            if [ -r "${DNS_ROUTES_INPUT:-$RUN/dns-routes}" ]; then
+                # The controller can already own an exact address witness
+                # from its saved DNS proof even when bootstrap is down.
+                awk -v h="$dx_h" -v p="$dx_p" 'NF==4 && $1==h && $3==p && ($4=="tcp" || $4=="udp") {print $1, $2, $3}' "${DNS_ROUTES_INPUT:-$RUN/dns-routes}"
+            fi
         fi
-    done | sort -u > "$dx_new"
+    done | sort -u > "$dx_new" || return 1
+    dns_local_routes_prune "$dx_new" || return 1
     if [ "${1:-}" != fresh ] && [ -f "$dx_state" ]; then
         while read -r dx_h dx_ip dx_p; do
             awk -v a="$dx_ip" -v p="$dx_p" '$2 == a && $3 == p { f = 1 } END { exit !f }' "$dx_new" ||
-                dns_excl_rule -D "$dx_ip" "$dx_p"
+                dns_excl_rule -D "$dx_ip" "$dx_p" || return 1
         done < "$dx_state"
     fi
-    while read -r dx_h dx_ip dx_p; do dns_excl_rule -A "$dx_ip" "$dx_p"; done < "$dx_new"
+    while read -r dx_h dx_ip dx_p; do
+        if [ -r "$STATE_DIR/doh-targets" ] &&
+           awk -v h="$dx_h" -v p="$dx_p" '$1==h && $2==p {f=1} END {exit !f}' "$STATE_DIR/doh-targets"; then
+            # Keep the owner's explicit admission while retaining its
+            # address observation for automatic health and cold recovery.
+            dns_excl_rule -D "$dx_ip" "$dx_p" || return 1
+            for dx_protocol in tcp udp; do
+                if [ -r "${DNS_ROUTES_INPUT:-$RUN/dns-routes}" ] &&
+                   awk -v a="$dx_ip" -v p="$dx_p" -v proto="$dx_protocol" 'NF==4 && $2==a && $3==p && $4==proto {f=1} END {exit !f}' "${DNS_ROUTES_INPUT:-$RUN/dns-routes}"; then
+                    dns_local_route_rule -A "$dx_ip" "$dx_p" "$dx_protocol" || return 1
+                fi
+            done
+        else
+            dns_excl_rule -A "$dx_ip" "$dx_p" || return 1
+        fi
+    done < "$dx_new"
     mv -f "$dx_new" "$dx_state"
 }
+dns_excl_sync_unlocked() (
+    case "$FW_BACKEND" in
+        iptables) ;;
+        *) dns_config_snapshot >/dev/null; return $? ;;
+    esac
+    route_snapshot=$(mktemp "$RUN/.dns-routes.XXXXXX") || return 1
+    route_applied=$(mktemp "$RUN/.dns-applied.XXXXXX") || { rm -f "$route_snapshot"; return 1; }
+    trap 'rm -f "$route_snapshot" "$route_applied"' EXIT
+    if [ -r "$RUN/dns-routes" ]; then
+        cat "$RUN/dns-routes" > "$route_snapshot" || return 1
+    fi
+    DNS_ROUTES_INPUT=$route_snapshot
+    rm -f "$RUN/dns-routes.applied" "$RUN/dns-routes.reconciled" || return 1
+    dns_excl_apply "$@" || return 1
+    route_v4only=0
+    [ ! -f "$FW_V4ONLY" ] || route_v4only=1
+    awk -v v4only="$route_v4only" '
+        FILENAME==ARGV[1] && NF==3 { active[$1,$2,$3]=1; next }
+        NF==4 && (($1,$2,$3) in active) && (!v4only || $2 !~ /:/) { print }
+    ' "$RUN/dns-excl" "$route_snapshot" > "$route_applied" || return 1
+    mv -f "$route_applied" "$RUN/dns-routes.applied" &&
+        mv -f "$route_snapshot" "$RUN/dns-routes.reconciled"
+)
 dns_excl_sync() {
     fw_lock_acquire || return 1
-    dns_excl_sync_unlocked
-    fw_lock_release
+    dns_sync_rc=0
+    dns_excl_sync_unlocked || dns_sync_rc=$?
+    fw_lock_release || return 1
+    return "$dns_sync_rc"
 }
 
 fw_up() {
+    preflight_validate || return 1
+    watch_validate || return 1
     local rc
     fw_lock_acquire || return 1
     if [ "$FW_BACKEND" = nft ]; then
         # Остатки iptables (установка времён Entware) снимаются; таблица nft
         # заменяется своей транзакцией, без окна без правил.
-        fw_iptables_down
-        if fw_nft_up; then
+        if ! fw_iptables_down; then
+            rc=1
+        elif fw_nft_up; then
             rc=0
         else
             say "nft не принял правила — см. $RUN/fw.nft"
@@ -988,11 +1785,19 @@ fw_up() {
             rc=1
         fi
     else
-        fw_down_unlocked
-        if fw_up_unlocked; then
+        if ! fw_down_unlocked; then
+            rc=1
+        elif fw_up_unlocked; then
             rc=0
             dns_excl_sync_unlocked fresh || say "исключение DNS роутера встало не целиком"
+            user_rules_restore
         else
+            # IPv4 may already be hooked when IPv6 setup fails. Stop the
+            # producer before removing the release handler during rollback.
+            if [ -f "$RUN/tcp-watch-active" ] || [ -f "$RUN/preflight-active" ]; then
+                stop_pidfile "$CT_PID"
+                stop_pidfile "$DP_PID"
+            fi
             fw_down_unlocked
             rc=1
         fi
@@ -1015,6 +1820,13 @@ fw_family_installed() (
     loopback=127.0.0.0/8
     [ "$fw_tool" != ip6tables ] || loopback=::1/128
     local late_from
+    preflight_control_rules "$fw_tool" -C || return 1
+    preflight_queue_rules "$fw_tool" -C || return 1
+    preflight_nat_rule "$fw_tool" -C || return 1
+    watch_rules "$fw_tool" -C || return 1
+    watch_release_rules "$fw_tool" -C || return 1
+    late_watch_rules "$fw_tool" -C || return 1
+    voice_late_rules "$fw_tool" -C || return 1
     late_from=$(late_rst_from) || return 1
     # A jump into an empty chain does not send a single packet to d2kd.
     # Check the complete contract, including reply traffic and bypass. -C
@@ -1038,7 +1850,7 @@ fw_family_installed() (
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
     for proto in tcp udp; do
         "$fw_tool" -t mangle -C "$CHAIN_OUT" -p "$proto" -m multiport --dports "$DNS_PORTS" \
-            -j RETURN 2>/dev/null || return 1
+            -m mark ! --mark "$PROBE_MARK" -j RETURN 2>/dev/null || return 1
         "$fw_tool" -t mangle -C "$CHAIN_IN" -p "$proto" -m multiport --sports "$DNS_PORTS" \
             -j RETURN 2>/dev/null || return 1
     done
@@ -1090,6 +1902,16 @@ fw_family_installed() (
 )
 
 fw_installed() {
+    local D2K_PREFLIGHT_V6=0
+    preflight_validate || return 1
+    if preflight_ipv6_available; then
+        [ -f "$RUN/preflight-v6-active" ] || return 1
+        D2K_PREFLIGHT_V6=1
+    else
+        [ ! -f "$RUN/preflight-v6-active" ] || return 1
+    fi
+    if [ "${D2K_PREFLIGHT:-0}" != 1 ] && [ -f "$RUN/preflight-active" ]; then return 1; fi
+    watch_auto_resolve
     [ "$FW_BACKEND" != nft ] || { fw_nft_installed; return; }
     fw_family_installed iptables || return 1
     [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables
@@ -1137,7 +1959,8 @@ fastnat_restore() {
 # трогает и говорит об этом, а не обрабатывает молча всех.
 policy_mark() {
     command -v ndmc >/dev/null 2>&1 || return 0
-    ndmc -c "show ip policy" 2>/dev/null | tr -d '\033' | awk -v want="$1" '
+    policy_list=$(ndmc -c "show ip policy" 2>/dev/null) || return 0
+    printf '%s\n' "$policy_list" | tr -d '\033' | awk -v want="$1" '
         /policy, name = / {
             line = $0; sub(/.*policy, name = /, "", line)
             name = line; sub(/,.*/, "", name)
@@ -1149,10 +1972,18 @@ policy_mark() {
                 desc = line; sub(/.*description = /, "", desc)
                 sub(/:[[:space:]]*$/, "", desc); sub(/[[:space:]]+$/, "", desc)
             }
-            cur = (name == want || desc == want)
+            exact = (name == want); bydesc = (desc == want)
             next
         }
-        cur && /^[[:space:]]*mark:/ { print $2; exit }'
+        /^[[:space:]]*mark:/ {
+            if (exact) { id_count++; id_mark=$2 }
+            if (bydesc) { desc_count++; desc_mark=$2 }
+            exact=0; bydesc=0
+        }
+        END {
+            if (id_count == 1) print id_mark
+            else if (id_count == 0 && desc_count == 1) print desc_mark
+        }'
 }
 policy_args() {
     [ -n "${KEENETIC_POLICY:-}" ] || return 0
@@ -1262,6 +2093,11 @@ load_modules() {
 }
 
 start_engine() {
+    preflight_validate || return 1
+    if [ "${preflight_policy_conflict:-0}" = 1 ]; then
+        say "предварительная проба отключена: метка политики Keenetic пересекается со служебными битами"
+    fi
+    watch_validate || return 1
     [ "$MODE" = "off" ] && { say "MODE=off — запуск запрещён"; return 1; }
     [ -x "$DPBIN" ] || die "нет $DPBIN"
     [ -x "$BIN" ] || die "нет $BIN"
@@ -1271,9 +2107,10 @@ start_engine() {
     start_log_maintenance
 
     if running "$DP_PID"; then
-        if running "$CT_PID" && fw_installed && \
+        if running "$CT_PID" && watch_contract_matches && fw_installed && \
             ! legacy_http_present && \
             { [ ! -x "$HEAL" ] || running "$HL_PID"; }; then
+            shadow_reconcile
             say "движок уже запущен полностью"
             return 0
         fi
@@ -1288,37 +2125,32 @@ start_engine() {
     # Файл сокета переживает SIGKILL и мешает следующему запуску.
     rm -f "$SOCK"
 
-    dpmode=observe
-    [ "$MODE" = "apply" ] && dpmode=apply
     [ "$PROBE_MARK" != "$MARK" ] || die "PROBE_MARK должен отличаться от MARK"
     if ! { [ "$MEASURE_MARK" != "$MARK" ] && [ "$MEASURE_MARK" != "$PROBE_MARK" ]; }; then die "MEASURE_MARK должен отличаться от MARK и PROBE_MARK"; fi
 
-    set -- --health-file "$RUNTIME_DIR/d2kd.health"
-    # shellcheck disable=SC2046  # ключ и значение — два слова нарочно
-    set -- "$@" $(policy_args)
-    legacy_stats=${STATS_SEC:-900}
-    spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
-        --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
-        --probe-mark "$PROBE_MARK" --udp-reverse-hook \
-        --flows "$FLOWS" --control "$SOCK" --stats "$legacy_stats" \
-        "$@" --log "$LOG/d2kd.log" || die_with_log "датапат не запустился" "$LOG/d2kd.log"
-
-    # Ждём привязки очереди, а не спим наугад: правила, поставленные до
-    # привязки, отправляют пакеты в никуда.
-    i=0
-    while [ $i -lt 50 ]; do
-        bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
-            /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
-        [ -n "$bound" ] && [ "$bound" != "0" ] && break
-        i=$((i + 1))
-        sleep 0.1 2>/dev/null || sleep 1
-    done
-    if [ -z "$bound" ] || [ "$bound" = "0" ]; then
-        engine_stop
-        die "очередь $QUEUE_NUM не привязалась — правила не ставлю"
+    if [ "${TCP_WATCH:-0}" = 1 ]; then
+        : > "$RUN/tcp-watch-active" || return 1
+    else
+        rm -f "$RUN/tcp-watch-active"
     fi
-
+    if [ "${D2K_PREFLIGHT:-0}" = 1 ]; then
+        : > "$RUN/preflight-active" || return 1
+    else
+        rm -f "$RUN/preflight-active"
+    fi
     load_modules
+    D2K_PREFLIGHT_V6=0
+    if preflight_ipv6_available; then
+        D2K_PREFLIGHT_V6=1
+        : > "$RUN/preflight-v6-active" || return 1
+    fi
+    spawn_datapath
+    case $? in
+        0) ;;
+        1) die_with_log "датапат не запустился" "$LOG/d2kd.log" ;;
+        *) engine_stop; die "очередь $QUEUE_NUM не привязалась — правила не ставлю" ;;
+    esac
+
     fw_up || { engine_stop; die "не поставить правила"; }
 
     # После правил, но до контроллера: к моменту первого приветствия таблица
@@ -1326,34 +2158,223 @@ start_engine() {
     fastnat_off
     flowoffload_off
 
-    # Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
-    # потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
-    # роутере, файл оставался нулевым при исправно работающем движке.
-    set -- --health-file "$RUNTIME_DIR/d2kc.health"
-    spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
-        --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
-        --measure-mark "$MEASURE_MARK" \
-        "$@" --log "$LOG/d2kc.log" || { engine_stop; die_with_log "контроллер не запустился" "$LOG/d2kc.log"; }
-    if ! wait_running "$CT_PID" d2kc; then
-        engine_stop
-        die_with_log "контроллер завершился сразу после запуска" "$LOG/d2kc.log"
-    fi
+    spawn_controller
+    case $? in
+        0) ;;
+        1) engine_stop; die_with_log "контроллер не запустился" "$LOG/d2kc.log" ;;
+        *) engine_stop; die_with_log "контроллер завершился сразу после запуска" "$LOG/d2kc.log" ;;
+    esac
 
-    WATCHLOOP="while :; do
-        \"$HEAL\" >/dev/null 2>&1
-        sleep ${HEAL_EVERY:-60}
+    shadow_reconcile
+
+    WATCHLOOP="elapsed=${HEAL_EVERY:-60}
+    while :; do
+        if [ \$elapsed -ge ${HEAL_EVERY:-60} ]; then
+            \"$HEAL\" >/dev/null 2>&1
+            elapsed=0
+        elif [ \"$FW_BACKEND\" = iptables ] && [ -r \"$RUN/dns-routes\" ] &&
+             ! cmp -s \"$RUN/dns-routes\" \"$RUN/dns-routes.reconciled\"; then
+            \"$0\" dns-ensure >/dev/null 2>&1
+        fi
+        sleep 2
+        elapsed=\$((elapsed + 2))
     done"
     # Сторож правил — отдельным процессом, и его отсутствие НЕ отменяет обход,
     # а только страховку. Период 60 с унаследован у z2k (её сторож живёт
     # вызовом планировщика раз в минуту); событийный хук NDM реагирует
     # быстрее, а этот ловит сбросы, на которые хук не сработал.
     if [ -x "$HEAL" ]; then
-        spawn_daemon -S -b -m -p "$HL_PID" -x /bin/sh -- -c \
-            "$WATCHLOOP" \
-            || say "сторож правил не запустился — правила придётся возвращать вручную"
+        rm -f "$HL_PID.start"
+        if spawn_daemon -S -b -m -p "$HL_PID" -x /bin/sh -- -c "$WATCHLOOP"; then
+            pid_stamp "$HL_PID" || say "отметка сторожа не записалась — его номер проверяется по командной строке"
+        else
+            say "сторож правил не запустился — правила придётся возвращать вручную"
+        fi
     fi
 
+    : > "$ENGINE_WANT" || say "метка автовосстановления не записалась — упавший демон сам не поднимется"
     say "движок запущен: очередь $QUEUE_NUM, режим $MODE"
+}
+
+# Датапат с теми же ключами, что при полном запуске, и ожидание привязки
+# очереди. 0 — работает, 1 — не запустился, 2 — очередь не привязалась.
+spawn_datapath() {
+    dpmode=observe
+    [ "$MODE" = "apply" ] && dpmode=apply
+    set -- --health-file "$RUNTIME_DIR/d2kd.health"
+    [ "${D2K_PREFLIGHT:-0}" != 1 ] || set -- "$@" --preflight --provider-ips "$STATE_DIR/provider-ips"
+    [ "${D2K_PREFLIGHT_V6:-0}" != 1 ] || set -- "$@" --preflight-ipv6
+    [ "${TCP_WATCH:-0}" != 1 ] || set -- "$@" --watch-release-bit 0x20000000
+    [ "${LATE_WATCH:-0}" != 1 ] || set -- "$@" --late-watch-mark 0x40000000 --late-rules
+    # shellcheck disable=SC2046  # ключ и значение — два слова нарочно
+    set -- "$@" $(policy_args)
+    [ "${EXP_CONTROL:-0}" != 1 ] || set -- "$@" --exp-control "$EXP_SOCK"
+    legacy_stats=${STATS_SEC:-900}
+    rm -f "$DP_PID.start"
+    spawn_daemon -S -b -m -p "$DP_PID" -x "$DPBIN" -- \
+        --queue "$QUEUE_NUM" --mode "$dpmode" --mark "$MARK" \
+        --probe-mark "$PROBE_MARK" --udp-reverse-hook \
+        --flows "$FLOWS" --control "$SOCK" --stats "$legacy_stats" \
+        "$@" --log "$LOG/d2kd.log" || return 1
+
+    # Ждём привязки очереди, а не спим наугад: правила, поставленные до
+    # привязки, отправляют пакеты в никуда.
+    i=0
+    while [ $i -lt 50 ]; do
+        bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
+            /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
+        if [ -n "$bound" ] && [ "$bound" != "0" ]; then
+            pid_stamp "$DP_PID"
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    return 2
+}
+
+# Контроллер. 0 — работает, 1 — не запустился, 2 — завершился сразу.
+# Журнал задаётся ключом, а не перенаправлением: start-stop-daemon -b
+# потоки потомка не наследует, и вывод уходил бы в никуда — проверено на
+# роутере, файл оставался нулевым при исправно работающем движке.
+spawn_controller() {
+    # Controller, datapath and firewall share the same response-probe switch.
+    export D2K_PREFLIGHT D2K_PREFLIGHT_V6
+    rm -f "$CT_PID.start"
+    if [ "${NEWCHAIN:-0}" = 1 ] && { [ "${SHADOW:-0}" != 1 ] || [ "${EXP_CONTROL:-0}" != 1 ]; }; then
+        svc_log "контроллер не запущен: NEWCHAIN=1 требует SHADOW=1 и EXP_CONTROL=1"
+        return 1
+    fi
+    if [ "${SYNTHESIS_ONLY:-0}" = 1 ] && { [ "${SHADOW:-0}" != 1 ] || [ "${NEWCHAIN:-0}" != 1 ]; }; then
+        svc_log "контроллер не запущен: SYNTHESIS_ONLY=1 требует SHADOW=1 и NEWCHAIN=1"
+        return 1
+    fi
+    set --
+    if [ "${SYNTHESIS_ONLY:-0}" = 1 ]; then set -- --synthesis-only; fi
+    if [ "${SHADOW:-0}" = 1 ] && [ "${EXP_CONTROL:-0}" = 1 ]; then
+        set -- "$@" --shadow-queue "$RUNTIME_DIR/shadow.queue"
+    fi
+    if [ "${NEWCHAIN:-0}" = 1 ]; then
+        set -- "$@" --newchain-store "$DIR/state/shadow.d2km"
+    fi
+    spawn_daemon -S -b -m -p "$CT_PID" -x "$BIN" -- \
+        --control "$SOCK" --catalog "$DIR/state/catalog.json" --live "$LIVE" --mark "$PROBE_MARK" \
+        --measure-mark "$MEASURE_MARK" --doh-targets "$STATE_DIR/doh-targets" --force-targets "$STATE_DIR/force-targets" \
+        --dns-upstreams "$RUN/dns-upstreams" --dns-addresses "$RUN/dns-excl" --dns-routes "$RUN/dns-routes" \
+        --health-file "$RUNTIME_DIR/d2kc.health" --log "$LOG/d2kc.log" "$@" || return 1
+    wait_running "$CT_PID" d2kc || return 2
+    pid_stamp "$CT_PID"
+}
+
+# Новая цепочка владеет только своим сокетом опытов, каталогом и журналом.
+# Отказ тени не останавливает рабочий движок. Тот же сторож зовёт recover.
+spawn_shadow() {
+    [ -x "$SHADOWBIN" ] || { svc_log "тень не запущена: нет $SHADOWBIN"; return 1; }
+    [ -r "$DIR/files/modern.hex" ] || { svc_log "тень не запущена: нет формы $DIR/files/modern.hex"; return 1; }
+    prepare_runtime || return 1
+    rm -f "$SH_PID.start"
+    spawn_daemon -S -b -m -p "$SH_PID" -x "$SHADOWBIN" -- \
+        --queue "$RUNTIME_DIR/shadow.queue" --form "$DIR/files/modern.hex" --legacy-form "$DIR/files/legacy.hex" \
+        --store "$DIR/state/shadow.d2km" \
+        --journal "$LOG/shadow-why.jsonl" --log "$LOG/shadow.log" \
+        --exp-control "$EXP_SOCK" --daemon-log "$LOG/shadow-daemon.log" || return 1
+    wait_running "$SH_PID" d2kshadow || return 1
+    pid_stamp "$SH_PID"
+}
+
+shadow_reconcile() {
+    SHADOW_QUEUE=$RUNTIME_DIR/shadow.queue
+    if [ "${SHADOW:-0}" != 1 ]; then
+        running "$SH_PID" && stop_pidfile "$SH_PID"
+        return 0
+    fi
+    if [ "${EXP_CONTROL:-0}" != 1 ]; then
+        running "$SH_PID" && stop_pidfile "$SH_PID"
+        svc_log "тень не запущена: SHADOW=1 требует EXP_CONTROL=1"
+        return 0
+    fi
+    running "$SH_PID" || spawn_shadow || svc_log "тень не запустилась — сторож повторит запуск"
+    return 0
+}
+
+svc_log() {
+    mkdir -p "$LOG" 2>/dev/null
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$SERVICE_LOG" 2>/dev/null
+    say "$*"
+}
+
+# Штатная остановка снимает намерение и счёт попыток: после неё движок
+# своей волей не поднимается — ни сторожем, ни хуком NDM.
+engine_unwant() {
+    rm -f "$ENGINE_WANT" "$RECOVER_STATE"
+}
+
+# Пауза между попытками: первая сразу, дальше RECOVER_BASE_S, удваиваясь до
+# RECOVER_MAX_S. 0 — пробовать можно (попытка записана), 1 — рано.
+recover_backoff_ok() {
+    now=$(date +%s)
+    n=0; last=0
+    [ ! -r "$RECOVER_STATE" ] || read -r n last < "$RECOVER_STATE"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    delay=0
+    if [ "$n" -gt 0 ]; then
+        delay=$RECOVER_BASE_S; k=1
+        while [ "$k" -lt "$n" ] && [ "$delay" -lt "$RECOVER_MAX_S" ]; do
+            delay=$((delay * 2)); k=$((k + 1))
+        done
+        [ "$delay" -le "$RECOVER_MAX_S" ] || delay=$RECOVER_MAX_S
+    fi
+    [ $((now - last)) -ge "$delay" ] || return 1
+    printf '%s %s\n' $((n + 1)) "$now" > "$RECOVER_STATE"
+}
+
+recover_settle() {
+    [ -r "$RECOVER_STATE" ] || return 0
+    read -r n last < "$RECOVER_STATE"
+    case "$last" in ''|*[!0-9]*) rm -f "$RECOVER_STATE"; return 0 ;; esac
+    [ $(($(date +%s) - last)) -lt "$RECOVER_RESET_S" ] || rm -f "$RECOVER_STATE"
+}
+
+# ВОССТАНОВЛЕНИЕ ДВИЖКА. Только если движок запущен штатно и штатно не
+# остановлен (ENGINE_WANT) и MODE не off. Целые правила не трогаются: упавший
+# контроллер поднимается один (датапат принимает новое подключение и сам
+# снял пробы прежнего — ctlsrv.c, d2k_ctlsrv_peer_closed), упавший датапат —
+# вместе с контроллером (тот вышел по обрыву связи). Цепочки D2K, ручные
+# исключения в них, исключения DNS и каталог остаются как были; очередь с
+# --queue-bypass всё это время пропускала трафик без обхода. Неполные правила
+# или режим TCP_WATCH — прежний полный перезапуск движка.
+recover() {
+    [ -f "$ENGINE_WANT" ] || return 0
+    [ "$MODE" != "off" ] || return 0
+    dp=нет; ct=нет
+    running "$DP_PID" && dp=да
+    running "$CT_PID" && ct=да
+    if [ "$dp" = да ] && [ "$ct" = да ]; then
+        recover_settle
+        shadow_reconcile
+        return 0
+    fi
+    recover_backoff_ok || return 0
+    if [ ! -f "$RUN/tcp-watch-active" ] && [ ! -f "$RUN/preflight-active" ] && watch_contract_matches && fw_installed; then
+        if [ "$dp" = нет ]; then
+            svc_log "датапат не работает (контроллер работает: $ct) — восстанавливаю датапат и контроллер; правила, исключения и каталог не трогаю"
+            stop_pidfile "$SH_PID"
+            stop_pidfile "$CT_PID"
+            rst_rules_down dead
+            rm -f "$SOCK"
+            spawn_datapath || { svc_log "датапат не поднялся (код $?) — следующая попытка после паузы"; return 1; }
+        else
+            svc_log "контроллер не работает при живом датапате — восстанавливаю только контроллер; правила, исключения и каталог не трогаю"
+            rst_rules_down dead
+        fi
+        spawn_controller || { svc_log "контроллер не поднялся (код $?) — следующая попытка после паузы"; return 1; }
+        shadow_reconcile
+        svc_log "движок восстановлен: датапат pid $(cat "$DP_PID"), контроллер pid $(cat "$CT_PID")"
+        return 0
+    fi
+    svc_log "движок неполон (датапат: $dp, контроллер: $ct, правила неполны или TCP_WATCH) — восстанавливаю полным перезапуском движка"
+    start_engine
 }
 
 start_panel() {
@@ -1389,18 +2410,35 @@ start() {
 
 stop_pidfile() {
     p=$1
+    # Гасится только проверенный номер (running сверяет, чей он), а не
+    # «номер из файла»: тот мог достаться чужому процессу.
     if running "$p"; then
-        start-stop-daemon -K -q -p "$p" 2>/dev/null
+        sp=$(cat "$p" 2>/dev/null)
+        kill "$sp" 2>/dev/null
+        # d2kd: up to 2.5s post-NAT drain, one 2s filter-removal ACK and
+        # a 2s late-worker stop. Ten seconds leaves bounded cleanup headroom;
+        # other services retain their existing three-second grace.
+        stop_ticks_max=30
+        [ "$p" != "$DP_PID" ] || stop_ticks_max=100
+        # Shadow may be inside one bounded arm (plan ACK + TLS + receipt).
+        # Allow that arm to retire its own probe and save the result.
+        [ "$p" != "${SH_PID:-}" ] || stop_ticks_max=300
         i=0
-        while running "$p" && [ $i -lt 30 ]; do
+        while running "$p" && [ $i -lt "$stop_ticks_max" ]; do
             i=$((i + 1))
-            sleep 0.1 2>/dev/null || sleep 1
+            if ! sleep 0.1 2>/dev/null; then
+                sleep 1
+                # Preserve the datapath bound with integer-only sleep too.
+                if [ "$p" = "$DP_PID" ] || [ "$p" = "${SH_PID:-}" ]; then
+                    i=$((i + 9))
+                fi
+            fi
         done
         if running "$p"; then
-            start-stop-daemon -K -q -s KILL -p "$p" 2>/dev/null
+            kill -9 "$sp" 2>/dev/null
         fi
     fi
-    rm -f "$p"
+    rm -f "$p" "$p.start"
 }
 
 write_telegram_status() {
@@ -1502,18 +2540,30 @@ engine_stop() {
     # Сторож гасится ДО снятия правил: иначе он может заметить снятые правила
     # и успеть восстановить их, пока служба останавливается.
     stop_pidfile "$HL_PID" || return 1
-    fw_down
+    stop_pidfile "$SH_PID" || return 1
+    # Keep release rules present until no process can emit NF_REPEAT.
+    if [ -f "$RUN/tcp-watch-active" ] || [ -f "$RUN/preflight-active" ]; then
+        stop_pidfile "$CT_PID" || return 1
+        stop_pidfile "$DP_PID" || return 1
+    fi
+    local stop_fw_rc=0
+    fw_down || stop_fw_rc=1
+    rm -f "$RUN/tcp-watch-active" "$RUN/preflight-active" "$RUN/preflight-v6-active"
     legacy_http_stop
     fastnat_restore
     flowoffload_restore
     stop_pidfile "$CT_PID" || return 1
     stop_pidfile "$DP_PID" || return 1
+    late_chains_down
     rst_rules_down dead
     rm -f "$SOCK"
-    say "движок остановлен"
+    if [ "$stop_fw_rc" = 0 ]; then say "движок остановлен"
+    else say "движок остановлен, но очистка собственных правил не завершена"; fi
+    return "$stop_fw_rc"
 }
 
 stop() {
+    engine_unwant
     stop_pidfile "$DNS_SCHED_PID" || return 1
     stop_pidfile "$UPD_PID" || return 1
     telegram_stop || return 1
@@ -1529,6 +2579,9 @@ status() {
     echo "$NAME"
     running "$DP_PID" && echo "  датапат: работает (pid $(cat "$DP_PID"))" \
                       || echo "  датапат: не работает"
+    if [ "${SHADOW:-0}" = 1 ]; then
+        running "$SH_PID" && echo "  тень: работает (pid $(cat "$SH_PID"))" || echo "  тень: не работает"
+    fi
     running "$CT_PID" && echo "  контроллер: работает (pid $(cat "$CT_PID"))" \
                       || echo "  контроллер: не работает"
     running "$PN_PID" && echo "  панель: работает (pid $(cat "$PN_PID"))" \
@@ -1542,6 +2595,20 @@ status() {
     running "$HL_PID" && echo "  сторож правил: работает (pid $(cat "$HL_PID"))" \
                       || echo "  сторож правил: не работает"
     fw_installed && echo "  правила: стоят" || echo "  правила: отсутствуют или неполны"
+    if [ -s "$USER_RULES" ]; then
+        echo "  исключения владельца в цепочках D2K: $(wc -l < "$USER_RULES" | tr -d ' ') (сохраняются при пересборке правил: $USER_RULES)"
+    fi
+    watch_auto_resolve
+    if [ "${LATE_WATCH:-0}" = 1 ] && ! ls "$RUN"/late-watch-off.* >/dev/null 2>&1; then
+        echo "  поздняя доставка опыта: включена"
+    else
+        echo "  поздняя доставка опыта: выключена${LATE_WATCH_WHY:+ ($LATE_WATCH_WHY)} — опыт на продолжении клиента только в окне очереди"
+    fi
+    if [ -f "$ENGINE_WANT" ]; then
+        echo "  автовосстановление: включено — упавший демон поднимет сторож"
+    else
+        echo "  автовосстановление: выключено — движок штатно остановлен или не запускался"
+    fi
     if [ -n "${KEENETIC_POLICY:-}" ]; then
         pm=$(policy_mark "$KEENETIC_POLICY")
         if [ -n "$pm" ]; then echo "  политика Keenetic: «${KEENETIC_POLICY}» (метка 0x$pm) — остальные устройства идут как без D2K"
@@ -1566,7 +2633,16 @@ status() {
 # d2k-fw-heal.sh — оба зовут ЭТУ команду, а не повторяют её содержимое.
 # Руками она тоже годится.
 reapply() {
+    preflight_validate || return 1
+    watch_validate || return 1
+    # Мёртвый движок здесь не поднимается: после штатной остановки это было
+    # бы воскрешением, а упавший демон поднимает recover по намерению.
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
+    if [ "${TCP_WATCH:-0}" = 1 ] || [ -f "$RUN/tcp-watch-active" ] ||
+       [ "${D2K_PREFLIGHT:-0}" = 1 ] || [ -f "$RUN/preflight-active" ]; then
+        engine_stop && start_engine
+        return $?
+    fi
     legacy_http_stop
     load_modules
     fw_up || { fw_down; die "не поставить полный набор правил"; }
@@ -1605,8 +2681,9 @@ clear_found() {
 }
 
 case "$1" in
-    start)   start ;;
-    heal) if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi
+    start)   locked; start ;;
+    recover) engine_lock 0 || exit 0; recover ;;
+    heal) locked; if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi
           telegram_reapply ;;
     dns-tick) "$DNS_SCHEDULER" tick ;;
     dns-refresh) "$RELEASE/d2k-instagram-dns.sh" refresh ;;
@@ -1621,12 +2698,13 @@ case "$1" in
     tg-heal) telegram_reapply ;;
     tg-stop-rules) "$TG_FIREWALL" stop ;;
 
-    stop)    stop ;;
-    restart) stop && start ;;
-    engine-start) start_engine ;;
-    engine-stop) engine_stop ;;
+    stop)    locked; stop ;;
+    restart) locked; stop && start ;;
+    engine-start) locked; start_engine ;;
+    engine-stop) locked; engine_unwant; engine_stop ;;
     engine-restart)
         [ "$MODE" != "off" ] || die "MODE=off — перезапуск невозможен"
+        locked
         engine_stop && start_engine
         ;;
     telegram-enable) telegram_enable ;;
@@ -1634,8 +2712,8 @@ case "$1" in
     telegram-restart) telegram_restart ;;
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
-    reapply) reapply ;;
-    clear-found) clear_found ;;
+    reapply) locked; reapply ;;
+    clear-found) locked; clear_found ;;
     ppe-ensure) ppe_ensure ;;
     dns-ensure) if running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;
     ppe-remove) d2k_ppe_remove ;;

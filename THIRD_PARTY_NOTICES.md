@@ -1,24 +1,9 @@
 # Third-party notices
 
-## z2k domain-search instrument
+## D2K source
 
-The C QUIC instrument includes a port of `z2k-detect/internal/quicprobe` and
-exact embedded data from `files/fake/quic_5.bin`,
-`files/fake/quic_initial_www_google_com.bin`, and
-`files/fake/quic_initial_rutracker_org.bin` in the z2k source tree.
-Reference revision: `e9a391347671cbb07663d2bee5b3d92f016c789e`.
-The data in `core/profiles/quic_arms.h` is unchanged (1200 bytes per file);
-All bytes were compared to the donor by a Go harness, removed on 2026-10-06 (see git history).
-These are internal probe hypotheses, not imported user strategies.
-No Zapret/nfqws executable or runtime dependency is introduced.
-
-The C voice instrument uses the original internal voiceprobe hypotheses
-`files/fake/stun.bin` and `files/fake/quic_initial_dbankcloud_ru.bin` from the
-same revision. They are distributed with D2K and installed under
-`/opt/d2k/files/fake`; a missing donor hypothesis is skipped just as in the Go
-instrument. These are probe inputs, not a user strategy pool.
-
-The donor distributes this material under the following license:
+The D2K C source is copyright 2026 Necronicle and is distributed under the
+MIT license below.
 
 MIT License
 
@@ -44,9 +29,9 @@ SOFTWARE.
 
 ## OpenSSL
 
-The optional Telegram tunnel runtime statically links OpenSSL 3.5.8 from
+The D2K controller and optional Telegram tunnel runtime statically link OpenSSL 3.5.8 from
 upstream commit `f4dc4d58b48d346a8270183f89acf826d459b0ca`. OpenSSL is licensed
-under the Apache License 2.0. Source and license: <https://www.openssl.org/source/license.html>.
+under the Apache License 2.0. [License text](licenses/Apache-2.0.txt)
 
 `files/tg-roots.pem` contains the public ISRG Root X1 and ISRG Root X2 trust
 anchors published by Internet Security Research Group (ISRG) for the relay's

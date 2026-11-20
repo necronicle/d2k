@@ -100,6 +100,12 @@ typedef struct {
     uint32_t seq;         /* номер запуска (из d2k_hs_job) */
     unsigned complete_responses; /* fully framed replies on this connection */
     unsigned requests_sent;
+    /* The server itself ended the connection after a complete response with
+       explicit framing (Content-Length, chunked or bodiless status) and an
+       announced close ("Connection: close", or HTTP/1.0 without keep-alive).
+       A second request is impossible by protocol, not refused by the path.
+       Close-delimited bodies never set it: a FIN cannot prove they are whole. */
+    int server_closed;
     uint8_t local_ip[16]; /* actual connected socket, not a guessed interface */
     uint16_t local_port; /* host order */
     int fd;               /* его сокет: опоздавший ответ закрывает его */
@@ -109,7 +115,8 @@ typedef struct {
 extern uint16_t d2k_hs_probe_port;
 extern int d2k_hs_probe_ms;
 /* Блокирующий зонд: connect, два GET / с Host на одной связи; полное HTTP framing.
- * REAL сохраняет смысл ответа; complete_responses отдельно доказывает повтор. Сокет
+ * REAL сохраняет смысл ответа; complete_responses отдельно доказывает повтор, а
+ * server_closed — что второго запроса не было по объявлению самого сервера. Сокет
  * НЕ закрывает: им владеет поиск (close_port после ответа). */
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r);
 

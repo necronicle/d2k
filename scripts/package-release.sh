@@ -25,16 +25,22 @@ assets=
 for arch in $ARCHES; do
     tree="$STAGE/$arch"
     mkdir -p "$tree/builds" "$tree/scripts"
-    for bin in d2kd d2kc d2kfetch d2kpanel d2ktg; do
+    for bin in d2kd d2kc d2kshadow d2kfetch d2kpanel d2ktg; do
         test -s "$BUILDS/$bin-linux-$arch" || { echo "нет $BUILDS/$bin-linux-$arch" >&2; exit 1; }
         cp "$BUILDS/$bin-linux-$arch" "$tree/builds/"
     done
     cp "$ROOT/scripts/install.sh" "$ROOT/scripts/architecture.sh" "$ROOT/scripts/check-cpu.sh" \
        "$ROOT/scripts/select-panel-ip.sh" "$tree/scripts/"
     cp -R "$ROOT/files" "$tree/files"
+    mkdir -p "$tree/core/profiles"
+    cp "$ROOT/core/profiles/modern.hex" "$ROOT/core/profiles/legacy.hex" "$tree/core/profiles/"
     mkdir -p "$tree/internal/web"
     cp -R "$ROOT/internal/web/assets" "$tree/internal/web/assets"
-    tar -czf "$OUT/d2k-$arch.tar.gz" -C "$tree" builds scripts files internal
+    cp "$ROOT/LICENSE" "$ROOT/LICENSE-BINARY.md" "$ROOT/THIRD_PARTY_NOTICES.md" "$tree/"
+    mkdir -p "$tree/licenses"
+    cp "$ROOT/licenses/Apache-2.0.txt" "$tree/licenses/"
+    tar -czf "$OUT/d2k-$arch.tar.gz" -C "$tree" builds scripts files internal core \
+        LICENSE LICENSE-BINARY.md THIRD_PARTY_NOTICES.md licenses
     sum=$(sha "$OUT/d2k-$arch.tar.gz")
     assets="$assets${assets:+,}\"$arch\":{\"sha256\":\"$sum\"}"
 done

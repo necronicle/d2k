@@ -381,13 +381,15 @@ static void test_ladder_with_data_stage(void) {
     g_data_verdict = D2K_QAD_PASS; g_calls = g_data_calls = 0;
     r = d2k_quic_original_arms(&c);
     CHECK(r.kind == D2K_QA_COPIES && r.copies == 1 && !r.ttl &&
-          r.len > 0 && strcmp(r.blob_name, "quic5") == 0 && g_calls == 1 && g_data_calls == 1,
+          r.len == 1200 && strcmp(r.blob_name, "quic5") == 0 &&
+          g_calls == 1 && g_data_calls == 1,
           "первое плечо с прошедшим этапом данных завершает поиск");
 
     c.data = NULL;
     g_calls = g_data_calls = 0;
     r = d2k_quic_original_arms(&c);
-    CHECK(r.kind == D2K_QA_COPIES && r.copies == 1 && g_calls == 1 && !g_data_calls,
+    CHECK(r.kind == D2K_QA_COPIES && r.copies == 1 && r.len == 1200 &&
+          !strcmp(r.blob_name, "quic5") && g_calls == 1 && !g_data_calls,
           "без этапа данных (только юнит-оракул) — остановка на первом ответе");
 }
 

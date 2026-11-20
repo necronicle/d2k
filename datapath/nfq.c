@@ -24,6 +24,7 @@ struct d2k_nfq {
     uint16_t queue;
     uint32_t seq;
     uint64_t lost;
+    uint32_t release_id, release_mark, release_bit;
 };
 
 static void say(char *err, size_t cap, const char *fmt, ...)
@@ -241,13 +242,18 @@ ssize_t d2k_nfq_recv(d2k_nfq *q, uint8_t *buf, size_t cap, char *err, size_t err
     return -1;
 }
 
+void d2k_nfq_release_packet(d2k_nfq *q, uint32_t id, uint32_t mark, uint32_t bit) {
+    if (q) { q->release_id=id; q->release_mark=mark; q->release_bit=bit; }
+}
+
 int d2k_nfq_verdict(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
                     char *err, size_t errcap) {
     if (!q) {
         return -1;
     }
     uint8_t msg[64];
-    size_t n = d2k_nl_verdict(msg, sizeof msg, q->queue, q->seq++, pkt_id, verdict);
+    size_t n = d2k_nl_verdict_release(msg, sizeof msg, q->queue, q->seq++, pkt_id, verdict,
+        q->release_mark, pkt_id == q->release_id ? q->release_bit : 0);
     if (n == 0) {
         say(err, errcap, "вердикт не собрался");
         return -1;
@@ -265,8 +271,11 @@ int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
         return -1;
     }
     uint8_t msg[64 + 2048];
-    size_t n = d2k_nl_verdict_payload(msg, sizeof msg, q->queue, q->seq++, pkt_id, verdict,
-                                      payload, len);
+    /* Тот же контракт освобождения, что у d2k_nfq_verdict: только пакет,
+       названный d2k_nfq_release_packet, и только при ACCEPT (этап 18). */
+    size_t n = d2k_nl_verdict_payload_release(msg, sizeof msg, q->queue, q->seq++, pkt_id, verdict,
+                                              payload, len, q->release_mark,
+                                              pkt_id == q->release_id ? q->release_bit : 0);
     if (n == 0) {
         say(err, errcap, "вердикт с заменой не собрался");
         return -1;
@@ -280,4 +289,15 @@ int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
 
 uint64_t d2k_nfq_lost(const d2k_nfq *q) {
     return q ? q->lost : 0;
+}
+
+int d2k_nfq_accept_mark(d2k_nfq *q, uint32_t id, uint32_t mark,
+                         char *err, size_t cap) {
+    if (!q) return -1;
+    uint8_t msg[64];
+    size_t n = d2k_nl_verdict_mark(msg, sizeof msg, q->queue, q->seq++, id, mark);
+    if (!n || nl_write(q->fd, msg, n)) {
+        say(err, cap, "marked ACCEPT: %s", strerror(errno)); return -1;
+    }
+    return 0;
 }

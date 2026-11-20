@@ -24,6 +24,14 @@ static int fixture_write(void *ctx, const uint8_t *buf, size_t n,
     return 0;
 }
 
+static char fetch_request[10000];
+static int fetch_capture(void *ctx, const uint8_t *buf, size_t n, char *err, size_t cap) {
+    (void)ctx; (void)err; (void)cap;
+    assert(n < sizeof fetch_request);
+    memcpy(fetch_request, buf, n); fetch_request[n] = 0;
+    return 0;
+}
+
 /* Задача 44: поток HTTP/3 с кадром HEADERS заданной длины, кусками по step. */
 typedef struct { uint8_t *data; size_t len, pos, step; } h3_fixture;
 static long h3_fixture_recv(void *ctx, uint8_t *buf, size_t cap, char *err, size_t errcap) {
@@ -89,7 +97,7 @@ static d2k_qc *real_h3_conn(int *server, struct sockaddr_in *client_addr) {
     return c;
 }
 /* Сервер: кадр HEADERS длиной section_len на потоке 0, пакетами по ~1100 байт. */
-static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_t *data, size_t n) {
+static void real_h3_serve_end(int server, const struct sockaddr_in *to, const uint8_t *data, size_t n, int fin, int hole) {
     uint8_t secret[32];
     memset(secret, 0x42, sizeof secret);
     d2k_qw_keys sk;
@@ -99,7 +107,7 @@ static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_
         size_t take = n - off > 1100 ? 1100 : n - off;
         uint8_t fr[1200], hdr[16], pkt[1500];
         size_t o = 0;
-        fr[o++] = 0x0e; /* STREAM: OFF | LEN, без FIN */
+        fr[o++] = (uint8_t)(0x0e | (fin && off + take == n));
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, 0);
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, off);
         o += d2k_qw_varint_write(fr + o, sizeof fr - o, take);
@@ -108,9 +116,13 @@ static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_
         size_t pl = d2k_qw_pn_len(pn, -1);
         size_t m = d2k_qw_seal(&sk, 0, hdr, 9, pn, pl, fr, o, pkt, sizeof pkt);
         assert(m > 0);
-        assert(sendto(server, pkt, m, 0, (const struct sockaddr *)to, sizeof *to) == (ssize_t)m);
+        if (!hole || off != 4400)
+            assert(sendto(server, pkt, m, 0, (const struct sockaddr *)to, sizeof *to) == (ssize_t)m);
         pn++; off += take;
     }
+}
+static void real_h3_serve(int server, const struct sockaddr_in *to, const uint8_t *data, size_t n) {
+    real_h3_serve_end(server, to, data, n, 0, 0);
 }
 /* ЗАДАЧА 55: сервер keep-alive за коробкой с бюджетом потока. Каждый запрос
    (один пакет клиента) получает тот же ответ сегментами по mss; коробка
@@ -238,7 +250,7 @@ static int budget_checks(void) {
         d2k_ver_result r = {0}; char err[200] = "";
         r.level = D2K_VER_HANDSHAKE;
         request_page_budget(ka_read, ka_write, &k, "cdn.discordapp.com", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         int want = fake_first ? D2K_BUDGET_PASSED : D2K_BUDGET_CUT;
         if (r.level != D2K_VER_APPLICATION || r.status != 403 || r.budget != want ||
             r.budget_need != 50 || (fake_first && r.budget_packets < 50) ||
@@ -261,7 +273,7 @@ static int budget_checks(void) {
         d2k_ver_result r = {0}; char err[200] = "";
         r.level = D2K_VER_HANDSHAKE;
         request_page_budget(ka_read, ka_write, &k, "gateway.discord.gg", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.budget != (cut ? D2K_BUDGET_CUT : D2K_BUDGET_PASSED) ||
             r.budget_requests < (cut ? 9u : 20u)) {
             fprintf(stderr, "budget 404 cut=%d: budget %d pk %u req %u [%s]\n", cut, r.budget,
@@ -290,7 +302,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE ||
             r.budget_requests != 1 || !strstr(r.budget_note, "keep-alive")) {
             fprintf(stderr, "budget conn-close: level %d budget %d req %u [%s]\n",
@@ -304,7 +316,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE ||
             r.budget_requests != 4) {
             fprintf(stderr, "budget server close: level %d budget %d req %u [%s]\n",
@@ -319,7 +331,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            60, 0, &io, 0, &r, err, sizeof err);
+                            60, 0, &io, 0, &r, err, sizeof err, 0);
         if (r.budget != D2K_BUDGET_NOT_CHECKED || k.answered != 1) {
             fprintf(stderr, "budget off: budget %d answered %d\n", r.budget, k.answered); fails++;
         }
@@ -334,7 +346,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 0, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.budget != D2K_BUDGET_PASSED || r.budget_requests != 1 || k.answered != 1) {
             fprintf(stderr, "budget big: budget %d req %u\n", r.budget, r.budget_requests); fails++;
         }
@@ -348,7 +360,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.level != D2K_VER_APPLICATION || r.budget != D2K_BUDGET_NOT_APPLICABLE) {
             fprintf(stderr, "budget non-silence kind=%d: budget %d [%s]\n", kind, r.budget,
                     r.budget_note); fails++;
@@ -362,7 +374,7 @@ static int budget_checks(void) {
         budget_io io = { ka_packets, ka_spoke, &k };
         d2k_ver_result r = {0}; char err[200] = "";
         request_page_budget(ka_read, ka_write, &k, "example.com", 2, NULL,
-                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err);
+                            60, 0, &io, D2K_BUDGET_FIELD_PACKETS, &r, err, sizeof err, 0);
         if (r.budget != D2K_BUDGET_NOT_APPLICABLE || !r.budget_uncountable) {
             fprintf(stderr, "budget uncountable: budget %d flag %d\n", r.budget,
                     r.budget_uncountable); fails++;
@@ -420,6 +432,31 @@ static int budget_checks(void) {
     return fails;
 }
 
+/* Поле 24.10.2026 (h3-1024, класс B): www.cloudflare.com по QUIC прислал 139 КБ,
+   прибор остановился на 32 КиБ и назвал это обрывом. Предел
+   D2K_QUIC_ARM_DATA_BYTES — мера этапа данных плеча; прибор поля читает до FIN. */
+static int read_body_checks(void) {
+    int fails = 0;
+    for (int mode = 0; mode < 4; mode++) {
+        int all = mode & 1, full_response = (mode & 2) != 0;
+        static q_srv q; memset(&q, 0, sizeof q);
+        q.flen = h3_headers_frame(q.frame, 8);
+        q.left = 60; /* 60 датаграмм ≈ 54 КБ, FIN в последней */
+        d2k_verify_quic_read_all_set(all);
+        uint64_t bytes = 0; int complete = 0; char err[200] = "";
+        int closed = quic_read_body(q_recv, q_progress, &q, 0, verify_now_ms() + 5000, full_response,
+                                    &bytes, &complete, err, sizeof err);
+        int ok = (all || full_response) ? (complete && bytes > D2K_QUIC_ARM_DATA_BYTES && !closed)
+                     : (!complete && bytes >= D2K_QUIC_ARM_DATA_BYTES && bytes < 40000);
+        if (!ok) {
+            fprintf(stderr, "quic_read_body mode=%d: bytes %llu complete %d closed %d\n",
+                    mode, (unsigned long long)bytes, complete, closed); fails++;
+        }
+    }
+    d2k_verify_quic_read_all_set(0);
+    return fails;
+}
+
 int main(void) {
     struct { const char *reply; d2k_ver_level level; } cases[] = {
         {"HTTP/1.1 302 Found\r\nLocation: https://www.google.com/\r\nContent-Length: 0\r\n\r\n", D2K_VER_APPLICATION},
@@ -447,10 +484,15 @@ int main(void) {
         for (size_t fragment = 1; fragment <= 512; fragment *= 8) {
             fixture f = {cases[i].reply, 0, fragment, 0, 0};
             d2k_ver_result r = {0}; char err[200] = "";
-            r.level = D2K_VER_HANDSHAKE; r.name_ok = 0;
+            /* ИМЯ СОБЕСЕДНИКА ПОДТВЕРЖДЕНО: мишень здесь и есть запрошенный
+               хост, и разбор ответа меряется сам по себе. С 24.10.2026 это не
+               безразлично: 451 считается отказом сайта только от владельца
+               имени (core/verify.c), и фикстура обязана сказать, кто ответил.
+               Отдельный случай «имя не подтверждено» — ниже. */
+            r.level = D2K_VER_HANDSHAKE; r.name_ok = 1;
             request_complete_page(fixture_read, fixture_write, &f, "googlevideo.com",
                 0, NULL, 1000, 0, &r, err, sizeof err);
-            if (r.level != cases[i].level || r.name_ok != 0) {
+            if (r.level != cases[i].level || r.name_ok != 1) {
                 fprintf(stderr, "case %zu fragment %zu: level %d expected %d (%s)\n",
                     i, fragment, r.level, cases[i].level, r.reason); fails++;
             }
@@ -465,6 +507,30 @@ int main(void) {
             }
         }
     }
+    /* 451 БЕЗ ПОДТВЕРЖДЁННОГО ИМЕНИ — НЕ ОТКАЗ САЙТА (24.10.2026).
+       Тот же ответ, та же мишень; разница только в том, что собеседник имени
+       не подтвердил. Вставленный в линию 451 — штатный способ блокировки, и
+       закрывать по нему поиск нельзя. */
+    {
+        static const char deny[] = "HTTP/1.1 451 Unavailable\r\nContent-Length: 0\r\n\r\n";
+        for (int name_ok = -1; name_ok <= 1; name_ok++) {
+            fixture f = {deny, 0, 64, 0, 0};
+            d2k_ver_result r = {0}; char err[200] = "";
+            r.level = D2K_VER_HANDSHAKE; r.name_ok = name_ok;
+            request_complete_page(fixture_read, fixture_write, &f, "googlevideo.com",
+                0, NULL, 1000, 0, &r, err, sizeof err);
+            d2k_ver_level want = name_ok == 1 ? D2K_VER_DENIED : D2K_VER_HANDSHAKE;
+            if (r.level != want) {
+                fprintf(stderr, "451 при name_ok=%d: уровень %d, ждали %d (%s)\n",
+                        name_ok, r.level, want, r.reason); fails++;
+            }
+            if (name_ok != 1 && !strstr(r.reason, "не подтвердил имя сертификатом")) {
+                fprintf(stderr, "451 при name_ok=%d: причина не названа (%s)\n",
+                        name_ok, r.reason); fails++;
+            }
+        }
+    }
+
     struct { int code; d2k_ver_level before, after; } ech[] = {
         {451,D2K_VER_DENIED,D2K_VER_DENIED},
         {403,D2K_VER_BLOCKPAGE,D2K_VER_BLOCKPAGE},
@@ -628,6 +694,28 @@ int main(void) {
             d2k_qc_close(c); close(server);
         }
     }
+    /* A full fetch must read beyond 32 KiB. FIN with a missing range and
+       a large response without FIN must never become complete. */
+    for (int mode = 0; mode < 4; mode++) {
+        int server = -1; struct sockaddr_in to;
+        d2k_qc *c = real_h3_conn(&server, &to);
+        char err[100] = "";
+        const uint8_t request[] = {1, 2, 3};
+        assert(d2k_qc_stream_send(c, 0, request, sizeof request, 1, err, sizeof err) == 0);
+        static uint8_t reply[70000];
+        real_h3_serve_end(server, &to, reply, sizeof reply, mode != 2, mode == 3);
+        int closed = 0, complete = 0; uint64_t bytes = 0;
+        quic_read_response(c, verify_now_ms() + 250, mode != 0,
+                           &closed, &bytes, &complete, err, sizeof err);
+        int good = mode == 0 ? (!complete && bytes >= 32768 && bytes < 70000) :
+                   mode == 1 ? (complete && bytes == 70000) :
+                   (!complete && bytes == (mode == 2 ? 70000 : 68900));
+        if (!good) {
+            fprintf(stderr, "QUIC response mode %d: bytes=%llu complete=%d\n",
+                    mode, (unsigned long long)bytes, complete); fails++;
+        }
+        d2k_qc_close(c); close(server);
+    }
     /* Раунд 1: сбои чтения ТЕЛА тоже называют причину (после двоеточия не пусто). */
     {
         struct { const char *reply; int eof_err; const char *needle; } bad[] = {
@@ -680,7 +768,22 @@ int main(void) {
             }
         }
     }
+    {
+        char target[1600], expected[1700];
+        memset(target, 'x', 1400); target[1400] = 0;
+        memcpy(target, "/videoplayback?token=", 20);
+        snprintf(target + 1350, sizeof target - 1350, "%%2B&range=0-1048575");
+        snprintf(expected, sizeof expected, "GET %s HTTP/1.1\r\n", target);
+        fixture f = {"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", 0, 64, 0, 0};
+        d2k_ver_result r = {0}; char err[200] = "";
+        request_complete_page(fixture_read, fetch_capture, &f, "example.com", 0, target,
+                              1000, 0, &r, err, sizeof err);
+        if (strncmp(fetch_request, expected, strlen(expected)) || !r.body_complete) {
+            fprintf(stderr, "explicit fetch target was truncated or response incomplete\n"); fails++;
+        }
+    }
     fails += budget_checks();
+    fails += read_body_checks();
     if (fails) return 1;
     puts("Production HTTP reader: 76 fragments + 4 stylesheet + 4 ECH + long-header (TCP 4+limit, H3 3) + 6 failure-reason + 15 flow-budget (TCP 11, QUIC 4) checks passed without sockets");
     return 0;

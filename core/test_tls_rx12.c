@@ -9,7 +9,7 @@ static int fails;
 int main(void) {
     for(int mode=0;mode<4;mode++) {
         int fd[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,fd));
-        d2k_tls12 *t=calloc(1,sizeof *t);t->fd=fd[0];
+        d2k_tls12 *t=calloc(1,sizeof *t);t->fd=fd[0];CHECK(!suite12_of(0xc02f,t));
         uint8_t wire[16389]={23,3,3,0x40,0}, plain[16360], nonce[12]={0},aad[13],tag[16];
         memset(plain,'x',sizeof plain);aad_of(0,REC_APPDATA,sizeof plain,aad);
         CHECK(!d2k_aes128_gcm_encrypt(t->s_key,nonce,aad,sizeof aad,plain,sizeof plain,wire+13,tag));

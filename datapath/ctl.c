@@ -176,6 +176,16 @@ void d2k_ctl_accept(d2k_ctl *c) {
        позвать greet сразу после accept. */
 }
 
+d2k_ctl *d2k_ctl_accept_peer(d2k_ctl *listener) {
+    if (!listener || listener->lfd < 0) return NULL;
+    int fd=accept(listener->lfd,NULL,NULL);
+    if (fd<0) return NULL;
+    d2k_ctl *peer=calloc(1,sizeof *peer);
+    if (!peer || set_nonblock(fd)<0) { close(fd);free(peer);return NULL; }
+    peer->lfd=-1;peer->pfd=fd;
+    return peer;
+}
+
 static void drop_peer(d2k_ctl *c) {
     int connected = c->pfd >= 0;
     if (c->pfd >= 0) {
@@ -217,7 +227,7 @@ void d2k_ctl_flush(d2k_ctl *c) {
 void d2k_ctl_event(d2k_ctl *c, uint16_t type, const uint8_t *body, size_t len) {
     if (!c || c->pfd < 0 || len > D2K_CTL_FRAME_MAX - 2) {
         if (c) {
-            c->dropped++;
+            d2k_ctl_note_dropped(c, 1);
         }
         return;
     }
@@ -229,7 +239,7 @@ void d2k_ctl_event(d2k_ctl *c, uint16_t type, const uint8_t *body, size_t len) {
     if (need > D2K_CTL_OUT_RING - c->out_used) {
         /* Места нет даже после дописывания — кадр теряется ЦЕЛИКОМ и
            считается. Половина кадра сломала бы разбор у контроллера. */
-        c->dropped++;
+        d2k_ctl_note_dropped(c, 1);
         return;
     }
 
@@ -313,4 +323,10 @@ int d2k_ctl_poll(d2k_ctl *c,
 }
 
 uint64_t d2k_ctl_dropped(const d2k_ctl *c) { return c ? c->dropped : 0; }
+void d2k_ctl_note_dropped(d2k_ctl *c, uint64_t count) {
+    if (c) {
+        c->dropped = count > UINT64_MAX - c->dropped
+                   ? UINT64_MAX : c->dropped + count;
+    }
+}
 uint64_t d2k_ctl_sent(const d2k_ctl *c)    { return c ? c->sent : 0; }

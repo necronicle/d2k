@@ -77,7 +77,8 @@ static int known_key(const char *key) {
         "TG_STATUS", "TG_PORT", "TG_ENROLL_PORT",
         /* Читает files/S99d2k (разгрузка PPE на Keenetic); панели значение
            не нужно, но ключ законный и пишется установщиком. */
-        "D2K_PPE_DEOFFLOAD"
+        "D2K_PPE_DEOFFLOAD", "KEENETIC_POLICY",
+        "SHADOW", "EXP_CONTROL", "NEWCHAIN", "SYNTHESIS_ONLY"
     };
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         if (strcmp(key, keys[i]) == 0) { return 1; }

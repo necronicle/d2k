@@ -241,6 +241,75 @@ static void nap_ms(int ms) {
     (void)nanosleep(&ts, NULL);
 }
 
+/* Ограниченная по времени отправка открытого запроса. *sent_out — сколько
+   байт этого запроса действительно ушло в ядро, и при неудаче тоже: объём
+   лестницы считается по отправленному, а не по номеру ступени. */
+/* Неблокирующий режим — флагом самого дескриптора, а не MSG_DONTWAIT: флага
+   recv/send нет в чистом POSIX, и -std=c99 его не даёт (macOS). Прежние флаги
+   возвращаются на место. */
+static int nonblock_begin(int fd, int *saved, char *err, size_t cap) {
+    *saved = fcntl(fd, F_GETFL, 0);
+    if (*saved < 0 || (!(*saved & O_NONBLOCK) && fcntl(fd, F_SETFL, *saved | O_NONBLOCK) < 0)) {
+        snprintf(err, cap, "неблокирующий режим: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+static void nonblock_end(int fd, int saved) {
+    if (saved >= 0 && !(saved & O_NONBLOCK)) (void)fcntl(fd, F_SETFL, saved);
+}
+
+static int volume_send_plain_nb(int fd, const char *data, size_t len,
+                                int timeout_ms, size_t *sent_out, char *err, size_t cap) {
+    size_t sent = 0;
+    const int64_t deadline = now_ms() + timeout_ms;
+    *sent_out = 0;
+    while (sent < len) {
+        *sent_out = sent;
+        const int64_t left = deadline - now_ms();
+        if (left <= 0) {
+            snprintf(err, cap, "таймаут отправки: %zu/%zu байт", sent, len);
+            return -1;
+        }
+        struct pollfd p = { .fd = fd, .events = POLLOUT };
+        int ready = poll(&p, 1, left > INT_MAX ? INT_MAX : (int)left);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            snprintf(err, cap, "ожидание отправки: %s", strerror(errno));
+            return -1;
+        }
+        if (!ready) continue;
+        if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            snprintf(err, cap, "соединение закрыто при отправке: %zu/%zu байт", sent, len);
+            return -1;
+        }
+        if (!(p.revents & POLLOUT)) continue;
+        int flags = 0;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(fd, data + sent, len - sent, flags);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n <= 0) {
+            snprintf(err, cap, "отправлено %zu/%zu байт: %s", sent, len,
+                     n < 0 ? strerror(errno) : "соединение закрыто");
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    *sent_out = sent;
+    return 0;
+}
+static int volume_send_plain(int fd, const char *data, size_t len,
+                             int timeout_ms, size_t *sent_out, char *err, size_t cap) {
+    int saved;
+    *sent_out = 0;
+    if (nonblock_begin(fd, &saved, err, cap) != 0) return -1;
+    int rc = volume_send_plain_nb(fd, data, len, timeout_ms, sent_out, err, cap);
+    nonblock_end(fd, saved);
+    return rc;
+}
+
 static int clamp_ms(int64_t v, int lo, int hi) {
     if (v < lo) { return lo; }
     if (v > hi) { return hi; }
@@ -328,11 +397,108 @@ static int connect_bounded(const char *ip, uint16_t port, uint32_t mark,
     return fd;
 }
 
-/* Читает заголовки ответа до пустой строки. 0 — прочитано, -1 — обрыв. */
-static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int wait_ms, char *reason, size_t cap) {
+/* A server refusal or an explicit connection close is not a volume cut.
+   Per response: HTTP/1.1 stays open unless "Connection: close"; HTTP/1.0
+   stays open only with an explicit "keep-alive" token. 1xx (except 101) is
+   informational and is followed by the final response of the same request. */
+typedef struct {
     char line[4096];
-    size_t n = 0;
-    int seen_cr = 0;
+    size_t used;
+    int status;
+    int http10;
+    int close_token, keepalive_token;
+} volume_head;
+
+static void head_connection_tokens(volume_head *h, const char *p) {
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        const char *begin = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > begin && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if (end - begin == 5 && !strncasecmp(begin, "close", 5)) h->close_token = 1;
+        if (end - begin == 10 && !strncasecmp(begin, "keep-alive", 10)) h->keepalive_token = 1;
+    }
+}
+
+/* 0: need more, 1: final reusable response head, -2: unsuitable for the probe. */
+static int volume_head_feed(volume_head *h, unsigned char c,
+                            char *reason, size_t cap) {
+    if (c != '\n') {
+        if (!c || h->used + 1 >= sizeof h->line) {
+            snprintf(reason, cap, "заголовок ответа не пригоден для замера");
+            return -2;
+        }
+        h->line[h->used++] = (char)c;
+        return 0;
+    }
+    if (h->used && h->line[h->used - 1] == '\r') h->used--;
+    h->line[h->used] = '\0';
+    if (!h->status) {
+        const char *s = h->line;
+        if (h->used < 12 ||
+            (strncmp(s, "HTTP/1.1 ", 9) && strncmp(s, "HTTP/1.0 ", 9)) ||
+            s[9] < '1' || s[9] > '5' ||
+            s[10] < '0' || s[10] > '9' ||
+            s[11] < '0' || s[11] > '9' ||
+            (h->used > 12 && s[12] != ' ')) {
+            snprintf(reason, cap, "ответ не является корректным HTTP/1.x");
+            return -2;
+        }
+        h->status = (s[9] - '0') * 100 + (s[10] - '0') * 10 + s[11] - '0';
+        h->http10 = s[7] == '0';
+        h->close_token = h->keepalive_token = 0;
+    } else if (!h->used) {
+        if (h->status < 200 && h->status != 101) {
+            /* Informational: the final response of this request follows. */
+            h->status = 0;
+            h->http10 = h->close_token = h->keepalive_token = 0;
+            return 0;
+        }
+        int closes = h->close_token || (h->http10 && !h->keepalive_token);
+        if (h->status == 101 || h->status >= 400 || closes) {
+            snprintf(reason, cap, "HTTP %d%s: продолжение объёмной пробы невозможно",
+                     h->status, closes ? ", соединение закрывается сервером" : "");
+            return -2;
+        }
+        return 1;
+    } else if (!strncasecmp(h->line, "Connection:", 11)) {
+        head_connection_tokens(h, h->line + 11);
+    }
+    h->used = 0;
+    return 0;
+}
+
+/* СЕРВЕР ЗАКРЫЛ ПОТОК САМ (FIN) — НЕ ОБРЫВ ПО ОБЪЁМУ. TLS-слой сворачивает FIN
+   на границе записи в ту же ошибку чтения, что RST и тишину; различает их
+   ядро: CLOSE_WAIT — пришёл FIN собеседника, а мы ещё не закрыли; после RST —
+   CLOSED, при тишине — ESTABLISHED. Раскладка — начало struct tcp_info Linux
+   (TCP_INFO, состояние в первом байте, CLOSE_WAIT = 8) и tcp_connection_info
+   Darwin (TCP_CONNECTION_INFO 0x106, CLOSE_WAIT = 5), без библиотечных
+   заголовков разных лет (тот же приём, что d2k_verify_tcp_data_packets).
+   1 — FIN, 0 — нет, -1 — ядро не сказало (прежняя классификация). */
+static int volume_peer_fin(int fd) {
+#if defined(__linux__) || defined(__APPLE__)
+    uint8_t info[256];
+    socklen_t len = sizeof info;
+    memset(info, 0, sizeof info);
+#if defined(__linux__)
+    const int opt = 11, close_wait = 8;
+#else
+    const int opt = 0x106, close_wait = 5;
+#endif
+    if (fd < 0 || getsockopt(fd, IPPROTO_TCP, opt, info, &len) != 0 || len < 1) return -1;
+    return info[0] == close_wait;
+#else
+    (void)fd;
+    return -1;
+#endif
+}
+
+/* 0: reusable response, -1: transport failure, -2: unsuitable HTTP. */
+static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int fd, int wait_ms,
+                          char *reason, size_t cap) {
+    volume_head head = {0};
     int64_t deadline = now_ms() + wait_ms;
     for (;;) {
         int64_t left = deadline - now_ms();
@@ -341,44 +507,72 @@ static int drain_head_tls(d2k_tls *t, d2k_tls12 *t12, int wait_ms, char *reason,
         long r = t12 ? d2k_tls12_read(t12, &c, 1, (int)left, reason, cap)
                      : d2k_tls_read(t, &c, 1, (int)left, reason, cap);
         if (r <= 0) {
-            if (r == 0) { snprintf(reason, cap, "соединение закрыто"); }
+            if (r == 0) {
+                snprintf(reason, cap, "сервер завершил TLS до полного HTTP-ответа; причина неизвестна");
+                return -2;
+            }
+            if (volume_peer_fin(fd) == 1) {
+                snprintf(reason, cap, "сервер закрыл соединение (FIN) без полного HTTP-ответа");
+                return -2;
+            }
             return -1;
         }
-        if (c == '\n') {
-            if (n == 0 || (n == 1 && seen_cr)) { return 0; } /* пустая строка */
-            n = 0;
-            seen_cr = 0;
+        int parsed = volume_head_feed(&head, c, reason, cap);
+        if (parsed) return parsed > 0 ? 0 : parsed;
+    }
+}
+
+static int drain_head_plain_nb(int fd, int wait_ms, char *reason, size_t cap) {
+    volume_head head = {0};
+    int64_t deadline = now_ms() + wait_ms;
+    for (;;) {
+        int64_t left = deadline - now_ms();
+        if (left <= 0) { snprintf(reason, cap, "ответа нет"); return -1; }
+        struct pollfd p;
+        p.fd = fd; p.events = POLLIN; p.revents = 0;
+        int pr = poll(&p, 1, left > INT_MAX ? INT_MAX : (int)left);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) {
+            snprintf(reason, cap, "ожидание ответа: %s", strerror(errno));
+            return -1;
+        }
+        if (!pr) continue;
+        if (p.revents & POLLNVAL) {
+            snprintf(reason, cap, "сокет ответа закрыт");
+            return -1;
+        }
+        /* POLLHUP can accompany unread response bytes. Drain them first. */
+        if (!(p.revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        uint8_t c;
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (p.revents & (POLLHUP | POLLERR)) {
+                snprintf(reason, cap, "соединение закрыто без полного ответа");
+                return -2;
+            }
             continue;
         }
-        seen_cr = (c == '\r');
-        if (n + 1 < sizeof line) { line[n++] = (char)c; }
+        if (r == 0) {
+            snprintf(reason, cap, "сервер закрыл соединение (FIN) без полного ответа");
+            return -2;
+        }
+        if (r < 0) {
+            snprintf(reason, cap, "чтение: %s", strerror(errno));
+            return -1;
+        }
+        int parsed = volume_head_feed(&head, c, reason, cap);
+        if (parsed) return parsed > 0 ? 0 : parsed;
     }
 }
 
 static int drain_head_plain(int fd, int wait_ms, char *reason, size_t cap) {
-    size_t n = 0;
-    int seen_cr = 0;
-    int64_t deadline = now_ms() + wait_ms;
-    for (;;) {
-        if (now_ms() >= deadline) { snprintf(reason, cap, "ответа нет"); return -1; }
-        struct pollfd p;
-        p.fd = fd; p.events = POLLIN; p.revents = 0;
-        int pr = poll(&p, 1, (int)(deadline - now_ms()));
-        if (pr <= 0) { snprintf(reason, cap, "ответа нет"); return -1; }
-        uint8_t c;
-        ssize_t r = recv(fd, &c, 1, 0);
-        if (r <= 0) {
-            snprintf(reason, cap, r == 0 ? "соединение закрыто" : "чтение: %s", strerror(errno));
-            return -1;
-        }
-        if (c == '\n') {
-            if (n == 0 || (n == 1 && seen_cr)) { return 0; }
-            n = 0; seen_cr = 0;
-            continue;
-        }
-        seen_cr = (c == '\r');
-        n++;
-    }
+    int saved;
+    /* Local descriptor failure says nothing about the path. */
+    if (nonblock_begin(fd, &saved, reason, cap) != 0) return -2;
+    int rc = drain_head_plain_nb(fd, wait_ms, reason, cap);
+    nonblock_end(fd, saved);
+    return rc;
 }
 
 /* ДРУГОЙ ПУБЛИЧНЫЙ ПУТЬ ТОГО ЖЕ ИМЕНИ, КОГДА МЕРИТЬ БЫЛО НЕЧЕМ.
@@ -399,6 +593,8 @@ static int drain_head_plain(int fd, int wait_ms, char *reason, size_t cap) {
    пропускаем: повторять его нечем. */
 static int resource_retry_path(const d2k_ver_result *a, const char *sni,
                                const char *path, char *out, size_t cap) {
+    if (!a || !sni || !sni[0] || !out || !cap) return 0;
+    out[0] = '\0';
     size_t n = a->n_resources > D2K_RESOURCE_COUNT ? D2K_RESOURCE_COUNT : a->n_resources;
     for (size_t i = 0; i < n; i++) {
         const d2k_resource *r = &a->resources[i];
@@ -418,9 +614,10 @@ static int resource_retry_path(const d2k_ver_result *a, const char *sni,
    так же пустым приходил gzip-контроль сошедшейся пары. Об обрыве такой ответ
    не говорит ничего; один повтор того же вопроса по названной причине, не
    перебор. */
-static d2k_ver_result rx_probe(const char *ip, uint16_t port, const char *sni,
+static d2k_ver_result rx_probe(d2k_vol_result *res, const char *ip, uint16_t port, const char *sni,
                                size_t hello_wire, int tls12, int encoding,
                                uint32_t mark, const char *path) {
+    res->probes++;
     d2k_ver_result r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                                   hello_wire, tls12, encoding, mark, path);
     /* Тот же шум — и ответ, вставший раньше полосы (поле 17.10.2026, LR-rx8-1:
@@ -432,6 +629,7 @@ static d2k_ver_result rx_probe(const char *ip, uint16_t port, const char *sni,
         !r.local_limit && !d2k_volume_rx_partial(&r)) {
         d2k_verify_close(&r);
         nap_ms(RESPONSE_PROBE_GAP_MS);
+        res->probes++;
         r = d2k_verify_probe_path_on(-1, ip, port, sni, 6000,
                                      hello_wire, tls12, encoding, mark, path);
     }
@@ -454,7 +652,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
                                    size_t hello_wire, uint32_t mark, const char *path,
                                    char *retry, size_t retry_cap) {
     if (!res || !ip || !sni || !sni[0] || port == 80) { return 0; }
-    d2k_ver_result a = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
+    d2k_ver_result a = rx_probe(res, ip, port, sni, hello_wire, tls12, 0, mark, path);
     res->rx_tls_unavailable = a.level == D2K_VER_TRANSPORT && a.status == 0;
     if (a.body_complete && a.status >= 200 && a.status < 300 &&
         a.http_outcome != D2K_HTTP_BLOCKED && a.http_outcome != D2K_HTTP_LEGAL_DENIAL) {
@@ -495,7 +693,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
     if (rx_wire_partial(&a)) res->rx_partial_wire_bytes = a.rx_tls_wire_bytes;
     else res->rx_partial_bytes = a.body_bytes;
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result b = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
+    d2k_ver_result b = rx_probe(res, ip, port, sni, hello_wire, tls12, 0, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity-1 partial=%llu/%llu TLS=%04x wire=%llu missing=%u; "
              "identity-2 HTTP %d body=%llu complete=%d TLS=%04x wire=%llu missing=%u: %.40s",
@@ -514,7 +712,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         /* Повтор дошёл до конца, пройдя полосу: измерения РАСХОДЯТСЯ. Судит
            третий identity-прогон того же домена — см. d2k_volume_rx_needs_repeat. */
         nap_ms(RESPONSE_PROBE_GAP_MS);
-        d2k_ver_result c = rx_probe(ip, port, sni, hello_wire, tls12, 0, mark, path);
+        d2k_ver_result c = rx_probe(res, ip, port, sni, hello_wire, tls12, 0, mark, path);
         int agreed = d2k_volume_rx_pair_agrees(&a, &c);
         snprintf(res->rx_reason, sizeof res->rx_reason,
                  "identity-1 partial=%llu wire=%llu; identity-2 HTTP %d body=%llu "
@@ -538,7 +736,7 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
         settled_by_third = "; пару решил identity-3";
     }
     nap_ms(RESPONSE_PROBE_GAP_MS);
-    d2k_ver_result gz = rx_probe(ip, port, sni, hello_wire, tls12, 1, mark, path);
+    d2k_ver_result gz = rx_probe(res, ip, port, sni, hello_wire, tls12, 1, mark, path);
     snprintf(res->rx_reason, sizeof res->rx_reason,
              "identity %llu/%llu (пакетов %u/%u); gzip HTTP %d, тело %llu, complete=%d, "
              "encoding=%d, пакетов %u; TLS RX wire=%llu/%llu/%llu missing=%u/%u/%u%s",
@@ -571,6 +769,8 @@ static int measure_response_volume(d2k_vol_result *res, const char *ip,
 static void probe_response_volume(d2k_vol_result *res, const char *ip,
                                   uint16_t port, const char *sni, int tls12,
                                   size_t hello_wire, uint32_t mark, const char *path) {
+    /* TX outcome is final here; RX evidence may rewrite reason below. */
+    snprintf(res->tx_reason, sizeof res->tx_reason, "%s", res->reason);
     char retry[sizeof ((d2k_resource *)0)->path];
     retry[0] = '\0';
     if (!measure_response_volume(res, ip, port, sni, tls12, hello_wire, mark, path,
@@ -604,7 +804,18 @@ static void probe_response_volume(d2k_vol_result *res, const char *ip,
     snprintf(res->rx_reason, sizeof res->rx_reason, "%.102s: %.150s", lead, measured);
 }
 
+static d2k_vol_result volume_probe_path(const char *ip, uint16_t port, const char *sni,
+                                int plain, int tls12, size_t hello_wire,
+                                uint32_t mark, const char *path);
 d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *sni,
+                                int plain, int tls12, size_t hello_wire,
+                                uint32_t mark, const char *path) {
+    d2k_vol_result res = volume_probe_path(ip, port, sni, plain, tls12, hello_wire, mark, path);
+    /* No RX measurement ran (plain HTTP, no address): reason is the TX outcome. */
+    if (!res.tx_reason[0]) snprintf(res.tx_reason, sizeof res.tx_reason, "%s", res.reason);
+    return res;
+}
+static d2k_vol_result volume_probe_path(const char *ip, uint16_t port, const char *sni,
                                 int plain, int tls12, size_t hello_wire,
                                 uint32_t mark, const char *path) {
     d2k_vol_result res;
@@ -617,6 +828,7 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
     }
 
     int64_t started = now_ms();
+    res.probes++;
     int fd = connect_bounded(ip, port, mark, res.reason, sizeof res.reason);
     if (fd < 0) { return res; }
 
@@ -646,8 +858,11 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
 
     const char *host = (sni && sni[0]) ? sni : ip;
     char pad[D2K_VOL_CHUNK + 1];
-    fill_pad(pad, D2K_VOL_CHUNK);
     pad[D2K_VOL_CHUNK] = '\0';
+    /* Отправленный объём — сумма байт запросов, действительно ушедших в
+       соединение (открытый текст запроса; служебные байты записей TLS сюда
+       не входят), а не номер ступени, умноженный на размер набивки. */
+    uint64_t sent_bytes = 0;
 
     /* Пока RTT не измерен на самом запросе — ждём по потолку. */
     int read_timeout = READ_MAX_MS;
@@ -660,6 +875,9 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
                          "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
                          "Connection: keep-alive\r\n\r\n", host);
         } else {
+            /* Своя набивка каждому запросу: одинаковую коробка вправе схлопнуть
+               как повтор (см. fill_pad). */
+            fill_pad(pad, D2K_VOL_CHUNK);
             n = snprintf(req, sizeof req,
                          "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
                          "Connection: keep-alive\r\nX-Pad: %s\r\n\r\n", host, pad);
@@ -675,37 +893,59 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
             return res;
         }
 
-        int sent_kb = i * D2K_VOL_CHUNK / 1024;
         int64_t req_start = now_ms();
         char err[160];
         int bad = 0;
-        if (tls || tls_legacy) {
+        if (i > 0 && volume_peer_fin(fd) == 1) {
+            /* Сервер закрыл соединение между ответами, не объявив этого:
+               следующий запрос получил бы RST от самого сервера, и он
+               выглядел бы как обрыв. Это его политика, а не объём. */
+            snprintf(res.reason, sizeof res.reason,
+                     "сервер закрыл соединение (FIN) после ответа %d", i);
+            bad = 2;
+        } else if (tls || tls_legacy) {
             int written = tls_legacy
                 ? d2k_tls12_write(tls_legacy, (const uint8_t *)req, (size_t)n, err, sizeof err)
                 : d2k_tls_write(tls, (const uint8_t *)req, (size_t)n, err, sizeof err);
             if (written != 0) {
                 snprintf(res.reason, sizeof res.reason, "%s", err);
-                bad = 1;
-            } else if (drain_head_tls(tls, tls_legacy, read_timeout, err, sizeof err) != 0) {
-                snprintf(res.reason, sizeof res.reason, "%s", err);
-                bad = 1;
+                /* No complete request: the next response is not owed. How much
+                   of it left is unknown, so it is not counted. */
+                bad = 2;
+            } else {
+                sent_bytes += (uint64_t)n;
+                int response = drain_head_tls(tls, tls_legacy, fd, read_timeout, err, sizeof err);
+                if (response != 0) {
+                    snprintf(res.reason, sizeof res.reason, "%s", err);
+                    bad = response == -2 ? 2 : 1;
+                }
             }
         } else {
-            ssize_t w = send(fd, req, (size_t)n, 0);
-            if (w != n) {
-                snprintf(res.reason, sizeof res.reason, "запрос не ушёл: %s", strerror(errno));
-                bad = 1;
-            } else if (drain_head_plain(fd, read_timeout, err, sizeof err) != 0) {
+            size_t sent_now = 0;
+            int failed = volume_send_plain(fd, req, (size_t)n, read_timeout, &sent_now,
+                                           err, sizeof err);
+            sent_bytes += (uint64_t)sent_now;
+            if (failed != 0) {
                 snprintf(res.reason, sizeof res.reason, "%s", err);
-                bad = 1;
+                bad = 2;
+            } else {
+                int response = drain_head_plain(fd, read_timeout, err, sizeof err);
+                if (response != 0) {
+                    snprintf(res.reason, sizeof res.reason, "%s", err);
+                    bad = response == -2 ? 2 : 1;
+                }
             }
         }
         if (bad) {
-            res.at_kb = sent_kb;
-            if (i == 0) {
+            res.at_kb = sent_bytes / 1024 > INT_MAX ? INT_MAX : (int)(sent_bytes / 1024);
+            if (bad == 2) {
+                /* Server policy, protocol change, an incomplete request and
+                   local parser limits cannot establish an on-path volume cutoff. */
+                res.verdict = D2K_VOL_SHORT;
+            } else if (i == 0) {
                 /* Умерли на первом же запросе — мишень недоступна, а не блок. */
                 res.verdict = D2K_VOL_UNREACHABLE;
-            } else if (sent_kb >= D2K_VOL_MIN_KB) {
+            } else if (sent_bytes >= (uint64_t)D2K_VOL_MIN_KB * 1024) {
                 res.verdict = D2K_VOL_CUT;
             } else {
                 res.verdict = D2K_VOL_SHORT;
@@ -727,7 +967,7 @@ d2k_vol_result d2k_volume_probe_path(const char *ip, uint16_t port, const char *
     }
 
     res.verdict = D2K_VOL_PASSED;
-    res.at_kb = D2K_VOL_STEPS * D2K_VOL_CHUNK / 1024;
+    res.at_kb = sent_bytes / 1024 > INT_MAX ? INT_MAX : (int)(sent_bytes / 1024);
     snprintf(res.reason, sizeof res.reason, "лестница пройдена целиком");
     if (tls) { d2k_tls_free(tls); }
     if (tls_legacy) { d2k_tls12_free(tls_legacy); }

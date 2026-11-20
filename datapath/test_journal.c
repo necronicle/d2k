@@ -28,7 +28,41 @@ static d2k_key mk(uint16_t port) {
     return k;
 }
 
+static void test_preflight_snapshot(void) {
+    d2k_journal *j=d2k_journal_new(4);
+    d2k_key k=mk(1234);
+    uint8_t plan[D2K_PLAN_ID_LEN],trial[D2K_TRIAL_ID_LEN];
+    memset(plan,0x81,sizeof plan);memset(trial,0xf2,sizeof trial);
+    d2k_binding_context binding={0};binding.generation=123;binding.epoch[0]=7;
+    const uint8_t kinds[]={D2K_JRN_PREFLIGHT_START,D2K_JRN_PREFLIGHT_HANDOVER,D2K_JRN_PREFLIGHT_GAVE_UP};
+    for(size_t i=0;i<3;i++)
+        d2k_journal_add_preflight(j,20+i,&k,kinds[i],19,UINT64_C(0x102030405060708),D2K_CLIENT_SIDE_HIGH,plan,trial,&binding);
+    plan[0]=0;trial[0]=0;binding.generation=0;binding.epoch[0]=0;
+    for(size_t i=0;i<3;i++) {
+        const d2k_jrn_entry *e=d2k_journal_at(j,i);
+        CHECK(e && e->kind==kinds[i] && e->at_ns==20+i && !memcmp(&e->key,&k,sizeof k),"preflight event key/kind/time lost");
+        CHECK(e && e->num==19 && e->preflight_elapsed_ns==UINT64_C(0x102030405060708) && e->d_client_side==D2K_CLIENT_SIDE_HIGH,"preflight K/elapsed/client side lost");
+        CHECK(e && e->plan_id[0]==0x81 && e->trial_id[0]==0xf2 && e->binding.generation==123 && e->binding.epoch[0]==7,"preflight immutable identity lost");
+    }
+    d2k_journal_free(j);
+}
+
 int main(void) {
+    test_preflight_snapshot();
+#ifndef D2K_JOURNAL_FLOW_IDENTITY
+    CHECK(0,"journal does not snapshot flow incarnation");
+#else
+    {
+        d2k_journal *j=d2k_journal_new(8);d2k_flow f={0};f.key=mk(9000);
+        f.incarnation=123;f.flow_epoch[0]=9;
+        d2k_journal_add_suspect_bound(j,10,&f.key,D2K_SUSPECT_SILENT,0,NULL,&f);
+        f.incarnation=456;f.flow_epoch[0]=7;
+        const d2k_jrn_entry *e=d2k_journal_at(j,0);
+        CHECK(e&&e->flow_incarnation==123&&e->flow_epoch[0]==9,"delayed suspicion inherited current flow identity");
+        d2k_journal_free(j);
+    }
+#endif
+
     /* --- порядок от старой к новой ---------------------------------------- */
     {
         d2k_journal *j = d2k_journal_new(8);
@@ -116,7 +150,7 @@ int main(void) {
     {
         d2k_journal *j = d2k_journal_new(4);
         d2k_key k = mk(1);
-        d2k_jrn_detail det = {.ttl = 127, .ref_ttl = 124, .tos = 0x88, .ipid = 54321, .client_shape = 1};
+        d2k_jrn_detail det = {.ttl = 127, .ref_ttl = 124, .tos = 0x88, .ipid = 54321, .client_shape = 1, .client_side = D2K_CLIENT_SIDE_HIGH};
         d2k_journal_add(j, 1, &k, D2K_JRN_SUSPECT, D2K_SUSPECT_RST, 0, &det,
                         NULL, 0, NULL);
         const d2k_jrn_entry *e = d2k_journal_at(j, 0);
@@ -125,6 +159,7 @@ int main(void) {
         CHECK(e && e->d_tos == 0x88, "ToS потерян");
         CHECK(e && e->d_ipid == 54321, "идентификатор IP потерян");
         CHECK(e && e->code == D2K_SUSPECT_RST, "код причины потерян");
+        CHECK(e && e->d_client_side == D2K_CLIENT_SIDE_HIGH, "observed client side lost in journal");
         CHECK(e && e->d_client_shape == 1, "flow protocol survives expiry in journal");
 
         /* Без подробностей поля обязаны остаться нулевыми, а не мусорными. */

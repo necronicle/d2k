@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+task_tmp=$(mktemp -d)
+trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
+awk '/^engine_stop\(\)/,/^}/' "${DNS_TEST_SERVICE:-files/S99d2k}" > "$task_tmp/functions"
+. "$task_tmp/functions"
+RUN="$task_tmp/run";mkdir "$RUN"
+SOCK="$RUN/no-socket" HL_PID=heal SH_PID=shadow CT_PID=controller DP_PID=datapath
+stop_pidfile() { printf '%s\n' "stop:$1" >> "$RUN/order"; }
+fw_down() { printf '%s\n' firewall >> "$RUN/order";return "$FAIL_FW"; }
+legacy_http_stop() { :; }
+fastnat_restore() { :; }
+flowoffload_restore() { :; }
+late_chains_down() { :; }
+rst_rules_down() { :; }
+say() { :; }
+FAIL_FW=0
+: > "$RUN/preflight-active"
+engine_stop
+python3 - "$RUN/order" <<'PYTEST'
+import pathlib,sys
+rows=pathlib.Path(sys.argv[1]).read_text().splitlines()
+assert rows.index('stop:controller')<rows.index('firewall') and rows.index('stop:datapath')<rows.index('firewall'), 'active response owner must stop before its NF_REPEAT release rules disappear'
+PYTEST
+[ ! -f "$RUN/preflight-active" ]
+: > "$RUN/preflight-active"
+: > "$RUN/order"
+FAIL_FW=1
+if engine_stop; then echo 'failed firewall cleanup was reported as completed stop' >&2;exit 1;fi
+grep -qx 'stop:datapath' "$RUN/order"
+printf '%s\n' 'response lifecycle: owners stop before release rules; cleanup failure remains visible'

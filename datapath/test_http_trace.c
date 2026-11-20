@@ -41,7 +41,60 @@ int main(void) {
         CHECK(strstr(line,"status=OBSERVE"),"observation is not completion");
         packet[(family==6?40:20)+3]=81;
         CHECK(!d2k_http_trace(line,sizeof line,packet,n,&result,&outcome),"other ports not logged as HTTP80");
+
+        /* Same TLS record as a prefix and as an assembled input. The trace
+         * must describe ownership, execution identity and send outcome,
+         * without treating prepared packets as application success. */
+        uint8_t hello[1556]={0x16,0x03,0x01,0x06,0x0f,0x01};
+        uint8_t tls_packet[2048];
+        conn.dst_port=htons(443);
+        emit.bytes=hello;emit.len=1396;
+        n=d2k_wire_build(&conn,&emit,tls_packet,sizeof tls_packet);
+        memset(&result,0,sizeof result);
+        result.applied=1;result.execution_id=42;result.plan_id[0]=0xab;
+        result.trial_id[0]=0xcd;result.binding.generation=7;
+        outcome=(d2k_http_trace_outcome){.apply=1,.hook=4,.planned=2,.sent=2,.verdict=0};
+        CHECK(d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0)>0,
+              "TLS prefix has an execution trace");
+        CHECK(strstr(line,"input=PREFIX")&&strstr(line,"bytes=1396")&&strstr(line,"record_bytes=1556"),
+              "partial TLS input is named explicitly");
+        CHECK(strstr(line,"hold=NONE")&&strstr(line,"plan=ab00")&&strstr(line,"trial=cd00")&&
+              strstr(line,"execution=42")&&strstr(line,"generation=7"),
+              "TLS trace identifies the actual plan, trial and generation");
+        CHECK(strstr(line,"status=COMPLETE")&&strstr(line,"raw_sent=2")&&strstr(line,"application=UNKNOWN"),
+              "completed packet execution does not claim application success");
+        outcome.sent=1;
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0);
+        CHECK(strstr(line,"status=INCOMPLETE"),"missing send evidence is not completion");
+        outcome.output_failed=1;outcome.sent=1;
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0);
+        CHECK(strstr(line,"status=FAILED")&&!strstr(line,"status=COMPLETE"),
+              "partial raw send cannot report completed TLS execution");
+        outcome.output_failed=0;outcome.sent=1;outcome.pending=1;outcome.queued=1;
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0);
+        CHECK(strstr(line,"status=PENDING")&&strstr(line,"queued=1"),
+              "deferred TLS output is pending");
+        outcome.pending=0;outcome.queued=0;outcome.sent=2;
+        emit.len=sizeof hello;
+        n=d2k_wire_build(&conn,&emit,tls_packet,sizeof tls_packet);
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,2,1);
+        CHECK(strstr(line,"input=RECORD")&&strstr(line,"hold=ASSEMBLED")&&
+              strstr(line,"originals=2")&&strstr(line,"owned=1"),
+              "assembled local input is not reported as unheld");
+        outcome.original_failed=1;
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,2,1);
+        CHECK(strstr(line,"status=FAILED")&&strstr(line,"original=FAILED"),
+              "original disposition failure cannot report completion");
+        outcome.original_failed=0;result.applied=0;result.skipped="no matching plan";
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0);
+        CHECK(strstr(line,"status=SKIPPED")&&strstr(line,"plan=-")&&strstr(line,"no matching plan"),
+              "missing TLS plan does not acquire an execution identity");
+        outcome.apply=0;result.applied=1;
+        d2k_tls_trace(line,sizeof line,tls_packet,n,&result,&outcome,0,0);
+        CHECK(strstr(line,"status=OBSERVE"),"observe mode is not TLS execution");
+        CHECK(!d2k_tls_trace(line,sizeof line,tls_packet,10,&result,&outcome,0,0),
+              "truncated packet cannot acquire an execution trace");
     }
-    fprintf(stderr,"HTTP execution trace: %d failures\n",fails);
+    fprintf(stderr,"HTTP/TLS execution trace: %d failures\n",fails);
     return fails?1:0;
 }

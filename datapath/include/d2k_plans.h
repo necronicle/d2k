@@ -75,6 +75,7 @@
 #include <stdint.h>
 
 #include "d2k_plan.h"
+#include "d2k_rawmeasure_wire.h"
 
 /* Предел длины имени. Длиннее в SNI не бывает: RFC 6066 ограничивает имя
  * 255 байтами, а практика — куда меньше. */
@@ -105,15 +106,37 @@ static inline int d2k_binding_equal(const d2k_binding_context *a, const d2k_bind
     return 1;
 }
 int d2k_plantab_binding(const d2k_plantab *, const d2k_plan *, d2k_binding_context *);
+/* Разрешить точную ещё живую установку по её привязке (поколение уникально на
+ * установку). Возвращает тот же план, что и обычный выбор, без дублирования
+ * селекторов; переустановка тех же байт несёт новое поколение и не совпадёт;
+ * пробы с истёкшим сроком (now_ns) пропускаются. NULL — привязки уже нет. */
+const d2k_plan *d2k_plantab_find_by_binding(const d2k_plantab *,
+                                            const d2k_binding_context *, uint64_t now_ns);
 /* Name probe identity belongs to this installation, not to serialized plan bytes.
  * A legacy all-zero token is accepted and remains unknown proof. */
+/* Production SET_NAME_BOUND uses exact declared shape. Installation metadata
+ * does not alter program bytes/hash; legacy unbound lookup is unchanged. */
+int d2k_plantab_set_name_bound(d2k_plantab *,const uint8_t *,size_t,
+    uint64_t now_ns,d2k_plan *,uint8_t shape,uint8_t family);
 int d2k_plantab_set_name_trial(d2k_plantab *, const uint8_t *name, size_t len,
     uint64_t now_ns, d2k_plan *, uint8_t shape, uint16_t sport_be, uint8_t family,
     const uint8_t trial_id[D2K_TRIAL_ID_LEN]);
 void d2k_plantab_trial(const d2k_plantab *, const d2k_plan *, uint8_t out[D2K_TRIAL_ID_LEN]);
+int d2k_plantab_set_endpoint_trial(d2k_plantab *, const uint8_t *, uint8_t,
+    uint16_t, uint64_t, d2k_plan *, uint8_t, const uint8_t trial[16]);
+int d2k_plantab_set_endpoint_trial_port(d2k_plantab *, const uint8_t *, uint8_t,
+    uint16_t, uint16_t, uint64_t, d2k_plan *, uint8_t, const uint8_t trial[16]);
+int d2k_plantab_commit_endpoint_trial(d2k_plantab *, const uint8_t *, uint8_t,
+    uint16_t, uint8_t, const uint8_t trial[16]);
+int d2k_plantab_del_endpoint_trial(d2k_plantab *, const uint8_t *, uint8_t,
+    uint16_t, uint8_t, const uint8_t trial[16]);
 int d2k_plantab_del_name_bound(d2k_plantab *, const uint8_t *, size_t,
     uint8_t transport, const d2k_binding_context *);
 
+/* A bound non-ECH TLS13 proof requires a complete extension block to
+ * distinguish plain TLS from an ECH offer arriving in a later segment. */
+int d2k_plantab_needs_complete_tls_shape(const d2k_plantab *,const uint8_t *,size_t,
+    uint8_t family);
 int d2k_plantab_has_ech_target(const d2k_plantab *, const uint8_t *, size_t,
     const uint8_t *, uint8_t family, uint16_t sport_be);
 
@@ -131,6 +154,32 @@ int d2k_plantab_set_addr_shaped(d2k_plantab *, const uint8_t *, uint8_t family,
     uint64_t now_ns, d2k_plan *, uint8_t shape);
 int d2k_plantab_del_addr_shaped(d2k_plantab *, const uint8_t *, uint8_t family,
     uint8_t shape);
+/* Permanent service binding: exact address, family, server port and shape.
+ * Ports are in network order and must be nonzero. No wildcard shapes or
+ * implicit TLS/ECH transfer. Ownership of p transfers on every outcome.
+ * Legacy address lookup/deletion cannot see/remove these bindings. */
+int d2k_plantab_set_endpoint(d2k_plantab *, const uint8_t *, uint8_t family,
+    uint16_t dport_be, uint64_t now_ns, d2k_plan *, uint8_t shape);
+int d2k_plantab_del_endpoint(d2k_plantab *, const uint8_t *, uint8_t family,
+    uint16_t dport_be, uint8_t shape);
+/* RAW requires explicit transport; ambiguous legacy deletion preserves both. */
+int d2k_plantab_del_raw_endpoint(d2k_plantab *, const uint8_t *, uint8_t family,
+    uint16_t dport_be, uint8_t transport);
+int d2k_plantab_set_dns_endpoint(d2k_plantab *,const uint8_t *,uint8_t family,
+    uint16_t dport_be,uint64_t now_ns,uint16_t wire_length,d2k_plan *);
+int d2k_plantab_del_dns_endpoint(d2k_plantab *,const uint8_t *,uint8_t family,
+    uint16_t dport_be,uint8_t transport);
+void d2k_plantab_clear_dns_endpoints(d2k_plantab *);
+const d2k_plan *d2k_plantab_find_dns_endpoint(d2k_plantab *,const uint8_t *,uint8_t family,
+    uint16_t dport_be,uint8_t transport,const uint8_t *,size_t,uint64_t now_ns);
+const d2k_plan *d2k_plantab_find_target_endpoint(d2k_plantab *, const uint8_t *name, size_t,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t shape,
+    uint16_t sport_be, uint16_t dport_be);
+/* Этап 39: то же с транспортом потока (6/17): у формы RAW адресная запись
+ * своя для каждого транспорта плана. 0 — транспорт не задан (прежний поиск). */
+const d2k_plan *d2k_plantab_find_target_endpoint_tr(d2k_plantab *, const uint8_t *name, size_t,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint16_t dport_be, uint8_t transport);
 const d2k_plan *d2k_plantab_find_target(d2k_plantab *, const uint8_t *name, size_t,
     const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t shape, uint16_t sport_be);
 int d2k_plantab_set_name_family(d2k_plantab *, const uint8_t *, size_t,
@@ -138,6 +187,10 @@ int d2k_plantab_set_name_family(d2k_plantab *, const uint8_t *, size_t,
 int d2k_plantab_del_name_family(d2k_plantab *, const uint8_t *, size_t, uint8_t family);
 int d2k_plantab_del_name_probe_family(d2k_plantab *, const uint8_t *, size_t,
     uint8_t shape, uint16_t sport_be, uint8_t family);
+/* Exact probe key AND experiment token; stale/recycled ports preserve the
+ * currently installed owner's plan. A zero/absent token never deletes. */
+int d2k_plantab_del_name_probe_trial(d2k_plantab *,const uint8_t *,size_t,
+    uint8_t shape,uint16_t sport_be,uint8_t family,const uint8_t trial[D2K_TRIAL_ID_LEN]);
 /* Постоянная запись ровно (имя, транспорт, форма, семейство); пробы не
  * трогает (задача 21). 1 — что-то снято. */
 int d2k_plantab_del_name_shaped(d2k_plantab *, const uint8_t *, size_t,
@@ -163,6 +216,12 @@ typedef struct {
     uint8_t  family; /* 0 is the existing IPv4 caller default; otherwise 4/6. */
     uint8_t  src_ip6[16], dst_ip6[16];
 } d2k_addr_probe_flow;
+
+int d2k_plantab_set_dns_probe(d2k_plantab *,const d2k_addr_probe_flow *,
+    const uint8_t [16],uint64_t,uint64_t,uint16_t,const uint8_t [32],d2k_plan *);
+const d2k_plan *d2k_plantab_find_dns_probe(d2k_plantab *,const d2k_addr_probe_flow *,
+    int,const uint8_t *,size_t,uint64_t,uint8_t [16],int *reserved);
+
 
 d2k_plantab *d2k_plantab_new(size_t cap);
 void         d2k_plantab_free(d2k_plantab *t);
@@ -226,6 +285,10 @@ void         d2k_plantab_clear_probes(d2k_plantab *t);
  * (d2k_plantab_find_http): ни дедушкина запись, ни адрес, ни семейство
  * имён HTTP-запросу не достаются. */
 #define D2K_PLAN_SHAPE_HTTP 7
+/* Нагрузка без распознанного протокола — признак наблюдения потока (журнал,
+ * SUSPECT), записей такой формы в таблице не бывает (этап 12, 28.10.2026). */
+#define D2K_PLAN_SHAPE_RAW 8
+#define D2K_PLAN_SHAPE_DNS 9
 
 /* Learned areas never consume/evict exact bindings. Set owns p on all paths,
  * like set_name_family. Exceptions are exact and context-specific. */
@@ -301,13 +364,26 @@ int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be);
 /* Временный Plan для одного exact-flow опыта. plan ownership переходит
  * таблице при любом результате. expires_ns — монотонное время datapath.
  * 0 success; -1 capacity exhausted; -2 invalid args; -3 same flow already
- * owned by a different trial generation. */
+ * owned by a different trial generation, or a renewal whose evidence or plan
+ * differs from the installed one. */
+#define D2K_MEASURED_PROBE 1
+/* Owns p on every result. Guarded plans are invisible to ordinary lookups.
+ * plan_digest: SHA-256 of the plan's wire bytes. The same flow and trial with
+ * byte-identical report and plan only moves the expiry (lease renewal); the
+ * installed plan and evidence stay as they were. */
+int d2k_plantab_set_measured_probe(d2k_plantab *,const struct d2k_rawmeasure_report *,
+                                  const uint8_t trial[16],const uint8_t plan_digest[32],
+                                  uint64_t now,uint64_t expires,d2k_plan *p);
+const d2k_plan *d2k_plantab_find_measured_probe(d2k_plantab *,const d2k_ct_tuple *,
+    const uint8_t epoch[16],uint64_t generation,uint32_t seq,const uint8_t *payload,size_t len,
+    uint64_t now,uint8_t trial_out[16]);
 int d2k_plantab_set_addr_probe(d2k_plantab *t,
                                const d2k_addr_probe_flow *flow,
                                const uint8_t trial_id[D2K_TRIAL_ID_LEN],
                                uint64_t now_ns, uint64_t expires_ns,
                                d2k_plan *p);
-/* Removes only exact (flow, generation); stale deletes return 0. */
+/* Removes only exact (flow, generation); stale deletes return 0.
+ * A DNS entry returns 2 because it has no conntrack lease to remove. */
 int d2k_plantab_del_addr_probe(d2k_plantab *t,
                                const d2k_addr_probe_flow *flow,
                                const uint8_t trial_id[D2K_TRIAL_ID_LEN]);

@@ -14,16 +14,19 @@ module.exports=async function(visualFixture){
  fs.writeFileSync(tgStatus,'connected\n');writeLive();
  fs.writeFileSync(service,'#!/usr/bin/env node\n'+
   'const fs=require("node:fs");const action=process.argv[2];\n'+
-  'const paths='+JSON.stringify({config,log,engine})+';\n'+
+  'const paths='+JSON.stringify({config,log,engine,policyFail:path.join(temp,"policy-fail")})+';\n'+
   'if(action==="engine-stop")fs.rmSync(paths.engine,{force:true});\n'+
   'if(action==="engine-start"||action==="engine-restart")fs.writeFileSync(paths.engine,'+JSON.stringify(pid)+');\n'+
   'if(action.startsWith("telegram-"))fs.writeFileSync(paths.config,fs.readFileSync(paths.config,"utf8").replace(/TG_ENABLED=[01]/,"TG_ENABLED="+(action==="telegram-enable"?1:0)));\n'+
-  'fs.appendFileSync(paths.log,action+"\\n");\n',{mode:0o700});
+  'fs.appendFileSync(paths.log,action+"\\n");\n'+
+  'if(action==="engine-restart"&&fs.existsSync(paths.policyFail))process.exit(1);\n',{mode:0o700});
  const socket=net.createServer();await new Promise(r=>socket.listen(0,'127.0.0.1',r));
  const port=socket.address().port;await new Promise(r=>socket.close(r));
+ const ndmc=path.join(temp,'ndmc');
+ fs.writeFileSync(ndmc,"#!/bin/sh\nprintf '%s\\n' 'policy, name = Policy7, description = Work <devices>:' ' mark: 00ab' 'policy, name = D2Ktest:' ' mark: ff'\n",{mode:0o700});
  const child=spawn(path.join(__dirname,'d2kpanel'),['serve','--config',config,'--listen','127.0.0.1:'+port,
   '--live',live,'--assets',path.resolve(__dirname,'../internal/web/assets'),'--service',service,
-  '--engine-pid',engine,'--controller-pid',controller,'--telegram-pid',telegram,'--telegram-status',tgStatus],{stdio:'ignore'});
+  '--engine-pid',engine,'--controller-pid',controller,'--telegram-pid',telegram,'--telegram-status',tgStatus],{stdio:'ignore',env:{...process.env,PATH:temp+path.delimiter+process.env.PATH}});
  const timer=setInterval(writeLive,2000),url='http://127.0.0.1:'+port+'/';
  const close=async()=>{
   clearInterval(timer);child.kill('SIGTERM');
@@ -41,7 +44,7 @@ module.exports=async function(visualFixture){
   /* seen — проверка «команды НЕ было». waitFor для этого не годится: он
      ждёт появления и падает по тайм-ауту, то есть отрицание им стоит три
      секунды и читается как поломка. */
-  return {url,close,telegram:status=>fs.writeFileSync(tgStatus,status+'\n'),
+  return {url,close,policyFail:on=>{const file=path.join(temp,"policy-fail");if(on)fs.writeFileSync(file,"1");else fs.rmSync(file,{force:true});},policy:()=>{const match=fs.readFileSync(config,"utf8").match(/^KEENETIC_POLICY='([^']*)'/m);return match?match[1]:"";},telegram:status=>fs.writeFileSync(tgStatus,status+'\n'),
    seen:(command)=>fs.existsSync(log)&&fs.readFileSync(log,'utf8').split('\n').includes(command),
    waitFor:async(command)=>{
    for(let i=0;i<60;i++){

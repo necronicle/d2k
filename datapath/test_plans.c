@@ -8,6 +8,7 @@
  * задачи: внутреннее поле давности наружу не выставлено и не должно быть.
  */
 #include <stdio.h>
+#include <arpa/inet.h>
 #include <string.h>
 #include <sys/resource.h>
 #include "d2k_plans.h"
@@ -38,6 +39,23 @@ static d2k_plan *mkplan(void) {
     return p;
 }
 
+/* План с явным транспортом TCP (proto tcp tls): запись транспорта и порядок. */
+static const uint8_t tcp_tlv[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+    0x00, 0x02, 0x00, 0x02, 6, 1,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+static d2k_plan *mktcp(void) {
+    d2k_plan *p = NULL;
+    char err[128];
+    if (d2k_plan_load(tcp_tlv, sizeof tcp_tlv, &p, err, sizeof err) != 0) {
+        printf("ПРОВАЛ: TCP-план не грузится: %s\n", err);
+        fails++;
+        return NULL;
+    }
+    return p;
+}
+
 /* quicdeny (задача 50): UDP, исполнитель 11, одна запись QDENY. */
 static const uint8_t deny_tlv[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 11, 0, 0, 0, 2,
@@ -58,7 +76,350 @@ static uint32_t addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
     return r;
 }
 
+/* Exact endpoint authority beats inherited area rules, never own name proof. */
+static void endpoint_before_area(void) {
+    const uint8_t host[]="resolver.example.test",suffix[]="example.test";
+    const uint8_t ip[16]={192,0,2,51},other[16]={192,0,2,52};
+    for(uint8_t family=4;family<=6;family+=2) {
+        d2k_plantab *t=d2k_plantab_new(16);
+        d2k_plan *group=mktcp(),*other_group=mktcp(),*exact=mktcp(),*named=mktcp(),*probe=mktcp();
+        CHECK(!d2k_plantab_set_suffix_family(t,suffix,sizeof suffix-1,1,group,1,family),"area install");
+        CHECK(!d2k_plantab_set_suffix_family(t,suffix,sizeof suffix-1,1,other_group,1,family==4?6:4),"other-family area install");
+        CHECK(!d2k_plantab_set_addr_shaped(t,other,family,1,mktcp(),1),"legacy whole-address install");
+        CHECK(!d2k_plantab_set_endpoint(t,ip,family,htons(8443),2,exact,1),"exact endpoint install");
+        const d2k_plan *selected=d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,3,1,0,htons(8443),6);
+        CHECK(selected==exact,"exact endpoint shadowed by suffix");
+        d2k_binding_context binding={0};
+        CHECK(d2k_plantab_binding(t,selected,&binding) && binding.kind==D2K_BIND_ADDR &&
+              !binding.temporary && d2k_plantab_find_by_binding(t,&binding,3)==exact,
+              "receipt metadata must identify the selected endpoint");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,other,family,3,1,0,htons(8443),6)==group,
+              "other IP must retain inherited area");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,3,1,0,htons(443),6)==group,
+              "other port must retain inherited area");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family==4?6:4,3,1,0,htons(8443),6)==other_group,
+              "other-family group must not inherit this endpoint");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,3,D2K_PLAN_SHAPE_ECH_TCP,0,htons(8443),6)==group,
+              "exact endpoint must not cross protocol shape");
+        CHECK(!d2k_plantab_set_bypass_family(t,host,sizeof host-1,6,1,family),"area bypass install");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,4,1,0,htons(8443),6)==exact,
+              "inherited bypass shadowed exact service");
+        CHECK(!d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,other,family,4,1,0,htons(8443),6),
+              "without endpoint the existing bypass must remain effective");
+        CHECK(!d2k_plantab_set_name_family(t,host,sizeof host-1,5,named,1,0,family),"own name install");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,6,1,0,htons(8443),6)==named,
+              "exact endpoint shadowed explicit name");
+        CHECK(!d2k_plantab_set_name_family(t,host,sizeof host-1,7,probe,1,htons(31000),family),"own probe install");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,8,1,htons(31000),htons(8443),6)==probe,
+              "endpoint shadowed own name probe");
+        memset(&binding,0,sizeof binding);
+        CHECK(d2k_plantab_binding(t,probe,&binding) && binding.kind==D2K_BIND_NAME && binding.temporary &&
+              d2k_plantab_find_by_binding(t,&binding,8)==probe,"probe receipt identity changed");
+        CHECK(d2k_plantab_del_name_family(t,host,sizeof host-1,family)==1,"remove own name records");
+        CHECK(!d2k_plantab_set_name_family(t,host,sizeof host-1,9,mktcp(),D2K_PLAN_SHAPE_GRANDFATHER,0,family),
+              "grandfather name install");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,host,sizeof host-1,ip,family,10,1,0,htons(8443),6)!=exact,
+              "exact endpoint shadowed grandfather name");
+        d2k_plantab_free(t);
+    }
+}
+
+/* A service proven at one port does not authorize another service on that IP. */
+static void raw_endpoint_ports(void) {
+    const uint8_t a[16] = {192, 0, 2, 9};
+    for (uint8_t family = 4; family <= 6; family += 2) {
+        d2k_plantab *t = d2k_plantab_new(8);
+        d2k_plan *tcp = mktcp(), *udp = mkdeny();
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),1,tcp,D2K_PLAN_SHAPE_RAW)==0,
+              "RAW TCP endpoint install");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),2,udp,D2K_PLAN_SHAPE_RAW)==0,
+              "RAW UDP endpoint same port install");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,NULL,0,a,family,3,D2K_PLAN_SHAPE_RAW,0,htons(443),6)==tcp,
+              "RAW TCP endpoint transport preserved");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,NULL,0,a,family,3,D2K_PLAN_SHAPE_RAW,0,htons(443),17)==udp,
+              "RAW UDP endpoint transport preserved");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,NULL,0,a,family,3,D2K_PLAN_SHAPE_RAW,0,htons(8443),6)==NULL,
+              "RAW TCP endpoint cannot cross port");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,NULL,0,a,family,3,D2K_PLAN_SHAPE_RAW,0,htons(8443),17)==NULL,
+              "RAW UDP endpoint cannot cross port");
+        CHECK(d2k_plantab_del_endpoint(t,a,family,htons(443),D2K_PLAN_SHAPE_RAW)==0,
+              "ambiguous RAW deletion preserves owners");
+        CHECK(d2k_plantab_del_raw_endpoint(t,a,family,htons(443),6)==1,
+              "RAW TCP deletion exact");
+        CHECK(d2k_plantab_find_target_endpoint_tr(t,NULL,0,a,family,3,D2K_PLAN_SHAPE_RAW,0,htons(443),17)==udp,
+              "RAW TCP deletion preserves UDP");
+        CHECK(d2k_plantab_del_raw_endpoint(t,a,family,htons(443),17)==1,
+              "RAW UDP deletion exact");
+        d2k_plantab_free(t);
+    }
+}
+
+static void endpoint_ports(void) {
+    const uint8_t ip[16] = {192, 0, 2, 7};
+    const uint8_t ip6[16] = {0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
+    for (unsigned family = 4; family <= 6; family += 2) {
+        const uint8_t *a = family == 4 ? ip : ip6;
+        d2k_plantab *t = d2k_plantab_new(8);
+        d2k_plan *p1 = mkplan(), *p2 = mkplan(), *q = mkdeny();
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),1,p1,D2K_PLAN_SHAPE_MODERN)==0,
+              "install first service");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(8443),2,p2,D2K_PLAN_SHAPE_MODERN)==0,
+              "install second service");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),3,q,D2K_PLAN_SHAPE_QUIC)==0,
+              "same port other protocol");
+#define EP(port, shape) d2k_plantab_find_target_endpoint(t,NULL,0,a,family,10,shape,0,htons(port))
+        CHECK(EP(443,D2K_PLAN_SHAPE_MODERN)==p1,"first port keeps its plan");
+        CHECK(EP(8443,D2K_PLAN_SHAPE_MODERN)==p2,"second port gets own plan");
+        CHECK(EP(443,D2K_PLAN_SHAPE_QUIC)==q,"same port QUIC isolated from TLS");
+        CHECK(EP(8443,D2K_PLAN_SHAPE_QUIC)==NULL,"QUIC cannot cross service port");
+        CHECK(EP(9443,D2K_PLAN_SHAPE_MODERN)==NULL,"other port has no authority");
+        CHECK(EP(0,D2K_PLAN_SHAPE_MODERN)==NULL,"unknown port has no authority");
+        CHECK(EP(443,D2K_PLAN_SHAPE_ECH_TCP)==NULL,"no implicit endpoint shape transfer");
+        CHECK(d2k_plantab_find_target(t,NULL,0,a,family,10,D2K_PLAN_SHAPE_MODERN,0)==NULL,
+              "legacy portless lookup cannot broaden service binding");
+        CHECK(d2k_plantab_del_addr_family(t,a,family)==0,"legacy delete cannot remove service bindings");
+        d2k_plan *broad = mkplan();
+        CHECK(d2k_plantab_set_addr_shaped(t,a,family,11,broad,D2K_PLAN_SHAPE_MODERN)==0,
+              "legacy address coexists");
+        CHECK(EP(443,D2K_PLAN_SHAPE_MODERN)==p1,"exact endpoint beats legacy broad address");
+        CHECK(EP(9443,D2K_PLAN_SHAPE_MODERN)==broad,"legacy address retains previous scope");
+        CHECK(d2k_plantab_del_addr_shaped(t,a,family,D2K_PLAN_SHAPE_MODERN)==1,
+              "delete legacy address only");
+        CHECK(EP(443,D2K_PLAN_SHAPE_MODERN)==p1,"service survives legacy deletion");
+        CHECK(d2k_plantab_del_endpoint(t,a,family,htons(443),D2K_PLAN_SHAPE_MODERN)==1,
+              "delete exact endpoint shape");
+        CHECK(EP(443,D2K_PLAN_SHAPE_MODERN)==NULL,"deleted service gone");
+        CHECK(EP(443,D2K_PLAN_SHAPE_QUIC)==q,"delete preserves other protocol");
+        CHECK(EP(8443,D2K_PLAN_SHAPE_MODERN)==p2,"delete preserves other port");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,0,12,mkplan(),D2K_PLAN_SHAPE_MODERN)==-2,
+              "reject zero server port");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),12,mkplan(),D2K_PLAN_SHAPE_ANY)==-2,
+              "reject unknown shape");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),12,mkplan(),D2K_PLAN_SHAPE_GRANDFATHER)==-2,
+              "reject wildcard shape");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(443),12,mkdeny(),D2K_PLAN_SHAPE_MODERN)==-2,
+              "reject UDP plan for TCP shape");
+        CHECK(d2k_plantab_set_endpoint(t,a,family,htons(3478),12,mkdeny(),D2K_PLAN_SHAPE_VOICE)==-2,
+              "reject QUIC plan for STUN service despite same UDP transport");
+        CHECK(d2k_plantab_count(t)==2,"invalid inserts preserve other services");
+        d2k_plantab_free(t);
+#undef EP
+    }
+}
+
+/* ЭТАП 39: собственные решения формы RAW (поток без протокола) у ОДНОГО адреса —
+   отдельно для TCP и для UDP. Прежде ключ адресной записи был (адрес, семейство,
+   форма): решение второго транспорта затирало первое, и UDP-поток игры получал
+   TCP-план («план объявлен для другого транспорта», lab-udp-raw LATE). Теперь
+   у формы RAW в ключе транспорт плана; поиск указывает свой транспорт. */
+static void raw_transports_coexist(void) {
+    const uint8_t ip[16] = {198, 51, 100, 7};
+    d2k_plantab *t = d2k_plantab_new(8);
+    d2k_plan *tcp = mktcp(), *udp = mkdeny(), *udp2 = mkdeny();
+    CHECK(tcp && udp && udp2 && d2k_plan_transport(tcp) == 6 && d2k_plan_transport(udp) == 17,
+          "raw: стенд — транспорты тестовых планов не те");
+    CHECK(d2k_plantab_set_addr_shaped(t, ip, 4, 1, udp, D2K_PLAN_SHAPE_RAW) == 0, "raw: UDP-решение адреса");
+    CHECK(d2k_plantab_set_addr_shaped(t, ip, 4, 2, tcp, D2K_PLAN_SHAPE_RAW) == 0, "raw: TCP-решение адреса");
+#define RAWEP(tr) d2k_plantab_find_target_endpoint_tr(t, NULL, 0, ip, 4, 10, D2K_PLAN_SHAPE_RAW, 0, htons(27015), (tr))
+    CHECK(RAWEP(17) == udp, "raw: TCP-решение затёрло UDP-решение того же адреса");
+    CHECK(RAWEP(6) == tcp, "raw: TCP-поток не получил своё решение");
+    CHECK(d2k_plantab_set_addr_shaped(t, ip, 4, 3, udp2, D2K_PLAN_SHAPE_RAW) == 0, "raw: новое UDP-решение");
+    CHECK(RAWEP(17) == udp2 && RAWEP(6) == tcp, "raw: замена UDP-решения задела TCP-решение");
+#undef RAWEP
+    d2k_plantab_free(t);
+}
+
+static void measured_probe_scope(void) {
+#ifndef D2K_MEASURED_PROBE
+    CHECK(0,"measured plan has no exact connection/content guard");
+#else
+    static const uint8_t q_digest[32]={0x8e,0x35,0xc2,0xcd,0x3b,0xf6,0x64,0x1b,0xdb,0x0e,0x20,0x50,0xb7,0x69,0x32,0xcb,0xb2,0xe6,0x03,0x4a,0x0d,0xda,0xcc,0x1d,0x9b,0xea,0x82,0xa6,0xba,0x57,0xf7,0xcf};
+    for(int family=4;family<=6;family+=2)for(int proto=6;proto<=17;proto+=11) {
+        d2k_plantab *t=d2k_plantab_new(8);struct d2k_rawmeasure_report r={0};
+        r.request.tuple.family=family;r.request.tuple.proto=proto;
+        r.request.tuple.src[0]=192;r.request.tuple.dst[0]=1;
+        r.request.tuple.sport_be[0]=0xab;r.request.tuple.dport_be[1]=9;
+        r.request.epoch[0]=3;r.request.generation=7;r.request.token[0]=8;r.request.seconds=10;
+        r.code=D2K_RM_REPEAT_SILENT;r.flags=D2K_RM_PRIOR_REPLY;r.sample_len=r.smallest_data=r.largest_data=1;
+        r.sample_seq=proto==6?99:0;r.client_data=2;r.exact_repeats=1;memcpy(r.sample_digest,q_digest,32);
+        uint8_t token[16]={5},got[16]={0},payload='q',other='r';
+        uint8_t tlv[sizeof tcp_tlv];memcpy(tlv,tcp_tlv,sizeof tlv);tlv[16]=proto;tlv[17]=proto==6?1:2;
+        d2k_plan *p=NULL;char err[128];CHECK(!d2k_plan_load(tlv,sizeof tlv,&p,err,sizeof err),"measured fixture plan");
+        static const uint8_t plan_sum[32]={0x51};
+        CHECK(!d2k_plantab_set_measured_probe(t,&r,token,plan_sum,1,100,p),"measured probe rejected");
+#define FIND(q,e,g,seq,data,len,now) d2k_plantab_find_measured_probe(t,q,e,g,seq,data,len,now,got)
+        CHECK(FIND(&r.request.tuple,r.request.epoch,7,r.sample_seq,&payload,1,2)==p&&!memcmp(got,token,16),"own measured continuation missed");
+        d2k_addr_probe_flow ordinary={0};ordinary.family=family;ordinary.transport=proto;
+        memcpy(family==6?ordinary.src_ip6:ordinary.src_ip4,r.request.tuple.src,family==6?16:4);
+        memcpy(family==6?ordinary.dst_ip6:ordinary.dst_ip4,r.request.tuple.dst,family==6?16:4);
+        memcpy(&ordinary.src_port_be,r.request.tuple.sport_be,2);memcpy(&ordinary.dst_port_be,r.request.tuple.dport_be,2);
+        CHECK(!d2k_plantab_find_addr_probe(t,&ordinary,2,got),"ordinary lookup bypassed measured content guard");
+        uint8_t stale[16]={6};CHECK(!d2k_plantab_del_addr_probe(t,&ordinary,stale),"stale cleanup deleted measured candidate");
+        d2k_plantab_trial(t,p,got);CHECK(!memcmp(got,token,16),"execution lost measured trial token");
+
+        d2k_ct_tuple neighbor=r.request.tuple;neighbor.src[0]++;
+        CHECK(!FIND(&neighbor,r.request.epoch,7,r.sample_seq,&payload,1,2),"another LAN client got candidate");
+        neighbor=r.request.tuple;neighbor.dport_be[1]++;
+        CHECK(!FIND(&neighbor,r.request.epoch,7,r.sample_seq,&payload,1,2),"neighbor service got candidate");
+        CHECK(!FIND(&r.request.tuple,r.request.epoch,8,r.sample_seq,&payload,1,2),"new connection got candidate");
+        uint8_t oldepoch[16]={4};CHECK(!FIND(&r.request.tuple,oldepoch,7,r.sample_seq,&payload,1,2),"other daemon epoch got candidate");
+        CHECK(!FIND(&r.request.tuple,r.request.epoch,7,r.sample_seq,&other,1,2),"different bytes same length got candidate");
+        if(proto==6)CHECK(!FIND(&r.request.tuple,r.request.epoch,7,r.sample_seq+1,&payload,1,2),"different TCP stream range got candidate");
+        CHECK(!FIND(&r.request.tuple,r.request.epoch,7,r.sample_seq,&payload,1,100),"expired candidate survived");
+        CHECK(!d2k_plantab_probe_count(t),"expired measured candidate leaked");
+#undef FIND
+        d2k_plantab_free(t);
+    }
+#endif
+}
+
+/* Renewal of a measured trial lease: same flow, trial, evidence and plan
+   only move the expiry; anything else is refused and the installed entry
+   (plan, evidence, expiry) stays exactly as it was. */
+static void measured_probe_renewal(void) {
+    static const uint8_t q_digest[32]={0x8e,0x35,0xc2,0xcd,0x3b,0xf6,0x64,0x1b,0xdb,0x0e,0x20,0x50,0xb7,0x69,0x32,0xcb,0xb2,0xe6,0x03,0x4a,0x0d,0xda,0xcc,0x1d,0x9b,0xea,0x82,0xa6,0xba,0x57,0xf7,0xcf};
+    static const uint8_t plan_sum[32]={0x51},other_sum[32]={0x52};
+    for(int proto=6;proto<=17;proto+=11) {
+        d2k_plantab *t=d2k_plantab_new(8);struct d2k_rawmeasure_report r={0};
+        r.request.tuple.family=4;r.request.tuple.proto=proto;r.request.tuple.src[0]=192;r.request.tuple.dst[0]=1;
+        r.request.tuple.sport_be[0]=0xab;r.request.tuple.dport_be[1]=9;
+        r.request.epoch[0]=3;r.request.generation=7;r.request.token[0]=8;r.request.seconds=120;
+        r.code=D2K_RM_REPEAT_SILENT;r.flags=D2K_RM_PRIOR_REPLY;r.sample_len=r.smallest_data=r.largest_data=1;
+        r.sample_seq=proto==6?99:0;r.client_data=2;r.exact_repeats=1;memcpy(r.sample_digest,q_digest,32);
+        r.repeat_gap_ms=64000;
+        uint8_t token[16]={5},foreign[16]={6},got[16]={0},payload='q';
+        uint8_t tlv[sizeof tcp_tlv];memcpy(tlv,tcp_tlv,sizeof tlv);tlv[16]=proto;tlv[17]=proto==6?1:2;
+        char err[128];d2k_plan *p=NULL,*q=NULL;
+#define LOAD(x) (x=NULL,!d2k_plan_load(tlv,sizeof tlv,&x,err,sizeof err))
+#define FIND(now) d2k_plantab_find_measured_probe(t,&r.request.tuple,r.request.epoch,7,r.sample_seq,&payload,1,now,got)
+        CHECK(LOAD(p)&&!d2k_plantab_set_measured_probe(t,&r,token,plan_sum,10,100,p),"renewal fixture install");
+        CHECK(LOAD(q)&&!d2k_plantab_set_measured_probe(t,&r,token,plan_sum,60,180,q),"identical renewal refused");
+        CHECK(FIND(150)==p&&!memcmp(got,token,16),"renewal did not extend the installed plan");
+        CHECK(d2k_plantab_probe_count(t)==1,"renewal duplicated the entry");
+        struct d2k_rawmeasure_report changed=r;changed.repeat_gap_ms=1000;
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&changed,token,plan_sum,70,400,q)==-3,"renewal with changed evidence accepted");
+        changed=r;changed.exact_repeats=2;changed.client_data=3;
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&changed,token,plan_sum,70,400,q)==-3,"renewal with more repeats accepted");
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&r,token,other_sum,70,400,q)==-3,"renewal with another plan accepted");
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&r,foreign,plan_sum,70,400,q)==-3,"foreign trial replaced owned one");
+        CHECK(FIND(170)==p&&!memcmp(got,token,16),"refused renewal changed the installed entry");
+        CHECK(!FIND(180)&&!d2k_plantab_probe_count(t),"refused renewal moved the expiry");
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&r,token,plan_sum,200,300,q)==0,"fresh install after expiry refused");
+        CHECK(LOAD(q)&&d2k_plantab_set_measured_probe(t,&r,token,plan_sum,300,300,q)==-2,"empty lease accepted");
+#undef FIND
+#undef LOAD
+        d2k_plantab_free(t);
+    }
+}
+
+
+/* Explicit bytes also exercise the production parser independently of core. */
+static d2k_plan *mkpreflight(void) {
+    const uint8_t b[]={ 'D','2','K','P',0,1,0,18,0,0,0,3,
+        0,2,0,2,6,1, 1,0x14,0,11, 0,7,3,9,1,0,0,9,96,0,1, 0,0x10,0,5,0,1,0x16,3,1 };
+    d2k_plan *p=NULL;char err[200];
+    CHECK(!d2k_plan_load(b,sizeof b,&p,err,sizeof err),"preflight fixture rejected");return p;
+}
+static void test_preflight_plan_is_endpoint_bound(void) {
+    d2k_plantab *t=d2k_plantab_new(8);uint8_t ip[4]={192,0,2,1};
+    CHECK(d2k_plantab_set_name_family(t,(const uint8_t *)"x.example",9,1,mkpreflight(),
+        D2K_PLAN_SHAPE_MODERN,0,4)==-2,"preflight accepted name binding");
+    CHECK(d2k_plantab_set_suffix_family(t,(const uint8_t *)"x.example",9,1,mkpreflight(),D2K_PLAN_SHAPE_MODERN,
+        4)==-2,"preflight accepted suffix binding");
+    CHECK(d2k_plantab_set_addr_shaped(t,ip,4,1,mkpreflight(),D2K_PLAN_SHAPE_MODERN)==-2,
+        "preflight accepted address without server port");
+    CHECK(!d2k_plantab_set_endpoint(t,ip,4,htons(443),1,mkpreflight(),D2K_PLAN_SHAPE_MODERN),
+        "preflight endpoint rejected");
+    CHECK(d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(443)),
+        "unnamed endpoint not found");
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(8443)),
+        "preflight leaked to other port");
+    uint8_t other[4]={192,0,2,2};
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,other,4,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(443)),
+        "preflight leaked to other address");
+    uint8_t ip6[16]={0x20,1,0xd,0xb8,0,0,0,0,0,0,0,0,0,0,0,1};
+    CHECK(!d2k_plantab_set_endpoint(t,ip6,6,htons(443),1,mkpreflight(),D2K_PLAN_SHAPE_MODERN),
+        "preflight rejected IPv6 endpoint");
+    const d2k_plan *v6=d2k_plantab_find_target_endpoint(t,NULL,0,ip6,6,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(443));
+    CHECK(v6,"preflight IPv6 endpoint not found");
+    uint8_t other6[16];memcpy(other6,ip6,sizeof other6);other6[15]++;
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,other6,6,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(443)),
+        "preflight IPv6 leaked to other address");
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,ip6,6,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(8443)),
+        "preflight IPv6 leaked to other port");
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,ip6,4,2,D2K_PLAN_SHAPE_MODERN,htons(1234),htons(443)),
+        "preflight IPv6 leaked to IPv4");
+    d2k_plantab_free(t);
+}
+
+static void test_endpoint_trial_verifier_port(void) {
+    d2k_plantab *t=d2k_plantab_new(8);
+    const uint8_t ip[16]={192,0,2,8}, token[16]={7};
+    uint16_t port=htons(443), verifier=htons(33111), other=htons(33112);
+    CHECK(!d2k_plantab_set_endpoint_trial_port(t,ip,4,port,verifier,1,mkpreflight(),D2K_PLAN_SHAPE_MODERN,token),
+          "install isolated endpoint trial");
+    CHECK(!d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,other,port),
+          "neighboring client must not see the trial");
+    const d2k_plan *trial=d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,verifier,port);
+    CHECK(trial,"bound verifier sees trial");
+    CHECK(d2k_plantab_commit_endpoint_trial(t,ip,4,port,D2K_PLAN_SHAPE_MODERN,token)==1,"promote matching trial");
+    CHECK(d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,other,port)==trial,
+          "confirmed binding serves client connections");
+    d2k_plantab_free(t);
+}
+
+static void test_endpoint_trial_cleanup(void) {
+    d2k_plantab *t=d2k_plantab_new(8);uint8_t ip[16]={192,0,2,8},other[16]={192,0,2,9};
+    uint8_t a[16]={1},b[16]={2},zero[16]={0};
+    CHECK(!d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),1,mkpreflight(),D2K_PLAN_SHAPE_MODERN,a),"install first endpoint trial");
+    const d2k_plan *p=d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,2,D2K_PLAN_SHAPE_MODERN,0,htons(443));
+    uint8_t got[16];d2k_plantab_trial(t,p,got);CHECK(!memcmp(got,a,16),"endpoint runtime events retain installation token");
+    const uint8_t trial_host[]="resolver.example",trial_suffix[]="example";
+    CHECK(!d2k_plantab_set_suffix_family(t,trial_suffix,sizeof trial_suffix-1,1,mktcp(),1,4),"trial area fixture");
+    CHECK(d2k_plantab_find_target_endpoint(t,trial_host,sizeof trial_host-1,ip,4,2,1,0,htons(443))==p,
+          "endpoint trial must precede inherited area");
+    CHECK(!d2k_plantab_set_bypass_family(t,trial_host,sizeof trial_host-1,6,1,4),"trial bypass fixture");
+    CHECK(d2k_plantab_find_target_endpoint(t,trial_host,sizeof trial_host-1,ip,4,2,1,0,htons(443))==p,
+          "endpoint trial must precede inherited bypass");
+    d2k_binding_context trial_binding={0};
+    CHECK(d2k_plantab_binding(t,p,&trial_binding) && trial_binding.kind==D2K_BIND_ADDR && trial_binding.temporary &&
+          d2k_plantab_find_by_binding(t,&trial_binding,2)==p,"selected endpoint trial receipt metadata");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,b),"foreign trial cannot delete");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,zero),"unknown trial cannot delete");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,other,4,htons(443),D2K_PLAN_SHAPE_MODERN,a),"other address cannot delete");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(444),D2K_PLAN_SHAPE_MODERN,a),"other port cannot delete");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_LEGACY,a),"other protocol shape cannot delete");
+    CHECK(d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),3,mkpreflight(),D2K_PLAN_SHAPE_MODERN,b)==-1,"parallel endpoint trial cannot replace owner");
+    CHECK(d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,a)==1,"first endpoint trial removed");
+    CHECK(!d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),3,mkpreflight(),D2K_PLAN_SHAPE_MODERN,b),"next endpoint generation");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,a),"late old cleanup preserves newer experiment");
+    CHECK(d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,b)==1,"own endpoint trial deleted");
+    CHECK(!d2k_plantab_set_endpoint(t,ip,4,htons(443),4,mkpreflight(),D2K_PLAN_SHAPE_MODERN),"confirmed endpoint fixture");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,b),"trial cleanup preserves confirmed endpoint");
+    CHECK(!d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),5,mkpreflight(),D2K_PLAN_SHAPE_MODERN,a),"candidate over confirmed endpoint");
+    CHECK(d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,a)==1,"failed overlay removed");
+    CHECK(d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,6,D2K_PLAN_SHAPE_MODERN,0,htons(443)),"failed candidate preserves confirmed endpoint");
+    CHECK(!d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),7,mkpreflight(),D2K_PLAN_SHAPE_MODERN,a),"disconnect candidate");
+    d2k_plantab_clear_probes(t);
+    p=d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,8,D2K_PLAN_SHAPE_MODERN,0,htons(443));
+    d2k_plantab_trial(t,p,got);CHECK(p&&got[0]==0,"disconnect restores confirmed owner and drops trial");
+    CHECK(!d2k_plantab_set_endpoint_trial(t,ip,4,htons(443),9,mkpreflight(),D2K_PLAN_SHAPE_MODERN,b),"promotion candidate");
+    CHECK(!d2k_plantab_commit_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,a),"foreign token cannot promote");
+    CHECK(d2k_plantab_commit_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,b)==1,"own candidate promoted");
+    CHECK(!d2k_plantab_del_endpoint_trial(t,ip,4,htons(443),D2K_PLAN_SHAPE_MODERN,b),"cleanup cannot remove promoted candidate");
+    d2k_plantab_clear_probes(t);CHECK(d2k_plantab_find_target_endpoint(t,NULL,0,ip,4,10,D2K_PLAN_SHAPE_MODERN,0,htons(443)),"promoted plan survives controller disconnect");
+    d2k_plantab_free(t);
+}
 int main(void) {
+    test_endpoint_trial_cleanup();
+    test_endpoint_trial_verifier_port();
+    test_preflight_plan_is_endpoint_bound();
+    measured_probe_renewal();
+    measured_probe_scope();
+    endpoint_before_area();
+    endpoint_ports();
+    raw_endpoint_ports();
+    raw_transports_coexist();
     /* Entropy unavailable: keep packet plans usable, but do not invent proof. */
     {
         struct rlimit saved, closed;
@@ -922,6 +1283,11 @@ int main(void) {
                       c.family == family && c.shape == (kind == D2K_BIND_FLOW ? D2K_PLAN_SHAPE_QUIC : D2K_PLAN_SHAPE_MODERN) &&
                       c.temporary == (kind == D2K_BIND_FLOW), "installed binding context missing");
                 CHECK(!install || c.generation != saved.generation, "same-hash reinstall reused generation");
+                CHECK(d2k_plantab_find_by_binding(t, &c, 99) == p,
+                      "live binding lookup");
+                if (kind == D2K_BIND_FLOW)
+                    CHECK(!d2k_plantab_find_by_binding(t, &c, 100),
+                          "probe expired exactly at deadline");
                 saved = c;
                 CHECK(!d2k_plantab_set_name_family(t,(const uint8_t *)"other.test",10,2,mkplan(),
                       D2K_PLAN_SHAPE_MODERN,0,family), "unrelated install");

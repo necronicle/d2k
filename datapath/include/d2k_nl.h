@@ -54,6 +54,7 @@
 #define D2K_NFQA_VERDICT_HDR  2
 #define D2K_NFQA_MARK         3
 #define D2K_NFQA_TIMESTAMP    4
+#define D2K_NFQA_IFINDEX_INDEV  5
 #define D2K_NFQA_IFINDEX_OUTDEV 6
 #define D2K_NFQA_PAYLOAD     10
 #define D2K_NFQA_CAP_LEN     13
@@ -126,6 +127,7 @@ typedef struct {
     int have_mark;
     /* Выходной интерфейс (NFQA_IFINDEX_OUTDEV): есть у пакетов POSTROUTING,
        OUTPUT и FORWARD. Нужен шлюзу маршрута (d2k_routemark_gate). */
+    uint32_t indev;  /* NFQA_IFINDEX_INDEV, zero when unavailable */
     uint32_t outdev;
     int have_outdev;
     /* Метка времени приёма пакета ядром (NFQA_TIMESTAMP, стенные часы, нс).
@@ -170,4 +172,16 @@ size_t d2k_nl_cfg_params(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
                          uint32_t copy_range, uint8_t copy_mode,
                          uint32_t maxlen, uint32_t flags, uint32_t mask);
 
+/* Opt-in firewall handshake: preserve nfmark, request a bounded re-entry. */
+/* Вердикт с заменой нагрузки И освобождением (этап 18): payload + NFQA_MARK
+ * (mark|bit) + NF_REPEAT при ACCEPT и ненулевом bit; без bit — обычный
+ * вердикт с заменой. */
+size_t d2k_nl_verdict_payload_release(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                                      uint32_t id, uint32_t verdict, const uint8_t *payload,
+                                      size_t len, uint32_t mark, uint32_t bit);
+size_t d2k_nl_verdict_release(uint8_t *, size_t, uint16_t, uint32_t, uint32_t,
+                             uint32_t verdict, uint32_t original_mark, uint32_t release_bit);
+
+/* ACCEPT with an explicit packet mark, without NF_REPEAT/firewall handshake. */
+size_t d2k_nl_verdict_mark(uint8_t *, size_t, uint16_t, uint32_t, uint32_t, uint32_t);
 #endif /* D2K_NL_H */

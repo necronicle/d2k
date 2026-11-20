@@ -80,6 +80,7 @@ AR="$ZIG ar" RANLIB="$ZIG ranlib" \
     --prefix="$PREFIX" --openssldir=/opt/d2k/certs
 make -j "$JOBS" build_libs
 make install_sw
+[ "${LIBS_ONLY:-0}" != 1 ] || exit 0
 
 SMOKE="$ROOT/telegram/test_openssl_link.c"
 LIBDIR="$PREFIX/lib"

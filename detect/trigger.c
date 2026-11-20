@@ -203,5 +203,5 @@ int d2k_trigger_allows_poison(const d2k_trigger *t, const d2k_poison *p)
     if (!p) {
         return 0;
     }
-    return !p->tcp_ts || d2k_trigger_offers_ts(t);
+    return !(p->tcp_ts || p->md5_ts) || d2k_trigger_offers_ts(t);
 }

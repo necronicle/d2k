@@ -57,4 +57,9 @@ int d2k_nfq_verdict_payload(d2k_nfq *q, uint32_t pkt_id, uint32_t verdict,
 /* Сколько раз ядро сообщало о потерянных сообщениях. */
 uint64_t d2k_nfq_lost(const d2k_nfq *q);
 
+/* Only this packet ID may request the firewall release handshake. */
+void d2k_nfq_release_packet(d2k_nfq *, uint32_t id, uint32_t original_mark, uint32_t bit);
+
+int d2k_nfq_accept_mark(d2k_nfq *, uint32_t id, uint32_t mark,
+                         char *err, size_t errcap);
 #endif /* D2K_NFQ_H */

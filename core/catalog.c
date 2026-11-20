@@ -39,7 +39,10 @@
  * Ни одной forward declaration в файле поэтому не требуется.
  */
 #include <errno.h>
+#include "d2k_plantlv.h"
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
@@ -71,6 +74,7 @@ typedef struct {
     const char *s;
     size_t      len;
     size_t      i;
+    const char *store_path;
 } jctx;
 
 /* Смотрит на следующий незанятый пробелом байт, НЕ потребляя его, и
@@ -271,6 +275,17 @@ static int jparse_u16(jctx *j, uint16_t *out, const char *field, char *err, size
         return -1;
     }
     *out = (uint16_t)v;
+    return 0;
+}
+
+static int jparse_u32(jctx *j, uint32_t *out, const char *field, char *err, size_t errcap) {
+    int64_t v;
+    if (jparse_raw_int(j, &v, err, errcap) != 0) return -1;
+    if (v < 0 || (uint64_t)v > UINT32_MAX) {
+        set_err(err, errcap, "%s: вне диапазона uint32", field);
+        return -1;
+    }
+    *out = (uint32_t)v;
     return 0;
 }
 
@@ -502,6 +517,23 @@ static int jparse_rfc3339(jctx *j, int64_t *out, const char *field, char *err, s
     return 0;
 }
 
+/* ТРОЙСТВЕННЫЙ ПРИЗНАК В ФАЙЛЕ — "yes" ИЛИ "no", И НИЧЕГО БОЛЬШЕ.
+ *
+ * «Не измерено» в файле выглядит ОТСУТСТВИЕМ ключа, а не третьим словом:
+ * так старый каталог без вектора читается как пустое знание сам собой, без
+ * особого случая. Поэтому и значения всего два, а любое другое слово —
+ * отказ с причиной: опечатка в файле иначе прочиталась бы как отсутствие
+ * знания, то есть тихо изменила бы смысл записи (§2.4). */
+static int jparse_tri(jctx *j, int8_t *out, const char *field, char *err, size_t errcap) {
+    char word[8];
+    if (jparse_string_fixed(j, word, sizeof word, field, err, errcap) != 0) { return -1; }
+    if (strcmp(word, "yes") == 0) { *out = D2K_PROP_YES; return 0; }
+    if (strcmp(word, "no") == 0)  { *out = D2K_PROP_NO;  return 0; }
+    set_err(err, errcap, "%s: ожидалось \"yes\" или \"no\", прочитано \"%s\"", field, word);
+    return -1;
+}
+
+
 /* --------------------------------------------------------------------
  * Пропуск незнакомого значения и предел вложенности.
  *
@@ -660,13 +692,14 @@ static int parse_object(jctx *j, key_handler handle, void *ctx, int depth, char 
 /* Растит массив вдвое, когда некуда больше писать. Стартовая ёмкость 4 —
  * коробок и планов в реальном каталоге единицы (см. testdata),
  * экономить нечего, а частые realloc на пустом месте дороже одного
- * лишнего удвоения. cap передаётся снаружи, а не хранится в d2k_cat_box/
- * d2k_catalog: в этих структурах его нет (см. "Produces" задания), и
- * вызывающий (handle_box_key/handle_catalog_key) инициализирует его
+ * лишнего удвоения. Рабочий cap передаётся снаружи; вызывающий
+ * (handle_box_key/handle_catalog_key) по-прежнему инициализирует его
  * ТЕКУЩИМ числом элементов на каждый вызов — благодаря этому дубль ключа
  * "plans" в одном объекте (не встречается в реальных файлах, но не должен
  * переполнить буфер, если встретится) тоже получит верный размер, а не
- * решит, что ёмкость 0 при уже ненулевом числе элементов. */
+ * решит, что ёмкость 0 при уже ненулевом числе элементов.
+ * Диагностические cap_* в каталоге только запоминают размер успешного
+ * realloc и не участвуют в выборе размера следующего выделения. */
 static void *grow(void *arr, size_t *cap, size_t count, size_t elemsize,
                    char *err, size_t errcap) {
     if (count < *cap) return arr;
@@ -692,7 +725,7 @@ typedef int (*elem_parser)(jctx *j, void *out_elem, int depth, char *err, size_t
  * depth — глубина ЭТОГО массива (см. parse_object про тот же параметр и
  * D2K_JSON_MAX_DEPTH про общий предел). Элементы массива на один уровень
  * глубже самого массива — parse_elem зовётся с depth+1. */
-static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap,
+static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap, size_t *allocated_cap,
                         size_t elemsize, elem_parser parse_elem,
                         const char *what, int depth, char *err, size_t errcap) {
     if (depth > D2K_JSON_MAX_DEPTH) {
@@ -704,9 +737,11 @@ static int parse_array(jctx *j, void **arr, size_t *n, size_t *cap,
     if (jeat(j, '[', err, errcap) != 0) return -1;
     if (jpeek(j) == ']') { j->i++; return 0; }
     for (;;) {
+        int growing = *n >= *cap;
         void *p = grow(*arr, cap, *n, elemsize, err, errcap);
         if (!p) return -1;
         *arr = p;
+        if (growing) *allocated_cap = *cap;
         memset((char *)*arr + (*n) * elemsize, 0, elemsize);
         (*n)++;
         if (parse_elem(j, (char *)*arr + (*n - 1) * elemsize, depth + 1, err, errcap) != 0) return -1;
@@ -852,6 +887,42 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_bool_i(j, &out->enabled, "binding.enabled", err, errcap);
     if (strcmp(key, "transport") == 0)
         return jparse_u8(j, &out->transport, "binding.transport", err, errcap);
+    if (strcmp(key, "dns_authenticated") == 0)
+        return jparse_bool_i(j, &out->dns_authenticated, "binding.dns_authenticated", err, errcap);
+    if (strcmp(key, "dns_dot") == 0)
+        return jparse_bool_i(j, &out->dns_dot, "binding.dns_dot", err, errcap);
+    if (strcmp(key, "dns_query_bytes") == 0)
+        return jparse_u16(j,&out->dns_query_bytes,"binding.dns_query_bytes",err,errcap);
+    if (strcmp(key, "dns_http_version") == 0) {
+        if (jparse_u8(j,&out->dns_http_version,"binding.dns_http_version",err,errcap))return -1;
+        if (out->dns_http_version!=1 && out->dns_http_version!=2) {
+            set_err(err,errcap,"binding.dns_http_version must be 1 or 2");
+            return -1;
+        }
+        return 0;
+    }
+    if (strcmp(key, "dns_port") == 0) {
+        if (jparse_u16(j, &out->dns_port, "binding.dns_port", err, errcap) != 0) return -1;
+        if (!out->dns_port) {
+            set_err(err, errcap, "binding.dns_port must be 1..65535");
+            return -1;
+        }
+        return 0;
+    }
+    if (strcmp(key, "dns_name") == 0)
+        return jparse_string_fixed(j, out->dns_name, sizeof out->dns_name,
+                                   "binding.dns_name", err, errcap);
+    if (strcmp(key, "dns_address") == 0) {
+        if (jparse_string_fixed(j, out->dns_address, sizeof out->dns_address,
+                                "binding.dns_address", err, errcap) != 0) return -1;
+        if (!out->dns_address[0]) {
+            set_err(err, errcap, "binding.dns_address must be a numeric address");
+            return -1;
+        }
+        return 0;
+    }
+    if (strcmp(key, "server_port") == 0)
+        return jparse_u16(j, &out->server_port, "binding.server_port", err, errcap);
     if (strcmp(key, "family") == 0) {
         if (jparse_u8(j, &out->family, "binding.family", err, errcap) != 0) return -1;
         if (out->family != 4 && out->family != 6) {
@@ -869,6 +940,9 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
     if (strcmp(key, "probe_path") == 0)
         return jparse_string_fixed(j, out->probe_path, sizeof out->probe_path,
                                    "binding.probe_path", err, errcap);
+    if (strcmp(key, "preflight_name") == 0)
+        return jparse_string_fixed(j, out->preflight_name, sizeof out->preflight_name,
+                                   "binding.preflight_name", err, errcap);
     if (strcmp(key, "ech_origin") == 0)
         return jparse_string_fixed(j, out->ech_origin, sizeof out->ech_origin,
                                    "binding.ech_origin", err, errcap);
@@ -878,13 +952,69 @@ static int handle_binding_key(jctx *j, const char *key, void *ctx, int depth, ch
         return jparse_u8(j, &out->budget, "binding.budget", err, errcap);
     return jskip_value(j, depth + 1, err, errcap);
 }
+static int dns_binding_address_valid(const d2k_cat_binding *b) {
+    uint8_t address[16];
+    if (!b->dns_address[0]) return 1; /* No recorded DNS address. */
+    return memchr(b->dns_address, 0, sizeof b->dns_address) != NULL &&
+           (b->family == 0 || b->family == 4 || b->family == 6) &&
+           inet_pton(b->family == 6 ? AF_INET6 : AF_INET, b->dns_address, address) == 1;
+}
+
+static int plain_dns_binding_valid(const d2k_cat_binding *b) {
+    if (b->shape!=D2K_CAT_SHAPE_DNS)return !b->dns_query_bytes;
+    unsigned prefix=b->transport==6 ? 2 : 0;
+    return (b->transport==6 || b->transport==17) &&
+        b->dns_query_bytes>=17+prefix && b->dns_query_bytes<=272+prefix &&
+        !b->dns_authenticated && !b->dns_dot && !b->dns_http_version && !b->probe_path[0] &&
+        b->dns_name[0] && b->dns_address[0] && !strcmp(b->dns_address,b->target) &&
+        b->dns_port==b->server_port && b->server_port && !strcmp(b->kind,"service") &&
+        b->level>=3 && b->verified_by==D2K_VERBY_PROBE && b->budget==D2K_CAT_BUDGET_PASSED;
+}
+
 static int parse_binding(jctx *j, d2k_cat_binding *out, int depth, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
     out->family = 4;
-    return parse_object(j, handle_binding_key, out, depth, err, errcap);
+    if (parse_object(j, handle_binding_key, out, depth, err, errcap)) return -1;
+    if (!dns_binding_address_valid(out)) {
+        set_err(err, errcap, "binding.dns_address must be numeric and match binding.family");
+        return -1;
+    }
+    if (!plain_dns_binding_valid(out)) {
+        set_err(err,errcap,"invalid plain DNS proof or endpoint");
+        return -1;
+    }
+    return 0;
 }
+static int service_binding_valid(const d2k_cat_binding *b) {
+    uint8_t address[16];
+    /* Shapes share the control protocol numbering: TLS 1/2/6, QUIC 3,
+       STUN/voice 5, RAW 8 with explicit TCP/UDP transport. No wildcard context. */
+    int shape_ok = (b->transport == 6 && (b->shape == 1 || b->shape == 2 || b->shape == 6 || b->shape == 8)) ||
+                   (b->transport == 17 && (b->shape == 3 || b->shape == 5 || b->shape == 8)) ||
+                   b->shape==D2K_CAT_SHAPE_DNS;
+    return !strcmp(b->kind, "service") && b->server_port && shape_ok &&
+           (b->family == 4 || b->family == 6) &&
+           inet_pton(b->family == 6 ? AF_INET6 : AF_INET, b->target, address) == 1;
+}
+
 static int elem_binding(jctx *j, void *o, int depth, char *err, size_t errcap) {
-    return parse_binding(j, (d2k_cat_binding *)o, depth, err, errcap);
+    d2k_cat_binding *b = o;
+    if (parse_binding(j, b, depth, err, errcap)) return -1;
+    if (b->server_port || !strcmp(b->kind, "service")) {
+        set_err(err, errcap, "service binding must be in endpoints, not legacy bindings");
+        return -1;
+    }
+    return 0;
+}
+
+static int elem_endpoint(jctx *j, void *o, int depth, char *err, size_t errcap) {
+    d2k_cat_binding *b = o;
+    if (parse_binding(j, b, depth, err, errcap)) return -1;
+    if (!service_binding_valid(b)) {
+        set_err(err, errcap, "invalid service address, port or protocol context");
+        return -1;
+    }
+    return 0;
 }
 
 /* Числа поля d2k_cat_binding.shape — ЭТО ЗНАЧЕНИЯ d2k_shape, а не своя
@@ -910,6 +1040,90 @@ int d2k_cat_shape_fits(uint8_t stored, uint8_t got) {
  * Коробка и каталог целиком.
  * -------------------------------------------------------------------- */
 
+/* ВЕКТОР СВОЙСТВ КОРОБКИ (23.10.2026). Ключи — имена полей d2k_box_props;
+ * отсутствующий ключ оставляет поле неизмеренным. hops и reasm_boundary —
+ * числа, и ноль в них значит «не измерено» (расстояния в нуль хопов и порога
+ * в нулевой позиции не бывает), поэтому отдельного признака им не нужно. */
+static int handle_props_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
+    d2k_cat_props *out = (d2k_cat_props *)ctx;
+    if (strcmp(key, "reassembles") == 0)
+        return jparse_tri(j, &out->p.reassembles, "properties.reassembles", err, errcap);
+    if (strcmp(key, "parses_l7") == 0)
+        return jparse_tri(j, &out->p.parses_l7, "properties.parses_l7", err, errcap);
+    if (strcmp(key, "validates_checksum") == 0)
+        return jparse_tri(j, &out->p.validates_checksum, "properties.validates_checksum", err, errcap);
+    if (strcmp(key, "tolerates_reorder") == 0)
+        return jparse_tri(j, &out->p.tolerates_reorder, "properties.tolerates_reorder", err, errcap);
+    if (strcmp(key, "tolerates_left_overlap") == 0)
+        return jparse_tri(j, &out->p.tolerates_left_overlap, "properties.tolerates_left_overlap", err, errcap);
+    if (strcmp(key, "counts_duplicates") == 0)
+        return jparse_tri(j, &out->p.counts_duplicates, "properties.counts_duplicates", err, errcap);
+    if (strcmp(key, "inspects_syn") == 0)
+        return jparse_tri(j, &out->p.inspects_syn, "properties.inspects_syn", err, errcap);
+    if (strcmp(key, "validates_md5") == 0)
+        return jparse_tri(j, &out->p.validates_md5, "properties.validates_md5", err, errcap);
+    if (strcmp(key, "validates_seq_window") == 0)
+        return jparse_tri(j, &out->p.validates_seq_window, "properties.validates_seq_window", err, errcap);
+    if (strcmp(key, "validates_timestamps") == 0)
+        return jparse_tri(j, &out->p.validates_timestamps, "properties.validates_timestamps", err, errcap);
+    if (strcmp(key, "overlap_covers_sni") == 0)
+        return jparse_tri(j, &out->p.overlap_covers_sni, "properties.overlap_covers_sni", err, errcap);
+    if (strcmp(key, "handles_urgent") == 0)
+        return jparse_tri(j, &out->p.handles_urgent, "properties.handles_urgent", err, errcap);
+    if (strcmp(key, "response_gate") == 0)
+        return jparse_tri(j, &out->p.response_gate, "properties.response_gate", err, errcap);
+    if (strcmp(key, "gate_carry") == 0)
+        return jparse_tri(j, &out->p.gate_carry, "properties.gate_carry", err, errcap);
+    if (strcmp(key, "gate_own") == 0)
+        return jparse_tri(j, &out->p.gate_hello_own, "properties.gate_own", err, errcap);
+    if (strcmp(key, "gate_window") == 0)
+        return jparse_u16(j, &out->p.gate_window, "properties.gate_window", err, errcap);
+    if (strcmp(key, "gate_pieces") == 0)
+        return jparse_u32(j, &out->p.gate_pieces, "properties.gate_pieces", err, errcap);
+    if (strcmp(key, "gate_rtt") == 0)
+        return jparse_u32(j, &out->p.gate_rtt_ms, "properties.gate_rtt", err, errcap);
+    if (strcmp(key, "hops") == 0)
+        return jparse_i32(j, &out->p.hops, "properties.hops", err, errcap);
+    if (strcmp(key, "reasm_boundary") == 0)
+        return jparse_i32(j, &out->p.reasm_boundary, "properties.reasm_boundary", err, errcap);
+    if (strcmp(key, "client_shape") == 0)
+        return jparse_u8(j, &out->p.client_shape, "properties.client_shape", err, errcap);
+    if (strcmp(key, "measured_utc") == 0)
+        return jparse_rfc3339(j, &out->measured_at, "properties.measured_utc", err, errcap);
+    return jskip_value(j, depth + 1, err, errcap);
+}
+
+/* Массив фиксированный, как fingerprint.signals, и по той же причине: буфер
+ * в структуре конечен, а молчаливая потеря одной из записей хуже отказа. */
+static int parse_props(jctx *j, d2k_cat_box *out, int depth, char *err, size_t errcap) {
+    if (depth + 1 > D2K_JSON_MAX_DEPTH) {
+        set_err(err, errcap, "JSON вложен глубже %d уровней — отказ вместо риска переполнения стека",
+                D2K_JSON_MAX_DEPTH);
+        return -1;
+    }
+    if (jeat_null_if_present(j)) { return 0; }
+    if (jeat(j, '[', err, errcap) != 0) { return -1; }
+    if (jpeek(j) == ']') { j->i++; return 0; }
+    for (;;) {
+        if (out->n_props >= D2K_CAT_PROPS_MAX) {
+            set_err(err, errcap,
+                    "properties: записей больше %d, буфер фиксирован (запись #%zu)",
+                    D2K_CAT_PROPS_MAX, out->n_props + 1);
+            return -1;
+        }
+        memset(&out->props[out->n_props], 0, sizeof out->props[0]);
+        out->n_props++;
+        if (parse_object(j, handle_props_key, &out->props[out->n_props - 1],
+                         depth + 2, err, errcap) != 0) { return -1; }
+        int c = jpeek(j);
+        if (c == ',') { j->i++; continue; }
+        if (c == ']') { j->i++; break; }
+        set_err(err, errcap, "ожидался ',' или ']' в массиве properties (позиция %zu)", j->i);
+        return -1;
+    }
+    return 0;
+}
+
 static int handle_box_key(jctx *j, const char *key, void *ctx, int depth, char *err, size_t errcap) {
     d2k_cat_box *out = (d2k_cat_box *)ctx;
     if (strcmp(key, "id") == 0)
@@ -920,15 +1134,18 @@ static int handle_box_key(jctx *j, const char *key, void *ctx, int depth, char *
         return jparse_rfc3339(j, &out->updated, "box.updated", err, errcap);
     if (strcmp(key, "fingerprint") == 0)
         return parse_fp(j, &out->fp, depth + 1, err, errcap);
+    if (strcmp(key, "properties") == 0)
+        return parse_props(j, out, depth + 1, err, errcap);
     if (strcmp(key, "plans") == 0) {
         size_t cap = out->n_plans; /* см. grow() про то, почему не 0 */
-        return parse_array(j, (void **)&out->plans, &out->n_plans, &cap,
+        return parse_array(j, (void **)&out->plans, &out->n_plans, &cap, &out->cap_plans,
                             sizeof(d2k_cat_plan), elem_plan, "plans", depth + 1, err, errcap);
     }
-    if (strcmp(key, "bindings") == 0) {
+    if (strcmp(key, "bindings") == 0 || strcmp(key, "endpoints") == 0) {
         size_t cap = out->n_binds;
-        return parse_array(j, (void **)&out->binds, &out->n_binds, &cap,
-                            sizeof(d2k_cat_binding), elem_binding, "bindings", depth + 1, err, errcap);
+        return parse_array(j, (void **)&out->binds, &out->n_binds, &cap, &out->cap_binds,
+                            sizeof(d2k_cat_binding), !strcmp(key, "endpoints") ? elem_endpoint : elem_binding,
+                            key, depth + 1, err, errcap);
     }
     return jskip_value(j, depth + 1, err, errcap);
 }
@@ -967,13 +1184,26 @@ static int handle_domain_observation(jctx *j,const char *key,void *ctx,
 static int parse_domain_observations(jctx *j,d2k_group_state *s,int depth,
                                      char *err,size_t errcap) {
     if(depth>D2K_JSON_MAX_DEPTH) { set_err(err,errcap,"domain observations too deep"); return -1; }
+    if(d2k_group_store_open(s,j->store_path)) {
+        /* No flash-backed workspace: exact plans still load in full, family
+           learning is degraded. Only the span of the saved history is noted
+           here; d2k_catalog_load maps the original inode read-only for it.
+           It is never parsed into rows or copied to the heap. */
+        if(jpeek(j)!='[' || s->preserved_len) {
+            set_err(err,errcap,"invalid domain observations array"); return -1;
+        }
+        size_t start=j->i;
+        if(jskip_value(j,depth,err,errcap)) return -1;
+        s->preserved_off=start; s->preserved_len=j->i-start;
+        return 0;
+    }
     if(jeat(j,'[',err,errcap)) return -1;
     if(jpeek(j)==']') { j->i++; return 0; }
     for(;;) {
-        if(s->n_observations==D2K_GROUP_OBSERVATION_MAX) {
-            set_err(err,errcap,"too many domain observations"); return -1;
+        if(d2k_group_store_reserve(s,s->n_observations+1)) {
+            set_err(err,errcap,"cannot grow domain observation store"); return -1;
         }
-        d2k_group_observation *o=&s->observations[s->n_observations++];
+        d2k_group_observation *o=&d2k_group_rows(s)[s->n_observations++];
         memset(o,0,sizeof *o);
         if(parse_object(j,handle_domain_observation,o,depth+1,err,errcap)) return -1;
         int c=jpeek(j);
@@ -997,7 +1227,7 @@ static int handle_catalog_key(jctx *j, const char *key, void *ctx, int depth, ch
     d2k_catalog *out = (d2k_catalog *)ctx;
     if (strcmp(key, "boxes") == 0) {
         size_t cap = out->n_boxes;
-        return parse_array(j, (void **)&out->boxes, &out->n_boxes, &cap,
+        return parse_array(j, (void **)&out->boxes, &out->n_boxes, &cap, &out->cap_boxes,
                             sizeof(d2k_cat_box), elem_box, "boxes", depth + 1, err, errcap);
     }
     if(!strcmp(key,"domain_observations") || !strcmp(key,"domain_groups_frozen") ||
@@ -1028,22 +1258,44 @@ static int parse_catalog_obj(jctx *j, d2k_catalog *out, char *err, size_t errcap
     return parse_object(j, handle_catalog_key, out, 1, err, errcap);
 }
 
+static int preflight_bindings_valid(const d2k_catalog *c, char *err, size_t cap) {
+    for(size_t i=0;i<c->n_boxes;i++) {
+        const d2k_cat_box *box=&c->boxes[i];
+        for(size_t j=0;j<box->n_plans;j++) {
+            const d2k_cat_plan *p=&box->plans[j];
+            char why[160];
+            if(!p->text || d2k_plan_text_requires_endpoint(p->text,why,sizeof why)!=1)continue;
+            for(size_t k=0;k<box->n_binds;k++) {
+                const d2k_cat_binding *b=&box->binds[k];
+                if(!strcmp(b->plan_id,p->id) &&
+                   (!service_binding_valid(b) || b->transport!=6)) {
+                    set_err(err,cap,"preflight requires a TCP service endpoint binding");return 0;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+static int domain_group_available(const void *ctx,const d2k_domain_group *g) {
+    const d2k_catalog *cat=ctx;
+    const char *proto=g->key.transport==17?"quic":"tls";
+    for(size_t bi=0;bi<cat->n_boxes;bi++) {
+        const d2k_cat_box *b=&cat->boxes[bi];
+        for(size_t pi=0;pi<b->n_plans;pi++) {
+            const d2k_cat_plan *p=&b->plans[pi];
+            if(p->enabled && p->text && !strcmp(p->id,g->plan_id) &&
+               !strcmp(p->proto,proto)) return 1;
+        }
+    }
+    return 0;
+}
 static void prune_unavailable_domain_groups(d2k_catalog *cat) {
     d2k_group_state *s=cat->groups;
     if(!s) return;
     for(size_t i=0;i<s->n_groups;) {
         const d2k_domain_group *g=&s->groups[i];
-        int found=0;
-        const char *proto=g->key.transport==17?"quic":"tls";
-        for(size_t bi=0;bi<cat->n_boxes && !found;bi++) {
-            const d2k_cat_box *b=&cat->boxes[bi];
-            for(size_t pi=0;pi<b->n_plans;pi++) {
-                const d2k_cat_plan *p=&b->plans[pi];
-                if(p->enabled && p->text && !strcmp(p->id,g->plan_id) &&
-                   !strcmp(p->proto,proto)) { found=1; break; }
-            }
-        }
-        if(!found) s->groups[i]=s->groups[--s->n_groups]; else i++;
+        if(!domain_group_available(cat,g)) s->groups[i]=s->groups[--s->n_groups]; else i++;
     }
 }
 
@@ -1060,8 +1312,8 @@ static void free_box(d2k_cat_box *b) {
     }
     free(b->plans);
     free(b->binds);
-    b->plans = NULL; b->n_plans = 0;
-    b->binds = NULL; b->n_binds = 0;
+    b->plans = NULL; b->n_plans = b->cap_plans = 0;
+    b->binds = NULL; b->n_binds = b->cap_binds = 0;
 }
 
 void d2k_catalog_free(d2k_catalog *c) {
@@ -1070,55 +1322,48 @@ void d2k_catalog_free(d2k_catalog *c) {
         free_box(&c->boxes[i]);
     }
     free(c->boxes);
+    d2k_group_store_close(c->groups);
     free(c->groups);
     c->groups = NULL;
     c->boxes = NULL;
-    c->n_boxes = 0;
+    c->n_boxes = c->cap_boxes = 0;
 }
 
 /* --------------------------------------------------------------------
  * Чтение файла и публичная точка входа.
  * -------------------------------------------------------------------- */
 
-static int read_whole_file(const char *path, char **buf_out, size_t *len_out,
-                            char *err, size_t errcap) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+/* The catalog is parsed from a read-only mapping of the opened inode with
+   explicit bounds (the parser never relies on a terminator), not a heap copy
+   of the whole file. An empty file maps nothing and parses as empty input. */
+static int map_whole_file(const char *path, const char **map_out, size_t *len_out,
+                          uint64_t *dev_out, uint64_t *ino_out, char *err, size_t errcap) {
+    *map_out = NULL; *len_out = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         set_err(err, errcap, "%s: %s", path, strerror(errno));
         return -1;
     }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        set_err(err, errcap, "%s: fseek(END) не удался", path);
-        fclose(f);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        set_err(err, errcap, "%s: не обычный файл или размер не читается", path);
+        close(fd);
         return -1;
     }
-    long sz = ftell(f);
-    if (sz < 0) {
-        set_err(err, errcap, "%s: ftell не удался", path);
-        fclose(f);
-        return -1;
+    size_t len = (size_t)st.st_size;
+    *dev_out = (uint64_t)st.st_dev; *ino_out = (uint64_t)st.st_ino;
+    if (len) {
+        void *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) {
+            set_err(err, errcap, "%s: отображение не удалось: %s", path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        *map_out = m;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        set_err(err, errcap, "%s: fseek(0) не удался", path);
-        fclose(f);
-        return -1;
-    }
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) {
-        set_err(err, errcap, "%s: память не выделилась (%ld байт)", path, sz);
-        fclose(f);
-        return -1;
-    }
-    size_t got = (sz > 0) ? fread(buf, 1, (size_t)sz, f) : 0;
-    fclose(f);
-    if (got != (size_t)sz) {
-        set_err(err, errcap, "%s: прочиталось %zu из %ld байт", path, got, sz);
-        free(buf);
-        return -1;
-    }
-    buf[sz] = '\0';
-    *buf_out = buf;
-    *len_out = (size_t)sz;
+    close(fd);
+    *len_out = len;
     return 0;
 }
 
@@ -1126,15 +1371,23 @@ int d2k_catalog_load(const char *path, d2k_catalog *out, char *err, size_t errca
     if (err && errcap) err[0] = '\0';
     memset(out, 0, sizeof *out);
 
-    char *buf = NULL;
+    const char *map = NULL;
     size_t len = 0;
-    if (read_whole_file(path, &buf, &len, err, errcap) != 0) return -1;
+    uint64_t dev = 0, ino = 0;
+    if (map_whole_file(path, &map, &len, &dev, &ino, err, errcap) != 0) return -1;
 
-    jctx j; j.s = buf; j.len = len; j.i = 0;
+    jctx j; j.s = map ? map : ""; j.len = len; j.i = 0;j.store_path=path;
     int rc = parse_catalog_obj(&j, out, err, errcap);
+    if(rc==0 && !preflight_bindings_valid(out,err,errcap))rc=-1;
+    int groups_were_frozen=out->groups && out->groups->frozen;
+    if(rc==0 && out->groups) {
+        out->groups->plan_available=domain_group_available;
+        out->groups->plan_available_ctx=out;
+    }
     if(rc==0 && out->groups && d2k_group_restore(out->groups)) {
         set_err(err,errcap,"invalid domain learning observations"); rc=-1;
     }
+    if(rc==0 && groups_were_frozen && !out->groups->frozen) out->revision++;
     if(rc==0) prune_unavailable_domain_groups(out);
 
     /* Ревью 2026-09-10 (круг 1): курсор после успешного разбора не
@@ -1155,7 +1408,16 @@ int d2k_catalog_load(const char *path, d2k_catalog *out, char *err, size_t errca
             rc = -1;
         }
     }
-    free(buf);
+    /* Degraded family learning: the mapping of the original inode becomes
+       the preserved history (page cache backed by flash, never a heap copy);
+       it outlives an atomic replace of the path. Otherwise it is unmapped. */
+    if (rc == 0 && map && out->groups && out->groups->store_failed && out->groups->preserved_len &&
+        out->groups->preserved_off <= len && out->groups->preserved_len <= len - out->groups->preserved_off) {
+        out->groups->preserved_map = map; out->groups->preserved_map_len = len;
+        out->groups->preserved_dev = dev; out->groups->preserved_ino = ino;
+        map = NULL;
+    }
+    if (map) munmap((void *)map, len);
 
     if (rc != 0) {
         /* Незакрытая структура/дробное число/переполнение/мусор в хвосте —
@@ -1278,6 +1540,9 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
        структуре нет вообще, ей нечего сравнивать с нулём. */
     wr_indent(f, depth + 1); fprintf(f, "\"transport\": %u,\n", (unsigned)bd->transport);
     wr_indent(f, depth + 1); fprintf(f, "\"family\": %u,\n", (unsigned)(bd->family ? bd->family : 4));
+    if (bd->server_port) {
+        wr_indent(f, depth + 1); fprintf(f, "\"server_port\": %u,\n", (unsigned)bd->server_port);
+    }
     /* shape/verified_by — контекст, в котором проверка состоялась; тем же
        порядком и по тем же правилам, что transport (Go их тоже не знает и
        молча пропустит). Ноль выводится наравне с остальным: «не измерено» —
@@ -1289,6 +1554,36 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
     if (bd->probe_path[0]) {
         fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"probe_path\": ", f);
         write_json_string(f, bd->probe_path);
+    }
+    if (bd->preflight_name[0]) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"preflight_name\": ", f);
+        write_json_string(f, bd->preflight_name);
+    }
+    if (bd->dns_authenticated) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"dns_authenticated\": true", f);
+    }
+    if (bd->dns_dot) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"dns_dot\": true", f);
+    }
+    if (bd->dns_query_bytes) {
+        fputs(",\n",f);wr_indent(f,depth+1);
+        fprintf(f,"\"dns_query_bytes\": %u",(unsigned)bd->dns_query_bytes);
+    }
+    if (bd->dns_http_version) {
+        fputs(",\n", f); wr_indent(f, depth + 1);
+        fprintf(f,"\"dns_http_version\": %u",(unsigned)bd->dns_http_version);
+    }
+    if (bd->dns_port) {
+        fputs(",\n", f); wr_indent(f, depth + 1);
+        fprintf(f, "\"dns_port\": %u", (unsigned)bd->dns_port);
+    }
+    if (bd->dns_name[0]) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"dns_name\": ", f);
+        write_json_string(f, bd->dns_name);
+    }
+    if (bd->dns_address[0]) {
+        fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"dns_address\": ", f);
+        write_json_string(f, bd->dns_address);
     }
     if (bd->ech_origin[0]) {
         fputs(",\n", f); wr_indent(f, depth + 1); fputs("\"ech_origin\": ", f);
@@ -1310,6 +1605,68 @@ static void write_binding_elem(FILE *f, const void *e, int depth) {
     wr_indent(f, depth); fputc('}', f);
 }
 
+/* ПИШЕТСЯ ТОЛЬКО ИЗМЕРЕННОЕ. Неизмеренный признак ключа не получает вовсе —
+ * так «не измерено» и «нет» не сливаются в одно слово при перечитывании
+ * (§2.4), и файл не растёт на знание, которого нет. */
+static void write_tri(FILE *f, int depth, const char *key, int8_t v) {
+    if (v != D2K_PROP_YES && v != D2K_PROP_NO) { return; }
+    wr_indent(f, depth); fprintf(f, "\"%s\": \"%s\",\n", key, v == D2K_PROP_YES ? "yes" : "no");
+}
+
+static void write_props_elem(FILE *f, const void *e, int depth) {
+    const d2k_cat_props *r = (const d2k_cat_props *)e;
+    char at[32];
+    format_rfc3339(r->measured_at, at, sizeof at);
+    wr_indent(f, depth); fputs("{\n", f);
+    write_tri(f, depth + 1, "reassembles", r->p.reassembles);
+    write_tri(f, depth + 1, "parses_l7", r->p.parses_l7);
+    write_tri(f, depth + 1, "validates_checksum", r->p.validates_checksum);
+    write_tri(f, depth + 1, "tolerates_reorder", r->p.tolerates_reorder);
+    write_tri(f, depth + 1, "tolerates_left_overlap", r->p.tolerates_left_overlap);
+    write_tri(f, depth + 1, "counts_duplicates", r->p.counts_duplicates);
+    write_tri(f, depth + 1, "inspects_syn", r->p.inspects_syn);
+    write_tri(f, depth + 1, "validates_md5", r->p.validates_md5);
+    write_tri(f, depth + 1, "validates_seq_window", r->p.validates_seq_window);
+    write_tri(f, depth + 1, "validates_timestamps", r->p.validates_timestamps);
+    write_tri(f, depth + 1, "overlap_covers_sni", r->p.overlap_covers_sni);
+    write_tri(f, depth + 1, "handles_urgent", r->p.handles_urgent);
+    if (r->p.hops > 0) { wr_indent(f, depth + 1); fprintf(f, "\"hops\": %d,\n", r->p.hops); }
+    if (r->p.reasm_boundary > 0) {
+        wr_indent(f, depth + 1); fprintf(f, "\"reasm_boundary\": %d,\n", r->p.reasm_boundary);
+    }
+    write_tri(f, depth + 1, "response_gate", r->p.response_gate);
+    write_tri(f, depth + 1, "gate_carry", r->p.gate_carry);
+    write_tri(f, depth + 1, "gate_own", r->p.gate_hello_own);
+    if (r->p.gate_window) {
+        wr_indent(f, depth + 1); fprintf(f, "\"gate_window\": %u,\n", (unsigned)r->p.gate_window);
+    }
+    if (r->p.gate_pieces) {
+        wr_indent(f, depth + 1); fprintf(f, "\"gate_pieces\": %u,\n", (unsigned)r->p.gate_pieces);
+    }
+    if (r->p.gate_rtt_ms) {
+        wr_indent(f, depth + 1); fprintf(f, "\"gate_rtt\": %u,\n", (unsigned)r->p.gate_rtt_ms);
+    }
+    /* Форма клиента и время — ключ и срок записи: пишутся всегда и последними,
+       поэтому запятая стоит у всех полей выше, а не у последнего измеренного. */
+    wr_indent(f, depth + 1); fprintf(f, "\"client_shape\": %u,\n", (unsigned)r->p.client_shape);
+    wr_indent(f, depth + 1); fprintf(f, "\"measured_utc\": \"%s\"\n", at);
+    wr_indent(f, depth); fputc('}', f);
+}
+
+/* Old releases ignore the endpoints array. Never serialize service authority
+   in bindings: their parsers ignore unknown fields, including server_port. */
+static void write_binding_array(FILE *f, const d2k_cat_box *b, int services, int depth) {
+    size_t count = 0;
+    for (size_t i = 0; i < b->n_binds; i++) {
+        const d2k_cat_binding *bd = &b->binds[i];
+        if ((!strcmp(bd->kind, "service")) != services) continue;
+        fputs(count++ ? ",\n" : "[\n", f);
+        write_binding_elem(f, bd, depth + 1);
+    }
+    if (count) { fputc('\n', f); wr_indent(f, depth); fputc(']', f); }
+    else fputs("[]", f);
+}
+
 static void write_box_elem(FILE *f, const void *e, int depth) {
     const d2k_cat_box *b = (const d2k_cat_box *)e;
     char created_s[32], updated_s[32];
@@ -1324,7 +1681,22 @@ static void write_box_elem(FILE *f, const void *e, int depth) {
     write_json_array(f, b->plans, b->n_plans, sizeof(d2k_cat_plan), write_plan_elem, depth + 1);
     fputs(",\n", f);
     wr_indent(f, depth + 1); fputs("\"bindings\": ", f);
-    write_json_array(f, b->binds, b->n_binds, sizeof(d2k_cat_binding), write_binding_elem, depth + 1);
+    write_binding_array(f, b, 0, depth + 1);
+    int services = 0;
+    for (size_t i = 0; i < b->n_binds; i++)
+        if (!strcmp(b->binds[i].kind, "service")) { services = 1; break; }
+    if (services) {
+        fputs(",\n", f);
+        wr_indent(f, depth + 1); fputs("\"endpoints\": ", f);
+        write_binding_array(f, b, 1, depth + 1);
+    }
+    if (b->n_props > 0) {
+        /* Пустое знание ключа не получает: файл без вектора — обычное
+           состояние коробки, которую ещё не измеряли. */
+        fputs(",\n", f);
+        wr_indent(f, depth + 1); fputs("\"properties\": ", f);
+        write_json_array(f, b->props, b->n_props, sizeof(d2k_cat_props), write_props_elem, depth + 1);
+    }
     fputc('\n', f);
     wr_indent(f, depth); fputc('}', f);
 }
@@ -1352,6 +1724,45 @@ static void write_domain_group(FILE *f,const void *value,int depth) {
 
 int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t errcap) {
     if (err && errcap) err[0] = '\0';
+    if(!preflight_bindings_valid(c,err,errcap))return -1;
+    /* Degraded family learning: the history lives only in the read-only
+       mapping of the original catalog. Without it, refuse to save rather
+       than write a catalog that has lost that history. */
+    if (c->groups && c->groups->store_failed && c->groups->preserved_len &&
+        (!c->groups->preserved_map ||
+         c->groups->preserved_off > c->groups->preserved_map_len ||
+         c->groups->preserved_len > c->groups->preserved_map_len - c->groups->preserved_off)) {
+        set_err(err, errcap, "family history is not mapped; catalog not saved");
+        return -1;
+    }
+    /* Writing in place would truncate the very inode the preserved history
+       is read from; the atomic save writes a new inode and renames. */
+    if (c->groups && c->groups->preserved_map) {
+        struct stat st;
+        if (stat(path, &st) == 0 && (uint64_t)st.st_dev == c->groups->preserved_dev &&
+            (uint64_t)st.st_ino == c->groups->preserved_ino) {
+            set_err(err, errcap, "%s holds the preserved family history; save atomically", path);
+            return -1;
+        }
+    }
+    /* Validate before opening/truncating the destination. */
+    for (size_t i = 0; i < c->n_boxes; i++) {
+        for (size_t k = 0; k < c->boxes[i].n_binds; k++) {
+            const d2k_cat_binding *bd = &c->boxes[i].binds[k];
+            if (!dns_binding_address_valid(bd)) {
+                set_err(err, errcap, "refusing invalid DNS binding address or family");
+                return -1;
+            }
+            if (!plain_dns_binding_valid(bd)) {
+                set_err(err,errcap,"refusing invalid plain DNS proof or endpoint");
+                return -1;
+            }
+            if ((bd->server_port || !strcmp(bd->kind, "service")) && !service_binding_valid(bd)) {
+                set_err(err, errcap, "refusing invalid service binding");
+                return -1;
+            }
+        }
+    }
 
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -1377,7 +1788,10 @@ int d2k_catalog_save(const d2k_catalog *c, const char *path, char *err, size_t e
         fputs(",\n  \"domain_groups\": ",f);
         write_json_array(f,c->groups->groups,c->groups->n_groups,sizeof(d2k_domain_group),write_domain_group,1);
         fputs(",\n  \"domain_observations\": ",f);
-        write_json_array(f,c->groups->observations,c->groups->n_observations,sizeof(d2k_group_observation),write_domain_observation,1);
+        if(c->groups->store_failed && c->groups->preserved_len)
+            fwrite(c->groups->preserved_map+c->groups->preserved_off,1,c->groups->preserved_len,f);
+        else
+            write_json_array(f,d2k_group_rows(c->groups),c->groups->n_observations,sizeof(d2k_group_observation),write_domain_observation,1);
         fprintf(f,",\n  \"domain_groups_frozen\": %s",c->groups->frozen?"true":"false");
         fprintf(f,",\n  \"domain_groups_disabled\": %s",c->groups->disabled?"true":"false");
         if(c->groups->disabled_at) {

@@ -771,6 +771,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "d2kask: не удалось открыть управляющий сокет %s: %s\n", a.control_path, err);
         return 1;
     }
+    /* Та же сверка пары, что у d2kc: чужой версии датапат ответил бы на наши
+       команды отказом или молчанием, и «форма не получена» выглядело бы как
+       свойство сети, а не несовместимость (задание 02, 28.10.2026). */
+    if (d2k_link_greeting(fd, 2000, NULL, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kask: %s\n", err);
+        d2k_link_close(fd);
+        return 1;
+    }
 
     char trig_detail[512];
     const char *trig_how;

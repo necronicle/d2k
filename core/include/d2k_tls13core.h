@@ -113,6 +113,12 @@ int d2k_t13_ech_accepted(const uint8_t *inner, size_t inner_len,
  * legacy_version ServerHello (0x0303 — TLS 1.2). 0 — ServerHello обрезан. */
 unsigned d2k_t13_sh_version(const uint8_t *sh, size_t sh_len);
 
+int d2k_t13_schedule_hs_ikm(const uint8_t *shared, size_t shared_len,
+                            const uint8_t *tr, size_t tr_len,
+                            uint8_t c_hs[32], uint8_t s_hs[32], uint8_t hs_out[32]);
+/* key_share сервера любой группы и шифр (0x1301-0x1303); -1 — нет/HRR/шифр вне TLS 1.3. */
+int d2k_t13_sh_share(const uint8_t *sh, size_t sh_len, uint16_t *group, uint16_t *suite,
+                     const uint8_t **key, size_t *key_len, char *err, size_t errcap);
 int d2k_t13_sh_parse(const uint8_t *sh, size_t sh_len, const uint8_t **peer_key,
                      char *err, size_t errcap);
 

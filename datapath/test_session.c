@@ -6,6 +6,8 @@
  * человеку соединение и не узнать об этом.
  */
 #include <stdio.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
 #include <string.h>
 #include "test_nat_stub.h"
 #include "d2k_nat.h"
@@ -13,6 +15,8 @@
 #include "d2k_hold.h"
 #include "d2k_tls.h"
 #include "d2k_ctq.h"
+#include "d2k_crypto.h"
+#include "d2k_plantlv.h"
 
 static int fails;
 static size_t hold_released;
@@ -227,6 +231,29 @@ static size_t build_hello(uint8_t *out) {
     return o;
 }
 
+/* То же приветствие, но БЕЗ server_name; из расширений только
+   supported_versions — форма MODERN, имени нет. */
+static size_t build_hello_nosni(uint8_t *out) {
+    uint8_t body[256];
+    size_t b = 0;
+    body[b++] = 0x03; body[b++] = 0x03;
+    for (int i = 0; i < 32; i++) body[b++] = (uint8_t)i;
+    body[b++] = 0;
+    body[b++] = 0x00; body[b++] = 0x02; body[b++] = 0x13; body[b++] = 0x01;
+    body[b++] = 0x01; body[b++] = 0x00;
+    /* extensions: только supported_versions (TLS 1.3) — форма MODERN, имени нет */
+    body[b++] = 0x00; body[b++] = 0x07;
+    body[b++] = 0x00; body[b++] = 0x2b; body[b++] = 0x00; body[b++] = 0x03;
+    body[b++] = 0x02; body[b++] = 0x03; body[b++] = 0x04;
+    size_t o = 0;
+    out[o++] = 0x16; out[o++] = 0x03; out[o++] = 0x01;
+    out[o++] = (uint8_t)((b + 4) >> 8); out[o++] = (uint8_t)(b + 4);
+    out[o++] = 0x01; out[o++] = 0x00;
+    out[o++] = (uint8_t)(b >> 8); out[o++] = (uint8_t)b;
+    memcpy(out + o, body, b); o += b;
+    return o;
+}
+
 /* То же приветствие, добитое расширением padding (RFC 7685) до want байт на
    проводе. Нужно затем, что «перекрытие на полном сегменте» — отдельный
    случай приёмки U3: статическая проверка длины считает только объявленные
@@ -374,6 +401,90 @@ static const d2k_jrn_entry *last_suspect(const d2k_session *s) {
     return NULL;
 }
 
+/* ЭТАП 36: ОБМЕН НЕСЁТ ИДЕНТИЧНОСТЬ ИСПОЛНЕННОГО ПЛАНА. Подозрение несло
+ * её всегда (suspect_bound), обмен — нет: контроллер был вынужден приписывать
+ * ответ сервера ТЕКУЩЕЙ привязке каталога (и вовсе не мог — адресному потоку
+ * без имени). Ответ сервера на потоке под планом — событие с execution_id,
+ * plan_id исполненного плана и trial_id (ноль у постоянного плана); поток без
+ * плана — без идентичности. */
+static const d2k_jrn_entry *last_exchange(const d2k_session *s) {
+    const d2k_journal *j = d2k_session_journal(s);
+    for (size_t i = d2k_journal_count(j); i > 0; i--) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i - 1);
+        if (e && e->kind == D2K_JRN_EXCHANGE) return e;
+    }
+    return NULL;
+}
+
+static void test_exchange_carries_execution(void) {
+    uint8_t hello[512];
+    size_t hl = build_hello(hello);
+    const uint8_t appdata[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0x00};
+    for (int planned = 0; planned < 2; planned++) {
+        d2k_session *s = d2k_session_new(64, 64);
+        d2k_plan *p = NULL; char err[160];
+        CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &p, err, sizeof err) == 0,
+              "exchange identity: plan fixture");
+        uint8_t want_id[16] = {0};
+        if (planned && p && d2k_plan_id(p)) memcpy(want_id, d2k_plan_id(p), 16);
+        if (planned) d2k_session_set_plan(s, p); else d2k_plan_free(p);
+        uint8_t pkt[1024], buf[8192]; d2k_result r;
+        size_t pn = build_pkt(pkt, (uint16_t)(47750 + planned), 0x18, hello, hl);
+        d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
+        CHECK(!!r.applied == planned, "exchange identity: plan applied state is not the fixture's");
+        pn = build_rev_pkt(pkt, (uint16_t)(47750 + planned), 0x18, appdata, sizeof appdata);
+        d2k_session_packet(s, pkt, pn, 2000, buf, sizeof buf, &r);
+        const d2k_jrn_entry *e = last_exchange(s);
+        CHECK(e != NULL, "exchange identity: server answer not journaled");
+        if (planned) {
+            static const uint8_t zero[16];
+            CHECK(e && e->execution_id != 0 && !memcmp(e->plan_id, want_id, 16) &&
+                  !memcmp(e->trial_id, zero, 16),
+                  "exchange identity: answer under plan lacks the executed plan identity");
+        } else {
+            CHECK(e && e->execution_id == 0, "exchange identity: unplanned answer got a plan identity");
+        }
+        d2k_session_free(s);
+    }
+}
+
+/* ИМЯ КЛИЕНТСКОГО TCP-ПОТОКА ДОЕЗЖАЕТ ДО РЕЗУЛЬТАТА (24.10.2026).
+ *
+ * Построчная запись решений по клиентскому потоку есть у QUIC с 15.10, а про
+ * TCP датапат молчал: в issue 25 и 28 «в журнале нет записей» прочиталось как
+ * «датапат этот поток не видел», хотя правило очереди его берёт. Строку
+ * пишет d2kd.c, а имя для неё кладёт сюда сессия — проверяем именно это:
+ * без имени строка не отличит один поток от другого. */
+static void test_flow_name_reaches_result(void) {
+    uint8_t hello[512];
+    size_t hl = build_hello(hello);
+    d2k_session *s = d2k_session_new(64, 64);
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_owns_payload, sizeof plan_owns_payload, &p,
+                        err, sizeof err) == 0, "план не загрузился");
+    d2k_session_set_plan(s, p);
+    uint8_t pkt[1024], buf[8192];
+    d2k_result r;
+    size_t pn = build_pkt(pkt, 47720, 0x02, NULL, 0);
+    d2k_session_packet(s, pkt, pn, 500, buf, sizeof buf, &r);
+    pn = build_pkt(pkt, 47720, 0x18, hello, hl);
+    memset(&r, 0, sizeof r);
+    d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
+    CHECK(strcmp(r.flow_name, "hetzner.com") == 0,
+          "имя клиентского TCP-потока не доехало до результата — журналу нечего сказать");
+    const d2k_journal *j=d2k_session_journal(s);size_t greetings=0;
+    for(size_t i=0;i<d2k_journal_count(j);i++) {
+        const d2k_jrn_entry *e=d2k_journal_at(j,i);
+        if(e && e->kind==D2K_JRN_HELLO_SNI) {
+            greetings++;CHECK(e->d_client_side==D2K_CLIENT_SIDE_HIGH,
+                "ordinary TLS greeting lost observed client direction");
+        }
+    }
+    CHECK(greetings==1,"ordinary TLS greeting not journaled");
+    d2k_session_free(s);
+}
+
 static void test_suspect_tells_planned(void) {
     uint8_t hello[512];
     size_t hl = build_hello(hello);
@@ -388,7 +499,9 @@ static void test_suspect_tells_planned(void) {
         d2k_session_set_plan(s, p);
         uint8_t pkt[1024], buf[8192];
         d2k_result r;
-        size_t pn = build_pkt(pkt, 47700, 0x18, hello, hl);
+        size_t pn = build_pkt(pkt, 47700, 0x02, NULL, 0);
+        d2k_session_packet(s, pkt, pn, 500, buf, sizeof buf, &r);
+        pn = build_pkt(pkt, 47700, 0x18, hello, hl);
         d2k_session_packet(s, pkt, pn, 1000, buf, sizeof buf, &r);
         CHECK(r.applied, "план не применился — проверять нечего");
         /* Два повтора того же приветствия: клиент ждёт ответа. */
@@ -396,6 +509,8 @@ static void test_suspect_tells_planned(void) {
         d2k_session_packet(s, pkt, pn, 3000, buf, sizeof buf, &r);
         const d2k_jrn_entry *e = last_suspect(s);
         CHECK(e != NULL, "подозрение по повтору приветствия не записано");
+        CHECK(e && e->d_client_side == D2K_CLIENT_SIDE_HIGH,
+              "suspect lost observed initiating endpoint");
         CHECK(e && e->d_planned == D2K_PLANNED_YES,
               "подозрение молчит о том, что план к этому потоку применялся");
         d2k_session_free(s);
@@ -465,6 +580,33 @@ static void test_suspect_tells_planned(void) {
    прислал прикладные данные, поэтому причиной поиска может стать только
    воспроизводимый обрыв ответа, измеренный контроллером. */
 static void test_late_rst_after_tls_appdata(void) {
+    for (unsigned variant = 0; variant < 4; variant++) {
+        d2k_session *bad_session = d2k_session_new(64, 64);
+        CHECK(bad_session != NULL, "invalid TLS late-close session");
+        if (!bad_session) continue;
+        uint8_t hello[512], pkt[1024], buf[8192];
+        d2k_result result;
+        size_t hlen = build_hello(hello);
+        size_t n = build_pkt(pkt, 47800, 0x18, hello, hlen);
+        d2k_session_packet(bad_session, pkt, n, 1000, buf, sizeof buf, &result);
+        const uint8_t records[][6] = {
+            {0x17}, {0x17, 0x82, 0x03, 0, 1, 0},
+            {0x17, 0x03, 0xff, 0, 1, 0},
+            {0x17, 0x03, 0x03, 0x10, 0, 0}
+        };
+        n = build_rev_pkt(pkt, 47800, 0x18, records[variant], variant ? 6 : 1);
+        d2k_session_packet(bad_session, pkt, n, 2000, buf, sizeof buf, &result);
+        n = build_rev_pkt(pkt, 47800, 0x14, NULL, 0);
+        d2k_session_packet(bad_session, pkt, n, 3000, buf, sizeof buf, &result);
+        const d2k_jrn_entry *event = last_suspect(bad_session);
+        if (variant < 3) {
+            CHECK(!event, "invalid TLS header triggered late-response measurement");
+        } else {
+            CHECK(event && event->code == D2K_SUSPECT_RST_AFTER_APP,
+                  "segmented TLS record lost late-response suspicion");
+        }
+        d2k_session_free(bad_session);
+    }
     d2k_session *s = d2k_session_new(64, 64);
     CHECK(s != NULL, "сессия позднего RST не создалась");
     if (!s) { return; }
@@ -1332,6 +1474,43 @@ static void test_tcp_stall(void) {
         for (uint64_t k = 3; k <= 6; k++) d2k_session_sweep(s, k * S);
         CHECK(d2k_session_suspects(s) == 1, "17 пакетов при бюджете 16 не стали подозрением");
         d2k_session_free(s);
+        /* A newly measured budget must re-enable an existing flow that
+           exceeded the old band. Repeating the same config must not erase
+           the observation interval needed to detect a genuine stall. */
+        s = tcp_window(47918, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47918, 30, 60, 1); /* estimated data packets: 3+4+60-8=59 */
+        tcp_ct_queries = 0;
+        d2k_session_sweep(s, 2 * S);
+        d2k_session_sweep(s, 3 * S);
+        CHECK(tcp_ct_queries == 1, "old band should suspend this flow");
+        d2k_session_set_stall_budgets(s, NULL, 0);
+        d2k_session_sweep(s, 4 * S);
+        CHECK(tcp_ct_queries == 1, "identical default budget must not rearm a suspended flow");
+        const uint16_t invalid_budget[] = {0};
+        CHECK(d2k_session_set_stall_budgets(s, invalid_budget, 1) == -1,
+              "invalid budget must be rejected");
+        d2k_session_sweep(s, 5 * S);
+        CHECK(tcp_ct_queries == 1, "rejected budget must not change observation state");
+        const uint16_t b60[] = {60};
+        CHECK(d2k_session_set_stall_budgets(s, b60, 1) == 0, "new measured band accepted");
+        tcp_ct_set(47918, 40, 60, 1);
+        d2k_session_sweep(s, 6 * S);
+        CHECK(tcp_ct_queries == 2, "new band must re-enable suspended flow");
+        CHECK(d2k_session_suspects(s) == 0, "new band must start a fresh counter baseline");
+        d2k_session_set_stall_budgets(s, b60, 1);
+        tcp_ct_set(47918, 43, 60, 1);
+        d2k_session_sweep(s, 9 * S);
+        CHECK(last_suspect(s) && last_suspect(s)->code == D2K_SUSPECT_TCP_STALL,
+              "new measured band must detect existing stalled flow");
+        d2k_session_free(s);
+        s = tcp_window(47919, 1 * S, 50 * MS, 3, 4, 4, 3);
+        tcp_ct_set(47919, 30, 60, 0);
+        tcp_ct_queries = 0;
+        d2k_session_sweep(s, 2 * S);
+        d2k_session_set_stall_budgets(s, b60, 1);
+        d2k_session_sweep(s, 3 * S);
+        CHECK(tcp_ct_queries == 1, "new budget must not rearm a closing connection");
+        d2k_session_free(s);
         /* Пустой список — снова поле 04.10 (25). */
         s = tcp_window(47913, 1 * S, 50 * MS, 3, 4, 4, 3);
         d2k_session_set_stall_budgets(s, b16, 1);
@@ -1521,6 +1700,19 @@ static void test_shape_carries_client_tcp_options(void) {
     g = d2k_session_new(8, 8);
     n = build_pkt_ts(pkt, 41502, 0x18, hello, hlen);
     d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(count_kind(g, D2K_JRN_SHAPE) == 1,
+          "ordinary complete ClientHello must publish its form without ARM_SHAPE");
+    const d2k_jrn_entry *observed=last_of_kind(g,D2K_JRN_SHAPE);
+    CHECK(observed!=NULL,"ordinary shape has no flow event");
+    if(observed) {
+        d2k_jrn_entry old=*observed;size_t captured_len=0;
+        CHECK(d2k_session_shape_event(g,&old.key,old.at_ns,&captured_len)!=NULL && captured_len==hlen,
+              "event cannot retrieve its own snapshot");
+        n=build_pkt_ts(pkt,41503,0x18,hello,hlen);
+        d2k_session_packet(g,pkt,n,1001,buf,sizeof buf,&r);
+        CHECK(d2k_session_shape_event(g,&old.key,old.at_ns,&captured_len)==NULL && !captured_len,
+              "overwritten shape was attached to an older flow event");
+    }
     CHECK(d2k_session_want_shape(g, name, sizeof name - 1, 6) == 1, "последнее приветствие не отдано");
     olen = 77;
     o = d2k_session_shape_tcp_options_family(g, 4, &olen);
@@ -1530,8 +1722,517 @@ static void test_shape_carries_client_tcp_options(void) {
     d2k_session_free(g);
 }
 
+/* ПОЯВЛЕНИЕ ПОТОКА БЕЗ ПРОТОКОЛА, TCP (этап 42): один факт D2K_JRN_FLOW на
+   поток с первым сегментом клиента без распознанного протокола — с SYN
+   сторона клиента известна; повторы не дают новых; TLS-приветствие и поток
+   зонда — нет. */
+static void test_flow_fact_tcp(void) {
+    static const uint8_t game[] = "\x7f\x01GAME-HELLO\x00\x00\x00\x10";
+    uint8_t pkt[2048], buf[4096], hello[512];
+    d2k_result r;
+    size_t hlen = build_hello(hello);
+    {
+        d2k_session *s = d2k_session_new(64, 64);
+        size_t n = build_pkt(pkt, 45100, 0x02, NULL, 0);
+        d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, 45100, 0x12, NULL, 0);
+        d2k_session_packet(s, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45100, 0x18, game, sizeof game - 1);
+        for (int i = 0; i < 3; i++)
+            d2k_session_packet(s, pkt, n, 1200 + (uint64_t)i * 1000000, buf, sizeof buf, &r);
+        CHECK(count_kind(s, D2K_JRN_FLOW) == 1, "поток TCP без протокола: не один факт появления на поток");
+        const d2k_jrn_entry *e = last_of_kind(s, D2K_JRN_FLOW);
+        CHECK(e && e->key.proto == 6 && e->d_client_side == D2K_CLIENT_SIDE_HIGH && e->name_len == 0,
+              "поток TCP: факт без стороны клиента или с выдуманным именем");
+        CHECK(r.verdict == D2K_VERDICT_ACCEPT && r.n_out == 0, "поток TCP: факт появления изменил поток");
+        n = build_pkt(pkt, 45101, 0x18, hello, hlen);
+        d2k_session_packet(s, pkt, n, 5000000, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45102, 0x18, game, sizeof game - 1);
+        d2k_session_packet_probe(s, pkt, n, 5000000, buf, sizeof buf, &r);
+        CHECK(count_kind(s, D2K_JRN_FLOW) == 1, "поток TCP: факт появления у TLS-приветствия или зонда");
+        /* Этап 49: поток, подхваченный с середины (SYN не видели — сессия его
+           забыла, а метка поздней доставки снова привела его пакеты), не
+           «появился»: факт появления для него был бы новым соединением на
+           старом кортеже и сбросил бы его наблюдение у контроллера. */
+        n = build_pkt(pkt, 45103, 0x18, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, 6000000, buf, sizeof buf, &r);
+        d2k_session_packet(s, pkt, n, 7000000, buf, sizeof buf, &r);
+        CHECK(count_kind(s, D2K_JRN_FLOW) == 1, "поток TCP с середины (без SYN) назван появившимся");
+        d2k_session_free(s);
+    }
+}
+
+static void test_raw_measure_identity(void) {
+#ifndef D2K_SESSION_RAW_IDENTITY
+    CHECK(0,"live raw-flow identity unavailable");
+#else
+    d2k_session *s=d2k_session_new(8,32);CHECK(s!=NULL,"raw identity session");if(!s)return;
+    uint8_t packet[512],scratch[2048],epoch[16],next_epoch[16];d2k_result result;
+    uint64_t generation=0,next_generation=0;int previous=0;
+    d2k_ct_tuple t={0};t.family=4;t.proto=6;
+    uint8_t src[4]={192,168,1,67},dst[4]={1,2,3,4};
+    memcpy(t.src,src,4);memcpy(t.dst,dst,4);wr16(t.sport_be,49001);wr16(t.dport_be,443);
+    CHECK(d2k_session_raw_identity(s,&t,epoch,&generation,&previous)<0,"nonexistent flow has identity");
+    size_t n=build_pkt(packet,49001,0x02,NULL,0);
+    d2k_session_packet(s,packet,n,1,scratch,sizeof scratch,&result);
+    const uint8_t opaque[]={0x41,0x42,0x43,0x44};
+    n=build_pkt(packet,49001,0x18,opaque,sizeof opaque);
+    d2k_session_packet(s,packet,n,2,scratch,sizeof scratch,&result);
+    CHECK(!d2k_session_raw_identity(s,&t,epoch,&generation,&previous)&&generation&&!previous,"raw client identity not found");
+    const d2k_jrn_entry *birth=last_of_kind(s,D2K_JRN_FLOW);
+    CHECK(birth&&birth->flow_incarnation==generation&&!memcmp(birth->flow_epoch,epoch,16),"flow birth not bound to observed connection");
+    d2k_ct_tuple reverse=t;memcpy(reverse.src,t.dst,16);memcpy(reverse.dst,t.src,16);
+    memcpy(reverse.sport_be,t.dport_be,2);memcpy(reverse.dport_be,t.sport_be,2);
+    CHECK(d2k_session_raw_identity(s,&reverse,next_epoch,&next_generation,&previous)<0,"server direction accepted as client");
+    t.dport_be[1]++;CHECK(d2k_session_raw_identity(s,&t,next_epoch,&next_generation,&previous)<0,"neighbor service got identity");t.dport_be[1]--;
+    n=build_rev_pkt(packet,49001,0x18,opaque,sizeof opaque);
+    d2k_session_packet(s,packet,n,3,scratch,sizeof scratch,&result);
+    CHECK(!d2k_session_raw_identity(s,&t,next_epoch,&next_generation,&previous)&&previous&&next_generation==generation,"same-flow prior reply not measured");
+    n=build_pkt(packet,49001,0x02,NULL,0);wr32(packet+24,9000);
+    d2k_session_packet(s,packet,n,4,scratch,sizeof scratch,&result);
+    n=build_pkt(packet,49001,0x18,opaque,sizeof opaque);wr32(packet+24,9001);
+    d2k_session_packet(s,packet,n,5,scratch,sizeof scratch,&result);
+    CHECK(!d2k_session_raw_identity(s,&t,next_epoch,&next_generation,&previous)&&next_generation!=generation&&!previous&&!memcmp(epoch,next_epoch,16),"new connection inherited old identity/reply");
+    d2k_session_set_route_mark(s,99);
+    d2k_session_packet(s,packet,n,6,scratch,sizeof scratch,&result);
+    CHECK(d2k_session_raw_identity(s,&t,next_epoch,&next_generation,&previous)<0,"routed flow entered direct measurement");
+    d2k_session_free(s);
+#endif
+}
+
+/* Fixture report for already observed IPv4 TCP repetitions; packet bytes
+ * supply both the complete tuple and digest, never just the client port. */
+static int install_raw_packet_fixture(d2k_session *s,const uint8_t *packet,size_t n,
+                                      const uint8_t trial[16],uint64_t now) {
+    if(n<=40 || packet[0]!=0x45 || packet[32]!=0x50)return -1;
+    struct d2k_rawmeasure_report r={0};r.request.tuple.family=4;r.request.tuple.proto=6;
+    memcpy(r.request.tuple.src,packet+12,4);memcpy(r.request.tuple.dst,packet+16,4);
+    memcpy(r.request.tuple.sport_be,packet+20,2);memcpy(r.request.tuple.dport_be,packet+22,2);
+    int prior=0;
+    if(d2k_session_raw_identity(s,&r.request.tuple,r.request.epoch,&r.request.generation,&prior))return -1;
+    r.request.token[0]=9;r.request.seconds=10;r.code=D2K_RM_REPEAT_SILENT;
+    r.sample_len=r.smallest_data=r.largest_data=(uint16_t)(n-40);
+    r.sample_seq=((uint32_t)packet[24]<<24)|((uint32_t)packet[25]<<16)|((uint32_t)packet[26]<<8)|packet[27];
+    r.client_data=2;r.exact_repeats=1;d2k_sha256(packet+40,n-40,r.sample_digest);
+    uint8_t tlv[sizeof plan_bytes+6];memcpy(tlv,plan_bytes,sizeof plan_bytes);tlv[11]++;
+    const uint8_t proto[]={0,2,0,2,6,1};memcpy(tlv+sizeof plan_bytes,proto,6);
+    d2k_plan *p=NULL;char err[128];if(d2k_plan_load(tlv,sizeof tlv,&p,err,sizeof err))return -1;
+    return d2k_plantab_set_measured_probe(d2k_session_plans(s),&r,trial,(const uint8_t[32]){1},now,now+1000000000ull,p);
+}
+static void test_legacy_raw_port_is_not_identity(void) {
+    d2k_session *s=d2k_session_new(16,64);CHECK(s!=NULL,"legacy scope session");if(!s)return;
+    d2k_plan *p=NULL;char err[128];d2k_plan_load(plan_bytes,sizeof plan_bytes,&p,err,sizeof err);
+    const uint8_t target[]="1.2.3.4";
+    CHECK(p&&!d2k_plantab_set_name_probe(d2k_session_plans(s),target,sizeof target-1,1,p,D2K_PLAN_SHAPE_RAW,htons(49001)),"legacy scope fixture");
+    uint8_t packet[256],scratch[8192],data[]={'a','b','c'};d2k_result r;
+    for(unsigned client=0;client<2;client++) {
+        size_t n=build_pkt(packet,49001,0x02,NULL,0);packet[15]=(uint8_t)(67+client);
+        d2k_session_packet(s,packet,n,10+client*10,scratch,sizeof scratch,&r);
+        for(unsigned repeat=0;repeat<2;repeat++) {
+            n=build_pkt(packet,49001,0x18,data,sizeof data);packet[15]=(uint8_t)(67+client);
+            d2k_session_packet(s,packet,n,11+client*10+repeat,scratch,sizeof scratch,&r);
+            CHECK(!r.applied,"legacy port-only candidate touched unbound LAN client");
+        }
+    }
+    d2k_session_free(s);
+}
+static void test_measured_raw_scope(int later_segment) {
+#ifndef D2K_SESSION_MEASURED_PROBE
+    CHECK(0,"packet path has no measured exact-flow probe");
+#else
+    d2k_session *s=d2k_session_new(16,64);CHECK(s!=NULL,"measured session");if(!s)return;
+    uint8_t packet[256],scratch[8192],data[]={'q'};d2k_result out;
+    size_t n=build_pkt(packet,49001,0x02,NULL,0);d2k_session_packet(s,packet,n,10,scratch,sizeof scratch,&out);
+    n=build_pkt(packet,49001,0x18,data,sizeof data);
+    if(later_segment)wr32(packet+24,900); /* first data was already delivered */
+    d2k_session_packet(s,packet,n,11,scratch,sizeof scratch,&out);
+    struct d2k_rawmeasure_report r={0};r.request.tuple.family=4;r.request.tuple.proto=6;
+    memcpy(r.request.tuple.src,packet+12,4);memcpy(r.request.tuple.dst,packet+16,4);
+    memcpy(r.request.tuple.sport_be,packet+20,2);memcpy(r.request.tuple.dport_be,packet+22,2);
+    int prior=0;CHECK(!d2k_session_raw_identity(s,&r.request.tuple,r.request.epoch,&r.request.generation,&prior),"measured original identity");
+    r.request.token[0]=9;r.request.seconds=10;r.code=D2K_RM_REPEAT_SILENT;
+    r.sample_len=r.smallest_data=r.largest_data=1;r.sample_seq=1000;r.client_data=2;r.exact_repeats=1;
+    static const uint8_t digest[32]={0x8e,0x35,0xc2,0xcd,0x3b,0xf6,0x64,0x1b,0xdb,0x0e,0x20,0x50,0xb7,0x69,0x32,0xcb,0xb2,0xe6,0x03,0x4a,0x0d,0xda,0xcc,0x1d,0x9b,0xea,0x82,0xa6,0xba,0x57,0xf7,0xcf};
+    memcpy(r.sample_digest,digest,32);uint8_t token[16]={5};
+    uint8_t tlv[sizeof plan_bytes+6];memcpy(tlv,plan_bytes,sizeof plan_bytes);tlv[11]++;
+    const uint8_t proto[]={0,2,0,2,6,1};memcpy(tlv+sizeof plan_bytes,proto,6);
+    d2k_plan *p=NULL;char err[128];CHECK(!d2k_plan_load(tlv,sizeof tlv,&p,err,sizeof err),"measured plan fixture");
+    CHECK(!d2k_plantab_set_measured_probe(d2k_session_plans(s),&r,token,(const uint8_t[32]){1},12,100,p),"install measured plan");
+    n=build_pkt(packet,49001,0x02,NULL,0);packet[15]=68;d2k_session_packet(s,packet,n,13,scratch,sizeof scratch,&out);
+    for(unsigned i=0;i<2;i++){n=build_pkt(packet,49001,0x18,data,1);packet[15]=68;
+        d2k_session_packet(s,packet,n,14+i,scratch,sizeof scratch,&out);CHECK(!out.applied,"other LAN client received measured plan");}
+    data[0]='r';n=build_pkt(packet,49001,0x18,data,1);d2k_session_packet(s,packet,n,16,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"different payload received measured plan");
+    data[0]='q';n=build_pkt(packet,49001,0x18,data,1);d2k_session_packet(s,packet,n,17,scratch,sizeof scratch,&out);
+    CHECK(out.applied&&!memcmp(out.trial_id,token,16),"measured original repeat not applied with own token");
+    n=build_pkt(packet,49001,0x02,NULL,0);wr32(packet+24,2000);d2k_session_packet(s,packet,n,18,scratch,sizeof scratch,&out);
+    for(unsigned i=0;i<2;i++){n=build_pkt(packet,49001,0x18,data,1);
+        d2k_session_packet(s,packet,n,19+i,scratch,sizeof scratch,&out);CHECK(!out.applied,"replacement connection received old measured plan");}
+    d2k_session_free(s);
+#endif
+}
+
+static void test_raw_measured_refinement(void) {
+    d2k_session *s=d2k_session_new(16,64);
+    uint8_t packet[256],scratch[8192],data[]={0x7f,1,2,3,4,5};
+    uint8_t trial[16]={71};d2k_result out,first;
+    size_t n=build_pkt(packet,49010,0x02,NULL,0);
+    d2k_session_packet(s,packet,n,10,scratch,sizeof scratch,&out);
+    n=build_pkt(packet,49010,0x18,data,sizeof data);
+    d2k_session_packet(s,packet,n,11,scratch,sizeof scratch,&out);
+    CHECK(!install_raw_packet_fixture(s,packet,n,trial,12),"refinement first fixture");
+    d2k_session_packet(s,packet,n,13,scratch,sizeof scratch,&first);
+    CHECK(first.applied,"refinement first execution missing");
+    n=build_pkt(packet,49010,0x18,data+1,sizeof data-1);wr32(packet+24,1001);
+    trial[0]++;
+    CHECK(!install_raw_packet_fixture(s,packet,n,trial,2000000000ull),"refinement new measured fixture");
+    d2k_session_packet(s,packet,n,2000000001ull,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"refinement overwrote pending sends");
+    for(size_t i=0;i<first.n_out+1;i++)
+        d2k_session_sent(s,2000000002ull+i,&first.key,first.execution_id);
+    d2k_session_packet(s,packet,n,2000000010ull,scratch,sizeof scratch,&out);
+    CHECK(out.applied&&out.execution_id!=first.execution_id&&!memcmp(out.trial_id,trial,16),
+          "fresh measured trial rejected after previous execution");
+    d2k_result second=out;
+    for(size_t i=0;i<second.n_out+1;i++)
+        d2k_session_sent(s,2000000011ull+i,&second.key,second.execution_id);
+    d2k_session_packet(s,packet,n,2000000020ull,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"same measured trial executed twice after completion");
+    d2k_session_free(s);
+}
+
+static void test_raw_segmented_echo(void) {
+    for (int mode=0;mode<8;mode++) {
+        d2k_session *s=d2k_session_new(16,64);
+        uint8_t pkt[1500],buf[8192],trial[16]={0x72},data[100];d2k_result r;
+        memset(data,'x',50);memset(data+50,'y',50);
+        uint32_t base=mode==5?UINT32_MAX-20:5000;
+        size_t cut=mode==4?1:50;
+        size_t n=build_pkt(pkt,49002,0x02,NULL,0);
+        d2k_session_packet(s,pkt,n,1,buf,sizeof buf,&r);
+        n=build_rev_pkt(pkt,49002,0x12,NULL,0);
+        d2k_session_packet(s,pkt,n,2,buf,sizeof buf,&r);
+        n=build_pkt(pkt,49002,0x18,data,sizeof data);wr32(pkt+28,base);
+        d2k_session_packet(s,pkt,n,3,buf,sizeof buf,&r);
+        d2k_session_packet(s,pkt,n,4,buf,sizeof buf,&r);
+        CHECK(!install_raw_packet_fixture(s,pkt,n,trial,5),"segmented echo fixture");
+        d2k_session_packet(s,pkt,n,6,buf,sizeof buf,&r);
+        uint64_t execution=r.execution_id;
+        CHECK(r.applied,"segmented echo plan not applied");
+        if(mode==1) {
+            n=build_rev_pkt(pkt,49002,0x18,data+cut,sizeof data-cut);
+            wr32(pkt+24,base+(uint32_t)cut);wr32(pkt+28,1100);
+            d2k_session_packet(s,pkt,n,7,buf,sizeof buf,&r);
+            CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"out-of-order echo tail confirmed");
+        }
+        n=build_rev_pkt(pkt,49002,0x18,data,cut);
+        wr32(pkt+24,base);wr32(pkt+28,1000+(uint32_t)cut);
+        d2k_session_packet(s,pkt,n,8,buf,sizeof buf,&r);
+        CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"echo prefix confirmed full request");
+        if(mode==6)d2k_session_packet(s,pkt,n,9,buf,sizeof buf,&r);
+        if(mode==2) {
+            n=build_rev_pkt(pkt,49002,0x18,data+10,cut);
+            wr32(pkt+24,base+10);wr32(pkt+28,1100);
+            d2k_session_packet(s,pkt,n,9,buf,sizeof buf,&r);
+        }
+        if(mode!=4) {
+            n=build_rev_pkt(pkt,49002,0x18,data+cut,sizeof data-cut);
+            wr32(pkt+24,base+(uint32_t)cut);wr32(pkt+28,1100);
+            if(mode==3)pkt[40]^=1;
+            if(mode==7)pkt[33]|=0x01;
+            d2k_session_packet(s,pkt,n,10,buf,sizeof buf,&r);
+        }
+        const d2k_jrn_entry *e=last_of_kind(s,D2K_JRN_EXCHANGE);
+        int valid=mode==0||mode==1||mode==5||mode==6||mode==7;
+        CHECK(valid ? e&&e->code==D2K_RAW_PROOF_ECHO&&e->execution_id==execution : !e,
+              "segmented echo proof lost bytes or accepted gap/overlap/corruption/prefix");
+        d2k_session_free(s);
+    }
+}
+
+static void test_raw_progress_proof(void) {
+    d2k_session *s=d2k_session_new(16,64);
+    uint8_t packet[1500],scratch[8192],trial[16]={0x71};d2k_result out;
+    const uint8_t request[]="raw-request", reply[]="raw-response", next[]="next-request";
+    CHECK(s!=NULL,"RAW progress session");if(!s)return;
+    size_t n=build_pkt(packet,49001,0x02,NULL,0);
+    d2k_session_packet(s,packet,n,1,scratch,sizeof scratch,&out);
+    n=build_rev_pkt(packet,49001,0x12,NULL,0);
+    d2k_session_packet(s,packet,n,2,scratch,sizeof scratch,&out);
+    n=build_pkt(packet,49001,0x18,request,sizeof request);
+    d2k_session_packet(s,packet,n,3,scratch,sizeof scratch,&out);
+    d2k_session_packet(s,packet,n,4,scratch,sizeof scratch,&out);
+    CHECK(!install_raw_packet_fixture(s,packet,n,trial,5),"RAW progress fixture");
+    d2k_session_packet(s,packet,n,6,scratch,sizeof scratch,&out);
+    CHECK(out.applied,"RAW progress plan not applied");
+    uint64_t execution=out.execution_id;
+    n=build_rev_pkt(packet,49001,0x18,reply,sizeof reply);
+    wr32(packet+24,2000);wr32(packet+28,1000+sizeof request);
+    d2k_session_packet(s,packet,n,7,scratch,sizeof scratch,&out);
+    CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"RAW arbitrary TCP reply confirmed");
+    n=build_pkt(packet,49001,0x18,next,sizeof next);
+    wr32(packet+24,1000+sizeof request);wr32(packet+28,2001);
+    d2k_session_packet(s,packet,n,8,scratch,sizeof scratch,&out);
+    n=build_rev_pkt(packet,49001,0x18,(const uint8_t *)"next-response",14);
+    wr32(packet+24,2000+sizeof reply);wr32(packet+28,1000+sizeof request+sizeof next);
+    d2k_session_packet(s,packet,n,9,scratch,sizeof scratch,&out);
+    CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"RAW client without reply ACK promoted server burst");
+    n=build_pkt(packet,49001,0x18,next,sizeof next);
+    wr32(packet+24,1000);wr32(packet+28,2000+sizeof reply);
+    d2k_session_packet(s,packet,n,10,scratch,sizeof scratch,&out);
+    n=build_rev_pkt(packet,49001,0x18,(const uint8_t *)"next-response",14);
+    wr32(packet+24,2000+sizeof reply);wr32(packet+28,1000+sizeof request+sizeof next);
+    d2k_session_packet(s,packet,n,11,scratch,sizeof scratch,&out);
+    CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"RAW changed retransmission promoted progress");
+    n=build_pkt(packet,49001,0x18,next,sizeof next);
+    wr32(packet+24,1000+sizeof request);wr32(packet+28,2000+sizeof reply);
+    d2k_session_packet(s,packet,n,12,scratch,sizeof scratch,&out);
+    n=build_rev_pkt(packet,49001,0x18,reply,sizeof reply);
+    wr32(packet+24,2000);wr32(packet+28,1000+sizeof request+sizeof next);
+    d2k_session_packet(s,packet,n,13,scratch,sizeof scratch,&out);
+    CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"RAW server retransmission promoted progress");
+    n=build_rev_pkt(packet,49001,0x18,(const uint8_t *)"next-response",14);
+    wr32(packet+24,2000+sizeof reply);wr32(packet+28,1000+sizeof request+sizeof next);
+    d2k_session_packet(s,packet,n,14,scratch,sizeof scratch,&out);
+    CHECK(!count_kind(s,D2K_JRN_EXCHANGE),"RAW known server burst payload promoted progress");
+    n=build_rev_pkt(packet,49001,0x18,(const uint8_t *)"final-response",15);
+    wr32(packet+24,2000+sizeof reply+14);wr32(packet+28,1000+sizeof request+sizeof next);
+    d2k_session_packet(s,packet,n,15,scratch,sizeof scratch,&out);
+    const d2k_jrn_entry *e=last_of_kind(s,D2K_JRN_EXCHANGE);
+    CHECK(e&&e->code==D2K_RAW_PROOF_PROGRESS&&e->execution_id==execution&&
+          !memcmp(e->trial_id,trial,16),"RAW ordered progress lost execution-bound path proof");
+    d2k_session_free(s);
+}
+
+static void test_composed_stream_plan(void) {
+    uint8_t hello[512],pkt[1024],buf[8192],tlv[D2K_PLAN_TLV_MAX];
+    size_t hl=build_hello(hello),tl=0;char text[512],err[160];
+    uint32_t offset=(uint32_t)hl+20;
+    snprintf(text,sizeof text,"d2k-plan 1 5\nid 0123456789abcdef0123456789abcdef\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +1\norder reverse\n");
+    d2k_tls_info info;d2k_tls_parse(hello,hl,&info);
+    char *program=NULL;
+    CHECK(!d2k_plan_text_compose_after_split(text,(uint32_t)hl,(uint32_t)info.sni_off,
+        (uint32_t)info.sni_len,offset,6,3,&program,err,sizeof err),"composed: preserve measured SNI geometry");
+    CHECK(program && !d2k_plan_text_to_tlv(program,tlv,sizeof tlv,&tl,err,sizeof err),"composed: compile");
+    free(program);
+    for(int variant=0;variant<5;variant++) {
+        d2k_session *s=d2k_session_new(32,32);d2k_plan *p=NULL;d2k_result r;
+        CHECK(!d2k_plan_load(tlv,tl,&p,err,sizeof err),"composed: load");
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"hetzner.com",11,1,p),"composed: bind");
+        uint32_t start=UINT32_MAX-10;
+        size_t pn=build_pkt(pkt,47791,0x02,NULL,0);wr32(pkt+24,start-1);
+        d2k_session_packet(s,pkt,pn,10,buf,sizeof buf,&r);
+        pn=build_pkt(pkt,47791,0x18,hello,hl);wr32(pkt+24,start);
+        d2k_session_packet(s,pkt,pn,20,buf,sizeof buf,&r);
+        if(!r.applied)fprintf(stderr,"composed variant %d first input refused: %s\n",variant,r.skipped?r.skipped:"unknown");
+        CHECK(r.applied && r.n_out && r.verdict==D2K_VERDICT_DROP,"composed: first input executes");
+        uint64_t execution=r.execution_id;d2k_key key=r.key;
+        if(variant!=1)for(size_t i=0;i<=r.n_out;i++)d2k_session_sent(s,21,&key,execution);
+        CHECK(!d2k_session_done(s),"composed: first input is not complete plan");
+        if(variant==2) {
+            p=NULL;CHECK(!d2k_plan_load(tlv,tl,&p,err,sizeof err),"composed: reload");
+            CHECK(!d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"hetzner.com",11,22,p),"composed: replace binding");
+        }
+        uint8_t data[]={23,3,3,0,1,42};
+        if(variant==3 || variant==4) {
+            pn=build_pkt(pkt,47791,0x18,data+2,4);wr32(pkt+24,start+offset+2);
+            uint32_t anchor=0;
+            CHECK(d2k_session_stream_anchor(s,pkt,pn,&anchor) && anchor==start+offset,"composed: late assembly anchor");
+            CHECK(d2k_session_hold_candidate(s,pkt,pn)==D2K_HOLD_EXACT(6),"composed: exact tail ownership");
+            if(variant==4)d2k_session_note_unassembled(s,pkt,pn,25);
+        }
+        pn=build_pkt(pkt,47791,0x18,data,sizeof data);wr32(pkt+24,start+offset);
+        d2k_session_packet(s,pkt,pn,30,buf,sizeof buf,&r);
+        if(variant==0 || variant==3) {
+            CHECK(r.applied && r.n_out==2 && r.execution_id==execution,"composed: one execution across both inputs");
+            for(size_t i=0;i<=r.n_out;i++)d2k_session_sent(s,31,&key,r.execution_id);
+            CHECK(d2k_session_done(s)==1,"composed: done only after both inputs");
+            pn=build_pkt(pkt,47791,0x18,data+1,5);wr32(pkt+24,start+offset+1);
+            d2k_session_packet(s,pkt,pn,32,buf,sizeof buf,&r);
+            CHECK(r.applied && r.n_out==2 && r.execution_id==execution,"composed: partial retransmission retains partition and identity");
+            for(size_t i=0;i<=r.n_out;i++)d2k_session_sent(s,33,&key,r.execution_id);
+            CHECK(d2k_session_done(s)==1,"composed: replay is not a second completion");
+            pn=build_rev_pkt(pkt,47791,0x10,NULL,0);wr32(pkt+28,start+offset+6);
+            d2k_session_packet(s,pkt,pn,34,buf,sizeof buf,&r);
+            pn=build_pkt(pkt,47791,0x18,data,sizeof data);wr32(pkt+24,start+offset);
+            d2k_session_packet(s,pkt,pn,35,buf,sizeof buf,&r);
+            CHECK(!r.applied,"composed: acknowledged request no longer owns retransmission watch");
+        } else CHECK(!r.applied && !d2k_session_done(s),"composed: incomplete or replaced execution rejected");
+        d2k_session_free(s);
+    }
+}
+static void test_late_stream_plan(void) {
+    const char *text="d2k-plan 1 16\nid 0123456789abcdef0123456789abcdef\nproto tcp tls\nstream-offset 256\ninput 6 0 0\nsplit payload_start +3\norder forward\n";
+    uint8_t tlv[D2K_PLAN_TLV_MAX];size_t tl=0;char err[160];
+    CHECK(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&tl,err,sizeof err),"late stream: compile");
+    for(int variant=0;variant<10;variant++) {
+        d2k_session *s=d2k_session_new(32,32);d2k_plan *p=NULL;
+        CHECK(!d2k_plan_load(tlv,tl,&p,err,sizeof err),"late stream: load");
+        CHECK(!d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"hetzner.com",11,1,p),"late stream: bind");
+        uint8_t pkt[1024],buf[8192],hello[512],data[]={23,3,3,0,1,42};
+        size_t hl=build_hello(hello),pn;uint32_t start=variant==5?UINT32_MAX-15:1000;
+        d2k_result r;
+        if(variant!=1) {
+            pn=build_pkt(pkt,47790,0x02,NULL,0);wr32(pkt+24,start-1);
+            d2k_session_packet(s,pkt,pn,10,buf,sizeof buf,&r);
+        }
+        pn=build_pkt(pkt,47790,0x18,hello,hl);wr32(pkt+24,start);
+        d2k_session_packet(s,pkt,pn,20,buf,sizeof buf,&r);
+        CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT,"late stream: hello must remain direct");
+        if(variant!=1)CHECK(!count_plan_refused(s),"late stream: waiting is not refusal");
+        if(variant!=1)CHECK(d2k_session_retry_watch(s,pkt,pn)==1,"late stream: retain queue watch until target");
+        if(variant==2) {
+            p=NULL;CHECK(!d2k_plan_load(tlv,tl,&p,err,sizeof err),"late stream: replacement load");
+            CHECK(!d2k_plantab_set_name(d2k_session_plans(s),(const uint8_t *)"hetzner.com",11,21,p),"late stream: replace same bytes");
+        }
+        if(variant==6) {
+            pn=build_pkt(pkt,47790,0x02,NULL,0);wr32(pkt+24,start-1);
+            d2k_session_packet(s,pkt,pn,22,buf,sizeof buf,&r);
+        }
+        if(variant==3 || variant==4) {
+            pn=build_pkt(pkt,47790,0x18,data,sizeof data);wr32(pkt+24,start+(variant==3?254:257));
+            d2k_session_packet(s,pkt,pn,23,buf,sizeof buf,&r);
+            CHECK(!r.applied && !r.n_out,"late stream: crossing or missed boundary cannot execute");
+        }
+        if(variant==8 || variant==9) {
+            if(variant==8)pn=build_rev_pkt(pkt,47790,0x18,data,sizeof data);
+            else pn=build_pkt(pkt,47790,0x18,data,sizeof data);
+            wr32(pkt+24,start+128);
+            d2k_session_packet(s,pkt,pn,24,buf,sizeof buf,&r);
+            CHECK(!r.applied && !r.n_out,"late stream: earlier and reverse data remain direct");
+        }
+        pn=build_pkt(pkt,47790,0x18,data,variant==7?5:sizeof data);wr32(pkt+24,start+256);
+        d2k_session_packet(s,pkt,pn,30,buf,sizeof buf,&r);
+        int execute=variant==0 || variant==5 || variant==8 || variant==9;
+        CHECK(!!r.applied==execute,"late stream: exact live binding and sequence required");
+        if(execute) {
+            CHECK(r.n_out==2 && r.verdict==D2K_VERDICT_DROP,"late stream: split owns original");
+            CHECK(d2k_binding_known(&r.binding),"late stream: execution retains binding");
+            if(r.n_out==2)for(unsigned i=0;i<2;i++) {
+                const uint8_t *wire=buf+r.out[i].off;
+                size_t head=(wire[0]&15u)*4u;
+                CHECK(rd32(wire+head+4)==start+256+3*i,"late stream: emitted sequence");
+                head+=(wire[head+12]>>4)*4u;
+                CHECK(r.out[i].len==head+3 && !memcmp(wire+head,data+3*i,3),"late stream: preserve exact application bytes");
+            }
+        } else CHECK(!r.n_out && r.verdict==D2K_VERDICT_ACCEPT,"late stream: rejected scope passes original");
+        d2k_session_packet(s,pkt,pn,31,buf,sizeof buf,&r);
+        CHECK(!r.applied && !r.n_out,"late stream: no duplicate action");
+        d2k_session_free(s);
+    }
+}
+
+static void test_dns_flow(int permanent) {
+    static const uint8_t question[]={
+        0x12,0x34,1,0,0,1,0,0,0,0,0,0,3,'d','n','s',4,'t','e','s','t',0,0,1,0,1
+    };
+    const char *text[2]={
+        "d2k-plan 1 1\nid 0123456789abcdef0123456789abcdef\nproto tcp tls\nsplit payload_start +4\norder forward\n",
+        "d2k-plan 1 7\nid 0123456789abcdef0123456789abcdef\nproto udp quic\nipfrag 1\n"
+    };
+    d2k_nat_fn saved_nat = d2k_nat_hook;
+    nat_calls = nat_miss_first_n = 0;
+    d2k_nat_hook = nat_stub;
+    for (int udp=0;udp<2;udp++)for(int variant=0;variant<(permanent ? 7 : 6);variant++) {
+        if (permanent && variant==4)continue;
+        uint8_t payload[sizeof question+2],packet[128],buf[8192],tlv[D2K_PLAN_TLV_MAX];
+        size_t prefix=udp?0:2, length=sizeof question+prefix,n,tl;
+        uint8_t trial[16]={9},digest[32];
+        if (!udp)wr16(payload,sizeof question);
+        memcpy(payload+prefix,question,sizeof question);
+        d2k_sha256(payload,length,digest);
+        uint16_t source=47311;
+        d2k_session *s=d2k_session_new(32,32);
+        d2k_session_set_hook(s,D2K_HOOK_OUTPUT);
+        d2k_result r;
+        if (!udp && variant!=5) {
+            n=build_pkt(packet,source,0x02,NULL,0);
+            wr16(packet+22,53);
+            d2k_session_packet_probe(s,packet,n,10,buf,sizeof buf,&r);
+        }
+        char err[160];d2k_plan *plan=NULL;
+        CHECK(!d2k_plan_text_to_tlv(text[udp],tlv,sizeof tlv,&tl,err,sizeof err) &&
+            !d2k_plan_load(tlv,tl,&plan,err,sizeof err),"owned DNS: load trial");
+        d2k_addr_probe_flow flow={.family=4,.transport=udp?17:6,
+            .src_ip4={192,168,1,67},.dst_ip4={1,2,3,4},
+            .src_port_be=htons(source),.dst_port_be=htons(53)};
+        if (permanent) {
+            CHECK(!d2k_plantab_set_dns_endpoint(d2k_session_plans(s),flow.dst_ip4,4,
+                flow.dst_port_be,15,(uint16_t)length,plan),"DNS endpoint: install scoped wire length");
+            memset(trial,0,sizeof trial);
+        } else CHECK(!d2k_plantab_set_dns_probe(d2k_session_plans(s),&flow,trial,15,100,
+            (uint16_t)length,digest,plan),"owned DNS: install tuple and digest");
+        if (variant==2)payload[length-1]^=1;
+        if (variant==6) {
+            /* A different, valid one-question name has a different measured frame size. */
+            payload[prefix+12]=2;
+            memmove(payload+prefix+15,payload+prefix+16,length-prefix-16);
+            length--;
+            if (!udp)wr16(payload,(uint16_t)(length-prefix));
+        }
+        if (!udp) {
+            n=build_pkt(packet,source,0x18,payload,length);
+            wr16(packet+22,53);wr32(packet+24,variant==3 ? 1002 : 1001);
+        } else {
+            n=28+length;
+            memset(packet,0,28);
+            packet[0]=0x45;packet[8]=64;packet[9]=17;
+            wr16(packet+2,(uint16_t)n);
+            memcpy(packet+12,flow.src_ip4,4);memcpy(packet+16,flow.dst_ip4,4);
+            wr16(packet+20,variant==3 && !permanent ? source+1 : source);
+            wr16(packet+22,variant==3 && permanent ? 54 : 53);
+            wr16(packet+24,(uint16_t)(8+length));
+            memcpy(packet+28,payload,length);
+        }
+        nat_miss_first_n = udp && variant==5 ? nat_calls+1 : 0;
+        if (udp && variant==0 && !permanent) {
+            int prior_nat_calls=nat_calls;
+            packet[28]^=1;
+            d2k_session_packet_probe(s,packet,n,19,buf,sizeof buf,&r);
+            CHECK(!r.applied && !r.n_out && r.verdict==D2K_VERDICT_ACCEPT && nat_calls==prior_nat_calls,
+                  "owned DNS: direct UDP control passed without touching the trial");
+            packet[28]^=1;
+        }
+        if (variant==1)d2k_session_packet(s,packet,n,20,buf,sizeof buf,&r);
+        else d2k_session_packet_probe(s,packet,n,variant==4 ? 100 : 20,buf,sizeof buf,&r);
+        if (variant==0) {
+            if(!r.applied)fprintf(stderr,"owned DNS %s: %s\n",udp?"UDP":"TCP",r.skipped?r.skipped:"no verdict");
+            CHECK(r.applied && r.n_out && !memcmp(trial,r.trial_id,16),"owned DNS: exact query missing receipt");
+        } else if (permanent && udp && variant==5) {
+            CHECK(!r.applied && r.udp_defer_pending && r.udp_defer_binding.shape==D2K_PLAN_SHAPE_DNS,
+                  "DNS endpoint: first datagram waits for verified NAT");
+            d2k_ct_info mapping={.reply_tuple_known=1,.reply_tuple={.family=4,.proto=17}};
+            memcpy(mapping.reply_tuple.src,flow.dst_ip4,4);
+            memcpy(mapping.reply_tuple.dst,flow.src_ip4,4);
+            memcpy(mapping.reply_tuple.sport_be,&flow.dst_port_be,2);
+            memcpy(mapping.reply_tuple.dport_be,&flow.src_port_be,2);
+            d2k_result continued;
+            CHECK(d2k_session_udp_continue(s,21,&r.udp_defer_key,r.udp_defer_plan_id,
+                r.udp_defer_trial_id,&r.udp_defer_binding,r.udp_defer_epoch,r.udp_defer_incarnation,
+                &mapping,packet,n,buf,sizeof buf,&continued) && continued.applied && continued.n_out==2,
+                "DNS endpoint: the same first datagram executes with confirmed NAT");
+        } else CHECK(!r.applied && !r.n_out,"owned DNS: missing evidence or a wrong flow applied");
+        d2k_session_free(s);
+    }
+    d2k_nat_hook = saved_nat;
+}
+
 int main(void) {
+    /* First, as test_nat_stub.h requires: the host conntrack table (Linux,
+       Docker) must not decide whether the measured trial executes. */
     D2K_TEST_NAT_NO_TABLE();
+    test_dns_flow(0);
+    test_dns_flow(1);
+    test_late_stream_plan();
+    test_composed_stream_plan();
+    test_raw_segmented_echo();
+    test_raw_progress_proof();
+    test_raw_measured_refinement();
+    test_measured_raw_scope(0);
+    test_measured_raw_scope(1);
+    test_legacy_raw_port_is_not_identity();
+    test_raw_measure_identity();
+    test_flow_fact_tcp();
     test_template_plan_needs_client_timestamp();
     test_shape_carries_client_tcp_options();
     test_tcp_stall();
@@ -1571,7 +2272,9 @@ int main(void) {
               "IPv6 plan did not produce native IPv6 packets");
         d2k_session_free(v6);
     }
+    test_flow_name_reaches_result();
     test_suspect_tells_planned();
+    test_exchange_carries_execution();
     test_late_rst_after_tls_appdata();
     test_silent_cut_fin_retry();
     test_silent_cut_round1();
@@ -1820,6 +2523,341 @@ int main(void) {
         CHECK(d2k_session_hellos(w) == 1,
               "приветствие не узнано из-за отсутствия плана");
         d2k_session_free(w);
+        d2k_session_free(g);
+    }
+
+    /* --- TCP БЕЗ РАСПОЗНАННОГО ПРОТОКОЛА: молчание как подозрение (этап 12) --
+     * Нагрузка не TLS и не HTTP. Подозрение только при трёх уликах сразу:
+     * клиент повторил первый сегмент, SYN-ACK виден, данных от сервера нет
+     * дольше срока. Ответ с данными — не молчание; без повтора — не молчание;
+     * зонд контроллера — не клиент. Подозрение несёт форму RAW.            */
+    {
+        static const uint8_t game[] = "\x7f\x01GAME-HELLO\x00\x00\x00\x10";
+        for (int variant = 0; variant < 4; variant++) {
+            d2k_session *g = d2k_session_new(64, 64);
+            uint16_t sp = (uint16_t)(45000 + variant);
+            n = build_pkt(pkt, sp, 0x02, NULL, 0);                  /* SYN */
+            d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+            n = build_rev_pkt(pkt, sp, 0x12, NULL, 0);              /* SYN-ACK */
+            d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+            n = build_pkt(pkt, sp, 0x18, game, sizeof game - 1);     /* первый сегмент */
+            if (variant == 3) d2k_session_packet_probe(g, pkt, n, 1200, buf, sizeof buf, &r);
+            else d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+            if (variant == 2) {                                      /* сервер ответил данными */
+                n = build_rev_pkt(pkt, sp, 0x18, game, sizeof game - 1);
+                d2k_session_packet(g, pkt, n, 1300, buf, sizeof buf, &r);
+            }
+            if (variant != 1) {                                      /* повтор того же сегмента */
+                n = build_pkt(pkt, sp, 0x18, game, sizeof game - 1);
+                if (variant == 3) d2k_session_packet_probe(g, pkt, n, 1400, buf, sizeof buf, &r);
+                else d2k_session_packet(g, pkt, n, 1400, buf, sizeof buf, &r);
+            }
+            CHECK(d2k_session_hellos(g) == 0, "raw: нагрузка без протокола принята за приветствие");
+            CHECK(d2k_session_sweep(g, 1500) == 0, "raw: подозрение раньше срока");
+            size_t told = d2k_session_sweep(g, 1000 + 3000000000ull);
+            if (variant == 0) {
+                CHECK(told == 1, "raw: молчание при повторе и видимом SYN-ACK не заподозрено");
+                const d2k_journal *j = d2k_session_journal(g);
+                int found = 0;
+                for (size_t i = 0; i < d2k_journal_count(j); i++) {
+                    const d2k_jrn_entry *e = d2k_journal_at(j, i);
+                    if (e->kind != D2K_JRN_SUSPECT) continue;
+                    found++;
+                    CHECK(e->code == D2K_SUSPECT_SILENT && e->d_client_shape == D2K_PLAN_SHAPE_RAW &&
+                          e->d_planned == D2K_PLANNED_NO, "raw: подозрение без формы RAW/планности");
+                }
+                CHECK(found == 1 && d2k_session_sweep(g, 1000 + 9000000000ull) == 0,
+                      "raw: подозрение продублировано");
+            } else {
+                CHECK(told == 0, variant == 1 ? "raw: без повтора клиента названо молчанием"
+                                : variant == 2 ? "raw: ответ сервера с данными назван молчанием"
+                                : "raw: зонд контроллера назван молчащим клиентом");
+            }
+            d2k_session_free(g);
+        }
+        /* SYN-ACK не виден (обратной стороны в очереди нет) — не молчание. */
+        d2k_session *g = d2k_session_new(64, 64);
+        n = build_pkt(pkt, 45010, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45010, 0x18, game, sizeof game - 1);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        d2k_session_packet(g, pkt, n, 1400, buf, sizeof buf, &r);
+        CHECK(d2k_session_sweep(g, 1000 + 3000000000ull) == 0, "raw: без видимой обратной стороны названо молчанием");
+        d2k_session_free(g);
+    }
+
+    /* --- СБРОС ПОТОКА БЕЗ РАСПОЗНАННОГО ПРОТОКОЛА (этап 32) -----------------
+     * Прежде RST в ответ на первый сегмент не-TLS/не-HTTP потока не давал ничего:
+     * все ветки сброса требовали приветствия, поток молча забывался. Теперь это
+     * подозрение RST формы RAW с TTL сброса и TTL ответа сервера (SYN-ACK) —
+     * ДИАГНОСТИЧЕСКИЙ факт: закрытый порт сбрасывает так же, и вывод о коробке
+     * из одного сброса не делается. Не подозрение: сброс после данных сервера
+     * (обычное закрытие), поток зонда контроллера, сброс со стороны клиента.
+     * variant 0 — TTL сброса как у SYN-ACK; 1 — иной; 2 — данные сервера были;
+     * 3 — зонд; 4 — сбросил клиент. */
+    {
+        static const uint8_t game[] = "\x7f\x01GAME-HELLO\x00\x00\x00\x10";
+        for (int variant = 0; variant < 5; variant++) {
+            d2k_session *g = d2k_session_new(64, 64);
+            uint16_t sp = (uint16_t)(45100 + variant);
+            n = build_pkt(pkt, sp, 0x02, NULL, 0);
+            d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+            n = build_rev_pkt_ttl(pkt, sp, 0x12, NULL, 0, 52);
+            d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+            n = build_pkt(pkt, sp, 0x18, game, sizeof game - 1);
+            if (variant == 3) d2k_session_packet_probe(g, pkt, n, 1200, buf, sizeof buf, &r);
+            else d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+            if (variant == 2) {
+                n = build_rev_pkt_ttl(pkt, sp, 0x18, game, sizeof game - 1, 52);
+                d2k_session_packet(g, pkt, n, 1300, buf, sizeof buf, &r);
+            }
+            if (variant == 4) n = build_pkt(pkt, sp, 0x14, NULL, 0);
+            else n = build_rev_pkt_ttl(pkt, sp, 0x14, NULL, 0, variant == 1 ? 127 : 52);
+            if (variant == 3) d2k_session_packet_probe(g, pkt, n, 1400, buf, sizeof buf, &r);
+            else d2k_session_packet(g, pkt, n, 1400, buf, sizeof buf, &r);
+            CHECK(r.verdict == D2K_VERDICT_ACCEPT, "raw rst: сброс задержан или снят без плана");
+            const d2k_journal *j = d2k_session_journal(g);
+            int found = 0;
+            for (size_t i = 0; i < d2k_journal_count(j); i++) {
+                const d2k_jrn_entry *e = d2k_journal_at(j, i);
+                if (e->kind != D2K_JRN_SUSPECT) continue;
+                found++;
+                CHECK(e->code == D2K_SUSPECT_RST && e->d_client_shape == D2K_PLAN_SHAPE_RAW &&
+                      e->d_planned == D2K_PLANNED_NO, "raw rst: подозрение без кода RST/формы RAW/планности");
+                CHECK(e->d_ttl == (variant == 1 ? 127 : 52) && e->d_ref_ttl == 52,
+                      "raw rst: в подозрении нет TTL сброса и TTL ответа сервера");
+            }
+            if (variant <= 1) CHECK(found == 1, "raw rst: сброс в ответ на первый сегмент без протокола не замечен");
+            else CHECK(found == 0, variant == 2 ? "raw rst: обычное закрытие после данных сервера названо подозрением"
+                                  : variant == 3 ? "raw rst: поток зонда назван подозрением"
+                                  : "raw rst: сброс клиента назван подозрением");
+            CHECK(d2k_session_sweep(g, 1000 + 9000000000ull) == 0, "raw rst: после сброса ещё и молчание");
+            d2k_session_free(g);
+        }
+    }
+
+    /* --- ОПЫТ НА ПРОДОЛЖЕНИИ КЛИЕНТА (этап 12): поток без протокола ---------
+     * Контроллер ставит точную пробную запись формы RAW на порт клиента
+     * замолчавшего потока. Датапат применяет кандидата к ПОВТОРУ первого
+     * сегмента самого клиента (не к первому сегменту и не к чужому порту),
+     * APPLIED несёт trial ID опыта, а первые данные сервера после этого —
+     * EXCHANGE полного echo с planned=YES и формой RAW (только путь).     */
+    {
+        static const uint8_t game[] = "\x7f\x01GAME-HELLO\x00\x00\x00\x10";
+        const uint8_t key[] = "1.2.3.4";
+        uint8_t trial[16] = {0xd2, 0x12};
+        d2k_session *g = d2k_session_new(64, 64);
+        uint16_t cport = 45020;
+        uint16_t cport_be = (uint16_t)((cport >> 8) | ((cport & 0xff) << 8));
+        n = build_pkt(pkt, cport, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, cport, 0x12, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, cport, 0x18, game, sizeof game - 1);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && d2k_session_applied(g) == 0, "raw-опыт: план применён к первому сегменту, а не к повтору");
+        d2k_session_packet(g,pkt,n,1201,buf,sizeof buf,&r);
+        CHECK(!install_raw_packet_fixture(g,pkt,n,trial,1202),"raw-опыт: измеренная запись потока");
+        d2k_session_packet(g, pkt, n, 2200, buf, sizeof buf, &r);   /* повтор того же сегмента */
+        CHECK(r.n_out == 2 && d2k_session_applied(g) == 1 && r.applied,
+              "raw-опыт: план не применён к повтору первого сегмента клиента");
+        CHECK(!memcmp(r.trial_id, trial, 16), "raw-опыт: исполнение без trial ID опыта");
+        d2k_session_packet(g, pkt, n, 3200, buf, sizeof buf, &r);   /* ещё повтор — не второй раз */
+        CHECK(r.n_out == 0 && d2k_session_applied(g) == 1, "raw-опыт: план применён дважды к одному потоку");
+        n = build_rev_pkt(pkt, cport, 0x18, game, 1);
+        wr32(pkt+28,1001); /* Echo of only the first split byte, rest blocked. */
+        d2k_session_packet(g,pkt,n,3250,buf,sizeof buf,&r);
+        CHECK(count_kind(g,D2K_JRN_EXCHANGE)==0,"raw: partial echoed prefix confirmed the entire trial");
+        n = build_rev_pkt(pkt, cport, 0x18, game, 1);
+        wr32(pkt+28,1000+(uint32_t)(sizeof game-1));
+        d2k_session_packet(g,pkt,n,3260,buf,sizeof buf,&r);
+        CHECK(count_kind(g,D2K_JRN_EXCHANGE)==0,"raw: one echoed byte with full ACK confirmed trial");
+        n = build_rev_pkt(pkt, cport, 0x18, (const uint8_t *)"arbitrary", 9);
+        wr32(pkt+28,1000+(uint32_t)(sizeof game-1));
+        d2k_session_packet(g,pkt,n,3270,buf,sizeof buf,&r);
+        CHECK(count_kind(g,D2K_JRN_EXCHANGE)==0,"raw: arbitrary full-ACK payload confirmed trial");
+        n = build_rev_pkt(pkt, cport, 0x18, game, sizeof game - 1);
+        wr32(pkt+24,0x11223344); /* response starts at the client's observed ACK */
+        wr32(pkt+28,1000+(uint32_t)(sizeof game-1));
+        d2k_session_packet(g, pkt, n, 3300, buf, sizeof buf, &r);
+        {
+            const d2k_journal *j = d2k_session_journal(g);
+            int applied = 0, exchanged = 0;
+            for (size_t i = 0; i < d2k_journal_count(j); i++) {
+                const d2k_jrn_entry *e = d2k_journal_at(j, i);
+                if (e->kind == D2K_JRN_PLAN_APPLIED) { applied++; } /* trial ID опыта — в результате исполнения (r.trial_id), как у именных проб TCP */
+                if (e->kind == D2K_JRN_EXCHANGE) {
+                    exchanged++;
+                    CHECK(e->code == D2K_RAW_PROOF_ECHO && e->d_planned == D2K_PLANNED_YES && e->d_client_shape == D2K_PLAN_SHAPE_RAW,
+                          "raw-опыт: обмен без планности/формы RAW или с выдуманным кодом протокола");
+                    CHECK(e->execution_id != 0 && !memcmp(e->trial_id, trial, 16),
+                          "raw-опыт: обмен не несёт исполнение и trial ID опыта (этап 36)");
+                }
+            }
+            CHECK(applied == 1 && exchanged == 1, "raw-опыт: нет ровно одного APPLIED и одного EXCHANGE");
+        }
+        CHECK(d2k_session_sweep(g, 1000 + 9000000000ull) == 0, "raw-опыт: ответивший поток назван молчащим");
+        d2k_session_free(g);
+
+        /* ПОЗДНЯЯ ДОСТАВКА (этап 17): клиент повторял сегмент дольше окна
+           поиска (8 пакетов) ДО того, как контроллер поставил пробную запись
+           его порта — следующий повтор ТОГО ЖЕ потока обязан получить план. */
+        g = d2k_session_new(64, 64);
+        n = build_pkt(pkt, cport, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, cport, 0x12, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, cport, 0x18, game, sizeof game - 1);
+        for (int i = 0; i < 10; i++) {
+            d2k_session_packet(g, pkt, n, 1200 + (uint64_t)i * 1000, buf, sizeof buf, &r);
+            CHECK(r.n_out == 0, "поздняя доставка TCP: план взялся без записи");
+        }
+        CHECK(!install_raw_packet_fixture(g,pkt,n,trial,12000),"поздняя доставка TCP: измеренная запись");
+        /* Кортеж записи conntrack по адресу сервера и порту клиента — для метки
+           d2kd (именная проба порта → кортеж → метка); чужой порт не находит. */
+        d2k_ct_tuple lt; memset(&lt, 0xaa, sizeof lt);
+        CHECK(d2k_session_tcp_tuple_by_port(g, key, 7, 4, cport_be, &lt) == 0 &&
+              lt.proto == 6 && lt.family == 4 && !memcmp(lt.sport_be, &cport_be, 2) &&
+              lt.dst[0] == 1 && lt.dst[1] == 2 && lt.dst[2] == 3 && lt.dst[3] == 4,
+              "поздняя доставка TCP: кортеж по адресу/порту клиента не найден или не клиент→сервер");
+        {
+            uint16_t wrong = (uint16_t)(cport_be ^ 0x0100);
+            d2k_ct_tuple lw2;
+            CHECK(d2k_session_tcp_tuple_by_port(g, key, 7, 4, wrong, &lw2) == -1,
+                  "поздняя доставка TCP: чужой порт нашёл поток");
+        }
+        CHECK(d2k_session_retry_watch(g, pkt, n) == 0, "late_watch TCP: без флага пакет не отпускается");
+        CHECK(d2k_session_late_watch(g, &lt, 1) == 0, "late_watch TCP: флаг не поставился");
+        uint64_t before = d2k_session_late_delivered(g);
+        d2k_session_packet(g, pkt, n, 13000, buf, sizeof buf, &r);   /* повтор за окном, под меткой */
+        CHECK(r.n_out == 2 && r.applied && !memcmp(r.trial_id, trial, 16),
+              "поздняя доставка TCP: повтор за окном под пробной записью не получил план");
+        CHECK(d2k_session_late_delivered(g) == before + 1, "поздняя доставка TCP: пакет под меткой не сосчитан");
+        /* Пока стоит флаг, пакет потока не освобождается NF_REPEAT (D2K_WCLR
+           снял бы метку); после снятия — как раньше. */
+        CHECK(d2k_session_retry_watch(g, pkt, n) == 1, "late_watch TCP: под флагом пакет освобождается — метка слетит");
+        CHECK(d2k_session_late_watch(g, &lt, 0) == 0 && d2k_session_retry_watch(g, pkt, n) == 0,
+              "late_watch TCP: после снятия флага пакет держится");
+        d2k_session_free(g);
+
+        /* Постоянный адресный план формы RAW (подтверждённое решение адреса):
+           применяется к ПЕРВОМУ сегменту нового потока без протокола. */
+        g = d2k_session_new(64, 64);
+        d2k_plan *perm = NULL;
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &perm, err, sizeof err);
+        uint8_t dst4[4] = {1, 2, 3, 4};
+        CHECK(perm && d2k_plantab_set_addr_shaped(d2k_session_plans(g), dst4, 4, 1, perm,
+                  D2K_PLAN_SHAPE_RAW) == 0, "raw-опыт: постоянная адресная запись RAW");
+        n = build_pkt(pkt, 45030, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, 45030, 0x12, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45030, 0x18, game, sizeof game - 1);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2 && d2k_session_applied(g) == 1,
+              "raw-опыт: постоянный адресный план RAW не применён к первому сегменту");
+        n = build_pkt(pkt, 45031, 0x18, hello, hlen);          /* TLS-поток того же адреса — не его форма */
+        d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0, "raw-опыт: план формы RAW достался TLS-приветствию");
+        d2k_session_free(g);
+
+        /* Постоянный сервисный план формы RAW (подтверждённое решение адреса):
+           применяется к ПЕРВОМУ сегменту нового потока без протокола. */
+        g = d2k_session_new(64, 64);
+        d2k_plan *perm_service = NULL;
+        uint8_t service_plan[sizeof plan_bytes + 6];
+        const uint8_t service_proto[6]={0,2,0,2,6,1};
+        memcpy(service_plan,plan_bytes,12);service_plan[11]++;
+        memcpy(service_plan+12,service_proto,6);
+        memcpy(service_plan+18,plan_bytes+12,sizeof plan_bytes-12);
+        d2k_plan_load(service_plan, sizeof service_plan, &perm_service, err, sizeof err);
+        uint8_t dst4_service[4] = {1, 2, 3, 4};
+        CHECK(perm_service && d2k_plantab_set_endpoint(d2k_session_plans(g), dst4_service, 4, htons(443), 1, perm_service,
+                  D2K_PLAN_SHAPE_RAW) == 0, "raw-опыт: постоянная адресная запись RAW");
+        n = build_pkt(pkt, 45030, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, 45030, 0x12, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45030, 0x18, game, sizeof game - 1);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2 && d2k_session_applied(g) == 1,
+              "raw-опыт: постоянный адресный план RAW не применён к первому сегменту");
+        n = build_pkt(pkt, 45031, 0x18, hello, hlen);          /* TLS-поток того же адреса — не его форма */
+        d2k_session_packet(g, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0, "raw-опыт: план формы RAW достался TLS-приветствию");
+        n = build_pkt(pkt, 45035, 0x02, NULL, 0); pkt[22]=0x20;pkt[23]=0xfb;
+        d2k_session_packet(g,pkt,n,3000,buf,sizeof buf,&r);
+        n = build_rev_pkt(pkt, 45035, 0x12, NULL, 0);pkt[20]=0x20;pkt[21]=0xfb;
+        d2k_session_packet(g,pkt,n,3100,buf,sizeof buf,&r);
+        n = build_pkt(pkt, 45035, 0x18, game, sizeof game-1);pkt[22]=0x20;pkt[23]=0xfb;
+        d2k_session_packet(g,pkt,n,3200,buf,sizeof buf,&r);
+        CHECK(r.n_out==0 && d2k_session_applied(g)==1,
+              "RAW service proof on443 leaked into8443 packet execution");
+        d2k_session_free(g);
+
+        /* Чужой порт клиента с той же записью — опыта нет. */
+        g = d2k_session_new(64, 64);
+        d2k_plan *q = NULL;
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &q, err, sizeof err);
+        CHECK(q && d2k_plantab_set_name_trial(d2k_session_plans(g), key, 7, 1, q,
+                  D2K_PLAN_SHAPE_RAW, cport_be, 4, trial) == 0, "raw-опыт: запись для чужого порта");
+        n = build_pkt(pkt, 45021, 0x02, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, 45021, 0x12, NULL, 0);
+        d2k_session_packet(g, pkt, n, 1100, buf, sizeof buf, &r);
+        n = build_pkt(pkt, 45021, 0x18, game, sizeof game - 1);
+        d2k_session_packet(g, pkt, n, 1200, buf, sizeof buf, &r);
+        d2k_session_packet(g, pkt, n, 2200, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && d2k_session_applied(g) == 0, "raw-опыт: запись порта досталась чужому потоку");
+        d2k_session_free(g);
+    }
+
+    /* --- TCP БЕЗ SNI: адресная цель (этап 11, 28.10.2026) -----------------
+     * Приветствие без server_name: (1) пробная запись своего порта с ключом-
+     * адресом достаётся ТОЛЬКО потоку зонда с этого порта (plans.c: поток без
+     * имени ищет пробную запись по порту), чужой порт плана не получает;
+     * (2) адресная запись формы достаётся клиентскому потоку без имени;
+     * (3) без записей — пропуск, никакого выдуманного имени.              */
+    {
+        uint8_t nosni[256];
+        size_t nl = build_hello_nosni(nosni);
+        d2k_session *g = d2k_session_new(64, 64);
+        d2k_plan *probe = NULL, *addrp = NULL;
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &probe, err, sizeof err);
+        const uint8_t *key = (const uint8_t *)"1.2.3.4";
+        CHECK(probe && d2k_plantab_set_name_family(d2k_session_plans(g), key, 7, 1,
+                  probe, D2K_PLAN_SHAPE_MODERN, (uint16_t)((44001 >> 8) | ((44001 & 0xff) << 8)), 4) == 0,
+              "без SNI: пробная запись порта с ключом-адресом");
+        n = build_pkt(pkt, 44001, 0x18, nosni, nl);
+        d2k_session_packet_probe(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2 && d2k_session_applied(g) == 1,
+              "без SNI: план пробной записи не применён к потоку зонда своего порта");
+        n = build_pkt(pkt, 44002, 0x18, nosni, nl);
+        d2k_session_packet_probe(g, pkt, n, 2000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && d2k_session_applied(g) == 1,
+              "без SNI: пробная запись досталась чужому порту");
+        n = build_pkt(pkt, 44003, 0x18, nosni, nl);
+        d2k_session_packet(g, pkt, n, 3000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && d2k_session_applied(g) == 1,
+              "без SNI: пробная запись досталась клиентскому потоку");
+        d2k_session_free(g);
+
+        g = d2k_session_new(64, 64);
+        d2k_plan_load(plan_bytes, sizeof plan_bytes, &addrp, err, sizeof err);
+        uint8_t dst[4] = {1, 2, 3, 4};
+        CHECK(addrp && d2k_plantab_set_addr_shaped(d2k_session_plans(g), dst, 4, 1,
+                  addrp, D2K_PLAN_SHAPE_MODERN) == 0, "без SNI: адресная запись формы");
+        n = build_pkt(pkt, 44004, 0x18, nosni, nl);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 2 && d2k_session_applied(g) == 1,
+              "без SNI: адресный план не применён к клиентскому потоку без имени");
+        d2k_session_free(g);
+
+        g = d2k_session_new(64, 64);
+        n = build_pkt(pkt, 44005, 0x18, nosni, nl);
+        d2k_session_packet(g, pkt, n, 1000, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && r.verdict == D2K_VERDICT_ACCEPT && d2k_session_hellos(g) == 1,
+              "без SNI и без записей: поток не пропущен как есть");
         d2k_session_free(g);
     }
 
@@ -2175,6 +3213,17 @@ int main(void) {
         CHECK(r.verdict == D2K_VERDICT_ACCEPT, "ничего не отправив, оригинал обязаны пропустить");
         CHECK(r.skipped != NULL, "отказ по переполнению out[] не объяснён вызывающему");
         CHECK(d2k_session_applied(g) == 0, "план с лишним повтором засчитан применённым");
+        /* Поле 11.11: отказ уезжал с кодом «плана нет» и без идентификаторов —
+           опыт, поставивший такой план, квитанции не получал вовсе. Это отказ
+           исполнителя по найденному плану: код NOT_APPLIED и id плана. */
+        const d2k_journal *jr = d2k_session_journal(g);
+        size_t jn = d2k_journal_count(jr), coded = 0;
+        for (size_t i = 0; i < jn; i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(jr, i);
+            if (e && e->kind == D2K_JRN_PLAN_REFUSED && e->code == D2K_REFUSE_NOT_APPLIED &&
+                !memcmp(e->plan_id, d2k_plan_id(gp), D2K_PLAN_ID_LEN)) { coded++; }
+        }
+        CHECK(coded == 1, "отказ по переполнению out[] не уехал с кодом и id плана");
         d2k_session_free(g);
     }
 
@@ -2620,12 +3669,8 @@ int main(void) {
     {
         uint8_t whole[2048], part[2100], saved[2100];
         size_t whole_len = build_hello_pad(whole, 1544);
-        /* РЕЖЕМ ДО ИМЕНИ. Удержание существует ровно для куска, в котором
-           имени ещё нет: когда имя в первом сегменте, план применяется к нему
-           сразу и ждать остатка незачем (см. d2k_session_hold_candidate).
-           Сорок байт — заведомо меньше, чем смещение server_name у любого
-           приветствия: до него одних только записи, заголовка, версии и
-           random больше сорока. */
+        /* This cut precedes SNI; later cases also cover a visible SNI in
+           an incomplete record. Both can be assembled for stream plans. */
         const uint32_t HEAD1 = 40;
         const size_t cuts[] = {1, 4, 8, 60, 64, 70, 1448, 1544};
         const uint8_t name[] = "hetzner.com";
@@ -2710,6 +3755,74 @@ int main(void) {
                 1,5, 0,4, 0,0,46,224,          /* pace 12000 */
                 1,9, 0,1, 1                    /* detect-tcp-v1 */
             };
+            /* Retransmissions are new executions of the same complete input,
+               never a second discovery or a retry with changed bytes/plan. */
+            for (int scenario = 0; scenario < 9; scenario++) {
+                d2k_session *rt = d2k_session_new(64, 64);
+                d2k_plan *rp = NULL;
+                CHECK(rt && d2k_plan_load(strict_plan, sizeof strict_plan, &rp,
+                    err, sizeof err) == 0, "retry fixture");
+                if (!rt || !rp) { d2k_session_free(rt); d2k_plan_free(rp); continue; }
+                d2k_session_set_plan(rt, rp);
+                size_t rn = build_pkt(part, 47901, 0x02, NULL, 0);
+                d2k_session_packet(rt, part, rn, 1, buf, sizeof buf, &r);
+                CHECK(d2k_session_retry_watch(rt,part,rn)==1, "watch starts on SYN");
+                rn = build_pkt(part, 47901, 0x18, whole, whole_len);
+                wr32(part + 24, 1001);
+                d2k_session_packet(rt, part, rn, 2, buf, sizeof buf, &r);
+                CHECK(r.applied, "retry first execution");
+                uint64_t first_execution = r.execution_id;
+                if (scenario != 4) for (size_t j = 0; j <= r.n_out; j++)
+                    d2k_session_sent(rt, 3, &r.key, r.execution_id);
+                if (scenario == 2) part[40 + 20] ^= 1;
+                if (scenario == 3) {
+                    rp = NULL;
+                    CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &rp,
+                        err, sizeof err) == 0, "replacement retry plan");
+                    d2k_session_set_plan(rt, rp);
+                }
+                if (scenario == 5 || scenario == 6) {
+                    uint8_t reply[128];
+                    const uint8_t response[] = {0x16, 3, 3, 0, 1, 2};
+                    size_t reply_len;
+                    if (scenario == 5) reply_len = build_rev_pkt(reply, 47901, 0x18,
+                        response, sizeof response);
+                    else { reply_len = build_pkt(reply, 47901, 0x10, NULL, 0);
+                        wr32(reply + 28, 0x11223345); }
+                    d2k_session_packet(rt, reply, reply_len, 4, buf, sizeof buf, &r);
+                }
+                if (scenario == 7) {
+                    rn = build_pkt(part, 47901, 0x18, whole + 1448, whole_len - 1448);
+                    wr32(part + 24, 2449); part[40] ^= 1;
+                }
+                if (scenario == 8) {
+                    uint8_t another[2100];
+                    for (unsigned j = 0; j < D2K_HOLD_SLOTS; j++) {
+                        size_t an = build_pkt(another, (uint16_t)(48000+j), 0x02, NULL, 0);
+                        d2k_session_packet(rt, another, an, 4, buf, sizeof buf, &r);
+                        an = build_pkt(another, (uint16_t)(48000+j), 0x18, whole, whole_len);
+                        wr32(another+24,1001);
+                        d2k_session_packet(rt, another, an, 5, buf, sizeof buf, &r);
+                        CHECK(r.applied,"retry cache pressure fixture");
+                    }
+                }
+                if (scenario == 1) {
+                    rn = build_pkt(part, 47901, 0x18, whole + 1448, whole_len - 1448);
+                    wr32(part + 24, 2449);
+                    CHECK(!d2k_session_hold_candidate(rt, part, rn),
+                        "a lone retry tail does not wait for another head");
+                }
+                d2k_session_packet(rt, part, rn, 6, buf, sizeof buf, &r);
+                CHECK(d2k_session_retry_watch(rt,part,rn)==(scenario<3 || scenario==4 || scenario==7), "watch follows pending flight, reply, revision and eviction");
+                CHECK(r.applied == (scenario < 2), "retry requires completed sends, same bytes and plan revision");
+                if (r.applied) {
+                    CHECK(r.execution_id != first_execution,
+                        "retry receives a distinct execution identity");
+                    CHECK(r.replay_tls_bytes == whole_len,
+                        "retry reports the complete cached input length");
+                }
+                d2k_session_free(rt);
+            }
             d2k_session *g = d2k_session_new(64, 64);
             d2k_plan *gp = NULL;
             CHECK(g != NULL, "strict capture allocation");
@@ -2986,11 +4099,9 @@ int main(void) {
                     }
                 }
 
-                /* КУСОК С ИМЕНЕМ НЕ УДЕРЖИВАЕТСЯ, ХОТЯ ЗАПИСЬ И НЕ ЦЕЛАЯ.
-                   Ждать остаток незачем: план по имени выбирается уже сейчас.
-                   А на живой линии ожидание ещё и невыполнимо — пока голова
-                   без вердикта, ядро остатка не выпускает (замер 18.09,
-                   «добавлено к голове=0»). */
+                /* A stream plan owns the complete record even when SNI is
+                   already in the first segment. Immediate DROP ownership in
+                   d2kd releases the local TCP queue while collecting the tail. */
                 {
                     pn = build_pkt(part, 47511, 0x02, NULL, 0);
                     d2k_session_packet(g, part, pn, 13, buf, sizeof buf, &r);
@@ -3000,8 +4111,8 @@ int main(void) {
                     d2k_tls_parse(whole, 1448, &t1);
                     CHECK(t1.have_sni && !t1.have_record_end,
                           "набор испорчен: в голове 1448 байт нет имени или запись целая");
-                    CHECK(!d2k_session_hold_candidate(g, part, pn),
-                          "кусок с именем ушёл в удержание — остаток за ним не выйдет");
+                    CHECK(d2k_session_hold_candidate(g, part, pn),
+                          "stream plan must collect a partial record with visible SNI");
                 }
 
                 /* НОВОЕ СОЕДИНЕНИЕ НА ТОЙ ЖЕ ПЯТЁРКЕ — НОВОЕ НАЧАЛО ПОТОКА.
@@ -3099,7 +4210,7 @@ int main(void) {
                    for the bounded owning assembly (never guess MODERN). */
                 /* Issue #2: scenario 9 has an ECH/GREASE hello but only a
                    learned MODERN suffix, including segmented ClientHello. */
-                for (int scenario = 0; scenario < 10; scenario++) {
+                for (int scenario = 0; scenario < 12; scenario++) {
                     uint8_t late[2048];
                     memcpy(late, whole, whole_len);
                     size_t late_len = whole_len;
@@ -3109,7 +4220,7 @@ int main(void) {
                         q += 1 + late[q];
                         q += 2 + ((size_t)late[q] << 8 | late[q + 1]);
                         q += 1 + late[q];
-                        if (scenario == 4 || scenario == 5 || scenario == 8) {
+                        if (scenario == 4 || scenario == 5 || scenario == 8 || scenario >= 10) {
                             memmove(late + q + 2 + sizeof versions, late + q + 2, late_len - q - 2);
                             memcpy(late + q + 2, versions, sizeof versions);
                         } else memcpy(late + late_len, versions, sizeof versions);
@@ -3117,7 +4228,7 @@ int main(void) {
                         wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + sizeof versions));
                         wr16(late + 7, (uint16_t)(((unsigned)late[7] << 8 | late[8]) + sizeof versions));
                         wr16(late + 3, (uint16_t)(((unsigned)late[3] << 8 | late[4]) + sizeof versions));
-                        if (scenario == 4 || scenario >= 8) {
+                        if (scenario == 4 || (scenario >= 8 && scenario != 11)) {
                             const uint8_t ech[] = {0xfe,0x0d,0,11, 0,0,1,0,1,7,0,0,0,1,42};
                             memcpy(late + late_len, ech, sizeof ech); late_len += sizeof ech;
                             wr16(late + q, (uint16_t)(((unsigned)late[q] << 8 | late[q + 1]) + sizeof ech));
@@ -3132,9 +4243,14 @@ int main(void) {
                     uint16_t port = (uint16_t)(47540 + scenario);
                     d2k_plan *vp = NULL;
                     if (scenario != 3) {
-                        CHECK(d2k_plan_load(strict_plan, sizeof strict_plan, &vp,
+                        CHECK(d2k_plan_load(scenario >= 10 ? plan_bytes : strict_plan,
+                                            scenario >= 10 ? sizeof plan_bytes : sizeof strict_plan, &vp,
                                             err, sizeof err) == 0, "late version plan parse");
-                        if (scenario >= 6) {
+                        if (scenario >= 10) {
+                            CHECK(d2k_plantab_set_name_bound(d2k_session_plans(v), name,
+                                sizeof name - 1, 1, vp,D2K_PLAN_SHAPE_MODERN,4)==0,
+                                "strict plain TLS bound install");
+                        } else if (scenario >= 6) {
                             CHECK(d2k_plantab_set_suffix_family(d2k_session_plans(v), name,
                                 sizeof name - 1, 1, vp, scenario == 7 ? D2K_PLAN_SHAPE_LEGACY :
                                 scenario == 8 ? D2K_PLAN_SHAPE_ECH_TCP : D2K_PLAN_SHAPE_MODERN, 4) == 0,
@@ -3150,12 +4266,12 @@ int main(void) {
                     d2k_tls_info prefix;
                     d2k_tls_parse(late, 1388, &prefix);
                     CHECK(prefix.have_sni && prefix.exts_truncated &&
-                          prefix.is_tls13 == (scenario == 4 || scenario == 5 || scenario == 8) && !prefix.ech_offer,
+                          prefix.is_tls13 == (scenario == 4 || scenario == 5 || scenario == 8 || scenario >= 10) && !prefix.ech_offer,
                           "late TLS version not hidden in tail");
                     pn = build_pkt(part, port, 0x18, late, 1388);
                     wr32(part + 24, 1001);
                     int owns = d2k_session_hold_candidate(v, part, pn);
-                    CHECK(owns == (scenario < 2 || scenario >= 4), "named partial TLS shape released or own probe held");
+                    CHECK(owns == (scenario != 3), "stream plan collects both client and own-probe partial TLS");
                     if (owns) {
                         d2k_hold_batch vb;
                         CHECK(d2k_hold_feed(vh, 100, part, pn, 2,
@@ -3168,7 +4284,7 @@ int main(void) {
                             hold_release, v, &vb) == 2 && vb.count == 2,
                             "late version assembly lost original IDs");
                         d2k_session_packet(v, vb.packet, vb.len, 4, buf, sizeof buf, &r);
-                        CHECK(r.applied == (scenario == 0 || scenario == 4 || scenario >= 6), "late version/ECH applied wrong TLS plan");
+                        CHECK(r.applied == (scenario == 0 || scenario == 4 || (scenario >= 6 && scenario < 10) || scenario == 11), "late version/ECH applied wrong TLS plan");
                         CHECK(scenario != 0 || r.verdict == D2K_VERDICT_DROP,
                               "assembled modern hello sent unchanged");
                         CHECK(scenario != 1 || r.verdict == D2K_VERDICT_ACCEPT,
@@ -3182,7 +4298,7 @@ int main(void) {
                    несёт ECH, но подозрение уходило с формой 1, и контроллер
                    мерил cloudflare-ech.com обычным приветствием («проходит»,
                    покой 10 мин). Собранное целое приветствие — факт формы. */
-                for (int installed = 0; installed < 2; installed++) {
+                for (int installed = 0; installed < 3; installed++) {
                     uint8_t late[2048];
                     memcpy(late, whole, whole_len);
                     size_t late_len = whole_len;
@@ -3207,9 +4323,12 @@ int main(void) {
                             d2k_plan *selected = NULL;
                             CHECK(d2k_plan_load(plan_bytes, sizeof plan_bytes, &selected,
                                                err, sizeof err) == 0, "late ECH plan parse");
-                            CHECK(selected && d2k_plantab_set_name_family(d2k_session_plans(v),
-                                name, sizeof name - 1, 1, selected,
-                                D2K_PLAN_SHAPE_MODERN, 0, 4) == 0, "late ECH install MODERN plan");
+                            int installed_rc = selected ? installed == 2 ?
+                                d2k_plantab_set_name_bound(d2k_session_plans(v),name,sizeof name-1,
+                                    1,selected,D2K_PLAN_SHAPE_MODERN,4) :
+                                d2k_plantab_set_name_family(d2k_session_plans(v),name,sizeof name-1,
+                                    1,selected,D2K_PLAN_SHAPE_MODERN,0,4) : -1;
+                            CHECK(installed_rc==0,"late ECH install MODERN plan");
                         }
                         uint16_t port = 47560;
                         pn = build_pkt(part, port, 0x02, NULL, 0);
@@ -3217,19 +4336,19 @@ int main(void) {
                         pn = build_pkt(part, port, 0x18, late, 1388);
                         wr32(part + 24, 1001);
                         d2k_session_packet(v, part, pn, 2, buf, sizeof buf, &r);
-                        CHECK(d2k_session_applied(v) == (unsigned)installed,
+                        CHECK(d2k_session_applied(v) == (unsigned)(installed == 1),
                               "late ECH: first segment plan application");
                         d2k_key fk;
                         CHECK(d2k_key_make(&fk, 6, part + 12, part + 16, part + 20, part + 22) == 0,
                               "split ECH: flow key");
-                        CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_MODERN,
+                        CHECK(d2k_session_client_shape(v, &fk) == (installed == 2 ? D2K_PLAN_SHAPE_ANY : D2K_PLAN_SHAPE_MODERN),
                               "split ECH: head guess is not the fast-path MODERN");
                         pn = build_pkt(part, port, 0x18, late + 1388, late_len - 1388);
                         wr32(part + 24, 2389);
                         d2k_session_packet(v, part, pn, 3, buf, sizeof buf, &r);
                         CHECK(d2k_session_client_shape(v, &fk) == D2K_PLAN_SHAPE_ECH_TCP,
                               "split ECH: whole hello with ECH left the MODERN guess");
-                        CHECK(d2k_session_applied(v) == (unsigned)installed && !r.applied,
+                        CHECK(d2k_session_applied(v) == (unsigned)(installed == 1) && !r.applied,
                               "late ECH: shape correction reapplied a plan");
                         d2k_session_free(v);
                     }

@@ -78,6 +78,7 @@
  * измеренное.
  */
 #define _POSIX_C_SOURCE 200809L
+#include "../datapath/include/d2k_capture.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -93,6 +94,7 @@
 #include <unistd.h>
 
 #include "d2k_compose.h"
+#include "d2k_preflight_plan.h"
 #include "d2k_compose_internal.h" /* прототипы четырёх сборщиков TLV ниже — не наложением, а для planlab, см. её шапку */
 #include "d2k_hello.h"
 #include "d2k_link.h"
@@ -842,12 +844,18 @@ d2k_props d2k_props_ask_traced(int link_fd, const char *ip, uint16_t port,
     char name[256];
     if (d2k_hello_sni(trigger.bytes, trigger.len, &sni_off, &sni_len) != 0 ||
         sni_len == 0 || sni_len >= sizeof name) {
-        /* В триггере нет извлекаемого имени — SET_NAME нечем задать:
-           датапат матчит план по имени, а не по адресу (d2k_link.h). */
-        return pr;
+        /* В триггере нет имени — адресная цель (этап 11, 28.10.2026). Ключ
+           пробной записи вопроса — буквальный адрес: датапат ищет пробную
+           запись потока без SNI только по её порту (plans.c), имя записи на
+           провод не уходит, приветствие зонда остаётся без SNI. */
+        if (!d2k_hello_complete(trigger.bytes, trigger.len) || strlen(ip) >= sizeof name) {
+            return pr;
+        }
+        snprintf(name, sizeof name, "%s", ip);
+    } else {
+        memcpy(name, trigger.bytes + sni_off, sni_len);
+        name[sni_len] = '\0';
     }
-    memcpy(name, trigger.bytes + sni_off, sni_len);
-    name[sni_len] = '\0';
 
     for (int i = 0; i < D2K_PROPS_QUESTIONS; i++) {
         /* Тело фальшивки — ДВОЙНАЯ длина правды (build_fake_body), а правда
@@ -1460,6 +1468,22 @@ int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
     return d2k_arm_plan(&a, shape, decoy, send_cap, buf, cap);
 }
 
+/* First Z2K Googlevideo TCP arm, observed with preflight on 20.11.2026. */
+int d2k_compose_gv_reference(size_t send_cap,char *buf,size_t cap) {
+    unsigned seg=d2k_arm_segment(send_cap);
+    if(!seg || !buf || !cap)return -1;
+    size_t at=0;
+    return append_fmt(buf,cap,&at,
+        "d2k-plan 1 19\nid 00000000000000000000000000000000\n"
+        "proto tcp tls\nwire detect-tcp-v1\ninput tls-sni\nsegment %u\n"
+        "payload 1 0300002f2ae00000000000436f6f6b69653a206d737473686173683d5452444d5c576f726b0d0a010008000b000000\n"
+        "poison 1 seqshift=-3000\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+        "split payload_start +1\nsplit sni_start -4\nsplit sni_start +1\n"
+        "split sld_middle -2\nsplit sld_middle +0\nsplit sld_middle +2\n"
+        "split sni_end -1\norder reverse\n",seg);
+}
+
 int d2k_arm_plan(const d2k_arm *arm, d2k_shape shape, const char *decoy,
                  size_t send_cap, char *buf, size_t cap) {
     fb_arm a;
@@ -1707,4 +1731,97 @@ size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *deco
         if (everything_plan_text(target_shape, decoy, send_cap, out[0], buflen) == 0) { n = 1; }
     }
     return n;
+}
+
+
+int d2k_compose_preflight_from_props(const d2k_box_props *pr, const char *probe_name,
+    uint8_t window_scale, uint8_t family, uint8_t transport, const uint8_t *hello, size_t hello_len,
+    char *out, size_t cap, char *err, size_t errcap) {
+    if(err && errcap)err[0]=0;
+    if(!out || !cap)return -1;
+    out[0]=0;
+    const char *why=NULL;
+    if((family!=4 && family!=6) || transport!=6)why="preflight requires IPv4 or IPv6 TCP";
+    else if(!pr || pr->response_gate!=D2K_PROP_YES || pr->gate_carry!=D2K_PROP_YES)
+        why="preflight requires measured response gate and carry=YES";
+    else if(!pr->gate_window || !pr->gate_pieces || pr->gate_pieces>255 || !pr->gate_rtt_ms ||
+        (pr->gate_hello_own!=D2K_PROP_NO && pr->gate_hello_own!=D2K_PROP_YES))
+        why="preflight measurements incomplete or not representable";
+    else if(pr->gate_hello_own==D2K_PROP_NO && (!probe_name || !*probe_name))
+        why="preflight needs the measured probe name";
+    else if(window_scale != D2K_GATE_MEASURED_WSCALE &&
+            (window_scale != D2K_PF_REFERENCE_WSCALE ||
+             pr->gate_hello_own != D2K_PROP_NO || pr->gate_pieces != 1))
+        why="preflight window scale does not match the measured probe";
+    if(!why && (!hello || !hello_len || hello_len>D2K_CAPTURE_BYTES))
+        why="preflight hello must fit datapath capture (1..4096 bytes)";
+    if(why) {if(err && errcap)snprintf(err,errcap,"%s",why);return 0;}
+    int own=pr->gate_hello_own==D2K_PROP_YES;
+    if(!own) {
+        uint8_t white_hello[4096];size_t len=0;
+        if(!d2k_pf_name_valid((const uint8_t *)probe_name,strlen(probe_name)) ||
+           d2k_white_decoy_hello(probe_name,white_hello,sizeof white_hello,&len)) {
+            if(err && errcap)snprintf(err,errcap,"invalid network white name");
+            return 0;
+        }
+    }
+    uint64_t wait=(uint64_t)pr->gate_rtt_ms*8;
+    if(wait<1000)wait=1000;
+    if(wait>5000)wait=5000;
+    uint64_t handover=wait+(uint64_t)D2K_PF_FALLBACK_RESYN_DELAY_MS*D2K_PF_FALLBACK_RESYN_SENDS;
+    int reference=window_scale==D2K_PF_REFERENCE_WSCALE;
+    uint64_t timeout=reference?D2K_PF_REFERENCE_TIMEOUT_MS:wait*((uint64_t)pr->gate_pieces+1)+handover;
+    if(reference && handover>=timeout) handover=timeout-1;
+    if(timeout>D2K_PF_EXEC_MAX_TIMEOUT_MS) {
+        if(err && errcap)snprintf(err,errcap,"preflight K/RTT and handover exceed local SYN ownership budget");
+        return 0;
+    }
+    int n=snprintf(out,cap,"d2k-plan 1 19\nid 00000000000000000000000000000000\nproto tcp tls\n"
+        "preflight window=%u wscale=%u pieces=%u hello=%s%s%s timeout=%u data=1 resyn_delay=%u resyn_sends=%u resyn_timeout=%u\n"
+        "# resyn timing origin=fallback; finite retry budget, not a measured path property\npayload 1 ",
+        pr->gate_window,window_scale,pr->gate_pieces,own?"own":"white",
+        own?"":" name=",own?"":probe_name,(unsigned)timeout,
+        D2K_PF_FALLBACK_RESYN_DELAY_MS,D2K_PF_FALLBACK_RESYN_SENDS,(unsigned)handover);
+    if(n<0 || (size_t)n>=cap) {
+        out[0]=0;if(err && errcap)snprintf(err,errcap,"preflight plan buffer too small");return -1;
+    }
+    size_t pos=(size_t)n;
+    if(append_hex(out,cap,&pos,hello,hello_len) || append_fmt(out,cap,&pos,"\n")) {
+        out[0]=0;if(err && errcap)snprintf(err,errcap,"preflight hello plan buffer too small");return -1;
+    }
+    return 1;
+}
+int d2k_compose_preflight_candidate(const d2k_preflight_candidate *c,uint8_t family,
+    uint8_t transport,char *out,size_t cap,char *err,size_t errcap) {
+    if(err && errcap)err[0]=0;
+    if(!out || !cap)return -1;
+    out[0]=0;
+    if(!c || !c->present || !c->response_bytes || !c->rtt_ms ||
+       c->window!=1 || c->window_scale!=D2K_PF_REFERENCE_WSCALE || c->pieces!=1 ||
+       (family!=4 && family!=6) || transport!=6 ||
+       !memchr(c->name,0,sizeof c->name) ||
+       !d2k_pf_name_valid((const uint8_t *)c->name,strlen(c->name))) {
+        if(err && errcap)snprintf(err,errcap,"no repeated small-window reference evidence");
+        return 0;
+    }
+    uint8_t hello[4096];size_t len=0;
+    if(d2k_white_decoy_hello(c->name,hello,sizeof hello,&len))return 0;
+    uint64_t wait=(uint64_t)c->rtt_ms*8;
+    if(wait<1000)wait=1000;
+    if(wait>5000)wait=5000;
+    uint64_t handover=wait+(uint64_t)D2K_PF_FALLBACK_RESYN_DELAY_MS*D2K_PF_FALLBACK_RESYN_SENDS;
+    if(handover>=D2K_PF_REFERENCE_TIMEOUT_MS)handover=D2K_PF_REFERENCE_TIMEOUT_MS-1;
+    int n=snprintf(out,cap,"d2k-plan 1 19\nid 00000000000000000000000000000000\nproto tcp tls\n"
+        "# origin=fallback; repeated small-window response, direct carry unconfirmed\n"
+        "preflight window=%u wscale=%u pieces=%u hello=white name=%s timeout=%u data=1 resyn_delay=%u resyn_sends=%u resyn_timeout=%u\npayload 1 ",
+        c->window,c->window_scale,c->pieces,c->name,D2K_PF_REFERENCE_TIMEOUT_MS,
+        D2K_PF_FALLBACK_RESYN_DELAY_MS,D2K_PF_FALLBACK_RESYN_SENDS,(unsigned)handover);
+    if(n<0 || (size_t)n>=cap) {
+        out[0]=0;if(err && errcap)snprintf(err,errcap,"preflight candidate buffer too small");return -1;
+    }
+    size_t pos=(size_t)n;
+    if(append_hex(out,cap,&pos,hello,len) || append_fmt(out,cap,&pos,"\n")) {
+        out[0]=0;if(err && errcap)snprintf(err,errcap,"preflight candidate hello buffer too small");return -1;
+    }
+    return 1;
 }

@@ -60,6 +60,7 @@ cat > "$WORK/driver.sh" <<'DRIVER'
 set -e
 . /work/s99funcs.sh
 MODE=observe
+mkdir -p /opt/d2k/run
 
 fail() { echo "ПРОВАЛ: $*" >&2; exit 1; }
 

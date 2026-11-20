@@ -367,11 +367,19 @@ int d2k_t13_derive_secret(const uint8_t secret[32], const char *label,
 
 int d2k_t13_schedule_hs(const uint8_t shared[32], const uint8_t *tr, size_t tr_len,
                         uint8_t c_hs[32], uint8_t s_hs[32], uint8_t hs_out[32]) {
+    return d2k_t13_schedule_hs_ikm(shared, 32, tr, tr_len, c_hs, s_hs, hs_out);
+}
+
+/* Общий секрет любой длины: у гибрида X25519MLKEM768 он 64 байта
+   (секрет ML-KEM, затем X25519). */
+int d2k_t13_schedule_hs_ikm(const uint8_t *shared, size_t shared_len,
+                            const uint8_t *tr, size_t tr_len,
+                            uint8_t c_hs[32], uint8_t s_hs[32], uint8_t hs_out[32]) {
     uint8_t zero[32], early[32], derived[32], hs[32];
     memset(zero, 0, sizeof zero);
     d2k_hkdf_extract(zero, 32, zero, 32, early);
     if (d2k_t13_derive_secret(early, "derived", NULL, 0, derived) != 0) { return -1; }
-    d2k_hkdf_extract(derived, 32, shared, 32, hs);
+    d2k_hkdf_extract(derived, 32, shared, shared_len, hs);
     if (d2k_t13_derive_secret(hs, "c hs traffic", tr, tr_len, c_hs) != 0 ||
         d2k_t13_derive_secret(hs, "s hs traffic", tr, tr_len, s_hs) != 0) {
         return -1;
@@ -466,6 +474,57 @@ int d2k_t13_sh_parse(const uint8_t *sh, size_t sh_len, const uint8_t **peer_key,
         if (err && errcap) {
             snprintf(err, errcap, "сервер не прислал ключ X25519 — TLS 1.3 не согласован");
         }
+        return -1;
+    }
+    return 0;
+trunc:
+    if (err && errcap) { snprintf(err, errcap, "ServerHello обрезан"); }
+    return -1;
+}
+
+/* key_share сервера любой группы. HelloRetryRequest узнаётся по
+   особому Random (RFC 8446 §4.1.3) и отвергается отдельной причиной. */
+int d2k_t13_sh_share(const uint8_t *sh, size_t sh_len, uint16_t *group, uint16_t *suite_out,
+                     const uint8_t **key, size_t *key_len, char *err, size_t errcap) {
+    static const uint8_t hrr[32] = {
+        0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11,0xBE,0x1D,0x8C,0x02,0x1E,0x65,0xB8,0x91,
+        0xC2,0xA2,0x11,0x16,0x7A,0xBB,0x8C,0x5E,0x07,0x9E,0x09,0xE2,0xC8,0xA8,0x33,0x9C};
+    if (!sh || !group || !key || !key_len) { return -1; }
+    *key = NULL; *key_len = 0; *group = 0;
+    if (sh_len < 4 + 2 + 32) { goto trunc; }
+    if (memcmp(sh + 6, hrr, 32) == 0) {
+        if (err && errcap) { snprintf(err, errcap, "HelloRetryRequest: сервер просит другую группу ключей"); }
+        return -1;
+    }
+    size_t q = 4 + 2 + 32;
+    if (q + 1 > sh_len) { goto trunc; }
+    q += 1 + sh[q];
+    if (q + 3 > sh_len) { goto trunc; }
+    uint16_t suite = get16(sh + q); q += 3;
+    if (suite < 0x1301 || suite > 0x1303) {
+        if (err && errcap) {
+            snprintf(err, errcap, "сервер выбрал шифр 0x%04x, поддержаны 0x1301-0x1303", (unsigned)suite);
+        }
+        return -1;
+    }
+    if (suite_out) { *suite_out = suite; }
+    if (q + 2 > sh_len) { goto trunc; }
+    size_t ext_end = q + 2 + get16(sh + q);
+    q += 2;
+    if (ext_end > sh_len) { goto trunc; }
+    while (q + 4 <= ext_end) {
+        uint16_t et = get16(sh + q), el = get16(sh + q + 2);
+        q += 4;
+        if (q + el > ext_end) { goto trunc; }
+        if (et == 0x0033 && el >= 4 && (size_t)get16(sh + q + 2) + 4 == el) {
+            *group = get16(sh + q);
+            *key = sh + q + 4;
+            *key_len = get16(sh + q + 2);
+        }
+        q += el;
+    }
+    if (!*key) {
+        if (err && errcap) { snprintf(err, errcap, "сервер не прислал key_share — TLS 1.3 не согласован"); }
         return -1;
     }
     return 0;

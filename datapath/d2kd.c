@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -38,8 +39,10 @@
 #include "d2k_nfq.h"
 #include "d2k_nl.h"
 #include "d2k_raw.h"
+#include "d2k_resend.h"
 #include "d2k_sched.h"
 #include "d2k_session.h"
+#include "d2k_preflight_path.h"
 #include "d2k_time.h"
 #include "d2k_hold.h"
 #include "d2k_udp_hold.h"
@@ -47,12 +50,51 @@
 #include "d2k_udp_path.h"
 #include "d2k_routemark.h"
 #include "d2k_packet.h"
+#include "d2k_lateobs.h"
+#include "d2k_latewatch.h"
+#include "d2k_lwexec.h"
+#include "d2k_lwrules.h"
 #include "d2k_http80.h"
 #include "d2k_http_trace.h"
 #include "d2k_icmpguard.h"
+#include "d2k_postnat_own.h"
+#include "d2k_postnat_capture.h"
 
 /* Сколько решений по клиентскому QUIC пишется в журнал за запуск. */
 #define D2K_CLIENT_QUIC_LOG 300u
+/* РЕШЕНИЯ ПО КЛИЕНТСКОМУ TCP — В ЖУРНАЛ (24.10.2026). У QUIC такая запись
+   есть с 15.10, а про TCP датапат молчал: по журналу нельзя было ответить,
+   видел ли он поток браузера и почему не применил план (issue 25 и 28, где
+   «в логах нет записей» прочиталось как «не видел»). Первые
+   D2K_CLIENT_TCP_LOG решений на запуск, дальше тишина: на живом роутере
+   строка на сегмент — это журнал в десятки мегабайт. */
+#define D2K_CLIENT_TCP_LOG 300u
+static unsigned client_tcp_logged;
+
+/* Порты клиентского TCP-сегмента и первый байт нагрузки: 1 — разобрано.
+ *
+ * ТОЛЬКО ЗАПИСЬ РУКОПОЖАТИЯ (first == 0x16). Первая редакция писала строку на
+ * каждый сегмент с нагрузкой, и круг all-w1 (24.10.2026) дал 324 строки, из
+ * которых почти все — «плана для этой цели нет» на данных после рукопожатия:
+ * предел в 300 решений съедался шумом, а приветствия до журнала не доходили.
+ * Первый байт — та же улика, которой сессия отличает приветствие от данных
+ * (last_nonhello_first). */
+static int client_tcp_ports(const uint8_t *pkt, size_t len,
+                            unsigned *sport, unsigned *dport, size_t *payload,
+                            uint8_t *first)
+{
+    if (!pkt || len < 40 || (pkt[0] >> 4) != 4 || pkt[9] != 6) { return 0; }
+    size_t ihl = (size_t)(pkt[0] & 15u) * 4u;
+    if (ihl < 20 || ihl + 20 > len) { return 0; }
+    const uint8_t *tcp = pkt + ihl;
+    size_t doff = (size_t)(tcp[12] >> 4) * 4u;
+    if (doff < 20 || ihl + doff > len) { return 0; }
+    *sport = ((unsigned)tcp[0] << 8) | tcp[1];
+    *dport = ((unsigned)tcp[2] << 8) | tcp[3];
+    *payload = len - ihl - doff;
+    *first = *payload ? pkt[ihl + doff] : 0;
+    return 1;
+}
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
@@ -207,6 +249,7 @@ static struct {
     uint64_t hold_owned;       /* сегментов приветствия взято у ядра (DROP в слот) */
     uint64_t hold_resent;      /* оригиналов возвращено на провод своей посылкой */
     uint64_t hold_resend_fail; /* оригиналов, которые вернуть не удалось */
+    uint64_t hold_resend_split; /* оригиналов возвращено нарезкой по пределу пути */
 } st;
 
 /* ICMP time-exceeded на собственные фальшивки с пониженным TTL (поле
@@ -265,7 +308,13 @@ static void log_send_fail(const char *what, const char *err, int e) {
 typedef struct {
     d2k_session *sess; d2k_nfq *q;
     d2k_raw *raw; d2k_sched *sched;
+    int skip_verdict; uint32_t skip_id;
+    uint32_t *retry_ids, *retry_verdicts;
+    size_t *retry_count;
 } hold_context;
+/* Dedicated marks/sockets: never turn an ordinary fake into a preflight. */
+static d2k_raw *preflight_raw[3];
+static size_t preflight_releases_pending;
 static d2k_hold *holding;
 static d2k_udp_hold *udp_holding;
 static d2k_udp_release *udp_releases;
@@ -405,10 +454,15 @@ static void cap_refresh(d2k_raw *raw, d2k_ctlsrv *cx, d2k_ctl *ctl) {
 
 static int send_original_verdict(void *ctx, uint32_t id, uint32_t verdict) {
     hold_context *c = ctx;
+    if (c->skip_verdict && id == c->skip_id) return 0;
     char err[256];
     int rc = d2k_nfq_verdict(c->q, id, verdict, err, sizeof err);
     if (rc != 0) {
         st.verdict_fail++;
+        if (c->retry_count && *c->retry_count < D2K_UDP_HOLD_PACKETS) {
+            size_t i = (*c->retry_count)++;
+            c->retry_ids[i] = id; c->retry_verdicts[i] = verdict;
+        }
         fprintf(stderr, "d2kd: вердикт оригинала %u: %s\n", id, err);
     }
     if (verdict == D2K_NF_DROP) { st.dropped++; } else { st.accepted++; }
@@ -460,7 +514,9 @@ static void delayed_verdict_done(void *ctx, const d2k_key *key,
  * уже в слоте, буфер ядра свободен, хвост выходит за ~0,2 мс и тоже ложится в
  * слот. Лёг план — оригиналы ушли его посылкой, как и раньше у READY. Не лёг
  * (таймаут, смена ревизии, несовместимый кусок, READY без плана) — оригиналы
- * возвращаются на провод нашей посылкой, байт в байт, по порядку потока.
+ * возвращаются на провод нашей посылкой, с теми же данными, по порядку потока.
+ * Сегмент OUTPUT до GSO может быть длиннее MTU: возврат режет его по тому
+ * же пределу пути, что проверяет посылки плана (поле 11.11.2026).
  * Метка сырого сокета (0x2d) исключена из очереди правилом D2K_OUT, повторно
  * они не удерживаются. Так уже живут хвосты удержанной пачки UDP (задачи 42,
  * 46). Для TCP-стека DROP в OUTPUT после nf_queue — «отправлено»: номер
@@ -477,23 +533,90 @@ static int hold_owns(const hold_context *c, const uint8_t *p, size_t n) {
     return !(tcp[2] == 0 && tcp[3] == 80);
 }
 
-/* Оригинал, уже снятый у ядра, — обратно на провод как есть. Ошибка отправки
-   — наша, не коробки: считается и называется, первые строки — в журнал. */
+/* Socket boundary shared by all pieces of one original. */
+typedef struct { d2k_raw *raw; char err[256]; } original_sender;
+static int send_original_piece(void *ctx, const uint8_t *p, size_t n) {
+    original_sender *s = ctx;
+    if (d2k_raw_prepare(s->raw, p, n, s->err, sizeof s->err) != 0) return -1;
+    return d2k_raw_send(s->raw, p, n, s->err, sizeof s->err);
+}
+
+/* Оригинал уже снят у ядра. Данные возвращаются без изменений; слишком
+   большой OUTPUT/GSO-сегмент режется по пределу ЕГО направления, ровно
+   тому же d2k_raw_route_maxlen_family, что проверяет план в send_result. */
 static int resend_original(hold_context *c, const uint8_t *p, size_t n) {
-    char err[256];
-    if (d2k_raw_prepare(c->raw, p, n, err, sizeof err) != 0 ||
-        d2k_raw_send(c->raw, p, n, err, sizeof err) != 0) {
+    original_sender sender = {.raw = c->raw, .err = ""};
+    size_t cap = d2k_raw_maxlen(c->raw), sent = 0;
+    if (p && n >= 20) {
+        uint8_t family = p[0] >> 4;
+        if (family == 4 || (family == 6 && n >= 40)) {
+            cap = d2k_raw_route_maxlen_family(c->raw, p + (family == 6 ? 24 : 16), family);
+        }
+    }
+    int rc = d2k_resend_original(p, n, cap, send_original_piece, &sender, &sent);
+    int saved = errno;
+    /* A later piece can fail: count what actually left, without declaring
+       the entire original returned or retrying its already-sent prefix. */
+    st.emitted += sent;
+    st.emitted_now += sent;
+    if (rc != 0) {
         st.hold_resend_fail++;
         st.send_fail++;
         if (st.hold_resend_fail <= 16) {
-            fprintf(stderr, "d2kd: оригинал приветствия не возвращён на провод: %s\n", err);
+            fprintf(stderr, "d2kd: оригинал приветствия не возвращён на провод: %s\n",
+                    sender.err[0] ? sender.err : strerror(saved));
         }
+        errno = saved;
         return -1;
     }
     st.hold_resent++;
-    st.emitted++;
-    st.emitted_now++;
+    if (sent > 1) st.hold_resend_split++;
     return 0;
+}
+
+static int preflight_drop(void *ctx, uint32_t id) {
+    hold_context *c = ctx;
+    char err[256];
+    int rc = d2k_nfq_verdict(c->q, id, D2K_NF_DROP, err, sizeof err);
+    if (rc) {
+        st.verdict_fail++;
+        fprintf(stderr, "d2kd: preflight DROP: %s\n", err);
+    } else st.dropped++;
+    return rc;
+}
+static int preflight_send(void *ctx, const uint8_t *p, size_t n, uint32_t packet_mark) {
+    hold_context *c = ctx;
+    char err[256];
+    (void)c;
+    d2k_raw *sender=packet_mark>=D2K_PF_MARK && packet_mark<=D2K_PF_TOKEN_MARK
+        ? preflight_raw[packet_mark-D2K_PF_MARK] : NULL;
+    if (!sender) return -1;
+    if ((p[0] >> 4) == 6) {
+        if (routes.n_oif6)
+            (void)d2k_raw_adopt_egress(sender,routes.oif6,routes.n_oif6,NULL,0);
+    } else if (routes.n_oif4) {
+        (void)d2k_raw_adopt_egress(sender,routes.oif4,routes.n_oif4,NULL,0);
+    }
+    if (d2k_raw_prepare(sender, p, n, err, sizeof err) != 0 ||
+        d2k_raw_send(sender, p, n, err, sizeof err) != 0) {
+        st.send_fail++;
+        fprintf(stderr, "d2kd: preflight raw send failed: %s\n", err);
+        return -1;
+    }
+    if (packet_mark==D2K_PF_RELEASE_MARK || packet_mark==D2K_PF_TOKEN_MARK)
+        preflight_releases_pending++;
+    st.emitted++; st.emitted_now++;
+    return 0;
+}
+static int preflight_repeat(d2k_nfq *q,const d2k_nl_pkt *np) {
+    if (!np->have_mark || (np->mark!=D2K_PF_RELEASE_MARK && np->mark!=D2K_PF_TOKEN_MARK))
+        return 0;
+    char err[256];
+    d2k_nfq_release_packet(q,np->id,np->mark,D2K_PF_RELEASE_BIT);
+    if (d2k_nfq_verdict(q,np->id,D2K_NF_ACCEPT,err,sizeof err))
+        fprintf(stderr,"d2kd: preflight repeat failed: %s\n",err);
+    else if (preflight_releases_pending) preflight_releases_pending--;
+    return 1;
 }
 
 static int resend_originals(hold_context *c, const d2k_hold_batch *b) {
@@ -581,6 +704,169 @@ static void ct_probe(d2k_session *sess, int startup) {
         ctl_ct.told_off = 1;
         fprintf(stderr, "d2kd: детекторы тишины QUIC и TCP выключены: нет ctnetlink\n");
     }
+}
+
+/* ---- ПОЗДНЯЯ ДОСТАВКА (этап 17) ------------------------------------------
+ * Опыт на УЖЕ ИДУЩЕМ потоке: его пакеты за окном connbytes в очередь не
+ * попадают, повтор клиента под пробой невидим, опыт истекает «опыта не было»
+ * (этап 13). Правило S99d2k LATE_WATCH ставит в очередь пакеты записей
+ * conntrack с битом late_bit; бит ставит d2kd через ctnetlink на ТОЧНЫЙ кортеж
+ * опыта при установке пробы (крючки d2k_ctlsrv) и снимает при её снятии, по
+ * сроку (не дольше D2K_LW_MAX_NS) или при уходе контроллера. Ничего
+ * глобального: ни перехвата всего трафика, ни отключения ускорителя. Если за
+ * время опыта ни один пакет потока за окном не пришёл — это называется в
+ * журнале (ускоритель держит поток в железе, поток умер), а не выдаётся за
+ * опыт. Метка читается-меняется-пишется целиком: старые ядра без
+ * CTA_MARK_MASK иначе затёрли бы биты политики маршрутизации. */
+static uint32_t late_bit;       /* --late-watch-mark: бит способа «метка» */
+static int late_rules;          /* --late-rules: запасной способ «правила точного кортежа» */
+static int late_force_rules;    /* --late-backend rules: только правила (стенд) */
+static d2k_lw lwt;
+static d2k_lwexec *lwx;
+
+
+static d2k_session *lw_sess;
+
+/* ---- ИСПОЛНИТЕЛЬ ПОЗДНЕЙ ДОСТАВКИ (этап 53) --------------------------------
+   Всё медленное — в потоке исполнителя: своё ctnetlink (метка, перечисление,
+   проверка маски) и iptables (правила точного кортежа, -w). Цикл NFQUEUE
+   только кладёт заявки и забирает итоги. Состояние исполнителя статическое и
+   не освобождается: брошенный при остановке поток может ещё им пользоваться. */
+/* Внешний срок одного запуска iptables: при --wait=5 его не достичь; у старого
+   iptables (простое -w, ждёт без конца) — он и держит исполнитель. */
+static unsigned lwk_child_deadline_s = 15;
+static struct {
+    int fd;
+    uint32_t seq;
+    int backend;
+    d2k_lwrules rules;
+} lwk = { -1, 0, D2K_LW_BACKEND_NONE, { "D2K_LATE_OUT", "D2K_LATE_IN", 0, 5, 0, d2k_lwrules_spawn, &lwk_child_deadline_s } };
+
+static uint32_t lwk_seq(void) { if (++lwk.seq == 0) lwk.seq = 1; return lwk.seq; }
+
+/* Метка (маска подтверждена): одна маскированная запись нашего бита. */
+static int lwk_mark(const d2k_ct_tuple *t, int on) {
+    if (lwk.fd < 0) return -1;
+    int e = d2k_ct_mark_fd(lwk.fd, lwk_seq(), t, on ? late_bit : 0, late_bit, 200);
+    return e == 0 ? 0 : e == 2 ? 1 : -1;
+}
+
+static int lwk_collect(void *ctx, const d2k_ct_tuple *t, const d2k_ct_info *i) {
+    d2k_lw_done *d = ctx;
+    if (!i->mark_known || !(i->mark & late_bit)) return 0;
+    if (d->n < D2K_LW_SWEEP_LIST) d->list[d->n++] = *t; else d->over = 1;
+    return 0;
+}
+
+static void lwk_init(d2k_lw_done *d) {
+    if (late_bit && !late_force_rules) {
+        if (lwk.fd < 0) lwk.fd = d2k_ct_open();
+        int mask = lwk.fd >= 0 ? d2k_ct_mask_probe_fd(lwk.fd, &lwk.seq, late_bit, (uint16_t)getpid(), 200) : -1;
+        if (mask == 1) { d->backend = D2K_LW_BACKEND_MARK; return; }
+        fprintf(stderr, "d2kd: поздняя доставка: метка без маски стёрла бы чужие биты записи (%s)%s\n",
+                lwk.fd < 0 ? "нет ctnetlink" : mask == 0 ? "ядро пишет метку conntrack целиком"
+                                              : "поведение маски не определить",
+                late_rules ? " — способ «правила точного кортежа»" : " — поздняя доставка выключена");
+    }
+    d->backend = late_rules ? D2K_LW_BACKEND_RULES : D2K_LW_BACKEND_NONE;
+}
+
+static void lw_run(void *ctx, const d2k_lw_req *req, d2k_lw_done *d) {
+    (void)ctx;
+    switch (req->op) {
+    case D2K_LWOP_INIT:
+        lwk_init(d);
+        lwk.backend = d->backend;
+        d->rc = 0;
+        return;
+    case D2K_LWOP_INSTALL:
+    case D2K_LWOP_CLEAR: {
+        int on = req->op == D2K_LWOP_INSTALL;
+        if (lwk.backend == D2K_LW_BACKEND_MARK) d->rc = lwk_mark(&req->t, on);
+        else if (lwk.backend == D2K_LW_BACKEND_RULES)
+            d->rc = on ? d2k_lwrules_install(&lwk.rules, &req->t) : d2k_lwrules_clear(&lwk.rules, &req->t);
+        else d->rc = on ? -1 : 1;
+        return;
+    }
+    case D2K_LWOP_SWEEP:
+        if (lwk.backend == D2K_LW_BACKEND_RULES) { d->rc = d2k_lwrules_sweep(&lwk.rules); return; }
+        if (lwk.backend != D2K_LW_BACKEND_MARK) { d->rc = 0; d->dump_ok = 1; return; }
+        d->rc = 0;
+        d->dump_ok = 1;
+        for (uint8_t fam = 4; fam <= 6; fam += 2)
+            if (d2k_ct_dump_fd(lwk.fd, lwk_seq(), fam, lwk_collect, d, 500) < 0) d->dump_ok = 0;
+        return;
+    default:
+        d->rc = -1;
+    }
+}
+
+/* Граница d2k_latewatch: исполнитель, сессия, подтверждения контроллеру. */
+static d2k_ctlsrv *lw_cx;
+static int lw_op_submit(void *ctx, const d2k_lw_req *r) { (void)ctx; return d2k_lwexec_submit(lwx, r); }
+static void lw_op_ack(void *ctx, int ok, uint8_t reason, const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    (void)ctx; if (lw_cx) d2k_ctlsrv_ack_late(lw_cx, ok, reason, token);
+}
+static void lw_op_flag(void *ctx, const d2k_ct_tuple *t, int on) {
+    (void)ctx; (void)d2k_session_late_watch(lw_sess, t, on);
+}
+static uint64_t lw_op_delivered(void *ctx) { (void)ctx; return d2k_session_late_delivered(lw_sess); }
+static void lw_op_note(void *ctx, const d2k_ct_tuple *t, uint8_t code, uint32_t repeats,
+                       const uint8_t token[D2K_TRIAL_ID_LEN], uint64_t now) {
+    (void)ctx; d2k_session_note_lateobs(lw_sess, t, code, repeats, token, now);
+}
+static void lw_op_say(void *ctx, const char *line) { (void)ctx; fprintf(stderr, "%s\n", line); }
+
+static int lw_raw_identity(void *ctx,const struct d2k_rawmeasure_request *r,int *previous) {
+    (void)ctx;uint8_t epoch[16];uint64_t generation;
+    return !d2k_session_raw_identity(lw_sess,&r->tuple,epoch,&generation,previous) &&
+           generation==r->generation && !memcmp(epoch,r->epoch,16);
+}
+static void lw_raw_ack(void *ctx,int ok,uint8_t reason,const uint8_t token[16]) {
+    (void)ctx;if(lw_cx)d2k_ctlsrv_ack_raw_measure(lw_cx,ok,reason,token);
+}
+static void lw_raw_note(void *ctx,const struct d2k_rawmeasure_report *r) {
+    (void)ctx;if(lw_cx)(void)d2k_ctlsrv_raw_measure(lw_cx,r);
+}
+static void raw_measure_hook(void *ctx,const struct d2k_rawmeasure_request *r) {
+    (void)ctx;d2k_lw_measure(&lwt,r,now_ns());
+}
+
+/* Контроллер отключился — его наблюдения и опыты отменяются сразу (этап 53). */
+static void late_peer_closed(void *ctx) { (void)ctx; d2k_lw_peer_closed(&lwt, now_ns()); }
+
+/* D2K_CMD_LATE_OBSERVE (этап 49): наблюдение точного потока; подтверждение —
+   по готовности доставки (этап 53). */
+static void late_observe_hook(void *ctx, const d2k_ct_tuple *t, uint32_t seconds,
+                              const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    (void)ctx;
+    d2k_lw_observe(&lwt, t, seconds, token, now_ns());
+}
+
+static void late_addr_hook(void *ctx, const d2k_addr_probe_flow *flow, uint64_t expires_ns, int installed) {
+    (void)ctx;
+    d2k_ct_tuple t;
+    memset(&t, 0, sizeof t);
+    t.family = flow->family == 6 ? 6 : 4;
+    /* Measured probes also own TCP continuations beyond the initial window. */
+    t.proto = flow->transport;
+    memcpy(t.src, t.family == 6 ? flow->src_ip6 : flow->src_ip4, t.family == 6 ? 16 : 4);
+    memcpy(t.dst, t.family == 6 ? flow->dst_ip6 : flow->dst_ip4, t.family == 6 ? 16 : 4);
+    memcpy(t.sport_be, &flow->src_port_be, 2);
+    memcpy(t.dport_be, &flow->dst_port_be, 2);
+    if (installed) { (void)d2k_lw_trial_add(&lwt, &t, expires_ns, now_ns()); } else { d2k_lw_trial_del(&lwt, &t, now_ns()); }
+}
+
+static void late_name_hook(void *ctx, const uint8_t *name, size_t len, uint8_t transport, uint8_t family,
+                           uint16_t sport_be, uint64_t expires_ns, int installed) {
+    (void)ctx; (void)transport;
+    d2k_ct_tuple t;
+    if (d2k_session_tcp_tuple_by_port(lw_sess, name, len, family, sport_be, &t) != 0) {
+        /* Поток с этим портом в таблице не наблюдается: метить нечего. Это не
+           отказ опыта — проба порта стоит, новый поток клиента её получит. */
+        return;
+    }
+    if (installed) { (void)d2k_lw_trial_add(&lwt, &t, expires_ns, now_ns()); } else { d2k_lw_trial_del(&lwt, &t, now_ns()); }
 }
 
 static int out_verdict(void *ctx, uint32_t id, uint32_t verdict) {
@@ -826,11 +1112,23 @@ static void usage(void) {
         "\n"
         "  --queue N          номер очереди NFQUEUE (обязательно)\n"
         "  --plan FILE        план в канонической форме TLV\n"
+        "  --watch-release-bit M  opt-in firewall watch-release handshake bit\n"
+        "  --late-watch-mark M  opt-in: бит connmark, которым d2kd помечает через ctnetlink запись\n"
+        "                     ТОЧНОГО потока опыта, чтобы его пакеты за окном connbytes шли в очередь\n"
+        "                     (правило LATE_WATCH в S99d2k); снимается при снятии опыта или по сроку\n"
+        "  --late-rules         запасной способ поздней доставки без connmark (ядро без маски метки):\n"
+        "                     правила точного кортежа conntrack в своих цепочках D2K_LATE_OUT/D2K_LATE_IN\n"
+        "  --late-backend rules только правила точного кортежа (стенд)\n"
+        "  --adopt-ports LIST  на старте принять из conntrack уже существующие TCP/UDP потоки к этим\n"
+        "                     портам сервера (например 443,3478:3481); наблюдаются только счётчиками\n"
         "  --mode observe|apply   умолчание observe: ничего не менять\n"
         "  --mark M           SO_MARK на собственных пакетах (умолчание 0)\n"
         "  --probe-mark M     SO_MARK контроллера; его зонды не становятся новыми целями\n"
         "  --only-mark M[/K]|none  только клиенты политики Keenetic с этой меткой;\n"
         "                     none — политика не найдена, клиентов не обслуживать\n"
+        "  --preflight        пробное TCP-соединение по endpoint-плану или известному IP провайдера\n"
+        "  --provider-ips FILE  сохранённые DNS-адреса googlevideo/gvt1 для preflight\n"
+        "  --preflight-ipv6   разрешить пробу на маршрутизируемом IPv6 без NAT\n"
         "  --udp-reverse-hook обратное UDP-направление гарантированно стоит в NFQUEUE\n"
         "  --iface NAME       чей MTU берётся пределом длины посылки\n"
         "  --flows N          предел числа потоков — отдельно на TCP и на\n"
@@ -840,6 +1138,7 @@ static void usage(void) {
         "  --sched-slots N    сколько отложенных пакетов держать (128)\n"
         "  --journal N        глубина диагностического журнала, 0 — без него (256)\n"
         "  --control PATH     управляющий сокет для контроллера\n"
+        "  --exp-control PATH сокет опытов новой цепочки: только пробный план на свой порт\n"
         "  --idle SEC         молчащий поток забывается через (120)\n"
         "  --log FILE         писать вывод сюда вместо stdout\n"
         "  --stats SEC        период печати сводки, 0 — не печатать (10)\n"
@@ -905,8 +1204,9 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
            hs.plan_changed, hs.dropped_all, hs.joined, hs.mismatched, hs.sided,
            hs.full, hs.pending);
     printf("владение приветствием: взято у ядра=%" PRIu64
-           " возвращено на провод оригиналов=%" PRIu64 " не возвращено=%" PRIu64 "\n",
-           st.hold_owned, st.hold_resent, st.hold_resend_fail);
+           " возвращено на провод оригиналов=%" PRIu64 " не возвращено=%" PRIu64
+           " возвращено нарезкой=%" PRIu64 "\n",
+           st.hold_owned, st.hold_resent, st.hold_resend_fail, st.hold_resend_split);
     printf("пакетов %" PRIu64 ", байт %" PRIu64
            ", пропущено %" PRIu64 ", снято %" PRIu64 "\n",
            st.seen, st.bytes, st.accepted, st.dropped);
@@ -967,6 +1267,10 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                ps.reverse, ps.after_hello, ps.late, ps.not_hello,
                ps.last_first_byte);
         printf("имя уехало во второй сегмент: %" PRIu64 "\n", ps.sni_next_seg);
+        /* Этап 42: подавленные ограничением объёма потоки контроллер не
+           наблюдает — предел виден числом. */
+        printf("поток без протокола: сообщено %" PRIu64 ", подавлено %" PRIu64 "\n",
+               ps.flow_told, ps.flow_suppressed);
         if (ps.http_later || ps.http_unaligned || ps.http_open_end) {
             /* Keep-alive (поле 04.10.2026): следующие запросы соединения
                получают план, только начинаясь на известной границе с начала
@@ -980,6 +1284,16 @@ static void print_stats(const d2k_session *s, const d2k_sched *sched,
                " истекших=%" PRIu64 " отказов ёмкости=%" PRIu64 "\n",
                ps.capture_complete, ps.capture_rejected,
                ps.capture_expired, ps.capture_full);
+    }
+    if (lwx) {
+        printf("поздняя доставка (%s): поставлено %" PRIu64 ", снято %" PRIu64 ", записи не стало %" PRIu64
+               ", установка не подтверждена %" PRIu64 ", снятие не подтверждено (повтор) %" PRIu64
+               ", ждут снятия %zu, очередь исполнителя полна %" PRIu64 ", в исполнителе %zu, без пакетов %" PRIu64
+               "; датаграмм за окном принято в опыт %" PRIu64 "\n",
+               lwt.backend == D2K_LW_BACKEND_MARK ? "метка" : lwt.backend == D2K_LW_BACKEND_RULES ? "правила" : "нет",
+               lwt.st.set, lwt.st.cleared, lwt.st.gone, lwt.st.install_fail, lwt.st.clear_fail,
+               d2k_lw_pending_clears(&lwt), lwt.st.queue_full, d2k_lwexec_pending(lwx), lwt.st.silent,
+               d2k_session_late_delivered(s));
     }
     printf("потеряно ядром %" PRIu64 ", ошибок вердикта %" PRIu64
            ", ошибок отправки %" PRIu64 ", ошибок чтения %" PRIu64 "\n",
@@ -1038,6 +1352,9 @@ static const char *proto_name(uint8_t proto) {
    доисполнен» — читатель видел знак вопроса там, где всё сошлось. */
 static const char *jrn_kind(uint8_t k) {
     switch (k) {
+    case D2K_JRN_PREFLIGHT_START: return "preflight START";
+    case D2K_JRN_PREFLIGHT_HANDOVER: return "preflight HANDOVER";
+    case D2K_JRN_PREFLIGHT_GAVE_UP: return "preflight GAVE_UP";
     case D2K_JRN_HELLO_SNI:     return "приветствие";
     case D2K_JRN_HELLO_NONAME:  return "приветствие без имени";
     case D2K_JRN_PLAN_APPLIED:  return "план применён";
@@ -1050,6 +1367,7 @@ static const char *jrn_kind(uint8_t k) {
     case D2K_JRN_PLAN_DONE:     return "";
     case D2K_JRN_PLAN_UNSENT:   return "посылка не ушла";
     case D2K_JRN_PLAN_DAMAGED:  return "поток испорчен";
+    case D2K_JRN_FLOW:          return "поток без протокола появился";
     default:                    return "запись неизвестного вида";
     }
 }
@@ -1069,6 +1387,13 @@ static void print_journal(const d2k_session *s, uint64_t start) {
         const d2k_jrn_entry *e = d2k_journal_at(j, i);
         if (!e) {
             continue;
+        }
+        if (e->kind == D2K_JRN_PREFLIGHT_START || e->kind == D2K_JRN_PREFLIGHT_HANDOVER ||
+            e->kind == D2K_JRN_PREFLIGHT_GAVE_UP) {
+            printf("  preflight K=%u elapsed_ns=%" PRIu64 " client_side=%u plan=", e->num,
+                   e->preflight_elapsed_ns, e->d_client_side);
+            for (size_t k=0;k<D2K_PLAN_ID_LEN;k++) printf("%02x",e->plan_id[k]);
+            printf("\n");
         }
         /* Ключ канонизирован: «низкая» и «высокая» стороны, а не источник и
            назначение. Печатается как пара, через тире, чтобы стрелка не врала
@@ -1104,6 +1429,409 @@ static uint8_t refuse_of_errno(int e) {
     return (e == EMSGSIZE) ? D2K_REFUSE_TOO_LONG : D2K_REFUSE_SEND;
 }
 
+/* Both queued originals and post-NAT continuations use this sender. */
+static int send_result(d2k_session *sess, d2k_raw *raw, d2k_sched *sched,
+    int mode, uint64_t t, d2k_result *result, const uint8_t *obuf,
+    const uint8_t *original, size_t original_len, uint32_t *v,
+    int *payload_sent, uint64_t *last_at) {
+    d2k_result res = *result;
+    uint32_t verdict = *v;
+    char err[256];
+    int output_failed = 0;
+    if (mode == MODE_APPLY && raw && res.applied) {
+        /* Предел КАЖДОЙ ПОСЫЛКИ по ЕЁ направлению, а не один
+           общий на план: общий не знает ни про туннель,
+           поднятый к другой цели, ни про PMTU этого маршрута.
+           Адрес берётся из самого пакета (байты 16..19
+           заголовка IPv4), а не из ключа потока: ключ
+           канонический — в нём «низкий» и «высокий» конец, а
+           не источник и назначение. Маршрут спрашивается раз на
+           направление (d2k_raw_route_maxlen), дальше —
+           сравнение чисел. */
+        size_t cap = d2k_raw_maxlen(raw);
+        size_t too_long = 0;
+        for (size_t k = 0; k < res.n_out; k++) {
+            const uint8_t *ip = obuf + res.out[k].off;
+            uint8_t family = ip[0] >> 4;
+            size_t here = res.out[k].len >= (family == 6 ? 40u : 20u)
+                ? d2k_raw_route_maxlen_family(raw, ip + (family == 6 ? 24 : 16), family)
+                : cap;
+            if (res.out[k].len > here) {
+                too_long = res.out[k].len;
+                cap = here;
+                break;
+            }
+        }
+        if (too_long) {
+            fprintf(stderr,
+                "d2kd: план не исполнен: посылка %zu байт при пределе %zu\n",
+                too_long, cap);
+            st.send_fail++;
+            output_failed = 1;
+            res.n_out = 0;
+            /* Ничего не ушло и вердикт не отправлен — исход
+               считает общая политика, а не эта ветка. */
+            if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                        D2K_REFUSE_TOO_LONG,
+                                        res.execution_id, 0, 0)) {
+                verdict = D2K_NF_ACCEPT;
+            }
+        }
+    }
+
+    if (mode==MODE_APPLY && raw && res.applied && res.n_out) {
+        for(size_t k=0;k<res.n_out;k++) {
+            if(d2k_raw_prepare(raw,obuf+res.out[k].off,res.out[k].len,
+                               err,sizeof err)==0) continue;
+            fprintf(stderr,"d2kd: план не отправлен: %s\n",err);
+            st.send_fail++; output_failed = 1; res.n_out=0;
+            if(d2k_session_exec_failed(sess,t,&res.key,res.plan_id,
+                 D2K_REFUSE_SEND,res.execution_id,0,0)) verdict=D2K_NF_ACCEPT;
+            break;
+        }
+    }
+
+    /* ФАЛЬШИВКИ С ПОНИЖЕННЫМ TTL — В ПАМЯТЬ ДО ОТПРАВКИ:
+       ICMP узла, где она умрёт, может прийти раньше, чем
+       закончится этот проход. Мерило — TTL исходного пакета
+       потока: посылка ниже него сервера не достигнет. */
+    if (mode == MODE_APPLY && raw && res.applied && res.n_out &&
+        original && original_len >= 20) {
+        uint8_t orig_ttl = (original[0] >> 4) == 6
+            ? original[7] : original[8];
+        for (size_t k = 0; k < res.n_out; k++) {
+            (void)d2k_icmpguard_note(&icmpg, obuf + res.out[k].off,
+                                     res.out[k].len, orig_ttl, t);
+        }
+    }
+
+    /* Ушла ли уже НАГРУЗКА. Берётся из факта отправки, а не
+       из арифметики по номеру: номер не отличает ушедшее от
+       положенного в очередь. */
+    int payload_on_wire = 0;
+    uint64_t at = t;
+    for (size_t k = 0; k < res.n_out && mode == MODE_APPLY; k++) {
+        at += (uint64_t)res.out[k].delay_us * NS_PER_US;
+        const uint8_t *p = obuf + res.out[k].off;
+        size_t plen = res.out[k].len;
+        if (at <= t) {
+            if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
+                int send_errno = errno;
+                uint8_t failure = refuse_of_errno(send_errno);
+                st.send_fail++;
+                output_failed = 1;
+                /* Полный сокет: план не исполняется дальше,
+                   оригинал — общей политикой ниже (пока ушли
+                   одни фальшивки, он проходит ядром). */
+                log_send_fail("", err, send_errno);
+                /* НАША неудача — не свойство коробки. Пока её
+                   знал только этот счётчик, контроллер видел
+                   «план применён» и делал из неё вывод о
+                   коробке (0006). Теперь отказ уезжает
+                   отдельным фактом, привязанным к потоку и
+                   плану. */
+                if (res.applied) {
+                    /* Пока на провод уходили одни фальшивки,
+                       клиентский поток цел: коробка увидела
+                       лишнее, но байты человека не разорваны,
+                       и оригинал обязан пройти. Как только
+                       ушёл кусок нагрузки, чистого выхода
+                       нет. Решает общая политика. */
+                    if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                                failure, res.execution_id,
+                                                payload_on_wire, 0)) {
+                        verdict = D2K_NF_ACCEPT;
+                    } else {
+                        fprintf(stderr,
+                            "d2kd: поток испорчен: ушло %zu посылок из %zu, "
+                            "нагрузка уже на проводе\n", k, res.n_out);
+                    }
+                }
+                break;
+            }
+            st.emitted++;
+            st.emitted_now++;
+            if (k == res.first_payload) { payload_on_wire = 1; }
+            if (res.applied) {
+                d2k_session_sent(sess, t, &res.key, res.execution_id);
+            }
+        } else if (d2k_sched_push_serial(sched, at, p, plen,
+                                  res.applied ? &res.key : NULL, res.execution_id) != 0) {
+            st.send_fail++;
+            output_failed = 1;
+            if (res.applied &&
+                d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
+                                        D2K_REFUSE_QUEUE, res.execution_id,
+                                        payload_on_wire, 0)) {
+                verdict = D2K_NF_ACCEPT;
+            }
+            break;
+        } else {
+            st.deferred++;
+        }
+    }
+
+    *result = res; *v = verdict; *payload_sent = payload_on_wire; *last_at = at;
+    return output_failed;
+}
+
+#define POSTNAT_MARK 0x10000000u
+#define POSTNAT_SLOTS 32
+/* Sidecars retain held QUIC tails and a fallback after a partially sent plan.
+ * They outlive queue callbacks; callback success always transfers ownership. */
+typedef struct {
+    int used;
+    uint32_t head_id;
+    d2k_udp_hold_batch batch;
+    uint8_t *fallback;
+    size_t fallback_len;
+    uint64_t ready_at, execution;
+    d2k_key key;
+    int tails_done, wait_scheduler;
+    size_t retry_count;
+    uint32_t retry_ids[D2K_UDP_HOLD_PACKETS], retry_verdicts[D2K_UDP_HOLD_PACKETS];
+} postnat_side;
+typedef struct {
+    d2k_postnat_capture *capture;
+    d2k_postnat_own *own;
+    d2k_ct_async queries;
+    int ct;
+    unsigned ifindex;
+    size_t capture_limit;
+    int capture_failed;
+    uint64_t accepted, continued, fallback_count;
+    hold_context *hc;
+    d2k_udp_out *out;
+    uint64_t now, seq, drained_at;
+    postnat_side side[POSTNAT_SLOTS];
+} postnat_context;
+static void postnat_finish(postnat_context *c, unsigned slot, uint64_t at) {
+    postnat_side *s = &c->side[slot];
+    s->ready_at = at ? at : c->now;
+    s->wait_scheduler = s->ready_at > c->now;
+}
+/* Only after the scheduler has drained the head's generated sends. Failed
+ * NFQUEUE verdicts retry just their verdict, never their already-sent bytes. */
+static void postnat_finish_ready(postnat_context *c, postnat_side *s) {
+    if (!s->ready_at || s->ready_at > c->now || s->fallback ||
+        (s->wait_scheduler && s->ready_at > c->drained_at)) return;
+    if (!s->tails_done) {
+        s->tails_done = 1;
+        if (s->batch.count) {
+            c->hc->skip_verdict = 1; c->hc->skip_id = s->head_id;
+            c->hc->retry_ids = s->retry_ids; c->hc->retry_verdicts = s->retry_verdicts;
+            c->hc->retry_count = &s->retry_count;
+            int failed = d2k_udp_out_batch(c->out, &s->batch, D2K_NF_DROP, 1,
+                                           c->now, c->now, c->seq);
+            c->hc->retry_count = NULL; c->hc->skip_verdict = 0;
+            if (failed && s->execution) {
+                (void)d2k_session_exec_failed(c->hc->sess, c->now, &s->key, NULL,
+                    D2K_REFUSE_SEND, s->execution, 1, 1);
+                s->execution = 0;
+            }
+        }
+    }
+    for (size_t i = 0; i < s->retry_count;) {
+        if (out_verdict(c->hc, s->retry_ids[i], s->retry_verdicts[i])) { i++; continue; }
+        s->retry_count--;
+        s->retry_ids[i] = s->retry_ids[s->retry_count];
+        s->retry_verdicts[i] = s->retry_verdicts[s->retry_count];
+    }
+    if (s->retry_count) return;
+    if (s->execution) d2k_session_sent(c->hc->sess, c->now, &s->key, s->execution);
+    memset(s, 0, sizeof *s);
+}
+static int postnat_fallback(void *ctx, const uint8_t *orig, size_t olen,
+    const uint8_t *cap, size_t clen, const d2k_postnat_identity *id) {
+    postnat_context *c = ctx;
+    /* No capture means the kernel may still own the marked packet. Keep the
+       abandoned slot: a late capture must still fall back, never execute. */
+    if (!cap || !clen) return 0;
+    if (out_send_now(c->hc, orig, olen)) return 0;
+    if (++c->fallback_count <= 16) fprintf(stderr, "d2kd: postnat fallback original\n");
+    postnat_finish(c, id->owner_slot, c->now);
+    return 1;
+}
+static int postnat_query(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
+    postnat_context *c = ctx;
+    return d2k_ct_async_query(&c->queries, c->ct, t, c->now, out);
+}
+static int postnat_keep(void *ctx, const d2k_postnat_identity *id) {
+    postnat_context *c = ctx;
+    return d2k_plantab_find_by_binding(d2k_session_plans(c->hc->sess),
+                                      &id->binding, c->now) != NULL;
+}
+static int postnat_emit(void *ctx, const uint8_t *orig, size_t olen,
+    const uint8_t *cap, size_t clen, const d2k_ct_info *map,
+    const d2k_postnat_identity *id) {
+    postnat_context *c = ctx;
+    /* Allocate before execution: if only fakes went out and fallback is busy,
+       this sidecar takes responsibility without violating emit's contract. */
+    uint8_t *backup = malloc(olen);
+    if (!backup) return 0;
+    memcpy(backup, orig, olen);
+    uint8_t buf[OUT_BUF]; d2k_result r;
+    if (!d2k_session_udp_continue(c->hc->sess, c->now, &id->key, id->plan_id,
+        id->trial, &id->binding, id->flow_epoch, id->incarnation, map,
+        orig, olen, buf, sizeof buf, &r)) {
+        free(backup);
+        return postnat_fallback(c, orig, olen, cap, clen, id);
+    }
+    c->continued++; /* preparation count, never evidence of application success */
+    uint32_t verdict = r.verdict == D2K_VERDICT_DROP ? D2K_NF_DROP : D2K_NF_ACCEPT;
+    int payload = 0; uint64_t at = c->now;
+    uint64_t sent = st.emitted_now, queued = st.deferred;
+    int failed = send_result(c->hc->sess, c->hc->raw, c->hc->sched, MODE_APPLY,
+        c->now, &r, buf, orig, olen, &verdict, &payload, &at);
+    if (failed && sent == st.emitted_now && queued == st.deferred) {
+        free(backup); return 0;
+    }
+    if (!failed) {
+        c->side[id->owner_slot].key = r.key;
+        c->side[id->owner_slot].execution = r.execution_id;
+    }
+    if (verdict == D2K_NF_ACCEPT) {
+        if (out_send_now(c->hc, orig, olen)) {
+            if (sent == st.emitted_now && queued == st.deferred) {
+                free(backup); return 0; /* nothing sent or queued */
+            }
+            c->side[id->owner_slot].fallback = backup;
+            c->side[id->owner_slot].fallback_len = olen;
+            return 1;
+        }
+    }
+    free(backup);
+    if (c->continued <= 16) fprintf(stderr, "d2kd: postnat continuation prepared=%u failed=%d\n", r.applied, failed);
+    postnat_finish(c, id->owner_slot, at);
+    return 1;
+}
+static void postnat_step(postnat_context *c, int stopping) {
+    if (!c->capture) return;
+    c->now = now_ns();
+    uint8_t packet[65575]; size_t n;
+    for (unsigned i = 0; i < POSTNAT_SLOTS * 2; i++) {
+        int rc = d2k_postnat_capture_read(c->capture, packet, sizeof packet, &n);
+        if (rc < 0) {
+            if (!c->capture_failed) fprintf(stderr, "d2kd: postnat capture read failed: %s; new originals pass\n", strerror(errno));
+            c->capture_failed = 1;
+        }
+        if (rc <= 0) break;
+        (void)d2k_postnat_own_captured(c->own, packet, n);
+    }
+    d2k_ct_async_poll(&c->queries, c->ct);
+    d2k_postnat_own_clear(c->own, stopping ? NULL : postnat_keep, c,
+                          postnat_fallback, c);
+    d2k_postnat_own_expire(c->own, (int64_t)c->now, postnat_fallback, c);
+    if (!stopping) d2k_postnat_own_resolve(c->own, postnat_query, c, postnat_emit, c);
+    for (unsigned i = 0; i < POSTNAT_SLOTS; i++) {
+        postnat_side *s = &c->side[i];
+        if (s->fallback && !out_send_now(c->hc, s->fallback, s->fallback_len)) {
+            free(s->fallback); s->fallback = NULL;
+            postnat_finish(c, i, c->now);
+        }
+        postnat_finish_ready(c, s);
+    }
+}
+static int postnat_pending(const postnat_context *c) {
+    for (unsigned i = 0; i < POSTNAT_SLOTS; i++) if (c->side[i].used) return 1;
+    return 0;
+}
+static void postnat_stop_incomplete(postnat_context *c) {
+    unsigned flows = 0;
+    for (unsigned i = 0; i < POSTNAT_SLOTS; i++) {
+        postnat_side *s = &c->side[i];
+        if (!s->used) continue;
+        flows++;
+        if (s->execution) {
+            (void)d2k_session_exec_failed(c->hc->sess, c->now, &s->key, NULL,
+                D2K_REFUSE_SEND, s->execution, 1, 1);
+        }
+        /* An unobserved head may still be in the kernel. Never replay it.
+         * Unsent tails cannot complete this transaction; retire their queue
+         * IDs without transmitting them. Already-sent tails retry only their
+         * recorded verdict. Closing NFQUEUE retires any failed verdicts. */
+        if (!s->tails_done) {
+            for (size_t j = 0; j < s->batch.count; j++)
+                if (s->batch.ids[j] != s->head_id)
+                    (void)out_verdict(c->hc, s->batch.ids[j], D2K_NF_DROP);
+        }
+        for (size_t j = 0; j < s->retry_count; j++)
+            (void)out_verdict(c->hc, s->retry_ids[j], s->retry_verdicts[j]);
+        free(s->fallback);
+        memset(s, 0, sizeof *s);
+    }
+    fprintf(stderr, "d2kd: postnat shutdown incomplete owners=%zu flows=%u; uncertain heads not replayed, delivery not confirmed\n",
+            d2k_postnat_own_pending(c->own), flows);
+}
+static int postnat_begin(postnat_context *c, const d2k_nl_pkt *np,
+    const d2k_result *r, const d2k_udp_hold_batch *batch, uint32_t mark,
+    uint64_t now, uint64_t seq) {
+    if (!c->capture || c->capture_failed || !d2k_binding_known(&r->udp_defer_binding) || !r->udp_defer_pending || !np->have_payload || np->truncated ||
+        np->hook != D2K_HOOK_POSTROUTING ||
+        !np->have_outdev || np->outdev != c->ifindex || (mark & POSTNAT_MARK)) return 0;
+    /* The product queues at mangle POSTROUTING, after destination NAT.
+       Only SNAT-invariant packets that reach egress whole are captureable:
+       kernel fragmentation before tc would steal fragments without an owner. */
+    d2k_packet_view ip;
+    if (!d2k_packet_parse(np->payload, np->payload_len, &ip) ||
+        np->payload_len > c->capture_limit ||
+        np->payload_len > d2k_raw_maxlen(c->hc->raw) ||
+        np->payload_len > d2k_raw_route_maxlen_family(c->hc->raw, ip.dst.bytes, ip.family)) return 0;
+    unsigned i;
+    for (i = 0; i < POSTNAT_SLOTS; i++) if (!c->side[i].used) break;
+    if (i == POSTNAT_SLOTS) return 0;
+    if (d2k_routemark_routed(&routes, np->payload[0] >> 4, mark | POSTNAT_MARK)) return 0;
+    d2k_postnat_identity id = {0};
+    id.binding = r->udp_defer_binding; id.generation = id.binding.generation;
+    memcpy(id.epoch, id.binding.epoch, 16); memcpy(id.trial, r->udp_defer_trial_id, 16);
+    id.key = r->udp_defer_key; memcpy(id.plan_id, r->udp_defer_plan_id, 16);
+    memcpy(id.flow_epoch, r->udp_defer_epoch, 16); id.incarnation = r->udp_defer_incarnation;
+    id.owner_slot = i;
+    if (d2k_postnat_own_begin(c->own, np->payload, np->payload_len, &id,
+                              (int64_t)(now + 500 * NS_PER_MS)) != 1) return 0;
+    d2k_ct_tuple tuple;
+    if (d2k_postnat_udp_tuple(np->payload, np->payload_len, &tuple))
+        d2k_ct_async_forget(&c->queries, &tuple);
+    char err[256];
+    if (d2k_nfq_accept_mark(c->hc->q, np->id, mark | POSTNAT_MARK, err, sizeof err)) {
+        /* sendmsg failed atomically: kernel still owns the original. */
+        d2k_postnat_own_cancel(c->own, np->payload, np->payload_len);
+        fprintf(stderr, "d2kd: postnat mark failed: %s\n", err); return 0;
+    }
+    c->side[i].used = 1; c->side[i].head_id = np->id;
+    if (batch && batch->count) c->side[i].batch = *batch;
+    c->seq = seq;
+    if (++c->accepted <= 16) fprintf(stderr, "d2kd: postnat owned\n");
+    return 1;
+}
+
+/* Приём существующих потоков (этап 13): список портов сервера «a,b:c», до 16
+   диапазонов; принимаются TCP/UDP потоки с таким портом назначения. */
+typedef struct { d2k_session *sess; uint64_t now_ns; size_t adopted; size_t n; uint16_t lo[16], hi[16]; } adopt_ctx;
+static int adopt_parse_ports(const char *list, adopt_ctx *c) {
+    const char *p = list;
+    while (*p) {
+        char *end = NULL;
+        unsigned long a = strtoul(p, &end, 10), b = a;
+        if (end == p || a > 65535) return -1;
+        if (*end == ':') { p = end + 1; b = strtoul(p, &end, 10); if (end == p || b > 65535 || b < a) return -1; }
+        if (c->n >= 16) return -1;
+        c->lo[c->n] = (uint16_t)a; c->hi[c->n] = (uint16_t)b; c->n++;
+        if (*end == ',') { p = end + 1; } else if (*end == '\0') { break; } else { return -1; }
+    }
+    return c->n ? 0 : -1;
+}
+static int adopt_one(void *ctx, const d2k_ct_tuple *t, const d2k_ct_info *i) {
+    adopt_ctx *c = ctx;
+    uint16_t dport = (uint16_t)(t->dport_be[0] << 8 | t->dport_be[1]);
+    int want = 0;
+    for (size_t k = 0; k < c->n && !want; k++) want = dport >= c->lo[k] && dport <= c->hi[k];
+    if (!want) return 0;
+    if (t->proto == 6 && i->tcp_state_known && i->tcp_state != D2K_CT_TCP_ESTABLISHED) return 0;
+    if (d2k_session_adopt(c->sess, t, i, c->now_ns) == 0) c->adopted++;
+    return 0;
+}
+
 static int offline_self_check(void) {
     static const uint8_t want[32] = {0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
         0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};
@@ -1124,14 +1852,20 @@ int main(int argc, char **argv) {
        наименьший среди поднятых (см. d2k_raw_open, d2k_raw.h). */
     const char *ifname = NULL;
     const char *ctl_path = NULL;
+    const char *provider_ips_path = NULL;
+    const char *exp_ctl_path = NULL;   /* второй управляющий: только опыты новой цепочки */
     int mode = MODE_OBSERVE;
     uint32_t mark = 0;
     uint32_t probe_mark = 0;
+    uint32_t release_bit = 0;
+    uint32_t late_mark = 0;
+    const char *adopt_ports = NULL; /* этап 13: принять существующие потоки на старте */
     uint32_t flows = 2048, qlen = 1024, copy_range = MAX_PKT;
     uint32_t slots = 128, idle_s = 120, stats_s = 10, duration_s = 0;
     uint32_t journal = 256;
     int fail_open = 1;
     int udp_reverse_hook = 0;
+    int preflight = 0, preflight_ipv6 = 0;
     /* Только политика Keenetic (задача 59): S99d2k переводит имя политики в
        её метку (ndmc show ip policy) и отдаёт сюда. */
     int only_on = 0, only_none = 0;
@@ -1143,9 +1877,16 @@ int main(int argc, char **argv) {
 #define NEEDV() do { if (!v) { fprintf(stderr, "%s требует значения\n", a); return 2; } i++; } while (0)
         if (strcmp(a, "--health-file") == 0) { NEEDV(); health_path = v; }
         else if (strcmp(a, "--queue") == 0)            { NEEDV(); if (arg_u32(v, &queue)) goto badval; have_queue = 1; }
+        else if (strcmp(a, "--watch-release-bit") == 0) { NEEDV(); if (arg_u32(v, &release_bit) || !release_bit || (release_bit & (release_bit-1))) goto badval; }
+        else if (strcmp(a, "--late-watch-mark") == 0) { NEEDV(); if (arg_u32(v, &late_mark) || !late_mark || (late_mark & (late_mark-1))) goto badval; }
+        else if (strcmp(a, "--late-rules") == 0) { late_rules = 1; }
+        else if (strcmp(a, "--late-backend") == 0) { NEEDV(); if (strcmp(v, "rules") != 0) goto badval; late_rules = late_force_rules = 1; }
+        else if (strcmp(a, "--adopt-ports") == 0) { NEEDV(); adopt_ports = v; }
         else if (strcmp(a, "--plan") == 0)        { NEEDV(); plan_path = v; }
         else if (strcmp(a, "--log") == 0)         { NEEDV(); log_path = v; }
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
+        else if (strcmp(a, "--exp-control") == 0) { NEEDV(); exp_ctl_path = v; }
+        else if (strcmp(a, "--provider-ips") == 0) { NEEDV(); provider_ips_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
         else if (strcmp(a, "--probe-mark") == 0)  { NEEDV(); if (arg_u32(v, &probe_mark)) goto badval; }
         else if (strcmp(a, "--only-mark") == 0) {
@@ -1162,6 +1903,8 @@ int main(int argc, char **argv) {
                     only_mask == 0) goto badval;
             }
         }
+        else if (strcmp(a, "--preflight") == 0) { preflight = 1; }
+        else if (strcmp(a, "--preflight-ipv6") == 0) { preflight_ipv6 = 1; }
         else if (strcmp(a, "--udp-reverse-hook") == 0) { udp_reverse_hook = 1; }
         else if (strcmp(a, "--iface") == 0)       { NEEDV(); ifname = v; }
         else if (strcmp(a, "--flows") == 0)       { NEEDV(); if (arg_u32(v, &flows)) goto badval; }
@@ -1221,6 +1964,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--probe-mark должен отличаться от --mark: иначе собственные raw-пакеты нельзя отличить от зондов контроллера\n");
         return 2;
     }
+    /* Бит освобождения watch (NF_REPEAT с mark|bit) не должен быть частью
+       --mark/--probe-mark: иначе пакет с нашей/зондовой меткой выглядел бы уже
+       освобождённым и не освобождался бы никогда, а освобождённый пользовательский
+       пакет мог бы совпасть с меткой зонда. S99d2k проверяет это в watch_validate;
+       служба, запущенная мимо S99 (лаборатория), обязана отказать сама. */
+    if (release_bit && ((mark | probe_mark) & release_bit)) {
+        fprintf(stderr, "--watch-release-bit 0x%x пересекается с --mark 0x%x / --probe-mark 0x%x\n",
+                (unsigned)release_bit, (unsigned)mark, (unsigned)probe_mark);
+        return 2;
+    }
+    /* Бит поздней доставки (connmark записи, этап 17) — та же логика: он не
+       может быть частью меток посылок/зондов и бита освобождения. */
+    if (late_mark && (((mark | probe_mark) & late_mark) || (release_bit & late_mark))) {
+        fprintf(stderr, "--late-watch-mark 0x%x пересекается с --mark 0x%x / --probe-mark 0x%x / --watch-release-bit 0x%x\n",
+                (unsigned)late_mark, (unsigned)mark, (unsigned)probe_mark, (unsigned)release_bit);
+        return 2;
+    }
+    late_bit = late_mark;
 
     if (log_path) {
         /* Служба уходит в фон через start-stop-daemon, который потоки не
@@ -1320,6 +2081,11 @@ int main(int argc, char **argv) {
     }
 
     d2k_session *sess = d2k_session_new(flows, journal);
+    if (sess && preflight && mode == MODE_APPLY &&
+        d2k_session_set_preflight(sess, 1) != 0)
+        fprintf(stderr, "d2kd: preflight выключен: не удалось создать таблицу\n");
+    if (sess && preflight && mode == MODE_APPLY && provider_ips_path)
+        (void)d2k_session_provider_ips_load(sess,provider_ips_path,(uint64_t)time(NULL));
     http80 = d2k_http80_new();
     if (!http80) {
         fprintf(stderr, "d2kd: нет памяти для разбора HTTP — вставка провайдера не узнаётся\n");
@@ -1328,6 +2094,26 @@ int main(int argc, char **argv) {
         d2k_session_set_udp_reverse_hook(sess, 1);
     }
     ct_probe(sess, 1);
+    /* УЖЕ СУЩЕСТВУЮЩИЕ ПОТОКИ (этап 13, opt-in): один проход по таблице
+       conntrack на старте, приём потоков к названным портам сервера; дальше
+       они наблюдаются только счётчиками (d2k_session_adopt). Без ctnetlink —
+       принимать нечем, об этом сказано выше. */
+    if (adopt_ports && ctl_ct.up) {
+        adopt_ctx ac;
+        memset(&ac, 0, sizeof ac);
+        ac.sess = sess; ac.now_ns = now_ns();
+        if (adopt_parse_ports(adopt_ports, &ac) != 0) {
+            fprintf(stderr, "d2kd: --adopt-ports: не разобрано: %s\n", adopt_ports);
+        } else {
+            for (uint8_t fam = 4; fam <= 6; fam += 2) {
+                if (++ctl_ct.seq == 0) { ctl_ct.seq = 1; }
+                int got = d2k_ct_dump_fd(ctl_ct.fd, ctl_ct.seq, fam, adopt_one, &ac, 500);
+                if (got < 0) { fprintf(stderr, "d2kd: перечисление conntrack IPv%u не удалось\n", (unsigned)fam); }
+            }
+            fprintf(stderr, "d2kd: принято из conntrack на старте: %zu потоков к портам %s (наблюдение счётчиками, без плана)\n",
+                    ac.adopted, adopt_ports);
+        }
+    }
     /* Вместимость ячейки — «сколько байт унесёт способ отправки», а не
        «сколько байт пакета мы берём у ядра» (--copy-range): посылка плана
        бывает длиннее пришедшего, перекрытие несёт приставку сверх нагрузки.
@@ -1367,11 +2153,49 @@ int main(int argc, char **argv) {
     }
     fflush(stdout);
 
+    /* Вход опытов новой цепочки (ТЗ §16): пробный план на местный порт
+       собственного потока и его снятие — и больше ничего. Отказ открыть его
+       работу основного контроллера не останавливает. */
+    d2k_ctl *xctl = NULL;
+    d2k_ctl *xpeers[D2K_EXP_PEERS_MAX]={0};
+    if (exp_ctl_path) {
+        xctl = d2k_ctl_open(exp_ctl_path, err, sizeof err);
+        if (!xctl) fprintf(stderr, "сокет опытов не открыт (работаю без него): %s\n", err);
+    }
+
     d2k_ctlsrv cx;
     memset(&cx, 0, sizeof cx);
     cx.sess = sess;
     cx.ctl = ctl;
     cx.http80 = http80;
+    lw_sess = sess;
+    if (late_bit || late_rules) {
+        /* ПОЗДНЯЯ ДОСТАВКА (этапы 17, 49, 51, 53): способ (метка при подтверждённой
+           маске / правила точного кортежа / нет) выбирает исполнитель первой
+           заявкой; до его итога заявки ждут в очереди исполнителя, не в цикле. */
+        lwk.rules.queue = queue;
+        lwx = d2k_lwexec_start(lw_run, NULL, 128);
+        if (!lwx) {
+            fprintf(stderr, "d2kd: поздняя доставка выключена: исполнитель не запустился (память, поток)\n");
+        } else {
+            lw_cx = &cx;
+            d2k_lw_ops lw_ops = { lw_op_submit, lw_op_ack, lw_op_flag, lw_op_delivered, lw_op_note, lw_op_say, NULL,
+                                  late_bit };
+            d2k_lw_init(&lwt, &lw_ops);
+            d2k_lw_raw_ops raw_ops={lw_raw_identity,lw_raw_ack,lw_raw_note,NULL};
+            d2k_lw_raw_hooks(&lwt,&raw_ops);
+            cx.raw_measure_hook=raw_measure_hook;
+            cx.addr_probe_hook = late_addr_hook;
+            cx.name_probe_hook = late_name_hook;
+            cx.late_observe_hook = late_observe_hook;
+            cx.peer_closed_hook = late_peer_closed;
+            cx.probe_hook_ctx = &cx;
+            printf("d2kd: поздняя доставка: бит connmark 0x%x%s, исполнитель запущен\n",
+                   (unsigned)late_bit, late_rules ? ", запасной способ — правила точного кортежа" : "");
+            fflush(stdout);
+            d2k_lw_start(&lwt, now_ns());
+        }
+    }
     d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
     cx.send_limits = raw ? d2k_raw_limits(raw) : 0;
     /* Ноль без сырого сокета — «предел не объявлен»: в режиме наблюдения на
@@ -1392,7 +2216,7 @@ int main(int argc, char **argv) {
     }
     udp_follow = mode == MODE_APPLY && raw ? d2k_udp_follow_new() : NULL;
     hold_context hc = {sess, q, mode == MODE_APPLY ? raw : NULL,
-                       mode == MODE_APPLY ? sched : NULL};
+                       mode == MODE_APPLY ? sched : NULL, 0, 0, NULL, NULL, NULL};
     udp_out.verdict = out_verdict;
     udp_out.send_now = out_send_now;
     udp_out.send_at = out_send_at;
@@ -1438,6 +2262,65 @@ int main(int argc, char **argv) {
                 ifname ? "назван --iface" : "угадан: MTU выхода сырой посылки, "
                                             "иначе наименьший среди поднятых");
     }
+    postnat_context *pn = calloc(1, sizeof *pn);
+    if (pn) {
+        pn->ct = -1; pn->hc = &hc; pn->out = &udp_out;
+        pn->capture_limit = raw ? d2k_raw_maxlen(raw) : 0;
+        pn->ifindex = ifname ? if_nametoindex(ifname) :
+            (routes.n_oif4 == 1 ? routes.oif4[0] : 0);
+        const char *reason = "not apply mode or raw sender unavailable";
+        if (mode == MODE_APPLY && raw) {
+            reason = "no single eligible output interface";
+            if (pn->ifindex) {
+                reason = "capture mark conflicts with product marks or route policy";
+                if (!((mark | probe_mark | release_bit | late_mark) & POSTNAT_MARK) &&
+                    !d2k_routemark_routed(&routes, 4, POSTNAT_MARK) &&
+                    !d2k_routemark_routed(&routes, 6, POSTNAT_MARK)) {
+                    pn->own = d2k_postnat_own_new(POSTNAT_SLOTS, 65575);
+                    reason = "ownership allocation failed";
+                    if (pn->own) {
+                        pn->ct = d2k_ct_open();
+                        reason = "conntrack query socket unavailable";
+                        if (pn->ct >= 0) {
+                            pn->capture = d2k_postnat_capture_open(pn->ifindex,
+                                POSTNAT_MARK, 49152, err, sizeof err);
+                            reason = err;
+                        }
+                    }
+                }
+            }
+        }
+        if (pn->capture) fprintf(stderr, "d2kd: postnat capture enabled\n");
+        else fprintf(stderr, "d2kd: postnat capture disabled: %s; originals pass\n", reason);
+    } else {
+        fprintf(stderr, "d2kd: postnat capture disabled: context allocation failed; originals pass\n");
+    }
+    if (preflight && mode==MODE_APPLY && raw) {
+        int failed=0;
+        for (unsigned i=0;i<3;i++) {
+            preflight_raw[i]=d2k_raw_open(D2K_PF_MARK+i,ifname,err,sizeof err);
+            if (!preflight_raw[i]) { failed=1; break; }
+        }
+        if (failed) {
+            fprintf(stderr,"d2kd: preflight disabled: raw sockets: %s\n",err);
+            for (unsigned i=0;i<3;i++) { d2k_raw_close(preflight_raw[i]); preflight_raw[i]=NULL; }
+            (void)d2k_session_set_preflight(sess,0);
+            preflight=0;
+        } else if (preflight_ipv6) {
+            /* Prepare all three IPv6 senders before taking ownership of a SYN.
+             * prepare opens sockets and sets marks without sending a packet. */
+            const uint8_t ipv6_header[40] = {0x60, [6] = IPPROTO_TCP};
+            for (unsigned i=0;i<3;i++) {
+                if (d2k_raw_prepare(preflight_raw[i],ipv6_header,sizeof ipv6_header,err,sizeof err)) {
+                    fprintf(stderr,"d2kd: IPv6 preflight unsupported: %s\n",err);
+                    preflight_ipv6=0;
+                    break;
+                }
+            }
+        }
+    }
+    d2k_session_preflight_ipv6(sess, preflight && preflight_ipv6);
+    d2k_preflight_io pf_io = {&hc, preflight_drop, preflight_send};
     uint64_t last_routes = now_ns();
     uint64_t next_routes = last_routes + D2K_ROUTEMARK_REFRESH_NS;
     udp_path.sess = sess;
@@ -1460,6 +2343,9 @@ int main(int argc, char **argv) {
     const uint64_t idle_ns = (uint64_t)idle_s * NS_PER_S;
     uint64_t next_stats = stats_s ? start + (uint64_t)stats_s * NS_PER_S : 0;
     uint64_t next_expire = start + NS_PER_S;
+    uint64_t next_provider_reload = start;
+    ino_t provider_file_inode=0;
+    struct timespec provider_file_mtime={0};
     /* Счётчики связи уезжают контроллеру раз в секунду: реже — и он узнавал бы
        о своей слепоте позже, чем успел бы выбросить рабочий план. */
     uint64_t next_ctl_stats = start + NS_PER_S;
@@ -1467,6 +2353,19 @@ int main(int argc, char **argv) {
     while (!stop_flag) {
         (void)d2k_runtime_heartbeat(health_path, NULL, ctl && d2k_ctl_peer_fd(ctl) >= 0, 1, 1);
         uint64_t t = now_ns();
+        if(preflight && provider_ips_path && t>=next_provider_reload) {
+            struct stat st;
+            if(!stat(provider_ips_path,&st) &&
+               (st.st_ino!=provider_file_inode ||
+                st.st_mtim.tv_sec!=provider_file_mtime.tv_sec ||
+                st.st_mtim.tv_nsec!=provider_file_mtime.tv_nsec)) {
+                if(!d2k_session_provider_ips_load(sess,provider_ips_path,(uint64_t)time(NULL))) {
+                    provider_file_inode=st.st_ino;
+                    provider_file_mtime=st.st_mtim;
+                }
+            }
+            next_provider_reload=t+100*NS_PER_MS;
+        }
         /* Часы для вытеснения в таблице планов (d2k_plantab_set_name/set_addr,
            см. d2k_plans.h) — точность в сотни миллисекунд достаточна: там
            считают минуты простоя записи, а не наносекунды. */
@@ -1479,11 +2378,15 @@ int main(int argc, char **argv) {
            уборки таблицы. Не до фиксированного тика — иначе задержки плана
            округлялись бы вверх на его величину. */
         uint64_t wake = t + 200 * NS_PER_MS;      /* потолок ожидания: 200 мс */
+        if(preflight && provider_ips_path && next_provider_reload<wake)
+            wake=next_provider_reload;
         uint64_t due = d2k_sched_next_ns(sched);
         if (due && due < wake) { wake = due; }
         due = d2k_udp_release_next_ns(udp_releases);
         if (due && due < wake) { wake = due; }
         due = d2k_udp_hold_next_ns(udp_holding);
+        if (due && due < wake) { wake = due; }
+        due = d2k_session_preflight_next_ns(sess);
         if (due && due < wake) { wake = due; }
         due = d2k_hold_next(holding);
         if (due && due < wake) { wake = due; }
@@ -1497,7 +2400,8 @@ int main(int argc, char **argv) {
             timeout_ms = (d > 200) ? 200 : (int)d;
         }
 
-        struct pollfd pfd[4];
+        if (pn && postnat_pending(pn) && timeout_ms > 2) timeout_ms = 2;
+        struct pollfd pfd[8+D2K_EXP_PEERS_MAX];
         nfds_t nfd = 0;
         pfd[nfd].fd = d2k_nfq_fd(q);
         pfd[nfd].events = POLLIN;
@@ -1526,6 +2430,22 @@ int main(int argc, char **argv) {
             }
         }
 
+        nfds_t ixl=(nfds_t)-1,ixp[D2K_EXP_PEERS_MAX];
+        for(unsigned i=0;i<D2K_EXP_PEERS_MAX;i++)ixp[i]=(nfds_t)-1;
+        if(xctl) {
+            pfd[nfd]=(struct pollfd){d2k_ctl_listen_fd(xctl),POLLIN,0};
+            ixl=nfd++;
+            for(unsigned i=0;i<D2K_EXP_PEERS_MAX;i++)if(xpeers[i]) {
+                pfd[nfd]=(struct pollfd){d2k_ctl_peer_fd(xpeers[i]),POLLIN,0};
+                ixp[i]=nfd++;
+            }
+        }
+
+        if (pn && pn->capture) {
+            if (!pn->capture_failed)
+                pfd[nfd++] = (struct pollfd){d2k_postnat_capture_fd(pn->capture), POLLIN, 0};
+            pfd[nfd++] = (struct pollfd){pn->ct, POLLIN, 0};
+        }
         int pr = poll(pfd, nfd, timeout_ms);
         if (pr < 0 && errno != EINTR) {
             st.recv_err++;
@@ -1559,6 +2479,32 @@ int main(int argc, char **argv) {
                 d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx);
             }
             d2k_ctl_flush(ctl);
+        }
+        if(xctl) {
+            if(ixl!=(nfds_t)-1 && (pfd[ixl].revents&POLLIN)) {
+                unsigned i=0;while(i<D2K_EXP_PEERS_MAX && xpeers[i])i++;
+                if(i<D2K_EXP_PEERS_MAX) {
+                    xpeers[i]=d2k_ctl_accept_peer(xctl);
+                    if(xpeers[i])d2k_ctlsrv_greet(xpeers[i],raw?(uint32_t)d2k_raw_maxlen(raw):0u);
+                } else {
+                    /* Capacity is a resource limit, never eviction of a
+                       running experiment's stream. */
+                    int rejected=accept(d2k_ctl_listen_fd(xctl),NULL,NULL);
+                    if(rejected>=0)close(rejected);
+                }
+            }
+            for(unsigned i=0;i<D2K_EXP_PEERS_MAX;i++)if(xpeers[i]) {
+                if(ixp[i]!=(nfds_t)-1 && (pfd[ixp[i]].revents&(POLLIN|POLLHUP|POLLERR))) {
+                    d2k_ctlsrv xcx=cx;xcx.ctl=xpeers[i];
+                    d2k_ctl_poll(xpeers[i],d2k_ctlsrv_command_exp,&xcx);
+                    cx.ok_cmds=xcx.ok_cmds;cx.bad_cmds=xcx.bad_cmds;
+                }
+                d2k_ctl_flush(xpeers[i]);
+                if(d2k_ctl_peer_fd(xpeers[i])<0) {
+                    d2k_ctlsrv_forget_exp_ctl(xpeers[i]);
+                    d2k_ctl_close(xpeers[i]);xpeers[i]=NULL;
+                }
+            }
         }
 
         d2k_hold_flush(holding, now_ns(), d2k_session_plan_revision(sess), 0,
@@ -1609,6 +2555,15 @@ int main(int argc, char **argv) {
                         continue;   /* вердикт слать некому: нет номера пакета */
                     }
 
+                    d2k_nfq_release_packet(q, np.id, np.have_mark ? np.mark : 0, 0);
+                    /* Release requests never reach discovery, hold or the
+                     * normal fake sender. ACCEPT encodes NF_REPEAT with the
+                     * temporary bit; the firewall consumes control tokens. */
+                    if (preflight && mode==MODE_APPLY && np.have_mark &&
+                        (np.mark==D2K_PF_RELEASE_MARK || np.mark==D2K_PF_TOKEN_MARK)) {
+                        (void)preflight_repeat(q,&np);
+                        continue;
+                    }
                     st.seen++;
                     st.bytes += np.payload_len;
                     /* ICMP идёт в очередь только как time-exceeded (S99d2k,
@@ -1649,6 +2604,8 @@ int main(int argc, char **argv) {
                        таблицы, — тоже поток ядра. */
                     const int outbound = np.hook == D2K_HOOK_POSTROUTING ||
                                          np.hook == D2K_HOOK_OUTPUT;
+                    const uint32_t preflight_path = outbound ? np.outdev : np.indev;
+                    d2k_session_set_packet_path(sess,preflight_path);
                     const uint32_t route_gate = d2k_routemark_gate(&routes,
                         (np.have_payload && np.payload_len)
                             ? (uint8_t)(np.payload[0] >> 4) : 4,
@@ -1659,6 +2616,26 @@ int main(int argc, char **argv) {
                        «маршрут», иначе метка пакета как есть. */
                     const uint32_t umark = route_gate ? route_gate
                                                       : (np.have_mark ? np.mark : 0);
+
+                    /* Own SYN/replies before capture/hold/accounting. A raw
+                     * sender is mandatory; observe mode never starts a probe. */
+                    if (preflight && mode == MODE_APPLY && raw && !route_gate &&
+                        np.have_payload && !np.truncated && np.payload_len>=40 &&
+                        (((np.payload[0]>>4)==4 && np.payload[9]==6) ||
+                         (preflight_ipv6 && (np.payload[0]>>4)==6 &&
+                          np.payload_len>=60 && np.payload[6]==6)) &&
+                        !(np.have_mark && mark && np.mark == mark)) {
+                        uint8_t family=np.payload[0]>>4;
+                        size_t pf_cap=d2k_raw_route_maxlen_family(raw,np.payload+(family==6?24:16),family);
+                        if (pf_cap>d2k_raw_maxlen(raw)) pf_cap=d2k_raw_maxlen(raw);
+                        d2k_session_preflight_send_cap(sess,pf_cap);
+                        int pf = d2k_preflight_path_packet_path(sess, np.payload, np.payload_len,
+                            np.id, t, &pf_io, preflight_path);
+                        if (pf) {
+                            if (pf < 0) fprintf(stderr, "d2kd: preflight NF_DROP failed\n");
+                            continue;
+                        }
+                    }
 
                     /* QUIC split hold starts before session inspection, so the
                        first tail cannot escape while the ClientHello is still
@@ -1685,6 +2662,22 @@ int main(int argc, char **argv) {
                             anchor, have_anchor,
                             release_original, &hc, &batch);
                         if (hr == 1) {
+                            /* Зонд контроллера узнаётся по метке; его строки
+                               пишет своя ветка ниже. */
+                            int probe_here = probe_mark != 0 && np.have_mark &&
+                                             np.mark == probe_mark;
+                            if (!probe_here && client_tcp_logged < D2K_CLIENT_TCP_LOG) {
+                                unsigned sp = 0, dp = 0; size_t pl = 0; uint8_t f0 = 0;
+                                if (client_tcp_ports(np.payload, np.payload_len,
+                                                     &sp, &dp, &pl, &f0) && dp == 443) {
+                                    client_tcp_logged++;
+                                    fprintf(stderr, "d2kd: клиент TCP %u -> %u len=%zu: удержан; "
+                                                    "кусок приветствия собирается; applied=0 emits=0%s\n",
+                                            sp, dp, pl,
+                                            client_tcp_logged == D2K_CLIENT_TCP_LOG
+                                                ? " (дальше без журнала)" : "");
+                                }
+                            }
                             /* Взят в слот (или уже возвращён на провод из него):
                                у ядра копия больше не нужна — иначе хвост
                                локального потока не выйдет (см. hold_owns). */
@@ -1758,6 +2751,17 @@ int main(int argc, char **argv) {
                         }
                     }
 
+                    /* Rules set the watch on SYN. Release only ACCEPTed current
+                       packets; owned/delayed DROP IDs must never be re-injected. */
+                    /* Пакет наблюдаемого потока (этап 49) не освобождается с битом
+                       снятия: правило D2K_WCLR сняло бы метку наблюдения. */
+                    int late_observed = np.have_payload && !np.truncated &&
+                                        d2k_lw_packet(&lwt, np.payload, np.payload_len, t);
+                    if (release_bit && mode == MODE_APPLY && np.have_payload && !np.truncated &&
+                        !late_observed && !(np.have_mark && (np.mark & release_bit)) &&
+                        d2k_session_retry_watch(sess, np.payload, np.payload_len) == 0)
+                        d2k_nfq_release_packet(q, np.id, np.have_mark ? np.mark : 0, release_bit);
+
                     if (controller_probe && np.payload && np.payload_len >= 28 &&
                         np.payload[9] == 17) {
                         size_t ihl = (size_t)(np.payload[0] & 15u) * 4u;
@@ -1806,8 +2810,8 @@ int main(int argc, char **argv) {
                                 fprintf(stderr, "d2kd: клиент QUIC %u -> %u len=%zu%s%s%s: %s; %s; "
                                                 "applied=%u emits=%zu%s\n",
                                         sport, dport, np.payload_len - ihl - 8,
-                                        res.quic_name[0] ? " имя=" : "", res.quic_name,
-                                        res.quic_shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
+                                        res.flow_name[0] ? " имя=" : "", res.flow_name,
+                                        res.shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
                                         how,
                                         res.skipped ? res.skipped : "решение без отказа",
                                         (unsigned)res.applied, res.n_out,
@@ -1854,8 +2858,8 @@ int main(int argc, char **argv) {
                                     (unsigned)res.applied, res.n_out);
                         } else {
                             fprintf(stderr, "d2kd: клиент QUIC replay головы имя=%s%s: %s; applied=%u emits=%zu\n",
-                                    res.quic_name,
-                                    res.quic_shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
+                                    res.flow_name,
+                                    res.shape_miss ? " (имя в таблице, формы QUIC нет)" : "",
                                     res.skipped ? res.skipped : "план исполнен",
                                     (unsigned)res.applied, res.n_out);
                         }
@@ -1925,142 +2929,14 @@ int main(int argc, char **argv) {
                      * испорчен, оригинал уходит нетронутым. Частичная
                      * отправка такого выхода уже не даёт, поэтому проверяем
                      * ВСЕ посылки разом, а не по одной на ходу. */
-                    int output_failed = 0;
                     const size_t http_planned = res.n_out;
                     const uint64_t http_sent_before = st.emitted_now;
                     const uint64_t http_queued_before = st.deferred;
-                    if (mode == MODE_APPLY && raw && res.applied) {
-                        /* Предел КАЖДОЙ ПОСЫЛКИ по ЕЁ направлению, а не один
-                           общий на план: общий не знает ни про туннель,
-                           поднятый к другой цели, ни про PMTU этого маршрута.
-                           Адрес берётся из самого пакета (байты 16..19
-                           заголовка IPv4), а не из ключа потока: ключ
-                           канонический — в нём «низкий» и «высокий» конец, а
-                           не источник и назначение. Маршрут спрашивается раз на
-                           направление (d2k_raw_route_maxlen), дальше —
-                           сравнение чисел. */
-                        size_t cap = d2k_raw_maxlen(raw);
-                        size_t too_long = 0;
-                        for (size_t k = 0; k < res.n_out; k++) {
-                            const uint8_t *ip = obuf + res.out[k].off;
-                            uint8_t family = ip[0] >> 4;
-                            size_t here = res.out[k].len >= (family == 6 ? 40u : 20u)
-                                ? d2k_raw_route_maxlen_family(raw, ip + (family == 6 ? 24 : 16), family)
-                                : cap;
-                            if (res.out[k].len > here) {
-                                too_long = res.out[k].len;
-                                cap = here;
-                                break;
-                            }
-                        }
-                        if (too_long) {
-                            fprintf(stderr,
-                                "d2kd: план не исполнен: посылка %zu байт при пределе %zu\n",
-                                too_long, cap);
-                            st.send_fail++;
-                            output_failed = 1;
-                            res.n_out = 0;
-                            /* Ничего не ушло и вердикт не отправлен — исход
-                               считает общая политика, а не эта ветка. */
-                            if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
-                                                        D2K_REFUSE_TOO_LONG,
-                                                        res.execution_id, 0, 0)) {
-                                verdict = D2K_NF_ACCEPT;
-                            }
-                        }
-                    }
-
-                    if (mode==MODE_APPLY && raw && res.applied && res.n_out) {
-                        for(size_t k=0;k<res.n_out;k++) {
-                            if(d2k_raw_prepare(raw,obuf+res.out[k].off,res.out[k].len,
-                                               err,sizeof err)==0) continue;
-                            fprintf(stderr,"d2kd: план не отправлен: %s\n",err);
-                            st.send_fail++; output_failed = 1; res.n_out=0;
-                            if(d2k_session_exec_failed(sess,t,&res.key,res.plan_id,
-                                 D2K_REFUSE_SEND,res.execution_id,0,0)) verdict=D2K_NF_ACCEPT;
-                            break;
-                        }
-                    }
-
-                    /* ФАЛЬШИВКИ С ПОНИЖЕННЫМ TTL — В ПАМЯТЬ ДО ОТПРАВКИ:
-                       ICMP узла, где она умрёт, может прийти раньше, чем
-                       закончится этот проход. Мерило — TTL исходного пакета
-                       потока: посылка ниже него сервера не достигнет. */
-                    if (mode == MODE_APPLY && raw && res.applied && res.n_out &&
-                        np.have_payload && np.payload_len >= 20) {
-                        uint8_t orig_ttl = (np.payload[0] >> 4) == 6
-                            ? np.payload[7] : np.payload[8];
-                        for (size_t k = 0; k < res.n_out; k++) {
-                            (void)d2k_icmpguard_note(&icmpg, obuf + res.out[k].off,
-                                                     res.out[k].len, orig_ttl, t);
-                        }
-                    }
-
-                    /* Ушла ли уже НАГРУЗКА. Берётся из факта отправки, а не
-                       из арифметики по номеру: номер не отличает ушедшее от
-                       положенного в очередь. */
                     int payload_on_wire = 0;
                     uint64_t at = t;
-                    for (size_t k = 0; k < res.n_out && mode == MODE_APPLY; k++) {
-                        at += (uint64_t)res.out[k].delay_us * NS_PER_US;
-                        const uint8_t *p = obuf + res.out[k].off;
-                        size_t plen = res.out[k].len;
-                        if (at <= t) {
-                            if (d2k_raw_send(raw, p, plen, err, sizeof err) != 0) {
-                                int send_errno = errno;
-                                uint8_t failure = refuse_of_errno(send_errno);
-                                st.send_fail++;
-                                output_failed = 1;
-                                /* Полный сокет: план не исполняется дальше,
-                                   оригинал — общей политикой ниже (пока ушли
-                                   одни фальшивки, он проходит ядром). */
-                                log_send_fail("", err, send_errno);
-                                /* НАША неудача — не свойство коробки. Пока её
-                                   знал только этот счётчик, контроллер видел
-                                   «план применён» и делал из неё вывод о
-                                   коробке (0006). Теперь отказ уезжает
-                                   отдельным фактом, привязанным к потоку и
-                                   плану. */
-                                if (res.applied) {
-                                    /* Пока на провод уходили одни фальшивки,
-                                       клиентский поток цел: коробка увидела
-                                       лишнее, но байты человека не разорваны,
-                                       и оригинал обязан пройти. Как только
-                                       ушёл кусок нагрузки, чистого выхода
-                                       нет. Решает общая политика. */
-                                    if (d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
-                                                                failure, res.execution_id,
-                                                                payload_on_wire, 0)) {
-                                        verdict = D2K_NF_ACCEPT;
-                                    } else {
-                                        fprintf(stderr,
-                                            "d2kd: поток испорчен: ушло %zu посылок из %zu, "
-                                            "нагрузка уже на проводе\n", k, res.n_out);
-                                    }
-                                }
-                                break;
-                            }
-                            st.emitted++;
-                            st.emitted_now++;
-                            if (k == res.first_payload) { payload_on_wire = 1; }
-                            if (res.applied) {
-                                d2k_session_sent(sess, t, &res.key, res.execution_id);
-                            }
-                        } else if (d2k_sched_push_serial(sched, at, p, plen,
-                                                  res.applied ? &res.key : NULL, res.execution_id) != 0) {
-                            st.send_fail++;
-                            output_failed = 1;
-                            if (res.applied &&
-                                d2k_session_exec_failed(sess, t, &res.key, res.plan_id,
-                                                        D2K_REFUSE_QUEUE, res.execution_id,
-                                                        payload_on_wire, 0)) {
-                                verdict = D2K_NF_ACCEPT;
-                            }
-                            break;
-                        } else {
-                            st.deferred++;
-                        }
-                    }
+                    int output_failed = send_result(sess, raw, sched, mode, t, &res,
+                        obuf, np.have_payload ? np.payload : NULL, np.payload_len,
+                        &verdict, &payload_on_wire, &at);
 
                     /* ХВОСТЫ УДЕРЖАННОЙ ПАЧКИ — ЗА ГОЛОВОЙ (задачи 42, 46).
                      *
@@ -2106,7 +2982,14 @@ int main(int argc, char **argv) {
                     }
 
                     int original_failed = 0;
-                    if (udp_replay && res.quic_deny) {
+                    int postnat_owned = pn && mode == MODE_APPLY && !route_gate &&
+                        (!controller_probe || (res.udp_defer_binding.shape==D2K_PLAN_SHAPE_DNS &&
+                            !res.udp_defer_binding.temporary)) && outbound && !batch.count &&
+                        postnat_begin(pn, &np, &res, udp_replay ? &udp_batch : NULL,
+                                      np.have_mark ? np.mark : 0, t, udp_path.seq);
+                    if (postnat_owned) {
+                        /* Marked ACCEPT already sent; continuation owns head and tails. */
+                    } else if (udp_replay && res.quic_deny) {
                         /* QUIC для имени не пропускается: вся пачка снимается,
                            хвосты не уходят ни ядром, ни нашей посылкой —
                            иначе сервер получил бы часть ClientHello. */
@@ -2184,6 +3067,11 @@ int main(int argc, char **argv) {
                     } else if (!delayed_originals && res.applied && mode == MODE_APPLY) {
                         d2k_session_sent(sess, t, &res.key, res.execution_id);
                     }
+                    if (preflight && mode==MODE_APPLY && !controller_probe &&
+                        np.have_payload && !np.truncated) {
+                        if (d2k_preflight_path_complete_on(sess,np.payload,np.payload_len,t,&pf_io,preflight_path))
+                            fprintf(stderr,"d2kd: preflight cleanup send failed\n");
+                    }
                     if(!controller_probe && np.have_payload && !np.truncated) {
                         d2k_http80_delivered(http80,np.payload,np.payload_len,
                             !original_failed && !delayed_originals && verdict==D2K_NF_ACCEPT,
@@ -2219,6 +3107,14 @@ int main(int argc, char **argv) {
                         }
                         if (d2k_http_trace(line, sizeof line, np.payload, np.payload_len, &res, &outcome)) {
                             fprintf(stderr, "%s\n", line);
+                        }
+                        static unsigned tls_logged;
+                        if (tls_logged < 300 &&
+                            d2k_tls_trace(line, sizeof line, np.payload, np.payload_len,
+                                          &res, &outcome, batch.count, batch_owned)) {
+                            tls_logged++;
+                            fprintf(stderr, "%s%s\n", line,
+                                tls_logged == 300 ? " (TLS trace limit reached)" : "");
                         }
                     }
                 }
@@ -2293,6 +3189,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (pn) { pn->seq = udp_path.seq; pn->drained_at = t; postnat_step(pn, 0); }
+
         /* A split QUIC batch may keep its original NFQUEUE verdict behind the
            last delayed fake.  Drain only after the raw scheduler above has
            emitted every due fake, so the tail cannot overtake REC_DELAY. */
@@ -2302,6 +3200,13 @@ int main(int argc, char **argv) {
                                          delayed_verdict_done, &hc);
         }
 
+        /* Drain every due FSM, not just the first bounded output batch. */
+        while (d2k_session_preflight_next_ns(sess) &&
+               d2k_session_preflight_next_ns(sess) <= t) {
+            if (d2k_preflight_path_tick(sess, t, &pf_io) != 0)
+                fprintf(stderr, "d2kd: preflight timer raw send failed\n");
+        }
+
         if (t >= next_expire) {
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —
@@ -2309,6 +3214,11 @@ int main(int argc, char **argv) {
             d2k_session_sweep(sess, t);
             if (http80) { (void)d2k_http80_sweep(http80, t, http80_cut, ctl); }
             d2k_session_expire(sess, t, idle_ns);
+            if (lwx) {
+                d2k_lw_done lwd;
+                while (d2k_lwexec_poll(lwx, &lwd)) { d2k_lw_complete(&lwt, &lwd, t); }
+                d2k_lw_tick(&lwt, t, ctl && d2k_ctl_peer_fd(ctl) < 0);
+            }
             /* Окно следования — миллисекунды: всё старше и из прежних пачек
                приёма убирается (финальное ревью M-5). */
             d2k_udp_follow_age(udp_follow, t, udp_path.rseq + 1);
@@ -2318,27 +3228,9 @@ int main(int argc, char **argv) {
             d2k_ctlsrv_pump(ctl, sess, &events_seen);
         }
         if (ctl && t >= next_ctl_stats) {
-            /* Сколько СОБЫТИЙ мы потеряли. Датапат держит ровно один
-               исходящий кадр и теряет всё, что не поместилось (см. шапку
-               d2k_ctl.h) — это осознанный предел, а не дефект. Но контроллер
-               обязан знать, что был слеп: без этого числа пропавший обмен
-               выглядит у него ровно как «план не сработал», и он выбросил бы
-               рабочий план. Счётчик уже считался (d2k_ctl_dropped) и никуда
-               не уезжал. */
-            uint8_t body[D2K_KEY_WIRE_LEN + 8];
-            memset(body, 0, sizeof body);
-            uint64_t dr = d2k_ctl_dropped(ctl), sn = d2k_ctl_sent(ctl);
-            uint32_t dr32 = dr > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)dr;
-            uint32_t sn32 = sn > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)sn;
-            body[D2K_KEY_WIRE_LEN + 0] = (uint8_t)(dr32 >> 24);
-            body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)(dr32 >> 16);
-            body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(dr32 >> 8);
-            body[D2K_KEY_WIRE_LEN + 3] = (uint8_t)dr32;
-            body[D2K_KEY_WIRE_LEN + 4] = (uint8_t)(sn32 >> 24);
-            body[D2K_KEY_WIRE_LEN + 5] = (uint8_t)(sn32 >> 16);
-            body[D2K_KEY_WIRE_LEN + 6] = (uint8_t)(sn32 >> 8);
-            body[D2K_KEY_WIRE_LEN + 7] = (uint8_t)sn32;
-            d2k_ctl_event(ctl, D2K_EV_STATS, body, sizeof body);
+            /* Счётчики потерь канала — раз в секунду (тело и ключ — в ctlsrv,
+               рядом с приветствием: один формат событий без потока). */
+            d2k_ctlsrv_stats(ctl);
             next_ctl_stats = t + NS_PER_S;
         }
         if (next_stats && t >= next_stats) {
@@ -2353,6 +3245,41 @@ int main(int argc, char **argv) {
         (void)d2k_udp_release_flush(udp_releases, UINT64_MAX,
                                      send_delayed_verdict,
                                      delayed_verdict_done, &hc);
+        size_t cancelled = d2k_udp_release_cancel(udp_releases,
+                                                  delayed_verdict_done, &hc);
+        if (cancelled)
+            fprintf(stderr, "d2kd: shutdown incomplete delayed-verdict batches=%zu; unresolved IDs retire when NFQUEUE closes\n", cancelled);
+    }
+    /* Return every SYN owned by an unfinished probe while the marked raw
+     * socket is still alive. No conntrack/firewall edits belong to this step. */
+    while (d2k_session_preflight_next_ns(sess)) {
+        if (d2k_preflight_path_flush(sess, now_ns(), &pf_io) != 0) {
+            fprintf(stderr, "d2kd: preflight shutdown raw send failed\n");
+            break; /* no busy loop on a persistent local sender failure */
+        }
+    }
+    /* The returned SYNs still need their queued NF_REPEAT. Closing NFQUEUE
+     * here would discard those SYNs and leave their watch bits behind. */
+    if (preflight_releases_pending) {
+        uint64_t stop_at=now_ns()+2*NS_PER_S;
+        while (preflight_releases_pending && now_ns()<stop_at) {
+            struct pollfd p={d2k_nfq_fd(q),POLLIN,0};
+            if (poll(&p,1,10)<=0) continue;
+            ssize_t n=d2k_nfq_recv(q,rbuf,sizeof rbuf,err,sizeof err);
+            if(n<=0) continue;
+            d2k_nl_iter it; d2k_nl_msg m;
+            d2k_nl_iter_init(&it,rbuf,(size_t)n);
+            while(d2k_nl_next(&it,&m)) {
+                d2k_nl_pkt np;
+                if ((m.type&0xff)!=D2K_NFQNL_MSG_PACKET ||
+                    d2k_nl_packet(&m,&np) || !np.have_hdr) continue;
+                if (preflight_repeat(q,&np)) continue;
+                d2k_nfq_release_packet(q,np.id,np.have_mark ? np.mark : 0,0);
+                (void)d2k_nfq_verdict(q,np.id,D2K_NF_ACCEPT,err,sizeof err);
+            }
+        }
+        if(preflight_releases_pending)
+            fprintf(stderr,"d2kd: preflight shutdown incomplete: %zu release requests not received\n",preflight_releases_pending);
     }
     /* Originals already committed by completed groups cannot be replayed
        on shutdown. Explicitly fail their remaining queued sends; never let
@@ -2377,11 +3304,50 @@ int main(int argc, char **argv) {
             st.stale_deferred++;
         }
     }
+    if (pn) {
+        pn->drained_at = UINT64_MAX; /* scheduler cancelled above */
+        uint64_t warn_at = now_ns() + 2 * NS_PER_S;
+        /* Reserve the rest of the service's ten-second datapath stop grace
+         * for filter/device cleanup and the late-worker join. */
+        uint64_t stop_at = now_ns() + 2500 * NS_PER_MS;
+        while (postnat_pending(pn)) {
+            postnat_step(pn, 1);
+            if (postnat_pending(pn)) {
+                if (now_ns() >= stop_at) {
+                    postnat_stop_incomplete(pn);
+                    break;
+                }
+                if (now_ns() >= warn_at) {
+                    fprintf(stderr, "d2kd: postnat shutdown waits for capture/verdict/sender; retained originals are not discarded or blindly replayed\n");
+                    warn_at = now_ns() + 30 * NS_PER_S;
+                }
+                struct pollfd p = {pn->capture_failed ? -1 : d2k_postnat_capture_fd(pn->capture), POLLIN, 0};
+                (void)poll(&p, 1, 2);
+            }
+        }
+        if (d2k_postnat_capture_close(pn->capture, err, sizeof err))
+            fprintf(stderr, "d2kd: postnat cleanup: %s\n", err);
+        if (pn->ct >= 0) close(pn->ct);
+        fprintf(stderr, "d2kd: postnat totals owned=%llu prepared=%llu fallback=%llu pending=%zu\n",
+                (unsigned long long)pn->accepted, (unsigned long long)pn->continued,
+                (unsigned long long)pn->fallback_count, d2k_postnat_own_pending(pn->own));
+        d2k_postnat_own_free(pn->own); free(pn);
+    }
     printf("\n=== итог d2kd[%ld] ===\n", (long)getpid());
     print_stats(sess, sched, q, raw, now_ns() - start);
     print_journal(sess, start);
 
+    if (lwx && d2k_lwexec_stop(lwx, 2000) != 0) {
+        /* Исполнитель висит (iptables -w, ядро): брошен; его остатки (метки, свои
+           цепочки) уберёт уборка следующего старта. */
+        fprintf(stderr, "d2kd: исполнитель поздней доставки не вышел за 2 с — брошен; остатки уберёт следующий старт\n");
+    }
+    lwx = NULL;
     d2k_ctl_close(ctl);
+    for(unsigned i=0;i<D2K_EXP_PEERS_MAX;i++)if(xpeers[i]) {
+        d2k_ctlsrv_forget_exp_ctl(xpeers[i]);d2k_ctl_close(xpeers[i]);
+    }
+    d2k_ctl_close(xctl);
     /* The hold first, while the scheduler still exists (ревью M3); its
        release sends now (at == now). */
     udp_path.now_ns = now_ns();
@@ -2401,6 +3367,7 @@ int main(int argc, char **argv) {
     d2k_http80_free(http80);
     d2k_session_free(sess);
     d2k_nfq_close(q);
+    for (unsigned i=0;i<3;i++) { d2k_raw_close(preflight_raw[i]); preflight_raw[i]=NULL; }
     d2k_raw_close(raw);
     return 0;
 }

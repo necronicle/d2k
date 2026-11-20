@@ -7,26 +7,18 @@
  * формы не доставался вовсе. Оговорка в журнале это называет, но не лечит;
  * лечит зонд, говорящий ТЕМ ЖЕ протоколом (MVP_CHECKLIST, пункт 3).
  *
- * ПРИВЕТСТВИЕ СОБИРАЕТ ОН САМ, как и клиент 1.3, и по той же причине: зонд
- * обязан ДОВЕСТИ рукопожатие до конца, а для этого ему нужны свои ключи и
- * свой набор шифров. Чужие байты (снимок клиента или профиль) он отдать не
- * может — там чужой client_random и чужие предпочтения.
+ * ПРИВЕТСТВИЕ ЗОНДА собирается без supported_versions и добивается до
+ * клиентской длины (want_wire). В режиме формы d2k_tls_connect_form клиент
+ * 1.3 передаёт сюда транскрипт отправленного приветствия и ответ сервера 1.2:
+ * чужие random/key_share предварительно заменены на собственные.
  *
- * ПОЧЕМУ НЕ ПРОФИЛЬ СТАРОГО КЛИЕНТА. Профиль (core/profiles/legacy.hex)
- * предлагает сорок шесть шифрнаборов, и первыми в списке идут CHACHA20 и
- * AES-256: сервер выберет их, а зонд их не умеет — и отказал бы почти всегда.
- * Форма, которая здесь важна, это НЕ набор шифров, а отсутствие расширения
- * supported_versions: именно по нему d2k_hello_shape отличает старое
- * приветствие от современного, и именно по нему датапат выбирает план.
- * Приветствие зонда — старой формы в этом смысле и добивается до длины
- * клиентского (want_wire), ровно как у 1.3.
- *
- * ШИФРНАБОР ОДИН: ECDHE + AES_128_GCM_SHA256 (c02f/c02b); обмен — X25519
- * или secp256r1 (поле 07.10.2026: сервера Facebook в TLS 1.2 выбирают её). Это не
- * «пока», а та же дисциплина, что у d2k_tls13.h: каждая лишняя связка — ещё
- * одна ветка криптографии, которую придётся держать верной без повода.
- * Сервер, выбравший другое, получает честный отказ «зонд такого не умеет» —
- * это утверждение О НАС, а не о коробке, и в каталог по нему не идёт ничего.
+ * ШИФРНАБОРЫ: ECDHE + AES128-GCM-SHA256 (c02b/c02f), AES256-GCM-SHA384
+ * (c02c/c030), ChaCha20-Poly1305-SHA256 (cca9/cca8). Обмен — X25519 или
+ * secp256r1. Примитивы общие с suite.c; расписание и запись — TLS 1.2.
+ * Полевое основание 11.11.2026: форма Chrome предлагает c030, сервер flibusta.is
+ * выбирает его, а прежний зонд отказывал до прикладной проверки. EMS формы
+ * учитывается по RFC 7627. Неподдержанные шифр/группа дают явный отказ о
+ * возможностях зонда, не о коробке.
  *
  * ЧЕГО НЕ ПРОВЕРЯЕТ: подпись в ServerKeyExchange, цепочку доверия и Finished
  * сервера. Причина та же, что у клиента 1.3, и названа там же: предмет
@@ -39,6 +31,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_tls13.h"
 
 typedef struct d2k_tls12 d2k_tls12;
 
@@ -51,6 +44,11 @@ typedef struct d2k_tls12 d2k_tls12;
  * err (заполняется всегда и по-человечески). */
 int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
                       d2k_tls12 **out, char *err, size_t errcap);
+/* Owned measurement transport, with a fixed ClientHello random for one
+ * experiment series. No socket IO or transport ownership on this path. */
+size_t d2k_tls12_probe_hello(const uint8_t random[32],const char *,size_t,uint8_t *,size_t);
+int d2k_tls12_connect_probe(const d2k_tls_io *,const uint8_t random[32],const char *,
+    int,size_t,d2k_tls12 **,char *,size_t);
 
 /* Продолжение после приветствия 1.3 (с предложенной 1.2), на которое сервер
  * ответил 1.2: c_random и ch_msg (сообщение без заголовка записи) — того
@@ -60,6 +58,11 @@ int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
                      const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
                      const uint8_t *srv, size_t srv_len,
                      d2k_tls12 **out, char *err, size_t errcap);
+/* Как d2k_tls12_resume, но запись и чтение — через транспорт io. */
+int d2k_tls12_resume_io(const d2k_tls_io *io, const char *sni, int deadline_ms,
+                        const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
+                        const uint8_t *srv, size_t srv_len,
+                        d2k_tls12 **out, char *err, size_t errcap);
 /* Шлёт n байт прикладными данными. 0 или -1 с причиной. */
 int d2k_tls12_write(d2k_tls12 *t, const uint8_t *buf, size_t n,
                     char *err, size_t errcap);
@@ -75,6 +78,8 @@ uint64_t d2k_tls12_rx_wire_bytes(const d2k_tls12 *t);
 uint32_t d2k_tls12_rx_record_missing(const d2k_tls12 *t);
 
 int d2k_tls12_peer_name(const d2k_tls12 *t);
+/* ALPN, выбранный сервером; пустая строка — не выбран. */
+const char *d2k_tls12_alpn(const d2k_tls12 *);
 
 void d2k_tls12_free(d2k_tls12 *t);
 

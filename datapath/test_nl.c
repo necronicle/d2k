@@ -64,6 +64,42 @@ static size_t put(uint8_t *o, size_t pos, uint16_t type,
 }
 
 int main(void) {
+    {
+        uint8_t msg[64];
+        size_t n=d2k_nl_verdict_release(msg,sizeof msg,2001,7,9,D2K_NF_ACCEPT,0x102f,0x20000000);
+        /* nlattr header is host-order, the mark value is network-order:
+           build the expectation the same way attr() does so the check
+           holds on big-endian hosts too. */
+        uint8_t want[8]={0,0,0,0,0x20,0,0x10,0x2f};
+        wh16(want,8); wh16(want+2,3);
+        CHECK(n==40 && msg[27]==D2K_NF_REPEAT && !memcmp(msg+32,want,8), "release repeats with original packet mark preserved");
+        CHECK(d2k_nl_verdict_release(msg,39,2001,7,9,D2K_NF_ACCEPT,0,0x20000000)==0,"release needs mark space");
+        CHECK(d2k_nl_verdict_release(msg,sizeof msg,2001,7,9,D2K_NF_DROP,0,0x20000000)==32,"drop never repeats");
+        CHECK(d2k_nl_verdict_release(msg,sizeof msg,2001,7,9,D2K_NF_ACCEPT,0,0)==32,"disabled release is ordinary verdict");
+        CHECK(d2k_nl_verdict_mark(msg,sizeof msg,2001,7,9,0x2000102f)==40 &&
+              msg[27]==D2K_NF_ACCEPT && !memcmp(msg+32,want,8),
+              "capture mark ACCEPT preserves mark without repeating firewall");
+        CHECK(d2k_nl_verdict_mark(msg,39,2001,7,9,1)==0,"capture mark buffer bound");
+        /* Этап 18: замена нагрузки + освобождение одним вердиктом — NF_REPEAT,
+           NFQA_PAYLOAD, затем NFQA_MARK (mark|bit); без bit — обычная замена. */
+        {
+            uint8_t pay[5] = {1, 2, 3, 4, 5}, big[64 + 2048];
+            size_t pn = d2k_nl_verdict_payload_release(big, sizeof big, 2001, 7, 9, D2K_NF_ACCEPT, pay, 5, 0x102f, 0x20000000);
+            uint8_t wantm[8] = {0, 0, 0, 0, 0x20, 0x00, 0x10, 0x2f};
+            uint8_t wantp[4];
+            wh16(wantm, 8); wh16(wantm + 2, D2K_NFQA_MARK);
+            wh16(wantp, 9); wh16(wantp + 2, D2K_NFQA_PAYLOAD);
+            CHECK(pn == 32 + 12 + 8 && big[27] == D2K_NF_REPEAT && !memcmp(big + 32, wantp, 4) && !memcmp(big + 36, pay, 5) &&
+                  !memcmp(big + 44, wantm, 8), "payload release: repeat, payload then mark with original bits");
+            CHECK(d2k_nl_verdict_payload_release(big, 51, 2001, 7, 9, D2K_NF_ACCEPT, pay, 5, 0x102f, 0x20000000) == 0,
+                  "payload release requires space for mark");
+            CHECK(d2k_nl_verdict_payload_release(big, sizeof big, 2001, 7, 9, D2K_NF_ACCEPT, pay, 5, 0x102f, 0) == 44 && big[27] == D2K_NF_ACCEPT,
+                  "payload without bit is an ordinary replacement verdict");
+            CHECK(d2k_nl_verdict_payload_release(big, sizeof big, 2001, 7, 9, D2K_NF_DROP, pay, 5, 0x102f, 0x20000000) == 44 && big[27] == D2K_NF_DROP,
+                  "payload drop never repeats");
+        }
+    }
+
     /* ================= сборка ============================================ */
 
     /* --- вердикт: длина, раскладка и сетевые поля ------------------------ */
@@ -199,6 +235,9 @@ int main(void) {
 
         /* Выходной интерфейс (финальное ревью I-1): по нему видно, что поток
            уходит не туда, куда ушла бы сырая посылка. */
+        uint8_t idev[4];
+        wn32(idev, 11);
+        pos = put(buf, pos, 5 /* NFQA_IFINDEX_INDEV */, idev, sizeof idev, 1);
         uint8_t odev[4];
         wn32(odev, 7);
         pos = put(buf, pos, D2K_NFQA_IFINDEX_OUTDEV, odev, sizeof odev, 1);
@@ -231,6 +270,7 @@ int main(void) {
         CHECK(p.hw_protocol == 0x0800, "hw_protocol потерян");
         CHECK(p.hook == 3, "hook потерян");
         CHECK(p.have_mark && p.mark == 0x1234, "метка потеряна");
+        CHECK(p.indev == 11, "входной интерфейс потерян");
         CHECK(p.have_outdev && p.outdev == 7, "выходной интерфейс потерян");
         CHECK(p.have_tstamp && p.tstamp_ns == 1700000000ull * 1000000000ull + 123456000ull,
               "метка времени ядра потеряна");

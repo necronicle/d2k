@@ -348,7 +348,7 @@ static int send_level(d2k_qc *c, d2k_qw_level lvl, const uint8_t *payload,
                       size_t payload_len, size_t pad_to, char *err, size_t errcap) {
     uint8_t pkt[DGRAM_OUT];
     size_t n = seal_level(c, lvl, payload, payload_len, pad_to, pkt, sizeof pkt, err, errcap);
-    if (n == 0) { return -1; }
+    if (n == 0) { return -2; }
     if (send(c->fd, pkt, n, 0) != (ssize_t)n) {
         say(err, errcap, "датаграмма не ушла: %s", strerror(errno));
         return -1;
@@ -877,7 +877,7 @@ static int first_flight(d2k_qc *c, const char *sni, const char *alpn, size_t pad
     cho.extra_len = tp_len;
     cho.pad_to = pad_to;
     size_t ch_len = d2k_t13_ch_build(&cho, ch, sizeof ch);
-    if (ch_len == 0) { say(err, errcap, "приветствие не собралось"); return -1; }
+    if (ch_len == 0 || ch_len < pad_to) { say(err, errcap, "приветствие заданной длины не собралось"); return -1; }
     memcpy(c->transcript, ch, ch_len);
     c->tr_len = ch_len;
 
@@ -966,7 +966,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
 
     d2k_qc *c = calloc(1, sizeof *c);
     if (!c) { say(err, errcap, "не хватило памяти"); return -1; }
-    c->fd = -1;
+    c->fd = (o->use_fd > 0) ? o->use_fd : -1;
     c->peer_name = -1;
     c->version = D2K_QW_V1;
 
@@ -977,12 +977,11 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
     size_t want_ch = (o->form && o->form->ch_len) ? (size_t)o->form->ch_len : o->pad_to;
     if (first_flight(c, o->sni, o->alpn, want_ch, priv, frame, sizeof frame, &flen,
                      err, errcap) != 0) {
-        d2k_qc_close(c); return -1;
+        d2k_qc_close(c); return -2;
     }
 
     int af = strchr(o->ip, ':') ? AF_INET6 : AF_INET;
     c->family = af == AF_INET6 ? 6 : 4;
-    c->fd = (o->use_fd > 0) ? o->use_fd : -1;
 
     struct sockaddr_storage to;
     memset(&to, 0, sizeof to);
@@ -1086,15 +1085,13 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
             size_t take = c->tr_len - off < chunk ? c->tr_len - off : chunk;
             uint8_t part[2600];
             size_t plen = crypto_frame(part, sizeof part, off, c->transcript + off, take);
-            if (plen == 0 ||
-                send_level(c, D2K_QW_LEVEL_INITIAL, part, plen, pad, err, errcap) != 0) {
-                d2k_qc_close(c); return -1;
-            }
+            int send_rc = plen ? send_level(c, D2K_QW_LEVEL_INITIAL, part, plen,
+                                             pad, err, errcap) : -2;
+            if (send_rc != 0) { d2k_qc_close(c); return send_rc; }
         }
     } else if (!o->first_send) {
-        if (send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap) != 0) {
-            d2k_qc_close(c); return -1;
-        }
+        int send_rc = send_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200, err, errcap);
+        if (send_rc != 0) { d2k_qc_close(c); return send_rc; }
     } else {
         /* Замер плеча (задача 39): воздействие плеча идёт ПЕРЕД первым
            Initial на той же четвёрке, ровно как в вопросе-фильтре. Повторы
@@ -1102,7 +1099,7 @@ int d2k_qc_connect(const d2k_qc_opts *o, d2k_qc **out, char *err, size_t errcap)
         uint8_t pkt[DGRAM_OUT];
         size_t n = seal_level(c, D2K_QW_LEVEL_INITIAL, frame, flen, 1200,
                               pkt, sizeof pkt, err, errcap);
-        if (n == 0) { d2k_qc_close(c); return -1; }
+        if (n == 0) { d2k_qc_close(c); return -2; }
         int sent = o->first_send(c->fd, pkt, n, o->first_send_user);
         if (sent < 0) {
             say(err, errcap, "воздействие перед первым Initial не ушло");

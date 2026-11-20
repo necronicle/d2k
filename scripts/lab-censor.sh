@@ -193,7 +193,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 # ФОРКАЮЩИЙ сервер, свой. Почему не готовые — в шапке spike/labtls.c:
 # s_server обслуживает по очереди и виснет на зарезанном рукопожатии,
 # socat отвергает приветствие нашего зонда тревогой 40.
-cc -std=c99 -O2 -Wall -Wextra -o /tmp/labtls spike/labtls.c -lssl -lcrypto
+cc -std=c99 -O2 -DD2K_RELEASE_ID='"dev"' -Wall -Wextra -o /tmp/labtls spike/labtls.c -lssl -lcrypto
 /tmp/labtls "$PORT" /tmp/c.pem /tmp/k.pem >/tmp/server.log 2>&1 &
 SRV=$!
 i=0
@@ -240,7 +240,7 @@ int main(void) {
 }
 PC
 cc -std=c99 -O2 -Icore/include -Idatapath/include -o /tmp/probecheck /tmp/probecheck.c \
-   core/verify.c core/tls13.c core/tls12.c core/p256.c core/tls13core.c core/x25519.c core/crypto.c \
+   core/verify.c core/dns_upstreams.c core/domain.c core/tls13.c core/suite.c core/mlkem.c core/keccak.c core/tls12.c core/p256.c core/tls13core.c core/x25519.c core/crypto.c \
    core/hello.c core/meas.c core/link.c core/compose.c core/measured.c core/quicconn.c core/quicwire.c core/h3.c
 if ! /tmp/probecheck; then
     fail "СОБСТВЕННЫЙ ЗОНД не доходит до приложения на ГОЛОЙ линии — опыт бессмыслен: он покажет неудачу на каждом плече, включая рабочие"

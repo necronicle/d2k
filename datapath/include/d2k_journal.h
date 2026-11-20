@@ -54,6 +54,13 @@
    обеих сторон к началу тишины — в полосе бюджета коробки (num записи и
    события). Только RX-замер, с повторяемостью — как у позднего закрытия. */
 #define D2K_SUSPECT_TCP_STALL 8
+/* ПОЗДНЯЯ ТИШИНА ЗА ОКНОМ ОЧЕРЕДИ (этап 49). Заводит КОНТРОЛЛЕР по счётчикам
+   conntrack своего наблюдения потоков, датапат его не шлёт: сервер уже
+   отвечал, затем ни одного его пакета дольше двух шагов наблюдения, пока
+   клиент послал не меньше трёх, соединение ESTABLISHED. Числа пакетов, не
+   байты: повтор именно данных клиента ими не доказан. Только RX-замер, как у
+   TCP_STALL, но без полосы бюджета. */
+#define D2K_SUSPECT_LATE_SILENCE 10
 
 /* Бюджет потока коробки по умолчанию — поле 04.10 (task-55-facts §1.2: 25–27
    пакетов с данными обеих сторон в 18/18 оборванных потоках). Измеренные
@@ -127,11 +134,19 @@ const char *d2k_suspect_text(uint8_t code);
  * было; для контроллера это знак перемерить цель для этого клиента, а не
  * докладывать «план подтверждён» (замысел 2026-10-23, п. 5.3). */
 #define D2K_REFUSE_FLOW_UNFIT 6
+/* Local prerequisite unavailable (e.g. confirmed NAT tuple for fragments).
+ * Transient, not a property of the remote path or a permanent plan defect. */
+#define D2K_REFUSE_CONTEXT 7
 
 /* D2K_JRN_EXCHANGE code values for protocol-level UDP proofs. */
 #define D2K_UDP_PROOF_NONE            0
 #define D2K_UDP_PROOF_VOICE_DISCOVERY 1
 #define D2K_UDP_PROOF_STUN            2
+
+/* RAW path evidence, never protocol/application success. Values do not overlap
+ * TLS record types or parsed UDP proofs on the existing EXCHANGE wire. */
+#define D2K_RAW_PROOF_ECHO           64
+#define D2K_RAW_PROOF_PROGRESS       65
 
 const char *d2k_refuse_text(uint8_t code);
 
@@ -177,16 +192,37 @@ enum {
        повреждения, а не при следующем пакете: замолчавший поток следующего
        пакета может не прислать вовсе, и факт потерялся бы. Один раз на
        попытку — события лосси по контракту (d2k_ctl.h). */
-    D2K_JRN_PLAN_DAMAGED
+    D2K_JRN_PLAN_DAMAGED,
+    /* ПОЯВЛЕНИЕ ПОТОКА БЕЗ РАСПОЗНАННОГО ПРОТОКОЛА (этап 42): первая нагрузка
+       клиента TCP/UDP — не TLS/HTTP/QUIC/STUN/голос, не зонд. Один раз на
+       поток, не на пакет; с наблюдённой стороной клиента (d_client_side, ноль
+       — не известна). Это ФАКТ СУЩЕСТВОВАНИЯ: ни протокола, ни успеха, ни
+       подозрения в нём нет, и подбора он не запускает. Объём ограничен в
+       session.c (D2K_FLOW_FACT_*), подавленное считается. */
+    D2K_JRN_FLOW,
+    /* ИТОГ ПОЗДНЕГО НАБЛЮДЕНИЯ ТОЧНОГО ПОТОКА (этап 49): code — D2K_LATEOBS_*
+       (d2k_lateobs.h), num — сколько повторов сегмента с данными видно,
+       d_client_side — сторона клиента. Один на наблюдение. */
+    D2K_JRN_LATE_OBS,
+    D2K_JRN_PREFLIGHT_START,
+    D2K_JRN_PREFLIGHT_HANDOVER,
+    D2K_JRN_PREFLIGHT_GAVE_UP
 };
 
 /* Применялся ли план к потоку, о котором подозрение. Ноль — «не сказано»:
    так выглядит подозрение от службы, которая про это поле не знает. */
+/* Observed initiating endpoint in the canonical flow key. */
+#define D2K_CLIENT_SIDE_UNKNOWN 0
+#define D2K_CLIENT_SIDE_LOW 1
+#define D2K_CLIENT_SIDE_HIGH 2
 #define D2K_PLANNED_UNKNOWN 0
 #define D2K_PLANNED_YES     1
 #define D2K_PLANNED_NO      2
 
+#define D2K_JOURNAL_FLOW_IDENTITY 1
 typedef struct {
+    uint8_t flow_epoch[16];
+    uint64_t flow_incarnation;
     uint64_t at_ns;
     uint64_t execution_id;
     d2k_binding_context binding;
@@ -198,9 +234,10 @@ typedef struct {
      * различает вид записи, и без вида ни один из них не читается вовсе. */
     uint8_t  code;
     uint8_t  name_len;
-    /* Число при записи: байты обмена для D2K_JRN_EXCHANGE. Ноль для
+    /* Число при записи: байты обмена для D2K_JRN_EXCHANGE, K для PREFLIGHT_*. Ноль для
      * остального. */
     uint32_t num;
+    uint64_t preflight_elapsed_ns; /* preflight: time since client SYN */
 
     /* Подробности наблюдения — то, ЧЕМ подозрительный пакет отличался от
      * остальных в том же потоке. Для подозрения по сбросу это и есть
@@ -228,6 +265,7 @@ typedef struct {
      * сменить смысл её подозрений задним числом (§2.4). */
     uint8_t  d_planned;
     uint8_t  d_client_shape;
+    uint8_t  d_client_side;
     /* Идентификатор применённого плана (REC_ID). Значим при
      * kind == D2K_JRN_PLAN_APPLIED и у записей о судьбе посылок
      * (D2K_JRN_PLAN_DONE/D2K_JRN_PLAN_UNSENT), у остального нули.
@@ -265,12 +303,22 @@ typedef struct {
     /* См. d_planned у записи: сюда его кладёт тот, кто подозрение поднимает. */
     uint8_t  planned;
     uint8_t  client_shape;
+    uint8_t  client_side;
+    uint8_t flow_epoch[16];
+    uint64_t flow_incarnation;
 } d2k_jrn_detail;
 
 void d2k_journal_add(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                      uint8_t kind, uint8_t code, uint32_t num,
                      const d2k_jrn_detail *det,
                      const uint8_t *name, size_t name_len, const char *note);
+
+/* Immutable preflight fact: num is K; side identifies the initiating endpoint
+ * in the canonical key. Binding/trial are context, never application proof. */
+void d2k_journal_add_preflight(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+    uint8_t kind, uint32_t pieces, uint64_t elapsed_ns, uint8_t client_side,
+    const uint8_t *plan_id, const uint8_t *trial_id,
+    const d2k_binding_context *binding);
 
 /* Запись D2K_JRN_PLAN_APPLIED с идентификатором применённого плана
  * (d2k_plan_id, D2K_PLAN_ID_LEN байт; NULL — идентификатора нет, поле
@@ -301,6 +349,28 @@ void d2k_journal_add_refused(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                           uint8_t kind, uint8_t code, const uint8_t *plan_id,
                           const uint8_t *trial_id);
+
+/* Итог позднего наблюдения (этап 49) с токеном наблюдения в trial_id. */
+void d2k_journal_add_lateobs(d2k_journal *j, uint64_t at_ns, const d2k_key *key, uint8_t code,
+                             uint32_t repeats, const d2k_jrn_detail *det,
+                             const uint8_t token[D2K_TRIAL_ID_LEN]);
+
+void d2k_journal_add_suspect_request(d2k_journal *, uint64_t, const d2k_key *,
+    uint8_t, const d2k_jrn_detail *, const d2k_udp_request_context *);
+
+/* Snapshot the observed execution before the flow can be replaced. */
+void d2k_journal_add_suspect_bound(d2k_journal *, uint64_t, const d2k_key *,
+    uint8_t, uint32_t, const d2k_jrn_detail *, const d2k_flow *);
+/* Обмен (ответ сервера) с идентичностью исполнения ПОТОКА (этап 36): тот же
+   снимок, что у подозрения — plan_id, trial_id, execution_id, binding в момент
+   исполнения, не текущая запись таблицы. Поток без исполнения — без неё. */
+void d2k_journal_add_exchange_bound(d2k_journal *j, uint64_t at_ns,
+    const d2k_key *key, uint8_t code, uint32_t num, const d2k_jrn_detail *detail,
+    const d2k_flow *flow);
+
+/* Typed UDP response evidence keeps the matched request's context and size. */
+void d2k_journal_add_udp_proof(d2k_journal *, uint64_t, const d2k_key *,
+    uint8_t code, uint32_t bytes, const d2k_udp_request_context *);
 
 /* Copies the context selected by the execution, never today's table entry. */
 void d2k_journal_add_fate_bound(d2k_journal *, uint64_t, const d2k_key *,

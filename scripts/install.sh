@@ -297,14 +297,11 @@ TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать време�
 # мерил только /opt, и то ПОСЛЕ загрузки: на 8/16-МиБ роутере обрыв случался
 # уже внутри fetch, когда отказываться было поздно.
 #
-# Числа — замер, не оценка. Раскладка комплекта: 7635 КиБ на самой тяжёлой
-# арке (mips64el; mips и mipsel — 7470 и 7477), с запасом 8700.
-TMP_NEED_KB=8700
-# Установка выпуска держит в /tmp больше: распакованный архив (7752 КиБ,
-# замер 14.10.2026 на том же mips64el) и поверх него раскладку комплекта,
-# которую делает установщик ИЗ архива. Сам .tar.gz (2764 КиБ) удаляется
-# сразу после распаковки, поэтому пик — архив плюс раскладка, а не все три.
-TMP_RELEASE_NEED_KB=17600
+# На ARM64 комплект занимает 9070 КиБ. Перед публикацией размеры всех
+# архитектур сверяются с этими лимитами в scripts/test-install-manifest.sh.
+TMP_NEED_KB=10240
+# При установке выпуска распакованное дерево и раскладка одновременно занимают /tmp.
+TMP_RELEASE_NEED_KB=21504
 # Оба числа сторожит scripts/test-install-manifest.sh: он измеряет и
 # раскладку, и дерево выпуска и отвергает число ниже замера.
 need_kb=$TMP_NEED_KB
@@ -491,6 +488,9 @@ say "загрузка"
 fetch "scripts/select-panel-ip.sh" "$TMP/select-panel-ip.sh"
 fetch "builds/d2kpanel-linux-$ARCH" "$TMP/d2kpanel"
 fetch "builds/d2kc-linux-$ARCH" "$TMP/d2kc"
+fetch "builds/d2kshadow-linux-$ARCH" "$TMP/d2kshadow"
+fetch "core/profiles/modern.hex" "$TMP/modern.hex"
+fetch "core/profiles/legacy.hex" "$TMP/legacy.hex"
 fetch "builds/d2kfetch-linux-$ARCH" "$TMP/d2kfetch"
 fetch "builds/d2kd-linux-$ARCH" "$TMP/d2kd"
 fetch "builds/d2ktg-linux-$ARCH" "$TMP/d2ktg"
@@ -521,7 +521,7 @@ for face in onest jbmono; do
     fetch "internal/web/assets/fonts/OFL-$face.txt" "$TMP/panel/OFL-$face.txt"
 done
 
-chmod +x "$TMP/d2kfetch" "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kd" "$TMP/d2ktg" \
+chmod +x "$TMP/d2kfetch" "$TMP/d2kpanel" "$TMP/d2kc" "$TMP/d2kshadow" "$TMP/d2kd" "$TMP/d2ktg" \
          "$TMP/S99d2k" "$TMP/d2k-fw-heal.sh" "$TMP/d2k-ppe-deoffload.sh" "$TMP/d2k-log-maintenance.sh" "$TMP/d2k-update.sh" "$TMP/001-d2k.sh" \
          "$TMP/d2k-tg-firewall.sh" "$TMP/d2k-tg-watchdog.sh" \
          "$TMP/d2k-instagram-dns.sh" "$TMP/d2k-instagram-dns-scheduler.sh"
@@ -537,7 +537,22 @@ case "$PANEL_VERSION" in
     *features=telegram-control*) ;;
     *) die "скачанный d2kpanel устарел: в нём нет управления Telegram-туннелем" ;;
 esac
-"$TMP/d2kd" --help  >/dev/null 2>&1 || die "скачанный d2kd не запускается на этой системе"
+engine_version() {
+    version=$("$TMP/$1" --version 2>/dev/null) || return 1
+    case "$version" in "$1 release="*" wire="*) ;; *) return 1 ;; esac
+    metadata=${version#"$1 release="}
+    release=${metadata% wire=*}
+    wire=${metadata##* wire=}
+    case "$release" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    case "$wire" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$metadata"
+}
+controller=$(engine_version d2kc) || die "неизвестная версия движка d2kc"
+datapath=$(engine_version d2kd) || die "неизвестная версия движка d2kd"
+[ "$controller" = "$datapath" ] || die "версии движка расходятся: d2kc $controller, d2kd $datapath"
+if [ -n "${D2K_RELEASE_ID:-}" ]; then
+    [ "${controller% wire=*}" = "$D2K_RELEASE_ID" ] || die "версия движка расходится с выпуском $D2K_RELEASE_ID: $controller"
+fi
 TG_VERSION=$("$TMP/d2ktg" --version 2>/dev/null) || die "скачанный d2ktg не запускается на этой системе"
 case "$TG_VERSION" in
     *features=per-install-enrollment*) ;;
@@ -553,17 +568,11 @@ case "$TG_VERSION" in
     *meta-hosts-v3*) ;;
     *) die "скачанный d2ktg устарел: нет проверки сертификатов WhatsApp и fbcdn" ;;
 esac
-# d2kc без обязательного --control печатает использование и выходит кодом 2 —
-# это и есть признак «запускается и та арка». Ноль он здесь вернуть не может.
-#
-# Код снимается через `|| rc=$?`, а не отдельной строкой: при `set -e` (он
-# стоит вверху) команда, вернувшая 2 вне условия, ЗАВЕРШАЕТ установщик молча
-# — до всякой проверки. Ровно это и происходило: установка умирала на
-# проверке арки, ничего не сказав человеку, и до подмены файлов не доходила
-# никогда. Поймано scripts/lab-install.sh на первом же прогоне.
+# Проверка запуска демона без доступа к очереди и сети: ключ справки
+# завершает разбор аргументов до инициализации состояния.
 rc=0
-"$TMP/d2kc" >/dev/null 2>&1 || rc=$?
-[ "$rc" = 2 ] || die "скачанный d2kc не запускается на этой системе (код $rc)"
+"$TMP/d2kshadow" --help >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || die "скачанный d2kshadow не запускается на этой системе (код $rc)"
 say "проверено: $("$TMP/d2kpanel" --version | head -1)"
 
 # --- OpenWrt на nftables: место, пакеты, ядро ----------------------------
@@ -579,7 +588,7 @@ if [ "$FW" = nft ]; then
     opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
     avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
     new_kb=$(du -sk "$TMP" | awk '{ print $1 }')
-    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
+    old_kb=$(du -sk "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kshadow" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$DIR/panel" 2>/dev/null |
         awk '{ s += $1 } END { print s + 0 }')
     big_kb=$(du -sk "$TMP/d2ktg" | awk '{ print $1 }')
     need_kb=$((new_kb - old_kb + big_kb))
@@ -613,7 +622,7 @@ prepare_openwrt_hook
 # --- остановка прежней версии --------------------------------------------
 if [ -x "$INIT" ]; then
     say "останавливаю прежнюю версию"
-    "$INIT" stop || say "прежняя версия остановилась с ошибкой — продолжаю"
+    "$INIT" stop || die "прежняя версия не остановилась — файлы выпуска не заменены"
 fi
 
 # --- атомарная замена ----------------------------------------------------
@@ -634,6 +643,9 @@ install_data_atomic() {
 }
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
+install_atomic "$TMP/d2kshadow" "$SBIN/d2kshadow"
+install_data_atomic "$TMP/modern.hex" "$DIR/files/modern.hex"
+install_data_atomic "$TMP/legacy.hex" "$DIR/files/legacy.hex"
 install_atomic "$TMP/d2kfetch" "$SBIN/d2kfetch"
 install_atomic "$TMP/d2kd"   "$SBIN/d2kd"
 # Прокси открытого HTTP (d2khttp) больше не нужен: вставку провайдера в

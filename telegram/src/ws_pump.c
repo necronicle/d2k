@@ -19,7 +19,7 @@ int tg_ws_pump_init(tg_ws_pump *p,SSL *ssl) {
     if(!p||!ssl)return -1;
     memset(p,0,sizeof(*p));p->ssl=ssl;p->fd=SSL_get_fd(ssl);
     if(p->fd<0)return -1;
-    p->rx_cap=TG_WS_MAX_MESSAGE+10;p->rx=malloc(p->rx_cap);if(!p->rx)return -1;
+    p->rx_cap=TG_WS_RX_BASE;p->rx=malloc(p->rx_cap);if(!p->rx)return -1;
     int flags=fcntl(p->fd,F_GETFL,0);
     if(flags<0||fcntl(p->fd,F_SETFL,flags|O_NONBLOCK)<0){free(p->rx);memset(p,0,sizeof(*p));return -1;}
     return 0;
@@ -77,11 +77,30 @@ static int dispatch_frames(tg_ws_pump *p,tg_ws_message_cb callback,void *ctx) {
         uint8_t op;const uint8_t *data;size_t len,used;
         if(tg_ws_decode_server_frame(p->rx,total,TG_WS_MAX_MESSAGE,&op,&data,&len,&used)!=0||used!=total)return -1;
         if(op==TG_WS_PING){if(queue_opcode(p,TG_WS_PONG,data,len)!=0)return -1;}
-        else if(op==TG_WS_CLOSE){p->closed=1;return 0;}
+        else if(op==TG_WS_CLOSE){memmove(p->rx,p->rx+total,p->rx_len-total);p->rx_len-=total;p->closed=1;return 0;}
         else if(op==TG_WS_BINARY&&callback&&callback(ctx,data,len)!=0)return -1;
         memmove(p->rx,p->rx+total,p->rx_len-total);p->rx_len-=total;
     }
     return 0;
+}
+
+/* БУФЕР ПРИЁМА ПО ПОТРЕБНОСТИ. Раньше он сразу занимал предел сообщения
+   (2 МиБ) на всё время жизни соединения: после первого большого кадра эти
+   страницы оставались в памяти процесса навсегда, на каждом соединении.
+   Теперь буфер растёт вдвое, пока не вместит кадр (не больше предела), и
+   возвращается к исходному размеру, как только разобранных данных в нём нет. */
+static int rx_grow(tg_ws_pump *p) {
+    size_t limit=(size_t)TG_WS_MAX_MESSAGE+10;
+    if(p->rx_cap>=limit)return -1;
+    size_t cap=p->rx_cap*2<limit?p->rx_cap*2:limit;
+    uint8_t *rx=realloc(p->rx,cap);if(!rx)return -1;
+    p->rx=rx;p->rx_cap=cap;return 0;
+}
+
+static void rx_shrink(tg_ws_pump *p) {
+    if(p->rx_len||p->rx_cap<=TG_WS_RX_BASE)return;
+    uint8_t *rx=malloc(TG_WS_RX_BASE);if(!rx)return; /* нет памяти — оставить как есть */
+    free(p->rx);p->rx=rx;p->rx_cap=TG_WS_RX_BASE;
 }
 
 static int flush_tx(tg_ws_pump *p) {
@@ -106,7 +125,7 @@ int tg_ws_pump_process(tg_ws_pump *p,short revents,tg_ws_message_cb callback,voi
     if((revents&POLLIN)||p->read_wants_write||SSL_pending(p->ssl)>0){
         p->read_wants_write=0;
         for(;;){
-            if(p->rx_len==p->rx_cap){p->failed=1;return -1;}
+            if(p->rx_len==p->rx_cap&&rx_grow(p)!=0){p->failed=1;return -1;}
             size_t n=0;int rc=SSL_read_ex(p->ssl,p->rx+p->rx_len,p->rx_cap-p->rx_len,&n);
             if(rc!=1){int error=SSL_get_error(p->ssl,rc);
                 if(error==SSL_ERROR_WANT_READ)break;
@@ -116,6 +135,7 @@ int tg_ws_pump_process(tg_ws_pump *p,short revents,tg_ws_message_cb callback,voi
             }
             if(!n){p->failed=1;return -1;}p->rx_len+=n;
             if(dispatch_frames(p,callback,ctx)!=0){p->failed=1;return -1;}
+            rx_shrink(p);
             if(p->closed)return 0;
         }
     }

@@ -1139,3 +1139,15 @@ body[data-stale="true"] main { opacity: .55; filter: saturate(.4); transition: o
   .diag-history-actions { width: 100%; }
   .diag-history-actions .btn { flex: 1 1 auto; }
 }
+
+/* Policy controls use the existing ruled sheet, ink buttons and paper field. */
+.policy-form { display: grid; gap: 16px; }
+.policy-field { display: grid; gap: 8px; max-width: 640px; }
+.policy-field label { font-weight: 600; }
+.policy-field select { width: 100%; min-width: 0; min-height: 48px; padding: 10px 16px; border: 1px solid var(--rule); border-radius: 24px; background: var(--paper); color: var(--ink); font: inherit; }
+.policy-field select:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.policy-field select:disabled { color: var(--ink-3); }
+.policy-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.policy-note, .policy-status { margin: 0; max-width: 70ch; }
+.policy-note { color: var(--ink-2); }
+@media (max-width: 640px) { .policy-actions { align-items: stretch; } .policy-actions .btn { min-height: 44px; height: auto; white-space: normal; padding-block: 10px; } }

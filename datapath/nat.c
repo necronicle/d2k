@@ -192,4 +192,3 @@ int d2k_nat_outside_family(const char *path, uint8_t proto,
     fclose(f);
     return found;
 }
-

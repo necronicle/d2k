@@ -134,20 +134,59 @@ installed_paths() {
     for p in "$ROOT$DIR"/*.sh; do [ ! -f "$p" ] || printf '%s\n' "${p#"$ROOT"/}"; done
 }
 
-healthy() {
-    # Установщик сам ждёт привязки очереди и падает, если служба умерла
-    # сразу. Здесь — что она не умерла за минуту после него.
-    sleep "$HEALTH_WAIT"
-    for pid in d2kd.pid d2k.pid; do
-        p=$(cat "$DIR/run/$pid" 2>/dev/null) || return 1
-        kill -0 "$p" 2>/dev/null || return 1
+health_sample() {
+    health_proc=${D2K_PROC_DIR:-/proc}
+    health_runtime=${D2K_RUNTIME_DIR:-/tmp/d2k}
+    health_release=$(current_id)
+    [ -n "$health_release" ] || return 1
+    # Match S99d2k defaults and shell assignment semantics, including quoted
+    # empty values, leading spaces and comments; print only fixed component names.
+    health_optional=$(
+        PANEL_LISTEN=127.0.0.1:8090
+        TG_ENABLED=0
+        [ ! -r "$CONF" ] || . "$CONF" >/dev/null 2>&1 || exit 1
+        [ -z "$PANEL_LISTEN" ] || printf '%s\n' d2kpanel:d2k-panel.pid
+        [ "$TG_ENABLED" != 1 ] || printf '%s\n' d2ktg:d2ktg.pid
+    ) || return 1
+    # shellcheck disable=SC2086 # words above are fixed names, never config text
+    set -- d2kd:d2kd.pid d2kc:d2k.pid $health_optional
+    for health_item in "$@"; do
+        health_name=${health_item%:*}
+        health_pid=$(cat "$DIR/run/${health_item#*:}" 2>/dev/null) || return 1
+        case "$health_pid" in ''|*[!0-9]*) return 1 ;; esac
+        kill -0 "$health_pid" 2>/dev/null || return 1
+        # A live PID or heartbeat alone cannot identify the installed executable.
+        health_disk=$(openssl dgst -sha256 -r "$SBIN/$health_name" 2>/dev/null | cut -d' ' -f1)
+        health_exe=$(openssl dgst -sha256 -r "$health_proc/$health_pid/exe" 2>/dev/null | cut -d' ' -f1)
+        [ -n "$health_disk" ] && [ "$health_disk" = "$health_exe" ] || return 1
+        awk -v pid="$health_pid" -v rid="$health_release" -v name="$health_name" '
+          FILENAME==ARGV[1] {sub(/^.*\) /, ""); if($1!="Z" && $1!="X") start=$20; next}
+          FILENAME==ARGV[2] {boot=$1; next}
+          FILENAME==ARGV[3] {
+            if(NF!=11 || $1!="D2KH1" || $2!=pid || !start || $3!=start ||
+               $5!=boot || $6!=rid || $7!~/^[0-9]+$/ || $7<1 || $10!=1 ||
+               $4!~/^[0-9]+$/ || $4<1) exit 1
+            if(name=="d2kc" && ($8!=rid || $9!=1)) exit 1
+            print name,pid,start,$4,$7; ok=1
+          }
+          END {if(!ok) exit 1}
+        ' "$health_proc/$health_pid/stat" "$health_proc/sys/kernel/random/boot_id" \
+          "$health_runtime/$health_name.health" || return 1
     done
-    panel=$(sed -n 's/^PANEL_LISTEN=//p' "$DIR/config" 2>/dev/null | tail -n 1 | tr -d "\"'")
-    if [ -n "$panel" ]; then
-        p=$(cat "$DIR/run/d2k-panel.pid" 2>/dev/null) || return 1
-        kill -0 "$p" 2>/dev/null || return 1
-    fi
-    return 0
+}
+
+healthy() {
+    sleep "$HEALTH_WAIT"
+    health_sample > "$WORK/health.before" || return 1
+    sleep 2
+    health_sample > "$WORK/health.after" || return 1
+    # Advancing heartbeats establish current main-loop progress without mixing
+    # CLOCK_MONOTONIC with /proc/uptime (which includes time spent suspended).
+    # Require the same process incarnation and one wire version.
+    awk 'NR==FNR {pid[$1]=$2; start[$1]=$3; stamp[$1]=$4; wire[$1]=$5; count++; next}
+         {if($2!=pid[$1] || $3!=start[$1] || $4<=stamp[$1] || $5!=wire[$1] ||
+             (version && version!=$5)) bad=1; version=$5; seen++}
+         END {exit bad || seen!=count || seen<2}' "$WORK/health.before" "$WORK/health.after"
 }
 
 # $1 — manual (ставить даже выпуск, однажды не прошедший проверку).
@@ -209,7 +248,10 @@ install_release() {
         return 0
     fi
     log "выпуск $rid не прошёл проверку — возвращаю ${prev:-прежнюю версию}"
-    "$INIT" stop >> "$LOG" 2>&1 || true
+    if ! "$INIT" stop >> "$LOG" 2>&1; then
+        finish false "$rid" "выпуск $rid не прошёл проверку; остановка не удалась, файлы не перезаписаны; копия: $WORK/previous.tar" "$rid"
+        return 1
+    fi
     if tar -xf "$WORK/previous.tar" -C "${ROOT:-/}" && "$INIT" start >> "$LOG" 2>&1; then
         rm -f "$WORK/previous.tar"
         finish false "$rid" "выпуск $rid не прошёл проверку; возвращена прежняя версия" "$rid"

@@ -40,10 +40,40 @@ static int mark_ok(int fd, uint32_t mark) {
 }
 d2k_mark_fn d2k_mark_hook = mark_ok;
 
+/* Scripted TLS TX (task 60): the TLS session is a stub, but the TCP socket is
+   a real loopback connection, so the server's FIN/RST is a kernel fact that
+   the ladder must classify itself. how: 0 healthy, 1 FIN instead of response
+   tx_fail_step, 2 RST instead of it, 3 FIN right after response tx_fail_step-1. */
+static int tx_script, tx_listen = -1, tx_server = -1, tx_client = -1;
+static int tx_fail_step, tx_fail_how, tx_writes;
+static uint64_t tx_written;
+static unsigned tx_pad_sum[D2K_VOL_STEPS];
+static size_t tx_resp_off;
+static int tx_session;
+static void tx_server_close(int rst) {
+    if (tx_server < 0) return;
+    /* Unread data turns close() into RST on Linux and BSD: drain it first so
+       the FIN cases really send FIN. */
+    for (;;) {
+        struct pollfd q = { tx_server, POLLIN, 0 };
+        char sink[4096];
+        if (poll(&q, 1, 0) <= 0 || read(tx_server, sink, sizeof sink) <= 0) break;
+    }
+    if (rst) { struct linger lg = {1, 0}; (void)setsockopt(tx_server, SOL_SOCKET, SO_LINGER, &lg, sizeof lg); }
+    close(tx_server); tx_server = -1;
+    struct pollfd p = { tx_client, POLLIN, 0 };
+    (void)poll(&p, 1, 1000); /* the kernel has seen it before we report */
+}
+
 int d2k_tls_connect(int fd, const char *sni, int ms, size_t wire,
                     d2k_tls **out, char *err, size_t cap) {
     (void)fd; (void)sni; (void)ms; *out = NULL;
     CHECK(!expected_legacy && wire == expected_wire); modern_calls++;
+    if (tx_script) {
+        tx_client = fd; tx_server = accept(tx_listen, NULL, NULL);
+        CHECK(tx_server >= 0);
+        *out = (d2k_tls *)&tx_session; return 0;
+    }
     snprintf(err, cap, "TX reset"); return -1;
 }
 int d2k_tls12_connect(int fd, const char *sni, int ms, size_t wire,
@@ -53,18 +83,69 @@ int d2k_tls12_connect(int fd, const char *sni, int ms, size_t wire,
     snprintf(err, cap, "TX reset"); return -1;
 }
 int d2k_tls_write(d2k_tls *t, const uint8_t *b, size_t n, char *e, size_t c) {
-    (void)t; (void)b; (void)n; (void)e; (void)c; CHECK(0); return -1;
+    (void)e; (void)c;
+    if (!tx_script) { (void)t; (void)b; (void)n; CHECK(0); return -1; }
+    CHECK(t == (d2k_tls *)&tx_session && tx_writes < D2K_VOL_STEPS);
+    const char *pad = NULL;
+    for (size_t i = 0; i + 7 <= n && !pad; i++)
+        if (!memcmp(b + i, "X-Pad: ", 7)) pad = (const char *)b + i;
+    unsigned sum = 2166136261u;
+    for (const char *q = pad ? pad + 7 : NULL; q && q < (const char *)b + n && *q != '\r'; q++)
+        sum = (sum ^ (unsigned char)*q) * 16777619u;
+    if (tx_writes < D2K_VOL_STEPS) tx_pad_sum[tx_writes] = pad ? sum : 0;
+    tx_writes++; tx_written += n;
+    /* The bytes really travel: after the server has closed, the peer kernel
+       answers them with RST, as a real TLS write would provoke. */
+    int fl = 0;
+#ifdef MSG_NOSIGNAL
+    fl = MSG_NOSIGNAL;
+#endif
+    if (tx_client >= 0 && send(tx_client, b, n, fl) == (ssize_t)n && tx_server >= 0) {
+        /* The stub server consumes the request now: bytes still in flight at
+           a later close() would make the kernel answer them with RST and turn
+           a FIN case into an RST case. */
+        size_t got = 0; char sink[4096];
+        while (got < n) {
+            struct pollfd q = { tx_server, POLLIN, 0 };
+            if (poll(&q, 1, 1000) <= 0) break;
+            ssize_t r = read(tx_server, sink, n - got < sizeof sink ? n - got : sizeof sink);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        CHECK(got == n);
+    }
+    return 0;
 }
 int d2k_tls12_write(d2k_tls12 *t, const uint8_t *b, size_t n, char *e, size_t c) {
     (void)t; (void)b; (void)n; (void)e; (void)c; CHECK(0); return -1;
 }
 long d2k_tls_read(d2k_tls *t, uint8_t *b, size_t n, int ms, char *e, size_t c) {
-    (void)t; (void)b; (void)n; (void)ms; (void)e; (void)c; CHECK(0); return -1;
+    (void)ms;
+    if (!tx_script) { (void)t; (void)b; (void)n; (void)e; (void)c; CHECK(0); return -1; }
+    static const char resp[] = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n";
+    int k = tx_writes - 1;
+    CHECK(t == (d2k_tls *)&tx_session && n >= 1);
+    if ((tx_fail_how == 1 || tx_fail_how == 2) && k == tx_fail_step) {
+        tx_server_close(tx_fail_how == 2);
+        /* What the TLS layer reports for a FIN at a record boundary. */
+        snprintf(e, c, "соединение закрыто на 0-м байте из 5");
+        return -1;
+    }
+    if (tx_server < 0) {
+        snprintf(e, c, "соединение закрыто на 0-м байте из 5");
+        return -1;
+    }
+    *b = (uint8_t)resp[tx_resp_off++];
+    if (tx_resp_off == sizeof resp - 1) {
+        tx_resp_off = 0;
+        if (tx_fail_how == 3 && k == tx_fail_step - 1) tx_server_close(0);
+    }
+    return 1;
 }
 long d2k_tls12_read(d2k_tls12 *t, uint8_t *b, size_t n, int ms, char *e, size_t c) {
     (void)t; (void)b; (void)n; (void)ms; (void)e; (void)c; CHECK(0); return -1;
 }
-void d2k_tls_free(d2k_tls *t) { (void)t; CHECK(0); }
+void d2k_tls_free(d2k_tls *t) { CHECK(tx_script && t == (d2k_tls *)&tx_session); }
 void d2k_tls12_free(d2k_tls12 *t) { (void)t; CHECK(0); }
 
 d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
@@ -181,6 +262,233 @@ d2k_ver_result d2k_verify_probe_path_on(int fd, const char *ip, uint16_t port,
     return d2k_verify_probe_baseline(ip, port, sni, ms, wire, legacy, encoding, mark);
 }
 
+#include <signal.h>
+#include <sys/wait.h>
+
+/* ---- task 60: TX ladder correctness ---------------------------------- */
+
+static int head_rc(const char *s, size_t n) {
+    volume_head h; memset(&h, 0, sizeof h); char why[160];
+    for (size_t i = 0; i < n; i++) {
+        int rc = volume_head_feed(&h, (unsigned char)s[i], why, sizeof why);
+        if (rc) return rc;
+    }
+    return 0;
+}
+#define HEAD(lit) head_rc(lit, sizeof lit - 1)
+/* 1 — final reusable head; -2 — the server itself ends or refuses the probe. */
+static void head_parser_test(void) {
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nServer: x\r\nContent-Length: 5\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 204\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 301 Moved\r\nLocation: /a\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 200 OK\n\n") == 1);
+    /* Informational heads precede the final response of the same request. */
+    CHECK(HEAD("HTTP/1.1 100 Continue\r\n\r\n") == 0);
+    CHECK(HEAD("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 204\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 431 Too Large\r\n\r\n") == -2);
+    /* Keep-alive: HTTP/1.0 only with an explicit token, HTTP/1.1 unless close. */
+    CHECK(HEAD("HTTP/1.0 200 OK\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nconnection: Keep-Alive, Close\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nConnection: closed\r\n\r\n") == 1);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nX-Connection: close\r\n\r\n") == 1);
+    /* Server refusal and protocol change are not path evidence. */
+    CHECK(HEAD("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 400 Bad Request\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 503 Service Unavailable\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n") == -2);
+    /* Malformed or unparseable heads end the probe without a verdict. */
+    CHECK(HEAD("HTTP/2 200\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 2000 OK\r\n\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 600 X\r\n\r\n") == -2);
+    CHECK(HEAD("<html>\r\n") == -2);
+    CHECK(HEAD("HTTP/1.1 200 OK\r\nX: a\0b\r\n\r\n") == -2);
+    static char longline[6000];
+    int n = snprintf(longline, sizeof longline, "HTTP/1.1 200 OK\r\nX: ");
+    memset(longline + n, 'a', 5000); memcpy(longline + n + 5000, "\r\n\r\n", 4);
+    CHECK(head_rc(longline, (size_t)n + 5004) == -2);
+}
+
+/* Bounded plain write: a peer that never reads cannot hold the probe beyond
+   its deadline, the partial count is reported, the descriptor flags restored. */
+static void bounded_send_test(void) {
+    int sv[2]; CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, sv));
+    int small = 4096;
+    (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    static char big[1 << 20]; memset(big, 'x', sizeof big);
+    size_t sent = 0; char why[160] = "";
+    int64_t t0 = now_ms();
+    int rc = volume_send_plain(sv[0], big, sizeof big, 300, &sent, why, sizeof why);
+    int64_t took = now_ms() - t0;
+    CHECK(rc == -1 && sent > 0 && sent < sizeof big);
+    CHECK(took >= 250 && took < 3000 && strstr(why, "таймаут") != NULL);
+    CHECK(!(fcntl(sv[0], F_GETFL, 0) & O_NONBLOCK));
+    close(sv[1]);
+    rc = volume_send_plain(sv[0], big, 100, 300, &sent, why, sizeof why);
+    CHECK(rc == -1 && sent < 100);
+    close(sv[0]);
+}
+
+/* Real plain ladder against a scripted loopback server. */
+enum { PS_OK, PS_INFO, PS_HTTP10_KA, PS_HTTP10, PS_REFUSE, PS_CLOSE_HDR,
+       PS_FIN, PS_FIN_BETWEEN, PS_RST, PS_SILENT };
+static void plain_server(int ls, int how, int step, int report) {
+    int c = accept(ls, NULL, NULL);
+    uint64_t got = 0; char buf[16384]; size_t used = 0; int k = 0;
+    while (c >= 0) {
+        char *end = NULL;
+        for (;;) {
+            for (size_t i = 0; i + 4 <= used && !end; i++)
+                if (!memcmp(buf + i, "\r\n\r\n", 4)) end = buf + i;
+            if (end) break;
+            ssize_t r = read(c, buf + used, sizeof buf - used);
+            if (r <= 0) goto done;
+            used += (size_t)r; got += (uint64_t)r;
+        }
+        size_t reqlen = (size_t)(end + 4 - buf);
+        memmove(buf, buf + reqlen, used - reqlen); used -= reqlen;
+        if (k == step && how >= PS_HTTP10) {
+            static const char refuse[] = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n";
+            static const char closing[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            static const char old[] = "HTTP/1.0 200 OK\r\n\r\n";
+            if (how == PS_REFUSE) { (void)!write(c, refuse, sizeof refuse - 1); goto wait_close; }
+            if (how == PS_CLOSE_HDR) { (void)!write(c, closing, sizeof closing - 1); break; }
+            if (how == PS_HTTP10) { (void)!write(c, old, sizeof old - 1); break; }
+            if (how == PS_FIN) break;
+            if (how == PS_RST) {
+                struct linger lg = {1, 0};
+                (void)setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+                break;
+            }
+            if (how == PS_SILENT) goto wait_close;
+        }
+        static const char ok[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        static const char ka10[] = "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+        static const char info[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n"
+                                   "Link: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+        const char *resp = how == PS_HTTP10_KA ? ka10 : how == PS_INFO ? info : ok;
+        (void)!write(c, resp, strlen(resp));
+        k++;
+        if (how == PS_FIN_BETWEEN && k == step) break;
+    }
+    goto done;
+wait_close:
+    for (;;) { char sink[4096]; ssize_t r = read(c, sink, sizeof sink); if (r <= 0) break; got += (uint64_t)r; }
+done:
+    if (c >= 0) close(c);
+    (void)!write(report, &got, sizeof got);
+    (void)!write(report, &k, sizeof k);
+    _exit(0);
+}
+
+static d2k_vol_result run_plain(int how, int step, uint64_t *got, int *served) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(0x7f000001u);
+    socklen_t al = sizeof a;
+    CHECK(ls >= 0 && bind(ls, (struct sockaddr *)&a, al) == 0 &&
+          getsockname(ls, (struct sockaddr *)&a, &al) == 0 && listen(ls, 1) == 0);
+    int pfd[2]; CHECK(!pipe(pfd));
+    pid_t pid = fork();
+    if (pid == 0) { close(pfd[0]); plain_server(ls, how, step, pfd[1]); }
+    close(pfd[1]);
+    d2k_vol_result r = d2k_volume_probe_path("127.0.0.1", ntohs(a.sin_port), NULL, 1, 0, 0, 0, NULL);
+    *got = 0; *served = -1;
+    CHECK(read(pfd[0], got, sizeof *got) == (ssize_t)sizeof *got);
+    CHECK(read(pfd[0], served, sizeof *served) == (ssize_t)sizeof *served);
+    (void)waitpid(pid, NULL, 0); close(pfd[0]); close(ls);
+    return r;
+}
+
+static void plain_ladder_test(void) {
+    uint64_t got; int served; d2k_vol_result r;
+    static const struct { int how, step; d2k_vol_verdict verdict; int served; const char *what; } cases[] = {
+        { PS_OK,          0, D2K_VOL_PASSED,      10, "healthy keep-alive" },
+        { PS_INFO,        0, D2K_VOL_PASSED,      10, "100/103 before every final head" },
+        { PS_HTTP10_KA,   0, D2K_VOL_PASSED,      10, "HTTP/1.0 with keep-alive" },
+        { PS_HTTP10,      0, D2K_VOL_SHORT,        0, "HTTP/1.0 without keep-alive" },
+        { PS_REFUSE,      5, D2K_VOL_SHORT,        5, "server refuses padded request (431)" },
+        { PS_CLOSE_HDR,   5, D2K_VOL_SHORT,        5, "Connection: close" },
+        { PS_FIN,         5, D2K_VOL_SHORT,        5, "server FIN instead of response" },
+        { PS_FIN_BETWEEN, 5, D2K_VOL_SHORT,        5, "server FIN between responses" },
+        { PS_RST,         5, D2K_VOL_CUT,          5, "RST after 12 KB" },
+        { PS_SILENT,      5, D2K_VOL_CUT,          5, "silence after 12 KB" },
+        { PS_RST,         2, D2K_VOL_SHORT,        2, "RST below 12 KB" },
+        { PS_RST,         0, D2K_VOL_UNREACHABLE,  0, "RST on the first request" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        r = run_plain(cases[i].how, cases[i].step, &got, &served);
+        int ok = r.verdict == cases[i].verdict && served == cases[i].served &&
+                 r.at_kb == (int)(got / 1024);
+        if (!ok) fprintf(stderr, "plain %s: verdict=%d at_kb=%d server got %llu bytes, served %d: %s\n",
+                         cases[i].what, r.verdict, r.at_kb, (unsigned long long)got, served, r.reason);
+        CHECK(ok);
+        CHECK(!strcmp(r.tx_reason, r.reason)); /* plain HTTP: no RX ran */
+        if (cases[i].verdict == D2K_VOL_SHORT && cases[i].step == 5)
+            CHECK(got >= (uint64_t)D2K_VOL_MIN_KB * 1024); /* past the threshold, still no verdict */
+    }
+}
+
+/* TLS path: FIN, RST and a close between responses on a real loopback TCP. */
+static d2k_vol_result run_tls(int how, int step) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(0x7f000001u);
+    socklen_t al = sizeof a;
+    CHECK(ls >= 0 && bind(ls, (struct sockaddr *)&a, al) == 0 &&
+          getsockname(ls, (struct sockaddr *)&a, &al) == 0 && listen(ls, 1) == 0);
+    tx_listen = ls; tx_script = 1; tx_fail_how = how; tx_fail_step = step;
+    tx_writes = 0; tx_written = 0; tx_resp_off = 0; tx_client = -1;
+    memset(tx_pad_sum, 0, sizeof tx_pad_sum);
+    expected_legacy = 0; expected_wire = 1489; expected_path = NULL;
+    baseline_calls = 0; expected_gzip_call = 2; expected_gzip_call2 = -1;
+    d2k_vol_result r = d2k_volume_probe("127.0.0.1", ntohs(a.sin_port), "context.test", 0, 0, 1489, 0x2f);
+    if (tx_server >= 0) close(tx_server);
+    tx_server = -1; tx_script = 0; tx_client = -1; close(ls);
+    return r;
+}
+
+static void tls_ladder_test(void) {
+    d2k_vol_result r = run_tls(0, 0);
+    CHECK(r.verdict == D2K_VOL_PASSED && tx_writes == D2K_VOL_STEPS);
+    CHECK(r.at_kb == (int)(tx_written / 1024) && tx_written > (uint64_t)(D2K_VOL_STEPS - 1) * D2K_VOL_CHUNK);
+    for (int i = 1; i < D2K_VOL_STEPS; i++)
+        for (int j = 1; j < i; j++) CHECK(tx_pad_sum[i] && tx_pad_sum[i] != tx_pad_sum[j]);
+    /* RX is a separate measurement and still runs after the ladder. */
+    CHECK(r.rx_cut && baseline_calls == 3);
+
+    r = run_tls(1, 5);
+    if (r.verdict != D2K_VOL_SHORT) fprintf(stderr, "tls FIN: verdict=%d: %s\n", r.verdict, r.reason);
+    CHECK(r.verdict == D2K_VOL_SHORT && r.at_kb == (int)(tx_written / 1024));
+    CHECK(tx_written >= (uint64_t)D2K_VOL_MIN_KB * 1024);
+    CHECK(r.rx_cut && baseline_calls == 3);
+    /* TX and RX evidence stay distinct: reason carries the RX finding the
+       scheduler reports, tx_reason what ended the ladder. */
+    CHECK(strstr(r.tx_reason, "FIN") != NULL && strstr(r.reason, "FIN") == NULL);
+    /* With an RX cut, reason carries the RX evidence text (sched.c reports it
+       for packet-budget/wire verdicts). Without one, the TX reason survives. */
+    full_non_2xx = 1;
+    r = run_tls(1, 5);
+    full_non_2xx = 0;
+    CHECK(r.verdict == D2K_VOL_SHORT && !r.rx_cut && baseline_calls == 1);
+    CHECK(strstr(r.reason, "FIN") != NULL);
+
+    r = run_tls(2, 5);
+    if (r.verdict != D2K_VOL_CUT) fprintf(stderr, "tls RST: verdict=%d: %s\n", r.verdict, r.reason);
+    CHECK(r.verdict == D2K_VOL_CUT && r.at_kb == (int)(tx_written / 1024));
+    CHECK(r.rx_cut && baseline_calls == 3);
+
+    /* Server closed after response 4: the next write would be answered by
+       the server's own RST. Not a volume cut, and request 5 is never sent. */
+    r = run_tls(3, 5);
+    if (r.verdict != D2K_VOL_SHORT) fprintf(stderr, "tls FIN-between: verdict=%d: %s\n", r.verdict, r.reason);
+    CHECK(r.verdict == D2K_VOL_SHORT && tx_writes == 5 && r.at_kb == (int)(tx_written / 1024));
+}
+
 int main(void) {
     for (int family = 4; family <= 6; family += 2) {
     for (int legacy = 0; legacy <= 1; legacy++) {
@@ -212,6 +520,7 @@ int main(void) {
             : d2k_volume_probe(ip, port, "context.test", 0, legacy, expected_wire, 0x2f);
         CHECK(r.verdict == D2K_VOL_UNREACHABLE && r.rx_cut &&
               baseline_calls == 3 && r.rx_at_kb == 23);
+        CHECK(r.probes == 1 + baseline_calls);
         /* Задача 26: доказанный обрыв обязан назвать свой путь наверх. Мерили
            по названному ресурсу — он и в результате; мерили по «/» — поле
            пусто, выдумывать «/» нечем. */
@@ -383,6 +692,11 @@ int main(void) {
     probe_response_volume(&fn2, "127.0.0.1", 443, "context.test", 0, 1536, 0x2f, NULL);
     CHECK(baseline_calls == 1 && !fn2.rx_cut && !fn2.rx_short && !fn2.rx_unmeasured && !fn2.rx_direct_complete);
     full_non_2xx = 0;
+    signal(SIGPIPE, SIG_IGN);
+    head_parser_test();
+    bounded_send_test();
+    plain_ladder_test();
+    tls_ladder_test();
     if (failures) return 1;
     puts("test_volume_context: OK"); return 0;
 }

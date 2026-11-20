@@ -27,7 +27,9 @@
 #include "../runtime/d2k_runtime.h"
 #include "d2k_crypto.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,15 +38,27 @@
 #include <unistd.h>
 
 #include "d2k_sched.h"
+#include "dns_journal.inc"
+#ifdef D2K_TRUSTED_DOH
+#include "d2k_dns_capture.h"
+#include "d2k_provider_ips.h"
+static d2k_provider_ips provider_ips;
+static char provider_ips_path[D2K_CATALOG_PATH_MAX + 32];
+#endif
+#include "../synthesis/provider.h"
+#include "../synthesis/application_search.h"
+#include "../synthesis/application_history.h"
 #include "d2k_arm.h"
 #include "d2k_diagnostics.h"
 #include "../runtime/d2k_diagnostics_files.h"
 #include "d2k_httpsprobe.h"
 #include "d2k_httpsearch.h"
 #include "d2k_plantlv.h"
+#include "d2k_groups.h"
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include "d2k_link.h"
+#include <arpa/inet.h>
 
 /* Переходник к перенесённому измерителю (detect/bridge.c). Объявлен здесь, а
  * не в заголовке ядра: ядро о detect/ не знает и знать не должно — связь
@@ -52,6 +66,173 @@
 /* Просит перенесённый измеритель бросить всё, что он сейчас меряет. Нужен на
  * остановке: без него выход ждал окончания замера — до десятков минут. */
 void d2k_detect_stop_all(void);
+static int synthesis_session_feedback(void *ctx,const d2k_synthesis_feedback *event,
+    d2k_verification_status outcome)
+{
+    return d2k_tls_path_session_disposition(ctx,event->generation,event->program,outcome);
+}
+static void synthesis_session_release(void *ctx) {d2k_tls_path_session_free(ctx);}
+static const char *synthesis_catalog_path;
+typedef struct {d2k_application_search *search;FILE *archive;int reported_probes;} application_search_owner;
+static int application_search_feedback(void *ctx,const d2k_synthesis_feedback *event,
+    d2k_verification_status outcome) {
+    application_search_owner *owner=ctx;
+    return owner?d2k_application_search_feedback(owner->search,event,outcome):-1;
+}
+static void application_search_release(void *ctx) {
+    application_search_owner *owner=ctx;if(!owner)return;
+    d2k_application_search_free(owner->search);
+    if(owner->archive)fclose(owner->archive);
+    free(owner);
+}
+static int application_history_offer(void *ctx,FILE *file) {
+    return d2k_application_search_history(ctx,file);
+}
+static d2k_syn_status application_search_provider(const d2k_application_request *request,
+    const d2k_tls_stream *stream,const d2k_experiment *experiment,uint64_t generation,d2k_vres *out) {
+    uint64_t old_generation=0;
+    application_search_owner *old=d2k_sched_synthesis_take(application_search_release,&old_generation);
+    memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
+    application_search_owner *owner=NULL;
+    char *path=NULL;
+    if(old) {
+        if(!old_generation || !d2k_application_search_matches(old->search,request,
+            experiment,old_generation,stream->read_timeout_ms,stream->trigger->len)) {
+            application_search_release(old);
+        } else {
+            generation=old_generation;owner=old;goto resume;
+        }
+    }
+    owner=calloc(1,sizeof *owner);
+    if(!owner || !synthesis_catalog_path)goto fail;
+    size_t length=strlen(synthesis_catalog_path);
+    static const char suffix[]=".application-XXXXXX";
+    if(length>SIZE_MAX-sizeof suffix)goto fail;
+    path=malloc(length+sizeof suffix);if(!path)goto fail;
+    memcpy(path,synthesis_catalog_path,length);memcpy(path+length,suffix,sizeof suffix);
+    int fd=mkstemp(path);free(path);path=NULL;
+    if(fd<0)goto fail;
+    owner->archive=fdopen(fd,"w+b");
+    if(!owner->archive){close(fd);goto fail;}
+    owner->search=d2k_application_search_new(request,experiment,generation,
+        stream->read_timeout_ms,stream->trigger->len,owner->archive);
+    if(!owner->search)goto fail;
+    d2k_inference_control history_control={0};
+    if(experiment->cancel) {
+        history_control.cancelled=experiment->cancel->fn;
+        history_control.context=experiment->cancel->ctx;
+    }
+    if(d2k_application_history_scan(synthesis_catalog_path,application_history_offer,
+        owner->search,&history_control,NULL)<0)goto fail;
+resume:;
+    d2k_syn_status status=d2k_application_search_next(owner->search,out);
+    int total=out->probes;
+    out->probes=total>=owner->reported_probes?total-owner->reported_probes:0;
+    if(total>owner->reported_probes)owner->reported_probes=total;
+    if(status!=D2K_SYN_CANDIDATE ||
+       !d2k_sched_synthesis_retain(generation,owner,application_search_release,application_search_feedback))
+        application_search_release(owner);
+    return status;
+fail:
+    free(path);application_search_release(owner);
+    snprintf(out->reason,sizeof out->reason,"cannot create owned DoH application search/archive");
+    return D2K_SYN_ERROR;
+}
+static int application_stop(void *ctx) {
+    return ctx && *(const volatile sig_atomic_t *)ctx;
+}
+static int application_synthesis_dispatch(const d2k_application_request *request,size_t wire,
+    int timeout,uint32_t mark,const volatile sig_atomic_t *stop,d2k_vres *out) {
+    uint64_t generation=0;
+    d2k_trigger *trigger=calloc(1,sizeof *trigger);
+    d2k_detect_stop cancel={application_stop,(void *)stop};
+    d2k_experiment network={.family=request->family,.port=request->port,
+        .mark=mark,.connect_ms=timeout,.offer_ts=1,.cancel=&cancel};
+    if(!trigger || d2k_t13_random((uint8_t *)&generation,sizeof generation) || !generation ||
+       inet_pton(request->family==6?AF_INET6:AF_INET,request->ip,network.ip)!=1) {
+        free(trigger);memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
+        snprintf(out->reason,sizeof out->reason,"cannot create owned application synthesis context");return 1;
+    }
+    trigger->len=wire;size_t whole=wire;
+    d2k_tls_stream stream={trigger,&whole,1,timeout,1};
+    d2k_syn_status status=application_search_provider(request,&stream,&network,generation,out);
+    free(trigger);
+    return status!=D2K_SYN_CLOSED;
+}
+static int synthesis_response_control(d2k_tls_path_session *session,
+    const d2k_application_request *request,const d2k_experiment *experiment)
+{
+    const d2k_application_control *c=&request->control;unsigned epoch=0;
+    for(size_t i=0;i<sizeof c->epoch;i++)epoch|=c->epoch[i];
+    if(!session || !experiment->offer_ts || !epoch || !c->incarnation || !c->bytes ||
+       !c->low_port || !c->high_port || c->transport!=6 ||
+       (c->family!=4 && c->family!=6) || c->family!=request->family ||
+       c->family!=experiment->family || !memchr(c->name,0,sizeof c->name) ||
+       !c->name[0] || !strcmp(c->name,request->target))return 0;
+    for(const unsigned char *p=(const unsigned char *)c->name;*p;p++)
+        if(!((*p>='a' && *p<='z') || (*p>='A' && *p<='Z') ||
+             (*p>='0' && *p<='9') || *p=='.' || *p=='-'))return 0;
+    uint8_t *bytes=malloc(D2K_TRIGGER_MAX);if(!bytes)return -1;
+    size_t length=0;
+    if(d2k_hello_from_profile((d2k_shape)request->shape,c->name,bytes,D2K_TRIGGER_MAX,&length)) {
+        free(bytes);return -1;
+    }
+    size_t segment=d2k_raw_segment_max();if(segment>length)segment=length;
+    int added=d2k_tls_path_session_add_prefix(session,bytes,length,segment,0);
+    free(bytes);return added;
+}
+static d2k_syn_status synthesis_session_provider(const d2k_tls_stream *stream,
+    const d2k_experiment *experiment,uint64_t generation,d2k_vres *out)
+{
+    d2k_application_request request;
+    int requested=d2k_sched_application_request(&request)==1;
+    if(requested && !request.ech &&
+       !request.by_addr && request.transport==6 &&
+       (request.shape==D2K_SHAPE_MODERN || (request.shape==D2K_SHAPE_LEGACY && !request.doh)) &&
+       request.resource[0]=='/' && memchr(request.resource,0,sizeof request.resource))
+        return application_search_provider(&request,stream,experiment,generation,out);
+    int response_mode=requested && !request.ech && !request.by_addr && request.transport==6 &&
+        (request.shape==D2K_SHAPE_MODERN || request.shape==D2K_SHAPE_LEGACY) && !request.resource[0];
+    size_t whole=stream->trigger->len;
+    d2k_tls_stream response_stream=*stream;
+    d2k_experiment response_experiment=*experiment;
+    if(response_mode) {
+        response_stream.chunk_bytes=&whole;response_stream.chunks=1;
+        response_experiment.tls_input=stream->trigger->payload;
+        response_experiment.tls_input_length=whole;
+        stream=&response_stream;experiment=&response_experiment;
+    }
+    uint64_t previous_generation=0;
+    int previous_probes=0;
+    d2k_tls_path_session *session=d2k_sched_synthesis_take(synthesis_session_release,&previous_generation);
+    if(session && (!d2k_tls_path_session_resumable(session) ||
+                   !d2k_tls_path_session_matches(session,stream,experiment))) {
+        d2k_tls_path_session_free(session);session=NULL;
+    }
+    if(session) {generation=previous_generation;previous_probes=d2k_tls_path_session_probes(session);}
+    else session=response_mode?d2k_tls_path_session_new_response(stream,experiment,generation):
+        d2k_tls_path_session_new(stream,experiment,generation);
+
+    d2k_syn_status status=d2k_tls_path_session_next(session,out);
+    if(!session)return status;
+    if(response_mode && status==D2K_SYN_CLOSED) {
+        int added=synthesis_response_control(session,&request,experiment);
+        if(added>0)status=d2k_tls_path_session_next(session,out);
+        else if(added<0) {
+            status=D2K_SYN_ERROR;
+            if(out) {
+                out->program[0]=0;out->program_len=0;
+                snprintf(out->reason,sizeof out->reason,"не удалось построить вопрос из наблюдения прямого TLS-потока");
+            }
+        }
+    }
+    if(out)out->probes=out->probes>=previous_probes?out->probes-previous_probes:0;
+    if((status!=D2K_SYN_CANDIDATE && status!=D2K_SYN_DIRECT_RESPONSE) ||
+       !d2k_sched_synthesis_retain(generation,session,synthesis_session_release,synthesis_session_feedback))
+        d2k_tls_path_session_free(session);
+    return status;
+}
+
 /* Потолок сегмента отправителя замера (detect/raw.c): ставится по пределу
  * датапата вместе с d2k_sched_set_send_cap, чтобы замер и план шли одними
  * сегментами (поле 22.10.2026, issue #5/#7). */
@@ -61,34 +242,19 @@ d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               d2k_hello trigger, d2k_hello control,
                               uint32_t mark, int repeats,
                               uint32_t gap_us, uint32_t wait_ms,
-                              const volatile sig_atomic_t *stop);
+                              const volatile sig_atomic_t *stop,
+                              const d2k_sched_tcp_extra *extra);
 /* Только базовый вопрос того же измерителя (задача 32): им планировщик
  * подтверждает блокировку на рукопожатии, прежде чем пробовать свои планы. */
 d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                                    d2k_hello trigger, d2k_hello control,
                                    uint32_t mark, int repeats,
                                    uint32_t gap_us, uint32_t wait_ms,
-                                   const volatile sig_atomic_t *stop);
+                                   const volatile sig_atomic_t *stop,
+                                   const d2k_sched_tcp_extra *extra);
 /* Нейтральный байт перепроверки мёртвого адреса (задача 54). */
 int d2k_detect_sched_tcp_ack(const char *ip, uint16_t port, uint32_t mark,
                              const volatile sig_atomic_t *stop, int *probes);
-d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
-                                     d2k_hello trigger, d2k_hello control,
-                                     uint32_t mark, int repeats,
-                                     uint32_t gap_us, uint32_t wait_ms,
-                                     const volatile sig_atomic_t *stop,
-                                     const d2k_base_seed *seed);
-d2k_vres d2k_detect_sched_tcp_white(const char *ip, uint16_t port,
-                                    d2k_hello trigger, d2k_hello control, d2k_hello white,
-                                    uint32_t mark, int repeats,
-                                    uint32_t gap_us, uint32_t wait_ms,
-                                    const volatile sig_atomic_t *stop);
-d2k_vres d2k_detect_sched_tcp_seeded_white(const char *ip, uint16_t port,
-                                           d2k_hello trigger, d2k_hello control, d2k_hello white,
-                                           uint32_t mark, int repeats,
-                                           uint32_t gap_us, uint32_t wait_ms,
-                                           const volatile sig_atomic_t *stop,
-                                           const d2k_base_seed *seed);
 
 /* Период тика. Унаследован с Go-стороны (controller.go: time.NewTicker(3 *
    time.Second)) и там же обоснован: счётчики ядра опрашиваются по часам, а не
@@ -113,12 +279,48 @@ d2k_vres d2k_detect_sched_tcp_seeded_white(const char *ip, uint16_t port,
 
 static volatile sig_atomic_t stop_asked;
 static void on_signal(int sig) { (void)sig; stop_asked = 1; }
+typedef struct {
+    int output;
+    volatile sig_atomic_t halt;
+    dns_journal_cursor cursor;
+} dns_journal_reader;
+static void *dns_journal_run(void *context) {
+    dns_journal_reader *reader=context;
+    while(!reader->halt) {
+        FILE *f=popen("ndmc -c 'show log' 2>/dev/null","r");
+        if(f) {
+            dns_journal_cursor next=reader->cursor;
+            dns_journal_hits hits={0};
+            int valid=!dns_journal_scan(f,&next,&hits);
+            int status=pclose(f);
+            if(valid && status==0) {
+                reader->cursor=next;
+                for(size_t i=0;i<hits.count;i++)
+                    (void)write(reader->output,hits.names[i],sizeof hits.names[i]);
+            }
+        }
+        for(int i=0;i<50 && !reader->halt;i++) {
+            struct timespec pause={0,100000000L};
+            while(nanosleep(&pause,&pause)<0 && errno==EINTR && !reader->halt){}
+        }
+    }
+    return NULL;
+}
 
 static int64_t now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
+#ifdef D2K_TRUSTED_DOH
+static void observe_dns_answer(void *context,const d2k_dns_answer *answer) {
+    d2k_sched_dns_observe_answer(context,answer,now_ms());
+    (void)d2k_provider_ips_observe(&provider_ips,answer,(uint64_t)time(NULL));
+}
+static void observe_dns_question(void *context,const char *name,uint16_t type) {
+    d2k_sched_dns_observe_question(context,name,type,now_ms());
+}
+#endif
 
 /* Атомарное сохранение: временный файл рядом, затем rename. Рядом, а не в
    /tmp — rename между файловыми системами не работает, а /opt и /tmp на
@@ -404,6 +606,12 @@ static void usage(void) {
         "  --log      куда писать журнал (умолчание — стандартный вывод)\n"
         "  --https-cache  кэш HTTPS имён для вставки провайдера (умолчание — рядом с каталогом)\n"
         "  --mark     метка verifier-зондов; они идут через NFQUEUE (умолчание 0x2d)\n"
+        "  --synthesis-only: disable all legacy searches and catalog plans (requires SHADOW+NEWCHAIN)\n"
+        "  --newchain-store PATH: opt-in working bindings from SHADOW (default disabled)\n"
+        "  --shadow-queue ограниченная очередь TLS-подозрений для тени (умолчание — выключено)\n"
+        "  --dns-upstreams снимок текущих DNS-апстримов; изменения подхватываются автоматически\n"
+        "  --dns-addresses собственные наблюдения адресов апстримов, без смены TLS-имени\n"
+        "  --dns-routes частный снимок разрешений для восстановления настроенных DNS\n"
         "  --measure-mark метка измерений; обычно обходит собственную NFQUEUE (по умолчанию --mark)\n");
 }
 
@@ -415,6 +623,52 @@ static int offline_self_check(void) {
 }
 
 /* Bounded optional observer. Its state never participates in search decisions. */
+/* НАБЛЮДЕНИЕ ПОТОКОВ ПО CONNTRACK (этап 37): счётчики записи по кортежу.
+   Только чтение (GET); поток не меняется. Нет ctnetlink — наблюдения нет. */
+static int g_ct_fd = -1;
+static uint32_t g_ct_seq;
+static int ct_query_live(const d2k_ct_tuple *t, d2k_ct_info *out) {
+    if (g_ct_fd < 0) return -1;
+    if (++g_ct_seq == 0) g_ct_seq = 1;
+    int rc = d2k_ct_query_info_fd(g_ct_fd, g_ct_seq, t, out);
+    /* 2 — запись есть, счётчиков нет (учёт conntrack выключен): это «данных
+       нет» для наблюдения (counters_known = 0), а не «недоступно». */
+    if (rc == 2) { out->counters_known = 0; return 0; }
+    return rc == 0 ? 0 : rc == 1 ? 1 : -1;
+}
+
+/* Соседи по адресу (этап 38): одно перечисление conntrack семейства — только
+   чтение. Сосед — запись того же транспорта к тому же адресу и порту
+   сервера, кроме самого потока. Счётчики — за ВСЮ жизнь записи (этап 45):
+   ответ виден когда-то за её жизнь, не «сейчас». Ответ засчитывается только
+   доказанный: у UDP — хоть одна датаграмма оттуда; у TCP — байты сверх
+   наибольших возможных заголовков (IPv4: 60 IP + 60 TCP); у IPv6 заголовки
+   расширения не ограничены — данные байтами не доказываются. Иначе — «не
+   доказан» (ACK с опциями и короткий ответ неразличимы), а не «ответа нет». */
+typedef struct { const d2k_ct_tuple *self; unsigned flows, judged, answered; } peers_ctx;
+static int peers_cb(void *ctx, const d2k_ct_tuple *t, const d2k_ct_info *i) {
+    peers_ctx *c = ctx;
+    const d2k_ct_tuple *me = c->self;
+    size_t al = me->family == 6 ? 16 : 4;
+    if (t->family != me->family || t->proto != me->proto || memcmp(t->dst, me->dst, al) ||
+        memcmp(t->dport_be, me->dport_be, 2)) return 0;
+    if (!memcmp(t->src, me->src, al) && !memcmp(t->sport_be, me->sport_be, 2)) return 0;
+    c->flows++;
+    if (!i->counters_known) return 0;   /* учёт выключен — ответ не судим */
+    c->judged++;
+    if (me->proto == 6 ? me->family != 6 && i->reply_bytes > i->reply_pkts * 120u : i->reply_pkts > 0)
+        c->answered++;
+    return 0;
+}
+static int ct_peers_live(const d2k_ct_tuple *self, unsigned *flows, unsigned *judged, unsigned *answered) {
+    if (g_ct_fd < 0) return -1;
+    peers_ctx c = { self, 0, 0, 0 };
+    if (++g_ct_seq == 0) g_ct_seq = 1;
+    if (d2k_ct_dump_fd(g_ct_fd, g_ct_seq, self->family, peers_cb, &c, 200) < 0) return -1;
+    *flows = c.flows; *judged = c.judged; *answered = c.answered;
+    return 0;
+}
+
 static d2k_diag *diagnostics;
 static void diagnostic_event(void *ctx,const d2k_diag_event *e) {
     (void)ctx;d2k_diag_record(diagnostics,e);
@@ -468,11 +722,24 @@ int main(int argc, char **argv) {
     uint32_t mark = 0x2d;
     uint32_t measure_mark = 0;
     int have_measure_mark = 0;
+    const char *doh_path = NULL;
+    const char *dns_configuration = NULL,*dns_addresses=NULL,*dns_routes=NULL;
+    const char *force_path = NULL;
+    const char *shadow_queue = NULL,*newchain_store=NULL;
+    int synthesis_only=0;
 
     for (int i = 1; i < argc; i++) {
         const char *f = argv[i];
-        if (strcmp(f, "--health-file") == 0 && i + 1 < argc) { health_path = argv[++i]; }
+        if(!strcmp(f,"--synthesis-only")) {synthesis_only=1;}
+        else if (strcmp(f, "--health-file") == 0 && i + 1 < argc) { health_path = argv[++i]; }
         else if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
+        else if (strcmp(f, "--newchain-store") == 0 && i + 1 < argc) { newchain_store = argv[++i]; }
+        else if (strcmp(f, "--shadow-queue") == 0 && i + 1 < argc) { shadow_queue = argv[++i]; }
+        else if (strcmp(f, "--force-targets") == 0 && i + 1 < argc) { force_path = argv[++i]; }
+        else if (strcmp(f, "--doh-targets") == 0 && i + 1 < argc) { doh_path = argv[++i]; }
+        else if (strcmp(f,"--dns-upstreams")==0 && i+1<argc) {dns_configuration=argv[++i];}
+        else if (strcmp(f,"--dns-addresses")==0 && i+1<argc) {dns_addresses=argv[++i];}
+        else if (strcmp(f,"--dns-routes")==0 && i+1<argc) {dns_routes=argv[++i];}
         else if (strcmp(f, "--catalog") == 0 && i + 1 < argc) { catpath = argv[++i]; }
         else if (strcmp(f, "--live") == 0 && i + 1 < argc) { livepath = argv[++i]; }
         else if (strcmp(f, "--log") == 0 && i + 1 < argc) { logpath = argv[++i]; }
@@ -488,6 +755,10 @@ int main(int argc, char **argv) {
         }
     }
     if (!sock) { usage(); return 2; }
+    if(synthesis_only && (!shadow_queue || !newchain_store)) {
+        fprintf(stderr,"d2kc: SYNTHESIS_ONLY requires SHADOW and NEWCHAIN\n");return 2;
+    }
+    if(newchain_store && !shadow_queue) {fprintf(stderr,"d2kc: NEWCHAIN requires SHADOW (--shadow-queue)\n");return 2;}
 
     /* Тот же приём, что в d2kd.c и ctlprobe.c: процесс не имеет права умирать
        оттого, что собеседник отвалился между записями. */
@@ -508,6 +779,11 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#ifdef D2K_TRUSTED_DOH
+    d2k_verify_doh_set_tls(d2k_doh_trusted_tls_open);
+    d2k_verify_dot_set_probe(d2k_dot_trusted_probe);
+    d2k_verify_plain_dns_set_probe(d2k_plain_dns_probe);
+#endif
 
     d2k_catalog cat;
     memset(&cat, 0, sizeof cat);
@@ -525,6 +801,24 @@ int main(int argc, char **argv) {
         printf("d2kc: каталога %s нет — начинаю с пустого\n", catpath);
     }
 
+    if(!cat.groups) cat.groups=calloc(1,sizeof *cat.groups);
+    if(!cat.groups) {
+        fprintf(stderr,"d2kc: нет памяти под наблюдения семейств\n");
+        d2k_catalog_free(&cat);return 1;
+    }
+    /* Без рабочего файла на флеше (диск полон, каталог только для чтения,
+       нет дескриптора или отображения) обучение семейств ОТКЛЮЧЕНО, а не
+       перенесено в память: история остаётся в каталоге как есть, точные
+       подтверждённые планы работают. Отказ запуска стоил бы их всех. */
+    if(d2k_group_store_open(cat.groups,catpath))
+        fprintf(stderr,"d2kc: ДЕГРАДАЦИЯ: файловое хранилище наблюдений семейств рядом с %s "
+                       "не создалось — обучение семейств и их области отключены, история "
+                       "семейств в каталоге сохраняется без изменений; точные планы работают\n",
+                catpath);
+    if(cat.groups->store_failed && cat.groups->preserved_len && !cat.groups->preserved_map)
+        fprintf(stderr,"d2kc: ДЕГРАДАЦИЯ: историю семейств в %s не удалось отобразить для "
+                       "обратной записи — сохранение каталога отключено, файл на флеше не "
+                       "меняется; точные планы работают\n", catpath);
     int fd = d2k_link_open(sock, err, sizeof err);
     if (fd < 0) {
         fprintf(stderr, "d2kc: связь с датапатом %s: %s\n", sock, err);
@@ -536,15 +830,8 @@ int main(int argc, char **argv) {
        proves it uses this key layout. Old greetings have shorter keys and
        cannot be safely interpreted as version-4 traffic. */
     d2k_ev greeting;
-    if (d2k_link_next(fd, &greeting, 2000, err, sizeof err) != 0) {
-        fprintf(stderr, "d2kc: нет корректного приветствия датапата: %s\n", err);
-        d2k_link_close(fd);
-        d2k_catalog_free(&cat);
-        return 1;
-    }
-    if (greeting.kind != D2K_EV_PROTO || greeting.num != D2K_CTL_PROTO_VERSION || strcmp(greeting.release_id, D2K_RELEASE_ID)) {
-        fprintf(stderr, "d2kc: несовместимое приветствие датапата, нужна версия %u\n",
-                (unsigned)D2K_CTL_PROTO_VERSION);
+    if (d2k_link_greeting(fd, 2000, &greeting, err, sizeof err) != 0) {
+        fprintf(stderr, "d2kc: %s\n", err);
         d2k_link_close(fd);
         d2k_catalog_free(&cat);
         return 1;
@@ -558,7 +845,34 @@ int main(int argc, char **argv) {
         d2k_catalog_free(&cat);
         return 1;
     }
+#ifdef D2K_TRUSTED_DOH
+    d2k_sched_set_plain_trial(s,d2k_plain_dns_prepare,d2k_plain_dns_run_trial);
+#endif
+    if(d2k_sched_set_shadow(s,shadow_queue)) {
+        fprintf(stderr,"d2kc: путь очереди тени слишком длинный\n");
+        d2k_sched_free(s);d2k_link_close(fd);d2k_catalog_free(&cat);return 2;
+    }
     d2k_sched_set_measure_mark(s, have_measure_mark ? measure_mark : mark);
+    if (doh_path && d2k_sched_doh_load(s,doh_path)<0) {
+        fprintf(stderr,"d2kc: invalid DoH targets file\n"); return 2;
+    }
+    if (force_path && d2k_sched_force_load(s,force_path)<0) {
+        fprintf(stderr,"d2kc: invalid force targets file\n"); return 2;
+    }
+    int dns_reload_error=0;
+    if(dns_configuration && d2k_sched_doh_discover(s,dns_configuration,dns_addresses)<0) {
+        dns_reload_error=1;
+        fprintf(stderr,"d2kc: DNS configuration snapshot rejected; previous registry retained\n");
+    }
+    g_ct_fd = d2k_ct_open();
+    if (g_ct_fd >= 0 && d2k_ct_probe_fd(g_ct_fd, ++g_ct_seq, 200) == 1) {
+        d2k_sched_set_ct_query(s, ct_query_live);
+        d2k_sched_set_ct_peers(s, ct_peers_live);
+        printf("d2kc: наблюдение потоков по conntrack включено (только чтение счётчиков)\n");
+    } else {
+        printf("d2kc: conntrack по netlink недоступен — наблюдения скорости и застоя потоков нет\n");
+        if (g_ct_fd >= 0) { close(g_ct_fd); g_ct_fd = -1; }
+    }
     d2k_sched_set_send_cap(s, greeting.send_maxlen);
     d2k_raw_set_segment_max(d2k_arm_segment(greeting.send_maxlen));
 
@@ -566,11 +880,22 @@ int main(int argc, char **argv) {
 
     /* Зонд HTTPS — с меткой зондов контроллера: через очередь, с уже
        подтверждённым планом имени, без нового обнаружения. */
-    d2k_httpsprobe *hp = d2k_httpsprobe_new(mark, NULL);
-    if (!hp) {
+    d2k_httpsprobe *hp = synthesis_only?NULL:d2k_httpsprobe_new(mark, NULL);
+    if (!hp && !synthesis_only) {
         fprintf(stderr, "d2kc: зонд HTTPS не завёлся — вставка провайдера в HTTP "
                         "будет идти клиенту как есть\n");
     }
+#ifdef D2K_TRUSTED_DOH
+    {
+        const char *slash=strrchr(catpath,'/');
+        size_t dirlen=slash?(size_t)(slash-catpath+1):0;
+        if(dirlen<sizeof provider_ips_path-20) {
+            memcpy(provider_ips_path,catpath,dirlen);
+            strcpy(provider_ips_path+dirlen,"provider-ips");
+            (void)d2k_provider_ips_load(&provider_ips,provider_ips_path,(uint64_t)time(NULL));
+        }
+    }
+#endif
     /* Кэш HTTPS переживает перезапуск (ревью I2): иначе первый заход после
        каждого перезапуска снова видел бы портал. Рядом с каталогом. */
     char https_buf[D2K_CATALOG_PATH_MAX + 32];
@@ -596,17 +921,17 @@ int main(int argc, char **argv) {
             g_http_plans = plans_buf;
         }
     }
-    g_hr = d2k_hs_runner_new();
+    g_hr = synthesis_only?NULL:d2k_hs_runner_new();
     if (g_hr) {
         d2k_hs_ops ops = {hs_open_port, hs_close_port, hs_set_probe, hs_del_probe, hs_set_plan,
                           hs_del_plan, hs_start, hs_say, hs_changed, NULL};
         g_hs = d2k_httpsearch_new(&ops);
         if (g_hs) { hs_measured_poisons(g_hs, &cat); }
     }
-    if (!g_hs) {
+    if (!g_hs && !synthesis_only) {
         fprintf(stderr, "d2kc: поиск обхода HTTP не завёлся — вставка в HTTP без HTTPS "
                         "останется как есть\n");
-    } else if (g_http_plans) {
+    } else if (g_hs && g_http_plans) {
         size_t nl = 0;
         char herr[300];
         if (d2k_httpsearch_load(g_hs, g_http_plans, &nl, herr, sizeof herr) != 0) {
@@ -642,20 +967,20 @@ int main(int argc, char **argv) {
      *
      * Крючок, а не правка планировщика: тесты подменяют эту же точку, чтобы
      * утверждать развилку по транспорту, не выходя в сеть. */
+    synthesis_catalog_path=catpath;
+    /* Keep research searches out of the restored working controller. An
+       experimental result must not delay or short-circuit its measurements. */
+    d2k_detect_synthesis_set(synthesis_only ? synthesis_session_provider : NULL);
+    d2k_sched_application_synthesis_hook=synthesis_only ? application_synthesis_dispatch : NULL;
     d2k_sched_tcp_hook = d2k_detect_sched_tcp;
     /* Свои подтверждённые планы — до полного замера (задача 32, ТЗ §3.4):
      * базовый вопрос донора отдельно, тем же измерителем. */
     d2k_sched_tcp_base_hook = d2k_detect_sched_tcp_base;
-    /* Полный прогон берёт уже снятый ответ базы, а не спрашивает её снова;
-     * QUIC — тот же шаг своим путём (core/quicprobe.c). */
-    d2k_sched_tcp_seeded_hook = d2k_detect_sched_tcp_seeded;
-    /* Белое имя сети приманкой для вопроса «приветствие под меткой» (поле
-     * 10.10.2026): отдельный крючок, т.к. сигнатуру основного менять нельзя. */
-    d2k_sched_tcp_white_hook = d2k_detect_sched_tcp_white;
-    /* Тот же белый крючок, но на seeded-пути: у целей семейства C замер идёт
-     * снятыми байтами клиента (seed), и без этого приманка не доходила — вопрос
-     * не задавался в поле (прогон ac4edeb, 19 сайтов). */
-    d2k_sched_tcp_seeded_white_hook = d2k_detect_sched_tcp_seeded_white;
+    /* Дополнения полного прогона — ответ уже снятой базы, белое имя сети
+     * приманкой и знание о коробке из каталога — едут в d2k_sched_tcp_extra
+     * через тот же крючок. Прежде у каждого был свой: четыре сигнатуры и
+     * каскад выбора в планировщике (23.10.2026). QUIC свой путь сохраняет
+     * (core/quicprobe.c). */
     /* Перепроверка адреса с вердиктом address — сначала один нейтральный
      * байт, до любого триггера (задача 54). */
     d2k_sched_tcp_ack_hook = d2k_detect_sched_tcp_ack;
@@ -666,6 +991,23 @@ int main(int argc, char **argv) {
        хранит, и без этого прохода каждая уже изученная цель начинала бы поиск
        заново. Сам проход идёт порциями в цикле ниже — залпом он создавал бы
        окно, в котором датапату некуда сказать про живой трафик. */
+    if(d2k_sched_set_newchain(s,newchain_store)) {
+        fprintf(stderr,"d2kc: NEWCHAIN store path rejected\n");d2k_sched_free(s);d2k_link_close(fd);d2k_catalog_free(&cat);return 2;
+    }
+    if(d2k_sched_set_synthesis_only(s,synthesis_only)) {
+        fprintf(stderr,"d2kc: SYNTHESIS_ONLY dependencies rejected\n");return 2;
+    }
+    if(synthesis_only)printf("d2kc: SYNTHESIS_ONLY=1: старый поиск и восстановление каталога отключены; цели владельца — в DIRECT тени\n");
+    /* Restore acknowledged bindings before admitting client events or old
+       catalog work. Five seconds bounds startup on a broken control peer;
+       unresolved writes stay protected and retry through normal polling. */
+    int64_t restore_until=now_ms()+5000;
+    while(d2k_sched_newchain_pending(s) && now_ms()<restore_until) {
+        d2k_ev e;int rc=d2k_link_next(fd,&e,200,err,sizeof err);
+        if(rc<0)break;
+        if(rc==0 && (e.kind==D2K_EV_ACK || e.kind==D2K_EV_PROTO))d2k_sched_event(s,&e);
+    }
+    if(d2k_sched_newchain_pending(s))sched_say(NULL,"NEWCHAIN: restoration awaiting datapath ACK; pending ownership retained");
     (void)d2k_sched_sync(s);
 
     printf("d2kc: запущен, сокет %s, каталог %s (%zu коробок), метка 0x%x\n",
@@ -697,16 +1039,59 @@ int main(int argc, char **argv) {
     int64_t last_live = 0;
 
     int64_t last_tick = now_ms(), last_save = last_tick;
-    uint64_t dirty = cat.revision; /* catalog contents changed since last save */
+#ifdef D2K_TRUSTED_DOH
+    int64_t last_ip_save=last_tick;
+#endif
+    int64_t last_dns_save=0;
+    uint64_t saved_catalog_revision = 0; /* load migrations and startup changes still need saving */
     int link_lost = 0;
 
+    int64_t dns_reload_at=0;
+    int journal_pipe[2]={-1,-1};pthread_t journal_thread;int journal_started=0;
+    dns_journal_reader journal_reader={.output=-1};
+    if(dns_configuration && access("/bin/ndmc",X_OK)==0 && !pipe(journal_pipe)) {
+        journal_reader.output=journal_pipe[1];
+        int flags=fcntl(journal_pipe[0],F_GETFL,0);
+        int output_flags=fcntl(journal_pipe[1],F_GETFL,0);
+        if(flags>=0 && output_flags>=0 &&
+           !fcntl(journal_pipe[0],F_SETFL,flags|O_NONBLOCK) &&
+           !fcntl(journal_pipe[1],F_SETFL,output_flags|O_NONBLOCK) &&
+           !pthread_create(&journal_thread,NULL,dns_journal_run,&journal_reader))journal_started=1;
+        if(!journal_started){close(journal_pipe[0]);close(journal_pipe[1]);journal_pipe[0]=journal_pipe[1]=-1;}
+    }
+#ifdef D2K_TRUSTED_DOH
+    struct d2k_dns_capture *dns_capture=dns_configuration ? d2k_dns_capture_open() : NULL;
+#endif
     while (!stop_asked) {
+        int64_t dns_now=now_ms();
+#ifdef D2K_TRUSTED_DOH
+        d2k_dns_capture_drain_full(dns_capture,dns_now,observe_dns_question,observe_dns_answer,s);
+        if(provider_ips.dirty && provider_ips_path[0] && dns_now-last_ip_save>=100) {
+            if(d2k_provider_ips_save(&provider_ips,provider_ips_path,(uint64_t)time(NULL)))
+                fprintf(stderr,"d2kc: provider IP registry save failed\n");
+            last_ip_save=dns_now;
+        }
+#endif
+        if(dns_configuration && dns_now>=dns_reload_at) {
+            int failed=d2k_sched_doh_discover(s,dns_configuration,dns_addresses)<0;
+            if(failed && !dns_reload_error)
+                fprintf(stderr,"d2kc: DNS configuration snapshot rejected; previous registry retained\n");
+            dns_reload_error=failed;dns_reload_at=dns_now+1000;
+            if(dns_routes && d2k_sched_dns_routes(s,dns_routes)<0)
+                fprintf(stderr,"d2kc: DNS routing snapshot could not be published\n");
+            if(dns_routes) {
+                char applied[4096+sizeof ".applied"];
+                int n=snprintf(applied,sizeof applied,"%s.applied",dns_routes);
+                if(n>0 && (size_t)n<sizeof applied)d2k_sched_dns_routed(s,applied);
+            }
+        }
         (void)d2k_runtime_heartbeat(health_path, greeting.release_id, 1, 1, 1);
-        struct pollfd pfd[4];
+        struct pollfd pfd[5];
         pfd[0].fd = fd;                       pfd[0].events = POLLIN; pfd[0].revents = 0;
         pfd[1].fd = d2k_sched_wake_fd(s);     pfd[1].events = POLLIN; pfd[1].revents = 0;
         pfd[2].fd = d2k_httpsprobe_wake_fd(hp); pfd[2].events = POLLIN; pfd[2].revents = 0;
         pfd[3].fd = d2k_hs_runner_wake_fd(g_hr); pfd[3].events = POLLIN; pfd[3].revents = 0;
+        pfd[4].fd = journal_pipe[0];           pfd[4].events = POLLIN; pfd[4].revents = 0;
 
         int64_t t = now_ms();
         int wait = (int)(TICK_MS - (t - last_tick));
@@ -716,10 +1101,17 @@ int main(int argc, char **argv) {
                порция обязана идти сразу за чтением событий. */
             wait = 0;
         }
-        int pr = poll(pfd, 4, wait);
+        int pr = poll(pfd, 5, wait);
         if (pr < 0 && errno != EINTR) {
             fprintf(stderr, "d2kc: poll: %s\n", strerror(errno));
             break;
+        }
+        if(pr>0 && (pfd[4].revents&POLLIN)) {
+            char domain[256];
+            while(read(journal_pipe[0],domain,sizeof domain)==sizeof domain) {
+                domain[sizeof domain-1]=0;
+                (void)d2k_sched_dns_journal_error(s,domain);
+            }
         }
 
         if (pr > 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
@@ -731,7 +1123,19 @@ int main(int argc, char **argv) {
                 int drained = 0;
                 for (; drained < 256; drained++) {
                     d2k_ev ev;
-                    if (d2k_link_next(fd, &ev, 0, err, sizeof err) != 0) { break; }
+                    err[0] = '\0';
+                    int lrc = d2k_link_next(fd, &ev, 0, err, sizeof err);
+                    if (lrc != 0) {
+                        /* Кадр прочитан, но не принят (чужой формат, нет
+                           обязательных полей) — он пропущен, канал цел. Молчать
+                           нельзя: иначе невозможно отличить потерянный ACK от
+                           отвергнутого (зависший cleanup, задание 02 28.10). Обрыв
+                           связи сюда не попадает — о нём скажет peer_closed ниже. */
+                        if (lrc < 0 && err[0] && d2k_link_peer_closed(fd) != 1) {
+                            fprintf(stderr, "d2kc: событие датапата отвергнуто и пропущено: %s\n", err);
+                        }
+                        break;
+                    }
                     seen_events++;
                     switch (ev.kind) {
                     case D2K_EV_HELLO:    seen_hello++; break;
@@ -869,14 +1273,17 @@ int main(int argc, char **argv) {
             last_live = t;
         }
 
-        if (t - last_save >= SAVE_EVERY_MS) {
-            if (cat.revision != dirty) {
+        int save_dns=d2k_sched_dns_save_pending(s, saved_catalog_revision) && t - last_dns_save >= 1000;
+        if (save_dns || t - last_save >= SAVE_EVERY_MS) {
+            if (save_dns)last_dns_save=t;
+            if (cat.revision != saved_catalog_revision) {
                 if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
                     fprintf(stderr, "d2kc: каталог не сохранён: %s\n", err);
                 } else {
-                    dirty = cat.revision;
+                    saved_catalog_revision = cat.revision;
+                    d2k_sched_plain_dns_saved(s,d2k_sched_plain_dns_revision(s));
                     printf("d2kc: каталог сохранён (изменение %llu)\n",
-                           (unsigned long long)dirty);
+                           (unsigned long long)saved_catalog_revision);
                     fflush(stdout);
                 }
             }
@@ -895,6 +1302,11 @@ int main(int argc, char **argv) {
                         "работоспособность пары НЕ подтверждена\n");
     }
     printf("d2kc: останавливаюсь\n");
+    if(journal_started) {
+        journal_reader.halt=1;
+        pthread_join(journal_thread,NULL);
+        close(journal_pipe[0]);close(journal_pipe[1]);
+    }
     /* Сперва сказать измерителю бросить, потом уже дожидаться потоков: иначе
        d2k_sched_free досиживает замер до конца, и служба не выходит по
        сигналу (стенд транзита 17.09 повис на этом). Журнал при этом уезжает
@@ -906,9 +1318,15 @@ int main(int argc, char **argv) {
     /* Сперва дождаться зонда (он держит сокет), потом снять свою пробу. */
     d2k_hs_runner_free(g_hr);
     d2k_httpsearch_free(g_hs);
+#ifdef D2K_TRUSTED_DOH
+    d2k_dns_capture_free(dns_capture);
+    if(provider_ips.dirty && provider_ips_path[0] &&
+       d2k_provider_ips_save(&provider_ips,provider_ips_path,(uint64_t)time(NULL)))
+        fprintf(stderr,"d2kc: provider IP registry save failed on shutdown\n");
+#endif
     d2k_sched_free(s);
     d2k_diag_free(diagnostics);diagnostics=NULL;
-    if (cat.revision != dirty) {
+    if (cat.revision != saved_catalog_revision) {
         if (save_atomic(&cat, catpath, err, sizeof err) != 0) {
             fprintf(stderr, "d2kc: каталог не сохранён на выходе: %s\n", err);
         }

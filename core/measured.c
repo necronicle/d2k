@@ -226,8 +226,8 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
        пакет умрёт по дороге, сервер его не увидит. Без autottl в этом условии
        плечо с одной этой осью не выпускало фальшивку вовсе и план не
        собирался (поймано test_probe_plan на 12 входах). */
-    int fake = !between && (a->badsum || a->md5 || a->ttl || a->autottl ||
-                            a->seq_out || a->tcpts);
+    int fake = !between && (a->badsum || a->md5 || a->md5_ts || a->ttl ||
+                            a->autottl || a->seq_out || a->tcpts);
     int disorder = !between && a->disorder;
     /* raw.c prioritizes fake_between over disorder/seqovl; it uses SNI
      * START, not the old Plan builder's two cuts at 1 and SNI middle. */
@@ -241,6 +241,11 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
        порядком и промежуточной фальшивкой: там свой разрез. Вне окна — отказ,
        как у disorder_pos: разрез, которого не мерили, ставить нельзя. */
     if (a->split_pos && (between || disorder || (size_t)a->split_pos >= n)) { return -1; }
+    /* MD5+метка живёт только в фальшивке прямого пути: фальшивка «между»
+       кусками порчу с опциями не несёт (ветка !between выше), поэтому контекст
+       для комбо там отсутствует — явный отказ, а не тихая потеря опций. С
+       MD5-одиночкой комбо взаимоисключающи (один бит порчи на опции). */
+    if (a->md5_ts && (between || a->md5)) { return -1; }
     if (!fake && !between && !disorder && !ov && !a->disorder_pos && !a->split_pos) { return -1; }
     /* ПРЕДЕЛ ОТПРАВКИ (задача 37, I2; поле 22.10.2026, issue #5/#7). Посылки
        плана режутся сегментом seg — тем же потолком, что у сырого отправителя
@@ -326,11 +331,12 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
         if (append_fmt(buf, cap, &pos,
             "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\n"
             "wire detect-tcp-v1\ninput tls-sni\nsegment %u\n",
-            a->autottl ? 13u : a->md5 ? 12u : 5u, seg)) { return -1; }
+            a->md5_ts ? 15u : a->autottl ? 13u : a->md5 ? 12u : 5u, seg)) { return -1; }
     } else if (append_fmt(buf, cap, &pos,
         "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\n"
         "input %zu %zu %zu\nsegment %u\n",
-        a->autottl ? 13u : a->md5 ? 12u : 4u, n, in->sni_off, in->sni_len, seg)) { return -1; }
+        a->md5_ts ? 15u : a->autottl ? 13u : a->md5 ? 12u : 4u,
+        n, in->sni_off, in->sni_len, seg)) { return -1; }
     size_t flen = between ? n - mid : 2 * n;
     const uint8_t *prefix = in->decoy;
     size_t prefix_len = in->decoy_len;
@@ -345,6 +351,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *a, const d2k_arm_input *in,
                        a->autottl_min, a->autottl_max)) { return -1; }
         if (!between) {
             if (a->md5 && append_fmt(buf, cap, &pos, " md5")) { return -1; }
+            if (a->md5_ts && append_fmt(buf, cap, &pos, " md5ts")) { return -1; }
             if (a->tcpts && append_fmt(buf, cap, &pos, " tcpts")) { return -1; }
             if (a->tcpts_up && append_fmt(buf, cap, &pos, " tsup")) { return -1; }
             if (a->ipidzero && append_fmt(buf, cap, &pos, " ipidzero")) { return -1; }

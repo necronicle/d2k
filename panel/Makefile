@@ -111,3 +111,21 @@ clean-diagnostics:
 	$(RM) test_diagnostics
 
 server.o d2kpanel test_server test_server_san test_config_values test_header_deadline test_response_deadline: ../runtime/d2k_diagnostics_files.h
+
+.PHONY: test-policies
+test: test-policies
+test-policies: test_policies test_policy_review
+	./test_policies
+	./test_policy_review export
+	./test_policy_review layout
+	./test_policy_review collision
+	./test_policy_review cleanup
+test_policies: test_policies.c policies.h server.c server.h
+	$(CC) $(CFLAGS) -o $@ test_policies.c
+test_policy_review: test_policy_review.c policies.h server.c server.h
+	$(CC) $(CFLAGS) -o $@ test_policy_review.c
+clean: clean-policies
+clean-policies:
+	$(RM) test_policies test_policy_review
+
+d2kpanel test_server test_server_san test_header_deadline test_response_deadline test_config_values test_status_cache test_diagnostics: policies.h

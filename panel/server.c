@@ -32,6 +32,7 @@
 #endif
 
 static pid_t action_pid;
+static int policy_action;
 static const char *action_state = "idle";
 
 static long long monotonic_ms(void) {
@@ -364,6 +365,7 @@ static int run_service_action(const d2k_panel_config *cfg, const char *action, i
             (void)nanosleep(&pause, NULL);
         }
     }
+    policy_action = 0;
     action_pid = pid;
     action_state = "running";
     return 0;
@@ -878,6 +880,8 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *req,
 static int diagnostic_response(int fd,int code,const char *reason,const char *type,const char *body,size_t len) {
     return response_ex(fd,code,reason,type,"Cache-Control: no-store\r\n",body,len);
 }
+#include "policies.h"
+
 static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
                            const char *method,const char *action) {
     const char *dir=cfg&&cfg->diagnostics_dir?cfg->diagnostics_dir:D2K_DIAG_DIR;
@@ -936,6 +940,7 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     }
     char *query = strchr(path, '?');
     if (query) { *query++ = '\0'; }
+    if (!strcmp(path,"/api/policies")) return api_policies(fd,cfg,req,method);
     if (!strcmp(path,"/api/diagnostics"))
         return api_diagnostics(fd,cfg,req,method,query?query:"status");
     if (strcmp(path, "/api/update") == 0) {

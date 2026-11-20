@@ -118,13 +118,17 @@ echo "арка: $(uname -m) -> $ARCH"
 echo "== сборка того, что будет установлено =="
 # Сборка НАТИВНАЯ: контейнер той же арки, что и роутер Марка (aarch64).
 # Кросс-сборка проверяется отдельно, гейтом; здесь проверяется установка.
-make -s -C core d2kc d2kfetch
+make -s -C core d2kc d2kfetch d2kshadow
 make -s -C datapath d2kd
 cc -Wall -Wextra -Werror -o /tmp/d2k-ipv6-direct tests/ipv6-direct.c
 
 mkdir -p "$REL/builds" "$REL/files/fake" "$REL/internal/web/assets" "$REL/scripts"
 cp scripts/select-panel-ip.sh scripts/architecture.sh scripts/check-cpu.sh "$REL/scripts/"
 cp core/d2kc     "$REL/builds/d2kc-linux-$ARCH"
+cp core/d2kshadow "$REL/builds/d2kshadow-linux-$ARCH"
+mkdir -p "$REL/core/profiles"
+cp core/profiles/modern.hex "$REL/core/profiles/modern.hex"
+cp core/profiles/legacy.hex "$REL/core/profiles/legacy.hex"
 cp core/d2kfetch "$REL/builds/d2kfetch-linux-$ARCH"
 cp datapath/d2kd "$REL/builds/d2kd-linux-$ARCH"
 # d2ktg берётся готовым из builds/ — единственный бинарник, который там

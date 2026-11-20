@@ -29,12 +29,15 @@
  * той, которую проверяли.
  */
 #define _POSIX_C_SOURCE 200809L
+#include "../datapath/include/d2k_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include "d2k_plantlv.h"
+#include "../datapath/include/d2k_preflight_plan.h"
 
 enum {
     REC_ID      = 0x0001,
@@ -58,7 +61,12 @@ enum {
     REC_UDPLEN  = 0x010e,
     REC_QSPLIT  = 0x010f,
     REC_QDENY   = 0x0110,
-    REC_AUTOTTL = 0x0111
+    REC_AUTOTTL = 0x0111,
+    REC_STREAM_OFFSET = 0x0112,
+    REC_AFTER_SPLIT = 0x0113,
+    REC_PREFLIGHT = 0x0114,
+    REC_PREFLIGHT_RESYN = 0x0115,
+    REC_HANDOVER_APPLY = 0x0116
 };
 
 /* Пределы одного плана. Не выдуманы: столько же держит датапат в разобранном
@@ -81,6 +89,7 @@ typedef struct {
     uint8_t  ttl;
     uint8_t  flags;
     int32_t  seq_shift;
+    int32_t  ack_shift;
     /* autottl=<delta>,<min>-<max> в строке порчи: TTL считает датапат по TTL
        ответной стороны потока (ip_autottl документации zapret2). */
     uint8_t  autottl;
@@ -114,6 +123,17 @@ typedef struct {
     uint32_t   delay_us;
     uint8_t    wire_profile;
     uint8_t    input_tls;
+    uint8_t    has_stream_offset;
+    uint32_t   stream_offset;
+    uint32_t   after_offset,after_length,after_cut;
+    uint8_t preflight, pf_wscale, pf_pieces, pf_hello_own;
+    uint16_t pf_window, pf_data;
+    uint8_t pf_handover_apply;
+    uint32_t pf_timeout_ms;
+    uint32_t pf_resyn_timeout_ms;
+    uint16_t pf_resyn_delay_ms;
+    uint8_t pf_resyn_sends;
+    char pf_name[254];
     uint8_t    ipfrag;
     uint8_t    oob_enabled;
     uint16_t   oob_anchor;
@@ -209,6 +229,7 @@ static int anchor_by_name(const char *s, uint16_t *out) {
     static const struct { const char *n; uint16_t v; } a[] = {
         { "payload_start", 0 }, { "sni_start", 1 }, { "sni_end", 2 },
         { "hello_middle", 3 }, { "record_end", 4 }, { "sni_middle", 5 },
+        { "sld_middle", 6 },
     };
     for (size_t i = 0; i < sizeof a / sizeof a[0]; i++) {
         if (strcmp(a[i].n, s) == 0) { *out = a[i].v; return 0; }
@@ -284,7 +305,7 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         const char *nl = strchr(cur, '\n');
         size_t len = nl ? (size_t)(nl - cur) : strlen(cur);
         lineno++;
-        char line[8192];
+        char line[2 * D2K_CAPTURE_BYTES + 32];
         if (len >= sizeof line) {
             say(err, errcap, "строка %zu длиннее %zu байт", lineno, sizeof line - 1);
             plan_free(p);
@@ -302,8 +323,8 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
         }
         if (*t == '\0' || *t == '#') { continue; }
 
-        char *f[8];
-        int nfi = split_fields(t, f, 8);
+        char *f[12];
+        int nfi = split_fields(t, f, 12);
         if (nfi < 0) { say(err, errcap, "строка %zu: слов больше 8", lineno); goto bad; }
         size_t nf = (size_t)nfi;
         if (nf == 0) { continue; }
@@ -415,6 +436,21 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             if (p->wire_profile == 2 && p->minexec < 8) {
                 say(err, errcap, "tcp-template-v1 требует minexec=8"); goto bad;
             }
+        } else if (strcmp(f[0], "after-split") == 0) {
+            unsigned long offset,length,cut;
+            if(nf!=4 || p->after_length || str_u32(f[1],&offset) ||
+               str_u32(f[2],&length) || str_u32(f[3],&cut) || !offset ||
+               offset>=0x80000000UL || length<2 || length>65535 ||
+               length>=0x80000000UL-offset || !cut || cut>=length || cut>32767) {
+                say(err,errcap,"after-split requires unique TCP offset, length and interior cut");goto bad;
+            }
+            p->after_offset=(uint32_t)offset;p->after_length=(uint32_t)length;p->after_cut=(uint32_t)cut;
+        } else if (strcmp(f[0], "stream-offset") == 0) {
+            unsigned long offset;
+            if(nf!=2 || p->has_stream_offset || str_u32(f[1],&offset) || offset>=0x80000000UL) {
+                say(err,errcap,"stream-offset requires one unambiguous TCP offset");goto bad;
+            }
+            p->has_stream_offset=1;p->stream_offset=(uint32_t)offset;
         } else if (strcmp(f[0], "input") == 0) {
             if (nf == 2 && strcmp(f[1], "tls-sni") == 0) {
                 p->input_tls = 1;
@@ -455,6 +491,7 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 else if (strcmp(f[i], "ipidzero") == 0) { v->flags |= 1u << 2; }
                 else if (strcmp(f[i], "md5") == 0) { v->flags |= 1u << 3; }
                 else if (strcmp(f[i], "tsup") == 0) { v->flags |= 1u << 4; }
+                else if (strcmp(f[i], "md5ts") == 0) { v->flags |= 1u << 5; }
                 else if (strncmp(f[i], "autottl=", 8) == 0) {
                     /* Формат документации: delta,min-max. Дельта со знаком. */
                     int d = 0; unsigned lo = 0, hi = 0;
@@ -475,6 +512,12 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                         say(err, errcap, "строка %zu: ttl вне 0..255 \"%s\"", lineno, f[i]); goto bad;
                     }
                     v->ttl = (uint8_t)u;
+                } else if (strncmp(f[i], "ackshift=", 9) == 0) {
+                    long sh;
+                    if (parse_int(f[i]+9, INT32_MIN, INT32_MAX, &sh) != 0) {
+                        say(err, errcap, "ackshift outside int32"); goto bad;
+                    }
+                    v->ack_shift = (int32_t)sh;
                 } else if (strncmp(f[i], "seqshift=", 9) == 0) {
                     long sh;
                     if (parse_int(f[i] + 9, INT32_MIN, INT32_MAX, &sh) != 0) {
@@ -618,6 +661,56 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
                 }
                 p->delay_us = (uint32_t)u;
             }
+        } else if (strcmp(f[0], "handover") == 0) {
+            if(nf!=2 || strcmp(f[1],"apply") || p->pf_handover_apply) {
+                say(err,errcap,"handover expects one apply directive");goto bad;
+            }
+            p->pf_handover_apply=1;
+        } else if (strcmp(f[0], "preflight") == 0) {
+            unsigned seen=0;
+            if(p->preflight) {say(err,errcap,"duplicate preflight");goto bad;}
+            p->preflight=1;
+            for(size_t i=1;i<nf;i++) {
+                char *eq=strchr(f[i],'='); unsigned bit=0; unsigned long u=0;
+                if(!eq) {say(err,errcap,"preflight expects key=value");goto bad;}
+                *eq++=0;
+                if(!strcmp(f[i],"window")) {
+                    bit=1;if(parse_uint(eq,65535,&u)||!u)goto pf_bad;p->pf_window=(uint16_t)u;
+                } else if(!strcmp(f[i],"wscale")) {
+                    bit=2;if(parse_uint(eq,14,&u))goto pf_bad;p->pf_wscale=(uint8_t)u;
+                } else if(!strcmp(f[i],"pieces")) {
+                    bit=4;if(parse_uint(eq,255,&u)||!u)goto pf_bad;p->pf_pieces=(uint8_t)u;
+                } else if(!strcmp(f[i],"hello")) {
+                    bit=8;if(strcmp(eq,"own") && strcmp(eq,"white"))goto pf_bad;
+                    p->pf_hello_own=!strcmp(eq,"own");
+                } else if(!strcmp(f[i],"timeout")) {
+                    bit=16;if(parse_uint(eq,D2K_PF_EXEC_MAX_TIMEOUT_MS,&u)||u<1000)goto pf_bad;p->pf_timeout_ms=(uint32_t)u;
+                } else if(!strcmp(f[i],"data")) {
+                    bit=64;if(parse_uint(eq,65535,&u)||!u)goto pf_bad;p->pf_data=(uint16_t)u;
+                } else if(!strcmp(f[i],"resyn_delay")) {
+                    bit=128;if(parse_uint(eq,4999,&u)||!u)goto pf_bad;p->pf_resyn_delay_ms=(uint16_t)u;
+                } else if(!strcmp(f[i],"resyn_timeout")) {
+                    bit=512;if(parse_uint(eq,D2K_PF_EXEC_MAX_TIMEOUT_MS,&u)||!u)goto pf_bad;p->pf_resyn_timeout_ms=(uint32_t)u;
+                } else if(!strcmp(f[i],"resyn_sends")) {
+                    bit=256;if(parse_uint(eq,255,&u)||!u)goto pf_bad;p->pf_resyn_sends=(uint8_t)u;
+                } else if(!strcmp(f[i],"name")) {
+                    bit=32;size_t len=strlen(eq);
+                    if(!len || len>=sizeof p->pf_name)goto pf_bad;
+                    if(!d2k_pf_name_valid((const uint8_t *)eq,len))goto pf_bad;
+                    memcpy(p->pf_name,eq,len+1);
+                } else goto pf_bad;
+                if(seen&bit)goto pf_bad;
+                seen|=bit;continue;
+            pf_bad:
+                say(err,errcap,"invalid or duplicate preflight parameter");goto bad;
+            }
+            if((seen&127u)!=(p->pf_hello_own?95u:127u) ||
+               ((seen&896u) && ((seen&896u)!=896u || p->minexec<19 ||
+                 p->pf_resyn_timeout_ms>=p->pf_timeout_ms ||
+                 p->pf_resyn_timeout_ms<(uint64_t)p->pf_resyn_delay_ms*p->pf_resyn_sends)) ||
+               (p->minexec<19 && p->pf_timeout_ms>5000)) {
+                say(err,errcap,"preflight needs window/wscale/pieces/hello/timeout/data and name only for white");goto bad;
+            }
         } else if (strcmp(f[0], "guard") == 0) {
             if (nf != 2) { say(err, errcap, "строка %zu: guard ждёт одно слово", lineno); goto bad; }
             if (strcmp(f[1], "rst_alien") == 0) { p->guards |= 1u << 0; }
@@ -632,6 +725,39 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     if (!seen_header) {
         say(err, errcap, "нет заголовка d2k-plan");
         goto bad;
+    }
+    if(p->pf_handover_apply && (!p->preflight || p->minexec<20)) {
+        say(err,errcap,"handover apply requires preflight and minexec=20");goto bad;
+    }
+    if(p->preflight && (p->minexec<18 || p->transport!=6 || p->proto!=1)) {
+        say(err,errcap,"preflight requires TCP/TLS and minexec=18");goto bad;
+    }
+    if(p->preflight && !p->pf_handover_apply && (
+       p->n_payloads!=1 || p->n_poisons || p->n_splits || p->n_fakes || p->n_seqovls ||
+       p->order || p->guards || p->pace_us || p->input_len || p->settle_us || p->segment_size ||
+       p->wire_profile || p->input_tls || p->has_stream_offset || p->after_length ||
+       p->delay_us || p->ipfrag || p->oob_enabled || p->udplen || p->qsplit || p->qdeny)) {
+        say(err,errcap,"preflight requires minexec=18 and a standalone TCP/TLS plan");goto bad;
+    }
+    if(p->preflight) {
+        const pl_payload *hello=NULL;
+        for(size_t i=0;i<p->n_payloads;i++)if(p->payloads[i].id==p->pf_data)hello=&p->payloads[i];
+        if(!hello || !hello->len || hello->len>D2K_CAPTURE_BYTES) {
+            say(err,errcap,"preflight needs its referenced hello payload, 1..4096 bytes");goto bad;
+        }
+    }
+    for (size_t i=0; i<p->n_poisons; i++) {
+        if (p->poisons[i].ack_shift && (p->minexec<14 || p->transport!=6)) {
+            say(err,errcap,"ackshift requires minexec=14 and TCP"); goto bad;
+        }
+    }
+    if(p->has_stream_offset && (p->minexec<16 || p->transport!=6)) {
+        say(err,errcap,"stream-offset requires TCP and minexec=16");goto bad;
+    }
+    if(p->after_length && (p->minexec<17 || p->transport!=6 || p->proto!=1 ||
+       p->has_stream_offset || !p->input_len || p->input_len>p->after_offset ||
+       (p->wire_profile!=1 && p->wire_profile!=2))) {
+        say(err,errcap,"after-split requires minexec=17, exact first input and a TCP wire profile");goto bad;
     }
     if (p->input_tls && (p->minexec < 5 || p->transport != 6)) {
         say(err, errcap, "input tls-sni требует TCP и minexec=5"); goto bad;
@@ -674,6 +800,10 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             (p->minexec < 12 || p->transport != 6 || p->wire_profile != 1)) {
             say(err, errcap, "md5 требует minexec=12 и wire detect-tcp-v1 TCP"); goto bad;
         }
+        if ((p->poisons[i].flags & (1u << 5)) &&
+            (p->minexec < 15 || p->transport != 6 || p->wire_profile != 1)) {
+            say(err, errcap, "md5ts требует minexec=15 и wire detect-tcp-v1 TCP"); goto bad;
+        }
     }
     if (p->wire_profile && (p->minexec < 4 || p->transport != 6)) {
         say(err, errcap, "wire detect-tcp-v1 требует minexec=4 и proto tcp"); goto bad;
@@ -706,6 +836,116 @@ static void put_rec(wbuf *w, uint16_t typ, const uint8_t *v, size_t n) {
     put(w, v, n);
 }
 
+int d2k_plan_text_requires_endpoint(const char *text, char *err, size_t cap) {
+    pl_plan p;
+    if(!text || parse_text(text,&p,err,cap))return -1;
+    int required=p.preflight;plan_free(&p);return required;
+}
+int d2k_plan_text_compose_preflight(const char *preflight,const char *outgoing,
+    char **out,char *err,size_t errcap) {
+    if(out)*out=NULL;
+    if(!out || !preflight || !outgoing) {say(err,errcap,"missing composition input");return -1;}
+    pl_plan pf={0},tx={0};char *joined=NULL;
+    if(parse_text(preflight,&pf,err,errcap) || parse_text(outgoing,&tx,err,errcap))goto bad;
+    if(!pf.preflight || pf.pf_handover_apply || tx.preflight || tx.transport!=6 || tx.proto!=1) {
+        say(err,errcap,"composition requires standalone preflight and ordinary TCP/TLS program");goto bad;
+    }
+    const pl_payload *hello=NULL;
+    for(size_t i=0;i<pf.n_payloads;i++)if(pf.payloads[i].id==pf.pf_data)hello=&pf.payloads[i];
+    if(!hello || tx.n_payloads==MAX_PAYLOADS) {say(err,errcap,"no room for preflight hello payload");goto bad;}
+    unsigned id;
+    for(id=1;id<=MAX_PAYLOADS+1;id++) {
+        size_t i;for(i=0;i<tx.n_payloads;i++)if(tx.payloads[i].id==id)break;
+        if(i==tx.n_payloads)break;
+    }
+    size_t base_len=strlen(outgoing),extra=2*hello->len+sizeof pf.pf_name+512;
+    if(base_len>SIZE_MAX-extra) {say(err,errcap,"composition too large");goto bad;}
+    size_t size=base_len+extra,pos=0;
+    joined=malloc(size);
+    if(!joined) {say(err,errcap,"composition allocation failed");goto bad;}
+    unsigned version=tx.minexec>20?tx.minexec:20;
+    if(pf.minexec>version)version=pf.minexec;
+    pos=(size_t)snprintf(joined,size,"d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp tls\n",version);
+    for(const char *cur=outgoing;*cur;) {
+        const char *end=strchr(cur,'\n');if(!end)end=cur+strlen(cur);
+        const char *s=cur;while(s<end && isspace((unsigned char)*s))s++;
+        size_t len=(size_t)(end-s);
+        int header=(len>=8 && !memcmp(s,"d2k-plan",8) && (len==8 || isspace((unsigned char)s[8]))) ||
+            (len>=5 && !memcmp(s,"proto",5) && (len==5 || isspace((unsigned char)s[5]))) ||
+            (len>=2 && !memcmp(s,"id",2) && (len==2 || isspace((unsigned char)s[2])));
+        if(!header) {size_t n=(size_t)(end-cur);memcpy(joined+pos,cur,n);pos+=n;joined[pos++]='\n';}
+        cur=*end?end+1:end;
+    }
+    pos+=(size_t)snprintf(joined+pos,size-pos,
+        "handover apply\npreflight window=%u wscale=%u pieces=%u hello=%s%s%s timeout=%u data=%u",
+        pf.pf_window,pf.pf_wscale,pf.pf_pieces,pf.pf_hello_own?"own":"white",
+        pf.pf_hello_own?"":" name=",pf.pf_hello_own?"":pf.pf_name,pf.pf_timeout_ms,id);
+    if(pf.pf_resyn_delay_ms)pos+=(size_t)snprintf(joined+pos,size-pos,
+        " resyn_delay=%u resyn_sends=%u resyn_timeout=%u",pf.pf_resyn_delay_ms,pf.pf_resyn_sends,pf.pf_resyn_timeout_ms);
+    pos+=(size_t)snprintf(joined+pos,size-pos,"\npayload %u ",id);
+    static const char digits[]="0123456789abcdef";
+    for(size_t i=0;i<hello->len;i++) {joined[pos++]=digits[hello->bytes[i]>>4];joined[pos++]=digits[hello->bytes[i]&15];}
+    joined[pos++]='\n';joined[pos]=0;
+    pl_plan check;
+    if(parse_text(joined,&check,err,errcap))goto bad;
+    plan_free(&check);plan_free(&pf);plan_free(&tx);*out=joined;return 0;
+bad:
+    free(joined);plan_free(&pf);plan_free(&tx);return -1;
+}
+int d2k_plan_text_stream_offset(const char *text,uint32_t *offset,char *err,size_t cap) {
+    if(offset)*offset=0;
+    if(!text || !offset){say(err,cap,"missing plan or offset output");return -1;}
+    pl_plan p;
+    if(parse_text(text,&p,err,cap))return -1;
+    int scoped=p.has_stream_offset;*offset=p.stream_offset;plan_free(&p);return scoped;
+}
+int d2k_plan_text_after_split(const char *text,uint32_t *offset,uint32_t *length,
+    uint32_t *cut,char *err,size_t cap) {
+    if(!text || !offset || !length || !cut){say(err,cap,"missing composed plan output");return -1;}
+    *offset=*length=*cut=0;
+    pl_plan p;
+    if(parse_text(text,&p,err,cap))return -1;
+    *offset=p.after_offset;*length=p.after_length;*cut=p.after_cut;
+    int found=p.after_length!=0;plan_free(&p);return found;
+}
+int d2k_plan_text_compose_after_split(const char *text,uint32_t first_length,
+    uint32_t sni_offset,uint32_t sni_length,
+    uint32_t offset,uint32_t length,uint32_t cut,char **out,char *err,size_t cap) {
+    if(out)*out=NULL;
+    if(!text || !out || !first_length || sni_offset>first_length ||
+       sni_length>first_length-sni_offset || strncmp(text,"d2k-plan 1 ",11)) {
+        say(err,cap,"missing canonical first-input plan");return -1;
+    }
+    const char *body=strchr(text,'\n');
+    if(!body || strstr(body,"\nd2k-plan ")) {
+        say(err,cap,"ambiguous first-input plan header");return -1;
+    }
+    pl_plan p;
+    if(parse_text(text,&p,err,cap))return -1;
+    int compatible=p.schema==1 && p.minexec<=17 && p.transport==6 && p.proto==1 &&
+        (p.wire_profile==1 || p.wire_profile==2) && !p.has_stream_offset && !p.after_length &&
+        (!p.input_len || (p.input_len==first_length && p.input_sni_len==sni_length &&
+                         (!sni_length || p.input_sni_off==sni_offset)));
+    int add_input=!p.input_len;
+    plan_free(&p);
+    if(!compatible) {say(err,cap,"first-input plan cannot be composed without changing its contract");return -1;}
+    size_t old_length=strlen(body);
+    if(old_length>SIZE_MAX-192) {say(err,cap,"composed plan too large");return -1;}
+    size_t size=old_length+192;
+    char *program=malloc(size);
+    if(!program) {say(err,cap,"cannot allocate composed plan");return -1;}
+    char input[64]={0};
+    if(add_input)snprintf(input,sizeof input,"input %u %u %u\n",first_length,sni_offset,sni_length);
+    int n=snprintf(program,size,"d2k-plan 1 17%s%s%safter-split %u %u %u\n",
+        body,old_length && body[old_length-1]=='\n'?"":"\n",input,offset,length,cut);
+    uint8_t *tlv=malloc(D2K_PLAN_TLV_MAX);size_t written=0;
+    int valid=n>0 && (size_t)n<size && tlv &&
+        !d2k_plan_text_to_tlv(program,tlv,D2K_PLAN_TLV_MAX,&written,err,cap);
+    if(!tlv)say(err,cap,"cannot validate composed plan");
+    free(tlv);
+    if(!valid){free(program);return -1;}
+    *out=program;return 0;
+}
 int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                          size_t *out_len, char *err, size_t errcap) {
     if (err && errcap) { err[0] = '\0'; }
@@ -727,9 +967,9 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                        p.n_fakes + p.n_seqovls + 1 + (p.pace_us ? 1u : 0u) +
                        (p.guards ? 1u : 0u) + (p.input_len ? 1u : 0u) + (p.settle_us ? 1u : 0u) +
                        (p.segment_size ? 1u : 0u) + (p.wire_profile ? 1u : 0u) +
-                       (p.input_tls ? 1u : 0u) + (p.delay_us ? 1u : 0u) +
+                       (p.input_tls ? 1u : 0u) + (p.has_stream_offset ? 1u : 0u) + (p.after_length ? 1u : 0u) + (p.delay_us ? 1u : 0u) +
                        (p.ipfrag ? 1u : 0u) + (p.oob_enabled ? 1u : 0u) +
-                       (p.udplen ? 1u : 0u) + (p.qsplit ? 1u : 0u) + (p.qdeny ? 1u : 0u);
+                       (p.udplen ? 1u : 0u) + (p.qsplit ? 1u : 0u) + (p.qdeny ? 1u : 0u) + (p.preflight ? 1u : 0u) + (p.pf_resyn_delay_ms ? 1u : 0u) + (p.pf_handover_apply ? 1u : 0u);
     if (n_records > 0xFFFFu) {
         plan_free(&p);
         say(err, errcap, "слишком много записей (%zu)", n_records);
@@ -758,14 +998,17 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         put(&w, p.payloads[i].bytes, p.payloads[i].len);
     }
     for (size_t i = 0; i < p.n_poisons; i++) {
-        uint8_t v[8];
+        uint8_t v[12];
         v[0] = (uint8_t)(p.poisons[i].id >> 8); v[1] = (uint8_t)p.poisons[i].id;
         v[2] = p.poisons[i].ttl;
         v[3] = p.poisons[i].flags;
         uint32_t ss = (uint32_t)p.poisons[i].seq_shift;
         v[4] = (uint8_t)(ss >> 24); v[5] = (uint8_t)(ss >> 16);
         v[6] = (uint8_t)(ss >> 8);  v[7] = (uint8_t)ss;
-        put_rec(&w, REC_POISON, v, sizeof v);
+        uint32_t as = (uint32_t)p.poisons[i].ack_shift;
+        v[8]=(uint8_t)(as>>24); v[9]=(uint8_t)(as>>16);
+        v[10]=(uint8_t)(as>>8); v[11]=(uint8_t)as;
+        put_rec(&w, REC_POISON, v, as ? 12 : 8);
         /* Своей записью СРАЗУ ЗА порчей, на которую ссылается: разбор ищет
            порчу по id и висячую ссылку отвергает. */
         if (p.poisons[i].autottl) {
@@ -819,14 +1062,30 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
         put_u16(&w, REC_SEGMENT); put_u16(&w, 4); put_u32(&w, p.segment_size);
     }
     if (p.input_tls) { put_u16(&w, REC_INPUT_TLS); put_u16(&w, 0); }
+    if(p.has_stream_offset) {put_u16(&w,REC_STREAM_OFFSET);put_u16(&w,4);put_u32(&w,p.stream_offset);}
+    if(p.after_length) {put_u16(&w,REC_AFTER_SPLIT);put_u16(&w,12);put_u32(&w,p.after_offset);put_u32(&w,p.after_length);put_u32(&w,p.after_cut);}
     if (p.delay_us) {
         put_u16(&w, REC_DELAY); put_u16(&w, 4); put_u32(&w, p.delay_us);
     }
     if (p.wire_profile) { put_rec(&w, REC_WIRE, &p.wire_profile, 1); }
     if (p.ipfrag) { put_rec(&w, REC_IPFRAG, &p.ipfrag, 1); }
+    if (p.pf_handover_apply) { put_rec(&w, REC_HANDOVER_APPLY, &p.pf_handover_apply, 1); }
     if (p.udplen) { put_u16(&w, REC_UDPLEN); put_u16(&w, 2); put_u16(&w, p.udplen); }
     if (p.qsplit) { put_rec(&w, REC_QSPLIT, &p.qsplit, 1); }
     if (p.qdeny) { put_rec(&w, REC_QDENY, &p.qdeny, 1); }
+    if(p.preflight) {
+        /* W:u16, S:u8, K:u8, own:u8, timeout:u32, payload id:u16, white name bytes (no NUL). */
+        size_t name_len=strlen(p.pf_name);
+        put_u16(&w,REC_PREFLIGHT);put_u16(&w,(uint16_t)(11+name_len));
+        put_u16(&w,p.pf_window);put_u8(&w,p.pf_wscale);put_u8(&w,p.pf_pieces);
+        put_u8(&w,p.pf_hello_own);put_u32(&w,p.pf_timeout_ms);put_u16(&w,p.pf_data);
+        put(&w,(const uint8_t *)p.pf_name,name_len);
+    }
+    if(p.pf_resyn_delay_ms) {
+        put_u16(&w,REC_PREFLIGHT_RESYN);put_u16(&w,7);
+        put_u16(&w,p.pf_resyn_delay_ms);put_u8(&w,p.pf_resyn_sends);
+        put_u32(&w,p.pf_resyn_timeout_ms);
+    }
     if (p.oob_enabled) {
         uint8_t v[3] = { (uint8_t)(p.oob_anchor >> 8), (uint8_t)p.oob_anchor, p.oob_byte };
         put_rec(&w, REC_OOB, v, sizeof v);

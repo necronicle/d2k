@@ -1,0 +1,16 @@
+*.o
+*.a
+test_codes
+test_context
+test_experiment
+test_fact
+test_owner
+*.dSYM/
+test_why
+test_check
+test_box
+test_question
+test_tls
+test_program
+test_synth
+test_task

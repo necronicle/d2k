@@ -61,6 +61,7 @@ void d2k_http_read_response(d2k_http_read_fn read, void *ctx, int wait_ms,
                             d2k_http_read_result *result, char *err, size_t cap);
 
 #include "d2k_tls13core.h"
+#include "d2k_tls13.h"
 
 /* Предел заголовков ответа, байт. Поле 03.10.2026: край Meta отдаёт ~8,4 КБ,
    прежние 8 КБ браковали рабочие планы. Выше — ответ не принимается с
@@ -81,6 +82,7 @@ typedef struct {
     d2k_ver_level level;
     int      status;        /* код состояния HTTP, 0 — не разобран */
     uint16_t negotiated_tls; /* 0x0303 TLS1.2, 0x0304 TLS1.3; zero without handshake */
+    uint8_t  http_version;   /* 1 or 2, from authenticated ALPN */
     uint64_t rx_tls_wire_bytes; /* actual TLS recv bytes after handshake, incl. record headers */
     uint32_t rx_tls_record_missing; /* missing declared record body; not plaintext */
     uint64_t body_bytes;    /* прочитанное тело HTTP, без chunk framing */
@@ -108,6 +110,12 @@ typedef struct {
        Для обычного TLS несовпадение диагностическое; ECH требует отдельного
        строгого подтверждения имени origin и принятия ECH. */
     int      name_ok;
+    int      peer_authenticated; /* certificate chain and endpoint identity verified */
+    int      peer_auth_failed;    /* TLS reached the peer but authentication failed */
+    int      dns_reply_rejected;  /* malformed or refused DNS response; no application proof */
+    uint16_t dns_query_bytes;    /* exact submitted plain DNS bytes, including TCP length */
+    int      dns_session_ended;   /* peer ended this DNS session without a path failure */
+    uint8_t  doh_http_version;   /* 1 or 2, from authenticated ALPN */
     /* Зонд НЕ УМЕЕТ такой транспорт — и не научится сменой кандидата.
      *
      * Отличается от обычного «не измерено» (нет TCP, молчание) тем, что
@@ -154,6 +162,7 @@ typedef struct {
     unsigned budget_need;     /* 2 × бюджет коробки, пакетов с данными */
     unsigned budget_packets;  /* сколько пакетов с данными поток перенёс к итогу */
     unsigned budget_requests; /* запросов на потоке, включая первый */
+    unsigned doh_replies;     /* fully validated DNS replies on this stream */
     /* Текст кириллический, то есть по два байта на символ, и к нему ещё
      * подклеивается до 60 байт причины от линии. При 160 байтах поле
      * «сервер замолчал посреди повторов: N-й запрос, поток перенёс N пакетов
@@ -212,6 +221,11 @@ void d2k_verify_budget_set(unsigned budget_packets);
    NULL или нулевое n — как раньше. Поточная настройка: ставится перед одной
    проверкой и снимается сразу после. */
 void d2k_verify_quic_form_set(const d2k_quic_form *form);
+/* Прибор поля (d2kfetch): тело ответа HTTP/3 читается до FIN в рамках срока,
+   а не до D2K_QUIC_ARM_DATA_BYTES. Вопрос прибора — «страница целиком?»;
+   предел — мера этапа данных плеча (поле 24.10.2026: 139 КБ от
+   www.cloudflare.com сочтены обрывом на 32 КиБ). Поточная настройка. */
+void d2k_verify_quic_read_all_set(int on);
 unsigned d2k_verify_budget_get(void);
 
 /* Пакеты TCP с данными обеих сторон на сокете: TCP_INFO data_segs_in +
@@ -261,6 +275,18 @@ d2k_ver_result d2k_verify_probe_on(int use_fd, const char *ip, uint16_t port,
  * HTTP-запроса нет. Успех — level D2K_VER_HANDSHAKE и handshake_proof = 1;
  * прикладной уровень не измерен (см. handshake_proof). Сокет — как у
  * d2k_verify_probe_on. */
+/* ЗОНД РУКОПОЖАТИЯ TLS 1.2 (этап 15, 28.10.2026): для клиента TLS 1.2 без
+ * имени (адресная цель). Тем же протоколом, что и клиент: ClientHello 1.2 без
+ * server_name (sni пустое — расширения нет), ECDHE-RSA-AES128-GCM-SHA256,
+ * рукопожатие до Finished сервера, расшифрованного ключами общего секрета.
+ * HTTP-запроса нет. Успех — level D2K_VER_HANDSHAKE, handshake_proof = 1,
+ * negotiated_tls = 0x0303; прикладной уровень не измерен. ГРАНИЦА ДОКАЗАТЕЛЬСТВА
+ * (как у всего клиента 1.2 проекта, см. шапку tls12.c): подпись сертификата
+ * сервера не проверяется, набор шифров один; сервер без него, только 1.3,
+ * alert или обрыв — отказ с причиной, не «не измерено наполовину». */
+d2k_ver_result d2k_verify_probe12_handshake_on(int use_fd, const char *ip, uint16_t port,
+                                               const char *sni, int deadline_ms,
+                                               size_t hello_wire);
 d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t port,
                                         const char *sni, int deadline_ms, size_t hello_wire,
                                         const uint8_t *alpn_list, size_t alpn_len);
@@ -323,6 +349,20 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
                                                  size_t hello_wire, uint32_t mark,
                                                  const char *path);
 
+/* Fetch one complete HTTP/3 response within the existing deadline. Unlike
+ * the scheduler probe, reaching the data-stage threshold alone is not success.
+ * body_bytes counts authenticated stream bytes, including HTTP/3 framing. */
+/* Explicit diagnostic GET target (including query), not an automatic witness.
+ * Origin-form ASCII only, at most 8192 bytes, no controls or fragment. */
+d2k_ver_result d2k_verify_fetch_tcp_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12,
+    uint32_t mark, const char *path);
+
+d2k_ver_result d2k_verify_fetch_quic_on(int use_fd, const char *ip, uint16_t port,
+                                      const char *sni, int deadline_ms,
+                                      size_t hello_wire, uint32_t mark,
+                                      const char *path);
+
 /* Закрывает сокет обращения и обнуляет fd. Безопасна на любом результате, в
  * том числе на том, где обращения не было. */
 void d2k_verify_close(d2k_ver_result *r);
@@ -362,4 +402,88 @@ d2k_ver_result d2k_verify_probe_ech_origin_on(int use_fd, const char *ip,
     uint16_t port, const char *outer_name, const char *origin, int deadline_ms,
     size_t hello_wire, uint32_t dns_mark, const char *path);
 
+d2k_ver_result d2k_verify_doh_on(int, const char *, uint16_t, const char *, int, size_t, int, uint32_t, const char *);
+/* Authenticated TLS1.2/1.3 + complete HTTP/1.1 or HTTP/2 GET for preflight. */
+d2k_ver_result d2k_verify_preflight_on(int,const char *,uint16_t,const char *,int,size_t,int);
+d2k_ver_result d2k_verify_doh_question_on(int,const char *,uint16_t,const char *,int,
+    size_t,int,uint32_t,const char *,const char *,uint16_t);
+/* Socket DoH must authenticate its peer. The process installs its TLS
+ * implementation before starting workers. The socket remains borrowed. */
+typedef enum {
+    D2K_DOH_TLS_OK, D2K_DOH_TLS_NETWORK, D2K_DOH_TLS_AUTH, D2K_DOH_TLS_LOCAL,
+    D2K_DOH_TLS_PROTOCOL
+} d2k_doh_tls_status;
+typedef struct {
+    d2k_tls_io io;
+    void (*release)(void *);
+    uint8_t http_version; /* 1 or 2, from authenticated ALPN */
+    uint16_t tls_version;
+} d2k_doh_tls_session;
+typedef d2k_doh_tls_status (*d2k_doh_tls_open_fn)(int, const char *, uint16_t,
+    int, d2k_doh_tls_session *);
+void d2k_verify_doh_set_tls(d2k_doh_tls_open_fn);
+d2k_doh_tls_status d2k_doh_trusted_tls_open(int, const char *, uint16_t, int,
+    d2k_doh_tls_session *);
+/* DoT shares the verifier's exact TCP connection and flow receipt. */
+typedef void (*d2k_dot_probe_fn)(int,const char *,uint16_t,int,const char *,uint16_t,d2k_ver_result *);
+void d2k_verify_dot_set_probe(d2k_dot_probe_fn);
+void d2k_dot_trusted_probe(int,const char *,uint16_t,int,const char *,uint16_t,d2k_ver_result *);
+d2k_ver_result d2k_verify_dot_on(int, const char *, uint16_t, const char *, int, uint16_t, uint32_t);
+d2k_ver_result d2k_verify_dot_question_on(int,const char *,uint16_t,const char *,
+    int,uint16_t,uint32_t,const char *,uint16_t);
+typedef d2k_ver_result (*d2k_plain_dns_probe_fn)(const char *, uint16_t, uint8_t,
+    const char *, uint16_t, int, uint32_t);
+void d2k_verify_plain_dns_set_probe(d2k_plain_dns_probe_fn);
+d2k_ver_result d2k_verify_plain_dns_on(const char *, uint16_t, uint8_t,
+    const char *, uint16_t, int, uint32_t);
+d2k_ver_result d2k_plain_dns_probe(const char *, uint16_t, uint8_t,
+    const char *, uint16_t, int, uint32_t);
+/* DoH on an already owned measurement stream, using the same HTTP/2 and DNS
+ * validation as socket probes. Never opens/closes sockets or invents a flow
+ * identity. A nonzero packet budget requires a real cumulative data-packet
+ * counter; zero checks one DNS response only. Transport stays caller-owned. */
+d2k_ver_result d2k_verify_doh_io(const d2k_tls_io *,const char *host,const char *path,
+    int timeout_ms,size_t hello_wire,unsigned budget,long (*packets)(void *),void *);
+d2k_ver_result d2k_verify_doh_probe_io(const d2k_tls_io *,const d2k_tls_probe_seed *,
+    const char *,const char *,int,size_t,unsigned,long (*)(void *),void *);
+/* Owned TLS1.3 measurement stream, HTTP/1.1 and the existing complete-body
+ * verifier. Caller retains transport/seed. No socket, DNS lookup, plan install
+ * or volume certification. Certificate authentication limitations are the
+ * same as the existing measurement TLS client. path NULL requests root. */
+d2k_ver_result d2k_verify_https_probe_io(const d2k_tls_io *,const d2k_tls_probe_seed *,
+    const char *host,const char *path,int timeout_ms,size_t hello_wire,int encoding);
+typedef enum {D2K_HTTPS_REQUEST_BEGIN=1,D2K_HTTPS_REQUEST_SENT=2,
+    D2K_HTTPS_EXCHANGE_END=3} d2k_https_phase;
+typedef struct {
+    d2k_https_phase phase;
+    unsigned ordinal;
+    const uint8_t *request;
+    size_t request_length;
+    const d2k_ver_result *response;
+} d2k_https_observation;
+/* Synchronous borrowed snapshots. BEGIN/SENT bracket TLS request writes;
+ * redirects increment ordinal. END is the final exchange result, not proof
+ * of completion of each redirect body. No callbacks occur before TLS succeeds.
+ * Nonzero observer return aborts locally and cannot become network evidence. */
+typedef int (*d2k_https_observer)(void *,const d2k_https_observation *);
+d2k_ver_result d2k_verify_https_observe_io(const d2k_tls_io *,const d2k_tls_probe_seed *,
+    const char *,const char *,int,size_t,int,d2k_https_observer,void *);
+d2k_ver_result d2k_verify_https12_observe_io(const d2k_tls_io *,const uint8_t random[32],
+    const char *,const char *,int,size_t,int,d2k_https_observer,void *);
+typedef struct {
+    unsigned ordinal;
+    uint32_t stream_id;
+    int64_t started_ms,finished_ms;
+    int dns_valid,timed_out;
+    d2k_ver_result response;
+    unsigned query_schema;
+    int timeout_ms;
+} d2k_doh_observation;
+enum { D2K_DOH_QUERY_SCHEMA_V1=1 };
+/* Synchronous borrowed observation. Return 1 for another query, 0 to stop,
+ * -1 if evidence could not be retained. A failed query always ends the stream.
+ * Observation mode does not certify a volume budget or install a plan. */
+typedef int (*d2k_doh_observer)(void *,const d2k_doh_observation *);
+d2k_ver_result d2k_verify_doh_observe_io(const d2k_tls_io *,const d2k_tls_probe_seed *,
+    const char *,const char *,int,size_t,d2k_doh_observer,void *);
 #endif /* D2K_VERIFY_H */

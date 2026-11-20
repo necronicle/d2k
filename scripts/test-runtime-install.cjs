@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const engineFixture = require('./test-engine-fixture.cjs');
 const root = path.resolve(__dirname, '..');
 const tmp = fs.mkdtempSync('/tmp/runtime-install-test.');
 function fixture(name, contents, mode = 0o755) {
@@ -39,8 +40,13 @@ exit 1
   fixture('builds/d2kpanel-linux-amd64', '#!/bin/sh\necho features=telegram-control\n');
   fixture('builds/d2ktg-linux-amd64', '#!/bin/sh\necho features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3\n');
   fixture('builds/d2kfetch-linux-amd64', '#!/bin/sh\necho d2kfetch ${D2K_RELEASE_ID:-dev}\n');
-  fixture('builds/d2kd-linux-amd64', '#!/bin/sh\nexit 0\n');
-  for (const name of ['d2kc']) fixture(`builds/${name}-linux-amd64`, '#!/bin/sh\nexit 2\n');
+  fixture('builds/d2kd-linux-amd64', engineFixture('d2kd'));
+  fixture('builds/d2kshadow-linux-amd64', '#!/bin/sh\nexit 2\n');
+  for (const profile of ['modern', 'legacy']) {
+    const file = `core/profiles/${profile}.hex`;
+    fixture(file, fs.readFileSync(path.join(root, file)));
+  }
+  fixture('builds/d2kc-linux-amd64', engineFixture('d2kc'));
   fixture('files/S99d2k', '#!/bin/sh\nprintf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0\n');
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   for (const name of ['d2k-fw-heal.sh', 'd2k-ppe-deoffload.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh', 'd2k-instagram-dns-scheduler.sh']) fixture(`files/${name}`, '#!/bin/sh\nexit 0\n');
@@ -77,8 +83,23 @@ exit 1
   // Upgrade from a release that shipped the port-80 proxy (task 51): its binary goes away.
   fs.mkdirSync(path.join(tmp, 'opt/sbin'), { recursive: true });
   fs.writeFileSync(path.join(tmp, 'opt/sbin/d2khttp'), '#!/bin/sh\nexit 2\n', { mode: 0o755 });
+  const existingInit = path.join(tmp, 'opt/etc/init.d/S99d2k');
+  fs.mkdirSync(path.dirname(existingInit), { recursive: true });
+  fs.writeFileSync(existingInit, '#!/bin/sh\n[ "$1" != stop ] || exit 1\n', { mode: 0o755 });
+  const beforeStop = fs.readFileSync(path.join(tmp, 'opt/sbin/d2khttp'), 'utf8');
+  const stopFailed = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
+  assert.notEqual(stopFailed.status, 0, 'failed stop must prevent installation');
+  assert.equal(fs.readFileSync(path.join(tmp, 'opt/sbin/d2khttp'), 'utf8'), beforeStop);
+  assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2kd')), 'failed stop must not install binaries');
+  fs.unlinkSync(existingInit);
   const installOut = run('install');
   assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'diagnostic tool must be installed');
+  assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kshadow')), 'shadow daemon must be installed');
+  for (const profile of ['modern', 'legacy']) {
+    assert.deepEqual(fs.readFileSync(path.join(tmp, `opt/d2k/files/${profile}.hex`)),
+      fs.readFileSync(path.join(root, `core/profiles/${profile}.hex`)));
+  }
+  fs.writeFileSync(path.join(tmp, 'opt/d2k/state/shadow.d2km'), 'shadow knowledge');
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
   fs.writeFileSync(path.join(tmp, 'bin/mv'), '#!/bin/sh\ncase "$2" in *.migration.*) ls -l "$2" | cut -c1-10 >> "$CALLS.migration-mode";; esac\nexec /bin/mv "$@"\n', { mode: 0o755 });
   const migrationConfig = path.join(tmp, 'opt/d2k/config');
@@ -209,7 +230,7 @@ exit 1
   const ownedHook = fs.readFileSync(hostInit);
   const d2kdSource = path.join(tmp, 'source/builds/d2kd-linux-amd64');
   const d2kdInstalled = path.join(tmp, 'opt/sbin/d2kd');
-  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# next release\nexit 0\n');
+  fs.writeFileSync(d2kdSource, engineFixture('d2kd') + '# next release\n');
   fs.writeFileSync(hostInit, '#!/bin/sh\n# another service\n');
   const conflict = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
   assert.equal(conflict.status, 0, 'foreign host hook must not block a runtime update');
@@ -222,7 +243,7 @@ exit 1
   const hookCurrent = fs.readFileSync(hookSource);
   fs.writeFileSync(hookSource, '#!/bin/sh\n# invalid hook\n');
   const beforeCalls = calls(), beforeBinary = fs.readFileSync(d2kdInstalled);
-  fs.writeFileSync(d2kdSource, '#!/bin/sh\n# staged release\nexit 0\n');
+  fs.writeFileSync(d2kdSource, engineFixture('d2kd') + '# staged release\n');
   const badHook = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], { env, encoding: 'utf8', timeout: 10000 });
   assert.notEqual(badHook.status, 0, 'invalid native hook must fail preflight');
   assert.equal(calls(), beforeCalls, 'invalid hook must not stop or start the runtime');
@@ -250,6 +271,7 @@ exit 1
   fs.mkdirSync(runtime); fs.writeFileSync(path.join(runtime, 'live.json'), '{}');
   for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) fs.writeFileSync(path.join(runtime, `${binary}.health`), 'stale');
   fs.writeFileSync(path.join(runtime, 'log-tail.ABCDEF'), 'stale');
+  for (const name of ['shadow.queue','shadow.queue.seen','shadow.queue.seen.new','shadow.queue.consumer']) fs.writeFileSync(path.join(runtime, name), 'stale');
   fs.writeFileSync(path.join(runtime, 'unrelated'), 'keep');
   const customRuntime = path.join(tmp, 'custom-runtime');
   fs.mkdirSync(customRuntime);
@@ -288,6 +310,10 @@ exit 1
   assert(fs.readFileSync(path.join(tmp, 'calls'), 'utf8').includes('ppe-remove'), 'uninstall must remove own PPE rules even without init');
   assert(!fs.existsSync(path.join(runtime, 'live.json')), 'uninstall must remove volatile live snapshot');
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'uninstall must remove diagnostic tool');
+  assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2kshadow')), 'uninstall must remove shadow daemon');
+  assert(!fs.existsSync(path.join(tmp, 'opt/d2k/files/modern.hex')), 'uninstall removes observed form');
+  for (const name of ['shadow.queue','shadow.queue.seen','shadow.queue.seen.new','shadow.queue.consumer']) assert(!fs.existsSync(path.join(runtime, name)), 'uninstall removes owned shadow runtime files');
+  assert.equal(fs.readFileSync(path.join(tmp, 'opt/d2k/state/shadow.d2km'), 'utf8'), 'shadow knowledge', 'keep-state preserves independent shadow knowledge');
   for (const binary of ['d2kd','d2kc','d2kpanel','d2ktg']) assert(!fs.existsSync(path.join(runtime, `${binary}.health`)), 'uninstall must remove owned heartbeat');
   assert(!fs.existsSync(path.join(runtime, 'log-tail.ABCDEF')), 'uninstall must remove owned abandoned stage');
   assert.equal(fs.readFileSync(path.join(runtime, 'unrelated'), 'utf8'), 'keep');

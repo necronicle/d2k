@@ -49,6 +49,8 @@
 #include "d2k_tls13.h"
 #include "d2k_tls12.h"
 #include "d2k_verify.h"
+#include "d2k_dns_upstreams.h"
+#include "d2k_domain.h"
 #include "d2k_meas.h"
 
 static int64_t verify_now_ms(void) {
@@ -283,6 +285,14 @@ static long read12(void *sess, uint8_t *buf, size_t cap, int wait_ms,
 }
 
 typedef struct {
+    uint8_t *data;
+    size_t cap, len;
+    int overflow;
+    unsigned content_type_count;
+    int dns_content_type;
+} body_capture;
+
+typedef struct {
     read_fn rd;
     void *sess;
     uint8_t *buf;
@@ -291,6 +301,7 @@ typedef struct {
     char *err;
     size_t errcap;
     d2k_resource_scan *scan;
+    body_capture *capture;
     int local_limit; /* отказ по нашему пределу (строка chunk длиннее буфера) */
     uint8_t prefix[4096];
     size_t prefix_len;
@@ -312,6 +323,13 @@ static void body_feed(body_stream *s, const uint8_t *p, size_t n) {
     if (take > n) take = n;
     memcpy(s->prefix + s->prefix_len, p, take);
     s->prefix_len += take;
+    if (s->capture) {
+        size_t copy = s->capture->cap - s->capture->len;
+        if (copy > n) copy = n;
+        memcpy(s->capture->data + s->capture->len, p, copy);
+        s->capture->len += copy;
+        if (copy < n) s->capture->overflow = 1;
+    }
     d2k_resource_feed(s->scan, p, n);
 }
 
@@ -455,7 +473,7 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          int *conn_close, char *err, size_t errcap);
+                          int *conn_close, body_capture *capture, char *err, size_t errcap);
 static int read_status_buf(uint8_t *buf, size_t capacity,
                           read_fn rd, void *sess, int wait_ms,
                           int *cloudflare_challenge, uint64_t *body_bytes,
@@ -465,7 +483,7 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          int *conn_close, char *err, size_t errcap) {
+                          int *conn_close, body_capture *capture, char *err, size_t errcap) {
     size_t used = 0;
     if (local_limit) { *local_limit = 0; }
     if (conn_close) { *conn_close = 0; }
@@ -543,6 +561,12 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                             size_t end = v;
                             while (end < ln && line[end] != ';' && line[end] != ' ') end++;
                             html = span_eq_ascii_ci(line + v, end - v, "text/html");
+                            if (capture) {
+                                size_t tail=ln;
+                                while (tail>v && (line[tail-1]==' ' || line[tail-1]=='\t'))tail--;
+                                capture->content_type_count++;
+                                capture->dns_content_type=span_eq_ascii_ci(line+v,tail-v,"application/dns-message");
+                            }
                         } else if (span_eq_ascii_ci(line, kn, "content-length")) {
                             uint64_t x = 0; size_t digits = 0;
                             while (v < ln && line[v] >= '0' && line[v] <= '9') {
@@ -617,6 +641,7 @@ static int read_status_buf(uint8_t *buf, size_t capacity,
                 bs.rd = rd; bs.sess = sess; bs.buf = buf;
                 bs.used = used; bs.pos = hdr_len + 4;
                 bs.until = until; bs.err = err; bs.errcap = errcap;
+                bs.capture = capture;
                 d2k_resource_scan scan = {0};
                 if (html && encoding == 0 && code >= 200 && code < 300 &&
                     (!cloudflare_challenge || !*cloudflare_challenge)) bs.scan = &scan;
@@ -706,7 +731,7 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
                           char *location, size_t location_cap,
                           d2k_resource *resources, size_t *n_resources,
                           d2k_http_reply_result *http_reply, int *local_limit,
-                          int *conn_close, char *err, size_t errcap) {
+                          int *conn_close, body_capture *capture, char *err, size_t errcap) {
     /* Буфер на куче: заголовки Meta ~8,4 КБ не влезали в прежние 8 КБ на
        стеке (задача 44). Тело читается теми же 8192 байтами с начала. */
     size_t capacity = D2K_VERIFY_HEADER_LIMIT + 1;
@@ -722,7 +747,7 @@ static int read_status_rd(read_fn rd, void *sess, int wait_ms,
         cloudflare_challenge, body_bytes, body_expected, body_complete,
         body_has_length, body_chunked, body_framing_valid, body_encoding,
         location, location_cap, resources, n_resources, http_reply,
-        local_limit, conn_close, err, errcap);
+        local_limit, conn_close, capture, err, errcap);
     free(buf);
     return code_out;
 }
@@ -733,7 +758,7 @@ void d2k_http_read_response(d2k_http_read_fn rd, void *ctx, int wait_ms,
     r->status = read_status_rd(rd, ctx, wait_ms, NULL, &r->body_bytes,
         NULL, &r->complete, NULL, NULL, NULL, NULL,
         r->location, sizeof r->location, NULL, NULL, &r->reply,
-        &r->local_limit, &r->connection_close, err, cap);
+        &r->local_limit, &r->connection_close, NULL, err, cap);
 }
 
 d2k_ver_result d2k_verify_probe(const char *ip, uint16_t port, const char *sni,
@@ -828,6 +853,10 @@ unsigned d2k_verify_budget_get(void) { return g_verify_budget; }
    минимальное приветствие в одной датаграмме. */
 static __thread d2k_quic_form g_verify_quic_form;
 static __thread int g_verify_quic_form_set;
+/* Прибор поля читает тело HTTP/3 до FIN (d2k_verify_quic_read_all_set); зонд
+   плеча — до предела этапа данных. Поточная настройка, как форма. */
+static __thread int g_verify_quic_read_all;
+void d2k_verify_quic_read_all_set(int on) { g_verify_quic_read_all = on ? 1 : 0; }
 void d2k_verify_quic_form_set(const d2k_quic_form *f) {
     if (f && f->n) { g_verify_quic_form = *f; g_verify_quic_form_set = 1; }
     else { g_verify_quic_form_set = 0; }
@@ -940,7 +969,7 @@ static void budget_tcp(read_fn rd, write_fn wr, void *sess, const budget_io *io,
         if (wrote == 0) {
             code = read_status_rd(read_eof, &er, deadline_ms, &chal, &got, &expected, &complete,
                                   &a, &b, &c, &enc, NULL, 0, NULL, NULL, &hr, &ll, &cc,
-                                  err, sizeof err);
+                                  NULL, err, sizeof err);
         }
         if (wrote != 0 || !code || !complete) {
             long now = io->packets(io->ctx);
@@ -976,12 +1005,208 @@ static int fd_peer_spoke(void *ctx) {
 }
 static long fd_packets(void *ctx) { return d2k_verify_packets_hook(*(int *)ctx); }
 
+/* Explicit diagnostic fetches may carry a signed origin-form request target.
+ * Automatic stylesheet witnesses retain their separate restricted policy. */
+#define FETCH_TARGET_MAX 8192
+static int fetch_target_ok(const char *path) {
+    if (!path || path[0] != '/' || path[1] == '/') return 0;
+    for (size_t i = 0; i <= FETCH_TARGET_MAX; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (!c) return i > 0;
+        if (c <= 32 || c >= 127 || c == '#' || c == '\\') return 0;
+    }
+    return 0;
+}
+
+#include "dns_question_wire.inc"
+
+static const uint8_t doh_query[] = {
+    0x00,0x00,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x07,'e','x','a','m','p','l','e',0x03,'c','o','m',0x00,0x00,0x01,0x00,0x01
+};
+
+static size_t doh_base64url(const uint8_t *question,size_t length,char *out) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t at = 0;
+    for (size_t i = 0; i < length; i += 3) {
+        size_t left = length - i;
+        uint32_t v = (uint32_t)question[i] << 16;
+        if (left > 1) v |= (uint32_t)question[i + 1] << 8;
+        if (left > 2) v |= question[i + 2];
+        out[at++] = alphabet[(v >> 18) & 63];
+        out[at++] = alphabet[(v >> 12) & 63];
+        if (left > 1) out[at++] = alphabet[(v >> 6) & 63];
+        if (left > 2) out[at++] = alphabet[v & 63];
+    }
+    out[at] = 0;
+    return at;
+}
+
+static int doh_skip_rr(const uint8_t *b, size_t n, size_t *p) {
+    char owner[256];
+    if (ech_dns_name(b, n, p, owner) != 0 || n - *p < 10) return -1;
+    size_t rdlen = dns16(b + *p + 8);
+    *p += 10;
+    if (rdlen > n - *p) return -1;
+    *p += rdlen;
+    return 0;
+}
+
+static int doh_dns_valid(const uint8_t *question,size_t question_len,const uint8_t *b,size_t n,const char **why) {
+    if (n < 12) { *why = "short DNS header"; return -1; }
+    if (memcmp(b, question, 2) != 0) { *why = "DNS ID does not match query"; return -1; }
+    if (!(b[2] & 0x80) || (b[2] & 0x7a)) {
+        *why = "DNS response is not an un truncated standard-query answer";
+        return -1;
+    }
+    unsigned rcode = b[3] & 15;
+    if (rcode != 0 && rcode != 3) { *why = "DNS RCODE is not NOERROR or NXDOMAIN"; return -1; }
+    if (dns16(b + 4) != 1 || n < question_len ||
+        memcmp(b + 12, question + 12, question_len - 12) != 0) {
+        *why = "DNS question does not match the request";
+        return -1;
+    }
+    size_t p = question_len;
+    for (size_t section = 0; section < 3; section++) {
+        unsigned count = dns16(b + 6 + section * 2);
+        for (unsigned i = 0; i < count; i++) {
+            if (doh_skip_rr(b, n, &p) != 0) { *why = "malformed DNS resource record"; return -1; }
+        }
+    }
+    if (p != n) { *why = "trailing bytes after DNS message"; return -1; }
+    return 0;
+}
+
+static void request_doh_question(read_fn rd, write_fn wr, void *sess, const char *host,
+                        const char *endpoint_path,const uint8_t *question,size_t question_len,
+                        int deadline_ms,int tls12,
+                        d2k_ver_result *r, char *err, size_t errcap) {
+    char encoded[400], target[FETCH_TARGET_MAX + 1];
+    doh_base64url(question,question_len,encoded);
+    int tn = snprintf(target, sizeof target, "%s%sdns=%s", endpoint_path,
+                      strchr(endpoint_path, '?') ? "&" : "?", encoded);
+    if (!fetch_target_ok(endpoint_path) || tn <= 0 || (size_t)tn >= sizeof target ||
+        !fetch_target_ok(target)) {
+        r->local_refusal = 1;
+        snprintf(r->reason, sizeof r->reason, "invalid or oversized DoH endpoint path");
+        return;
+    }
+    char req[FETCH_TARGET_MAX + 1024];
+    int n = snprintf(req, sizeof req,
+        "GET %s HTTP/1.1\r\nHost: %s\r\nAccept: application/dns-message\r\n"
+        "Accept-Encoding: identity\r\nConnection: keep-alive\r\n\r\n", target, host);
+    if (n <= 0 || (size_t)n >= sizeof req) {
+        r->local_refusal = 1;
+        snprintf(r->reason, sizeof r->reason, "DoH request does not fit request buffer");
+        return;
+    }
+    if (wr(sess, (const uint8_t *)req, (size_t)n, err, errcap) != 0) {
+        snprintf(r->reason, sizeof r->reason, "DoH request failed: %.150s", err);
+        return;
+    }
+    uint8_t *body = malloc(65535);
+    if (!body) {
+        r->local_limit = 1;
+        snprintf(r->reason, sizeof r->reason, "not enough memory for DNS message");
+        return;
+    }
+    body_capture capture = { .data=body, .cap=65535 };
+    d2k_http_reply_result http_reply;
+    r->status = read_status_rd(rd, sess, deadline_ms, NULL, &r->body_bytes,
+        &r->body_expected, &r->body_complete, &r->body_has_length,
+        &r->body_chunked, &r->body_framing_valid, &r->body_encoding,
+        r->location, sizeof r->location, NULL, NULL, &http_reply,
+        &r->local_limit, &r->conn_close, &capture, err, errcap);
+    r->http_outcome = http_reply.outcome;
+    snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
+    if (r->status != 200) {
+        snprintf(r->reason, sizeof r->reason, "DoH HTTP status %d", r->status);
+    } else if (!r->body_complete) {
+        snprintf(r->reason, sizeof r->reason, "incomplete DoH HTTP body: %.100s", err);
+    } else if (r->peer_authenticated &&
+        (capture.content_type_count!=1 || !capture.dns_content_type ||
+         !r->body_framing_valid || r->body_encoding)) {
+        r->dns_reply_rejected=1;
+        snprintf(r->reason, sizeof r->reason, "DoH HTTP response has the wrong media type or framing");
+    } else if (capture.overflow || r->body_bytes > 65535) {
+        r->dns_reply_rejected=1;
+        snprintf(r->reason, sizeof r->reason, "DNS message exceeds 65535 bytes");
+    } else {
+        const char *why = NULL;
+        if (doh_dns_valid(question,question_len,body,capture.len,&why) != 0) {
+            r->dns_reply_rejected=1;
+            snprintf(r->reason, sizeof r->reason, "invalid DoH response: %s", why);
+        } else if (tls12) {
+            r->unsupported = 1;
+            r->level = D2K_VER_HANDSHAKE;
+            snprintf(r->reason, sizeof r->reason,
+                "DoH TLS 1.2 HTTP/1.1 reply is not durable HTTP/2 proof; unsupported");
+        } else {
+            r->level = D2K_VER_APPLICATION;
+            snprintf(r->reason, sizeof r->reason,
+                "matching DoH reply (%zu DNS bytes)", capture.len);
+        }
+    }
+    free(body);
+}
+
+static void request_doh(read_fn rd,write_fn wr,void *session,const char *authority,
+    const char *path,int timeout,int tls12,d2k_ver_result *r,char *err,size_t errcap) {
+    request_doh_question(rd,wr,session,authority,path,doh_query,sizeof doh_query,timeout,tls12,r,err,errcap);
+}
+
+static void request_doh_h1_session(const d2k_doh_tls_session *session,const char *authority,
+    const char *path,const uint8_t *question,size_t question_len,int timeout,d2k_ver_result *r) {
+    enum { replies_required=20, minimum_span_ms=30000 };
+    const int64_t start=verify_now_ms();
+    for (unsigned i=0;i<replies_required;i++) {
+        int64_t due=start+((int64_t)i*minimum_span_ms+replies_required-2)/(replies_required-1);
+        int64_t remaining;
+        while ((remaining=due-verify_now_ms())>0) {
+            struct timespec wait={remaining/1000,(remaining%1000)*1000000L};
+            if (nanosleep(&wait,NULL) && errno!=EINTR) {
+                r->local_refusal=1;
+                snprintf(r->reason,sizeof r->reason,"DoH HTTP/1.1 verification pacing failed");
+                return;
+            }
+        }
+        r->budget_requests++;
+        r->level=D2K_VER_HANDSHAKE;
+        r->status=r->body_complete=0;
+        char err[160]={0};
+        int64_t began=verify_now_ms();
+        request_doh_question(session->io.read,session->io.write,session->io.context,authority,path,
+            question,question_len,timeout,0,r,err,sizeof err);
+        if (r->level!=D2K_VER_APPLICATION) {
+            if (r->conn_close && r->body_complete)r->dns_session_ended=1;
+            if (!r->dns_reply_rejected && !r->dns_session_ended &&
+                verify_now_ms()-began>=timeout && (r->status==0 || r->status==200))
+                r->budget=D2K_BUDGET_CUT;
+            return;
+        }
+        r->doh_replies++;
+        r->level=D2K_VER_HANDSHAKE;
+        if (r->conn_close && i+1<replies_required) {
+            r->dns_session_ended=1;
+            snprintf(r->reason,sizeof r->reason,"DoH HTTP/1.1 peer closed its session after %u replies",r->doh_replies);
+            return;
+        }
+    }
+    int64_t elapsed=verify_now_ms()-start;
+    if (elapsed<minimum_span_ms)return;
+    r->level=D2K_VER_APPLICATION;
+    r->budget=D2K_BUDGET_PASSED;
+    snprintf(r->reason,sizeof r->reason,"DoH HTTP/1.1: %u matching DNS replies on one connection over %lld ms",
+        r->doh_replies,(long long)elapsed);
+}
+
 static void request_page_budget(read_fn rd, write_fn wr, void *sess,
                                 const char *host, int encoding,
                                 const char *initial_path,
                                 int deadline_ms, int tls12,
                                 const budget_io *io, unsigned budget,
-                                d2k_ver_result *r, char *err, size_t errcap);
+                                d2k_ver_result *r, char *err, size_t errcap, int explicit_fetch);
 /* Без проверки бюджета — прежнее чтение одного ответа (тесты разбора). */
 static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   const char *host, int encoding,
@@ -995,7 +1220,7 @@ static void request_complete_page(read_fn rd, write_fn wr, void *sess,
                                   int deadline_ms, int tls12,
                                   d2k_ver_result *r, char *err, size_t errcap) {
     request_page_budget(rd, wr, sess, host, encoding, initial_path, deadline_ms, tls12,
-                        NULL, 0, r, err, errcap);
+                        NULL, 0, r, err, errcap, 0);
 }
 
 static void request_page_budget(read_fn rd, write_fn wr, void *sess,
@@ -1003,13 +1228,20 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
                                 const char *initial_path,
                                 int deadline_ms, int tls12,
                                 const budget_io *io, unsigned budget,
-                                d2k_ver_result *r, char *err, size_t errcap) {
-    char path[1024] = "/";
-    if (initial_path) snprintf(path, sizeof path, "%s", initial_path);
+                                d2k_ver_result *r, char *err, size_t errcap, int explicit_fetch) {
+    char path[FETCH_TARGET_MAX + 1] = "/";
+    if (initial_path) {
+        if (!fetch_target_ok(initial_path)) {
+            r->local_refusal = 1;
+            snprintf(r->reason, sizeof r->reason, "недопустимый или слишком длинный путь HTTP-запроса");
+            return;
+        }
+        memcpy(path, initial_path, strlen(initial_path) + 1);
+    }
     const char *accept_encoding = encoding == 1 ? "gzip" :
                                   encoding == 2 ? "gzip, deflate" : "identity";
     for (int redirects = 0; redirects <= 3; redirects++) {
-        char req[2048];
+        char req[FETCH_TARGET_MAX + 1024];
         int n = snprintf(req, sizeof req,
                          "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
                          "Accept: */*\r\nAccept-Encoding: %s\r\nConnection: keep-alive\r\n\r\n",
@@ -1030,11 +1262,38 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
                                   &r->body_has_length, &r->body_chunked,
                                   &r->body_framing_valid, &r->body_encoding, r->location,
                                   sizeof r->location, r->resources, &r->n_resources,
-                                  &http_reply, &r->local_limit, &r->conn_close, err, errcap);
+                                  &http_reply, &r->local_limit, &r->conn_close, NULL, err, errcap);
         r->status = code;
         r->http_outcome = http_reply.outcome;
         snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
         if (r->cloudflare_challenge) { r->level = D2K_VER_CHALLENGE; return; }
+        /* HTTP 451 — ОТКАЗ САЙТА ТОЛЬКО ОТ САЙТА (24.10.2026).
+         *
+         * Код 451 сам по себе не говорит, КТО ответил, а решение по нему
+         * тяжёлое: поиск закрывается и цель молчит час. Кто ответил, говорит
+         * сертификат: имя в нём сверено с запрошенным (r->name_ok, выставлен
+         * до этого чтения). Совпало — внутри TLS отвечал владелец имени, и
+         * «юридический отказ сервиса» утверждать можно. Не совпало или
+         * сертификата не было — отвечал кто угодно, и по §2.4 это «не
+         * измерено», а не отказ сайта.
+         *
+         * Поле 24.10.2026, x-minus.pro: 451 приходил С РОУТЕРА под уже
+         * поставленным планом, с ПУСТЫМ телом по HTTP/2, а с эталонного VPS
+         * тот же адрес отдавал 200 и 14 822 байта. Цель не открылась ни в
+         * одном из шести кругов: поиск останавливался на 451 как на отказе
+         * сайта и уходил отдыхать на час.
+         *
+         * Заглушка блокировки (D2K_HTTP_BLOCKED) этой проверки не требует:
+         * её опознают по собственной подписи, а не по одному коду. */
+        if (http_reply.outcome == D2K_HTTP_LEGAL_DENIAL && r->name_ok != 1) {
+            r->http_outcome = D2K_HTTP_NEUTRAL;
+            snprintf(r->http_evidence, sizeof r->http_evidence, "HTTP 451 без имени");
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d, но собеседник не подтвердил имя сертификатом (%s) — "
+                     "отказом сайта это не считаю",
+                     code, r->name_ok == 0 ? "имя чужое" : "сертификата не было");
+            return;
+        }
         if (http_reply.outcome == D2K_HTTP_BLOCKED ||
             http_reply.outcome == D2K_HTTP_LEGAL_DENIAL) {
             r->level = http_reply.outcome == D2K_HTTP_BLOCKED ?
@@ -1046,7 +1305,7 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
             char next[sizeof path];
             if (r->body_framing_valid && redirects < 3 &&
                 redirect_path(r->location, host, next, sizeof next)) {
-                if (initial_path && !d2k_resource_path_ok(next)) {
+                if (initial_path && !(explicit_fetch ? fetch_target_ok(next) : d2k_resource_path_ok(next))) {
                     r->level = D2K_VER_HANDSHAKE;
                     snprintf(r->reason, sizeof r->reason, "stylesheet перенаправлен не на ресурс; не подтверждено");
                     return;
@@ -1111,17 +1370,22 @@ static int verify_contact(int use_fd, const char *ip, uint16_t port,
                                 local_addr, local_port, out_fd);
 }
 
+#include "doh_h2.inc"
+
 static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16_t port,
                                         const char *sni, int deadline_ms,
                                         size_t hello_wire, int encoding, uint32_t mark,
-                                        const char *path, const d2k_ech_config *ech) {
+                                        const char *path, const d2k_ech_config *ech,
+                                        int explicit_fetch) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
     r.name_ok = -1;   /* не смотрели — «сказать нечего», а не «нет» (§2.4) */
-    if (path && !d2k_resource_path_ok(path)) {
+    if (path && !(explicit_fetch ? fetch_target_ok(path) : d2k_resource_path_ok(path))) {
         if (use_fd >= 0) close(use_fd);
-        snprintf(r.reason, sizeof r.reason, "недопустимый путь stylesheet-пробы");
+        r.local_refusal = 1;
+        snprintf(r.reason, sizeof r.reason, "%s", explicit_fetch ?
+                 "недопустимый или слишком длинный путь HTTP-запроса" : "недопустимый путь stylesheet-пробы");
         return r;
     }
     snprintf(r.reason, sizeof r.reason, "проба не начиналась");
@@ -1174,7 +1438,7 @@ static d2k_ver_result verify_probe13_internal(int use_fd, const char *ip, uint16
     r.negotiated_tls=d2k_tls_version(t);
     uint64_t wire_before=d2k_tls_rx_wire_bytes(t);
     request_page_budget(read13, write13, t, host, encoding, path,
-                        deadline_ms, 0, &io, g_verify_budget, &r, err, sizeof err);
+                        deadline_ms, 0, &io, g_verify_budget, &r, err, sizeof err, explicit_fetch);
     r.rx_tls_wire_bytes=d2k_tls_rx_wire_bytes(t)-wire_before;
     r.rx_tls_record_missing=d2k_tls_rx_record_missing(t);
     long dp = d2k_verify_packets_hook(r.fd);
@@ -1190,7 +1454,7 @@ static d2k_ver_result verify_probe13_on(int use_fd, const char *ip, uint16_t por
     const char *sni, int deadline_ms, size_t hello_wire, int encoding,
     uint32_t mark, const char *path) {
     return verify_probe13_internal(use_fd, ip, port, sni, deadline_ms,
-                                   hello_wire, encoding, mark, path, NULL);
+                                   hello_wire, encoding, mark, path, NULL, 0);
 }
 
 static void ech_http_denial(d2k_ver_result *r) {
@@ -1215,7 +1479,7 @@ d2k_ver_result d2k_verify_probe_ech_on(int use_fd, const char *ip, uint16_t port
         return r;
     }
     d2k_ver_result r = verify_probe13_internal(use_fd, ip, port, origin, deadline_ms,
-                                               hello_wire, 0, mark, path, config);
+                                               hello_wire, 0, mark, path, config, 0);
     ech_http_denial(&r);
     return r;
 }
@@ -1367,14 +1631,17 @@ d2k_ver_result d2k_verify_probe_alpn_on(int use_fd, const char *ip, uint16_t por
 static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16_t port,
                                              const char *sni, int deadline_ms,
                                              size_t hello_wire, int encoding,
-                                             uint32_t mark, const char *path) {
+                                             uint32_t mark, const char *path,
+                                             int explicit_fetch, int doh) {
     d2k_ver_result r;
     memset(&r, 0, sizeof r);
     r.fd = -1;
     r.name_ok = -1;
-    if (path && !d2k_resource_path_ok(path)) {
+    if (path && !(explicit_fetch ? fetch_target_ok(path) : d2k_resource_path_ok(path))) {
         if (use_fd >= 0) close(use_fd);
-        snprintf(r.reason, sizeof r.reason, "недопустимый путь stylesheet-пробы");
+        r.local_refusal = 1;
+        snprintf(r.reason, sizeof r.reason, "%s", explicit_fetch ?
+                 "недопустимый или слишком длинный путь HTTP-запроса" : "недопустимый путь stylesheet-пробы");
         return r;
     }
     snprintf(r.reason, sizeof r.reason, "проба не начиналась");
@@ -1417,8 +1684,12 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
     budget_io io = { fd_packets, fd_peer_spoke, &r.fd };
     r.negotiated_tls=0x0303;
     uint64_t wire_before=d2k_tls12_rx_wire_bytes(t);
-    request_page_budget(read12, write12, t, host, encoding, path,
-                        deadline_ms, 1, &io, g_verify_budget, &r, err, sizeof err);
+    if (doh) {
+        request_doh(read12, write12, t, host, path, deadline_ms, 1, &r, err, sizeof err);
+    } else {
+        request_page_budget(read12, write12, t, host, encoding, path,
+                            deadline_ms, 1, &io, g_verify_budget, &r, err, sizeof err, explicit_fetch);
+    }
     r.rx_tls_wire_bytes=d2k_tls12_rx_wire_bytes(t)-wire_before;
     r.rx_tls_record_missing=d2k_tls12_rx_record_missing(t);
     long dp = d2k_verify_packets_hook(r.fd);
@@ -1427,24 +1698,71 @@ static d2k_ver_result verify_probe12_internal(int use_fd, const char *ip, uint16
     return r;
 }
 
+d2k_ver_result d2k_verify_probe12_handshake_on(int use_fd, const char *ip, uint16_t port,
+                                               const char *sni, int deadline_ms,
+                                               size_t hello_wire) {
+    d2k_ver_result r;
+    memset(&r, 0, sizeof r);
+    r.fd = -1;
+    r.name_ok = -1;
+    snprintf(r.reason, sizeof r.reason, "проба не начиналась");
+    if (!ip || !ip[0]) {
+        if (use_fd >= 0) close(use_fd);
+        return r;
+    }
+    r.family = strchr(ip, ':') ? 6 : 4;
+    int contact = verify_contact(use_fd, ip, port, 0, r.family,
+                                 r.local_addr, &r.local_port, &r.fd);
+    if (contact != 0) {
+        if (contact == -2) {
+            r.local_refusal = 1;
+            snprintf(r.reason, sizeof r.reason, "метка измерительного сокета не поставилась");
+        } else {
+            snprintf(r.reason, sizeof r.reason, "нет TCP");
+        }
+        return r;
+    }
+    r.level = D2K_VER_TRANSPORT;
+    if (r.family == 4) memcpy(r.local_ip4, r.local_addr, 4);
+    snprintf(r.reason, sizeof r.reason, "транспорт встал, рукопожатия нет");
+    char err[160];
+    err[0] = '\0';
+    d2k_tls12 *t = NULL;
+    if (d2k_tls12_connect(r.fd, (sni && sni[0]) ? sni : "", deadline_ms, hello_wire,
+                          &t, err, sizeof err) != 0) {
+        /* alert сервера, обрыв, только 1.3, чужой набор шифров — всё сюда,
+           с причиной клиента 1.2; это отказ, а не половина успеха. */
+        snprintf(r.reason, sizeof r.reason, "нет TLS 1.2 (без имени): %.130s", err);
+        return r;
+    }
+    r.level = D2K_VER_HANDSHAKE;
+    r.handshake_proof = 1;
+    r.negotiated_tls = 0x0303;
+    r.name_ok = d2k_tls12_peer_name(t);
+    snprintf(r.reason, sizeof r.reason,
+             "рукопожатие TLS 1.2 без имени завершено; приложение и сертификат не проверены");
+    d2k_tls12_free(t);
+    return r;
+}
+
 d2k_ver_result d2k_verify_probe12_on(int use_fd, const char *ip, uint16_t port,
                                      const char *sni, int deadline_ms,
                                      size_t hello_wire) {
     return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
-                                   hello_wire, 2, 0, NULL);
+                                   hello_wire, 2, 0, NULL, 0, 0);
 }
 
 d2k_ver_result d2k_verify_probe_identity_on(int use_fd, const char *ip, uint16_t port,
     const char *sni, int deadline_ms, size_t hello_wire, int tls12) {
     if (tls12) return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
-                                             hello_wire, 0, 0, NULL);
+                                             hello_wire, 0, 0, NULL, 0, 0);
     return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 0, 0, NULL);
 }
 
 d2k_ver_result d2k_verify_probe_gzip_on(int use_fd, const char *ip, uint16_t port,
     const char *sni, int deadline_ms, size_t hello_wire, int tls12) {
     if (tls12) return verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
-                                             hello_wire, 1, 0, NULL);
+                                             hello_wire, 1, 0, NULL, 0, 0);
     return verify_probe13_on(use_fd, ip, port, sni, deadline_ms, hello_wire, 1, 0, NULL);
 }
 
@@ -1462,7 +1780,7 @@ d2k_ver_result d2k_verify_probe_baseline(const char *ip, uint16_t port,
     }
     if (tls12) {
         return verify_probe12_internal(-1, ip, port, sni, deadline_ms,
-                                       hello_wire, encoding, mark, NULL);
+                                       hello_wire, encoding, mark, NULL, 0, 0);
     }
     return verify_probe13_on(-1, ip, port, sni, deadline_ms,
                              hello_wire, encoding, mark, NULL);
@@ -1478,9 +1796,18 @@ d2k_ver_result d2k_verify_probe_path_on(int use_fd, const char *ip, uint16_t por
         return r;
     }
     return tls12 ? verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
-                                            hello_wire, encoding, mark, path)
+                                            hello_wire, encoding, mark, path, 0, 0)
                  : verify_probe13_on(use_fd, ip, port, sni, deadline_ms,
                                        hello_wire, encoding, mark, path);
+}
+
+d2k_ver_result d2k_verify_fetch_tcp_on(int use_fd, const char *ip, uint16_t port,
+    const char *sni, int deadline_ms, size_t hello_wire, int tls12,
+    uint32_t mark, const char *path) {
+    return tls12 ? verify_probe12_internal(use_fd, ip, port, sni, deadline_ms,
+                                            hello_wire, 0, mark, path, 1, 0)
+                 : verify_probe13_internal(use_fd, ip, port, sni, deadline_ms,
+                                            hello_wire, 0, mark, path, NULL, 1);
 }
 
 void d2k_verify_close(d2k_ver_result *r) {
@@ -1545,6 +1872,29 @@ static long quic_recv_chunk(void *ctx, uint8_t *buf, size_t cap, char *err,
     uint64_t sid = 0;
     return d2k_qc_stream_recv(((quic_recv_ctx *)ctx)->c, &sid, buf, cap, 200,
                               err, errcap);
+}
+typedef void (*h3_progress_fn)(void *ctx, uint64_t *bytes, int *complete);
+static void quic_recv_progress(void *ctx, uint64_t *bytes, int *complete) {
+    d2k_qc_app_progress(((quic_recv_ctx *)ctx)->c, bytes, complete);
+}
+
+/* Тело ответа HTTP/3 после заголовков. Зонду плеча достаточно
+   D2K_QUIC_ARM_DATA_BYTES — лишние байты не храним; прибор поля
+   (g_verify_quic_read_all) читает до FIN в рамках срока: его вопрос —
+   «страница целиком?», и предел этапа данных ответом на него не является
+   (поле 24.10.2026, h3-1024: www.cloudflare.com прислал 139 КБ, остановка на
+   32 КиБ считалась обрывом). Возвращает closed. Выделено ради теста без сокетов. */
+static int quic_read_body(h3_recv_fn recv, h3_progress_fn progress, void *ctx, int closed,
+                          int64_t until, int full_response, uint64_t *bytes, int *complete,
+                          char *err, size_t errcap) {
+    uint64_t cap = (full_response || g_verify_quic_read_all) ? 0 : D2K_QUIC_ARM_DATA_BYTES;
+    progress(ctx, bytes, complete);
+    while (!closed && !*complete && (!cap || *bytes < cap) && verify_now_ms() < until) {
+        uint8_t sink[4096];
+        if (recv(ctx, sink, sizeof sink, err, errcap) < 0) { closed = 1; }
+        progress(ctx, bytes, complete);
+    }
+    return closed;
 }
 
 /* БЮДЖЕТ ПО QUIC: тот же порог по датаграммам обеих сторон (поле 04.10:
@@ -1717,7 +2067,16 @@ d2k_ver_result d2k_verify_probe_quic_path_on(int use_fd, const char *ip, uint16_
                                             hello_wire, 0, path);
 }
 
-d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, uint16_t port,
+/* The full-response caller and the field read-all switch share one drain. */
+static void quic_read_response(d2k_qc *c, int64_t until, int full_response,
+                               int *closed, uint64_t *bytes, int *complete,
+                               char *err, size_t errcap) {
+    quic_recv_ctx ctx = { c };
+    *closed = quic_read_body(quic_recv_chunk, quic_recv_progress, &ctx, *closed,
+                            until, full_response, bytes, complete, err, errcap);
+}
+
+static d2k_ver_result verify_quic_response(int full_response, int use_fd, const char *ip, uint16_t port,
                                                  const char *sni, int deadline_ms,
                                                  size_t hello_wire, uint32_t mark,
                                                  const char *path) {
@@ -1825,10 +2184,22 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
     if (h3_status != 0) {
         r.status = h3_status;
         if (h3_status == 451) {
-            r.level = D2K_VER_DENIED;
-            r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
-            snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451");
-            snprintf(r.reason, sizeof r.reason, "HTTP отказ: HTTP 451");
+            /* Та же сверка, что по TCP: кто ответил 451, говорит сертификат
+               (см. request_page_budget). name_ok по QUIC выставлен сразу
+               после рукопожатия. */
+            if (r.name_ok == 1) {
+                r.level = D2K_VER_DENIED;
+                r.http_outcome = D2K_HTTP_LEGAL_DENIAL;
+                snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451");
+                snprintf(r.reason, sizeof r.reason, "HTTP отказ: HTTP 451");
+            } else {
+                r.http_outcome = D2K_HTTP_NEUTRAL;
+                snprintf(r.http_evidence, sizeof r.http_evidence, "HTTP 451 без имени");
+                snprintf(r.reason, sizeof r.reason,
+                         "HTTP 451, но собеседник не подтвердил имя сертификатом (%s) — "
+                         "отказом сайта это не считаю",
+                         r.name_ok == 0 ? "имя чужое" : "сертификата не было");
+            }
         }
     }
     /* ЗАГОЛОВКИ — ЕЩЁ НЕ ПРИЛОЖЕНИЕ (задача 39). Поле 02.10.2026 (задача 33):
@@ -1842,20 +2213,12 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
     if (r.status != 0 && r.level != D2K_VER_DENIED) {
         uint64_t bytes = 0;
         int complete = 0;
-        d2k_qc_app_progress(c, &bytes, &complete);
-        while (!closed && !complete && bytes < D2K_QUIC_ARM_DATA_BYTES &&
-               verify_now_ms() < until) {
-            uint64_t sid = 0;
-            uint8_t sink[4096];
-            if (d2k_qc_stream_recv(c, &sid, sink, sizeof sink, 200, err, sizeof err) < 0) {
-                closed = 1;
-            }
-            d2k_qc_app_progress(c, &bytes, &complete);
-        }
+        quic_read_response(c, until, full_response, &closed, &bytes, &complete, err, sizeof err);
         r.body_bytes = bytes;
         r.body_complete = complete;
         /* То же правило, что у этапа данных плеча (d2k_quic_arm_data_judge). */
-        if (d2k_quic_arm_data_judge(1, r.status, bytes, complete) == D2K_QAD_PASS) {
+        if ((!full_response || complete) &&
+            d2k_quic_arm_data_judge(1, r.status, bytes, complete) == D2K_QAD_PASS) {
             r.level = D2K_VER_APPLICATION;
             snprintf(r.reason, sizeof r.reason,
                      "заголовки HTTP/3 получены, статус %d, данных %llu байт%s", r.status,
@@ -1865,11 +2228,23 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
                 quic_budget_io qio = { qb_request, qb_recv, qb_progress, qb_packets, &qc };
                 budget_quic(&qio, deadline_ms, g_verify_budget, &r);
             }
-        } else {
+        } else if (full_response) {
             snprintf(r.reason, sizeof r.reason,
-                     "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "
-                     "до %u и до конца ответа%s%.60s", r.status, (unsigned long long)bytes,
-                     D2K_QUIC_ARM_DATA_BYTES, closed ? ": " : "", closed ? err : "");
+                     "HTTP/3 статус %d, принято %llu байт, полный ответ не получен%s%.60s",
+                     r.status, (unsigned long long)bytes,
+                     closed ? ": " : "", closed ? err : "");
+        } else {
+            if (g_verify_quic_read_all) {
+                snprintf(r.reason, sizeof r.reason,
+                         "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "
+                         "до конца ответа%s%.60s", r.status, (unsigned long long)bytes,
+                         closed ? ": " : "", closed ? err : "");
+            } else {
+                snprintf(r.reason, sizeof r.reason,
+                         "заголовки HTTP/3 получены (статус %d), поток оборван на %llu байт "
+                         "до %u и до конца ответа%s%.60s", r.status, (unsigned long long)bytes,
+                         D2K_QUIC_ARM_DATA_BYTES, closed ? ": " : "", closed ? err : "");
+            }
         }
     } else if (headers_too_long) {
         r.local_limit = 1;
@@ -1883,5 +2258,402 @@ d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, ui
        TCP-зонда: закрытие удаляет ячейку потока в датапате раньше, чем придёт
        событие применения плана. */
     r.fd = d2k_qc_release(c);
+    return r;
+}
+
+/* Keep the scheduler's measured data-stage criterion separate from a fetch. */
+d2k_ver_result d2k_verify_probe_quic_path_mark_on(int use_fd, const char *ip, uint16_t port,
+                                                 const char *sni, int deadline_ms,
+                                                 size_t hello_wire, uint32_t mark,
+                                                 const char *path) {
+    return verify_quic_response(0, use_fd, ip, port, sni, deadline_ms, hello_wire, mark, path);
+}
+
+d2k_ver_result d2k_verify_fetch_quic_on(int use_fd, const char *ip, uint16_t port,
+                                      const char *sni, int deadline_ms,
+                                      size_t hello_wire, uint32_t mark,
+                                      const char *path) {
+    return verify_quic_response(1, use_fd, ip, port, sni, deadline_ms, hello_wire, mark, path);
+}
+
+static long uncounted_transport(void *ctx) {(void)ctx;return -1;}
+typedef struct {
+    d2k_tls *tls;
+    uint64_t before;
+    d2k_doh_observer observer;
+    void *ctx;
+} doh_tls_observer;
+static int observe_doh_tls(void *ctx,const d2k_doh_observation *observation) {
+    doh_tls_observer *w=ctx;
+    d2k_doh_observation current=*observation;
+    current.response.rx_tls_wire_bytes=d2k_tls_rx_wire_bytes(w->tls)-w->before;
+    current.response.rx_tls_record_missing=d2k_tls_rx_record_missing(w->tls);
+    return w->observer(w->ctx,&current);
+}
+typedef struct {
+    void *tls;
+    int legacy;
+    d2k_https_observer observer;
+    void *context;
+    unsigned ordinal;
+    int refused;
+} https_watch;
+static int https_notify(https_watch *w,d2k_https_phase phase,const uint8_t *request,
+    size_t length,const d2k_ver_result *response) {
+    d2k_https_observation event={phase,w->ordinal,request,length,response};
+    if(w->refused)return -1;
+    if(w->observer && w->observer(w->context,&event)){w->refused=1;return -1;}
+    return 0;
+}
+static long https_read(void *context,uint8_t *bytes,size_t length,int wait,char *err,size_t cap) {
+    https_watch *w=context;
+    return w->legacy?read12(w->tls,bytes,length,wait,err,cap):read13(w->tls,bytes,length,wait,err,cap);
+}
+static int https_write(void *context,const uint8_t *bytes,size_t length,char *err,size_t cap) {
+    https_watch *w=context;w->ordinal++;
+    if(https_notify(w,D2K_HTTPS_REQUEST_BEGIN,bytes,length,NULL))return -1;
+    if(w->legacy?write12(w->tls,bytes,length,err,cap):write13(w->tls,bytes,length,err,cap))return -1;
+    return https_notify(w,D2K_HTTPS_REQUEST_SENT,bytes,length,NULL);
+}
+static d2k_ver_result verify_https_owned(const d2k_tls_io *transport,const d2k_tls_probe_seed *seed,
+    const uint8_t random[32],
+    const char *host,const char *path,int timeout,size_t wire,int encoding,
+    d2k_https_observer observer,void *context) {
+    d2k_ver_result r={0};r.fd=-1;r.name_ok=-1;
+    int valid_host=host && *host && strlen(host)<=253;
+    if(valid_host)for(const unsigned char *p=(const unsigned char *)host;*p;p++) {
+        if(!((*p>='a' && *p<='z') || (*p>='A' && *p<='Z') ||
+             (*p>='0' && *p<='9') || *p=='.' || *p=='-' || *p=='_')) {
+            valid_host=0;break;
+        }
+    }
+    if(!transport || !transport->read || !transport->write || (!seed && !random) || !valid_host ||
+       (path && !fetch_target_ok(path)) || timeout<=0 || encoding<0 || encoding>2) {
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"invalid owned HTTPS transport, seed or target");return r;
+    }
+    r.level=D2K_VER_TRANSPORT;
+    static const uint8_t alpn[]={8,'h','t','t','p','/','1','.','1'};
+    d2k_tls *tls=NULL;d2k_tls12 *tls12=NULL;char err[160]={0};
+    int legacy=random!=NULL;
+    int failed=legacy?d2k_tls12_connect_probe(transport,random,host,timeout,wire,&tls12,err,sizeof err):
+        d2k_tls_connect_probe(transport,seed,host,timeout,wire,alpn,sizeof alpn,&tls,err,sizeof err);
+    if(failed) {
+        snprintf(r.reason,sizeof r.reason,"нет TLS на измерительном транспорте: %.120s",err);
+        return r;
+    }
+    r.level=D2K_VER_HANDSHAKE;r.name_ok=legacy?d2k_tls12_peer_name(tls12):d2k_tls_peer_name(tls);
+    r.negotiated_tls=legacy?0x0303:d2k_tls_version(tls);
+    uint64_t before=legacy?d2k_tls12_rx_wire_bytes(tls12):d2k_tls_rx_wire_bytes(tls);
+    https_watch watch={.tls=legacy?(void *)tls12:(void *)tls,.legacy=legacy,.observer=observer,.context=context};
+    request_page_budget(https_read,https_write,&watch,host,encoding,path,timeout,legacy,NULL,0,
+        &r,err,sizeof err,1);
+    r.rx_tls_wire_bytes=(legacy?d2k_tls12_rx_wire_bytes(tls12):d2k_tls_rx_wire_bytes(tls))-before;
+    r.rx_tls_record_missing=legacy?d2k_tls12_rx_record_missing(tls12):d2k_tls_rx_record_missing(tls);
+    if(https_notify(&watch,D2K_HTTPS_EXCHANGE_END,NULL,0,&r)) {
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"owned HTTPS observer refused evidence");
+    }
+    if(legacy)d2k_tls12_free(tls12);else d2k_tls_free(tls);
+    return r;
+}
+d2k_ver_result d2k_verify_https_observe_io(const d2k_tls_io *transport,const d2k_tls_probe_seed *seed,
+    const char *host,const char *path,int timeout,size_t wire,int encoding,d2k_https_observer observer,void *context) {
+    return verify_https_owned(transport,seed,NULL,host,path,timeout,wire,encoding,observer,context);
+}
+d2k_ver_result d2k_verify_https12_observe_io(const d2k_tls_io *transport,const uint8_t random[32],
+    const char *host,const char *path,int timeout,size_t wire,int encoding,d2k_https_observer observer,void *context) {
+    return verify_https_owned(transport,NULL,random,host,path,timeout,wire,encoding,observer,context);
+}
+d2k_ver_result d2k_verify_https_probe_io(const d2k_tls_io *transport,const d2k_tls_probe_seed *seed,
+    const char *host,const char *path,int timeout,size_t wire,int encoding) {
+    return d2k_verify_https_observe_io(transport,seed,host,path,timeout,wire,encoding,NULL,NULL);
+}
+static d2k_ver_result verify_doh_io(const d2k_tls_io *transport,const d2k_tls_probe_seed *seed,const char *host,const char *path,
+    int timeout,size_t wire,unsigned budget,long (*packets)(void *),void *ctx,
+    d2k_doh_observer observer,void *observer_ctx) {
+    d2k_ver_result r={0};r.fd=-1;
+    if(!transport || !transport->read || !transport->write || !host || !*host ||
+       !path || !fetch_target_ok(path) || timeout<=0 ||
+       budget>UINT32_MAX/2 || (budget && !packets)) {
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"invalid DoH transport, target or packet counter");return r;
+    }
+    r.level=D2K_VER_TRANSPORT;
+    char err[160]={0};d2k_tls *tls=NULL;
+    static const uint8_t alpn[]={2,'h','2'};
+    int rc=seed?d2k_tls_connect_probe(transport,seed,host,timeout,wire,alpn,sizeof alpn,&tls,err,sizeof err):
+        d2k_tls_connect_io(transport,host,timeout,wire,alpn,sizeof alpn,&tls,err,sizeof err);
+    if(rc) {
+        snprintf(r.reason,sizeof r.reason,"нет TLS на измерительном транспорте: %.120s",err);
+        return r;
+    }
+    r.level=D2K_VER_HANDSHAKE;r.name_ok=d2k_tls_peer_name(tls);
+    r.negotiated_tls=d2k_tls_version(tls);
+    uint64_t before=d2k_tls_rx_wire_bytes(tls);
+    budget_io counter={packets?packets:uncounted_transport,NULL,ctx};
+    doh_tls_observer watcher={tls,before,observer,observer_ctx};
+    request_doh_h2_observed(read13,write13,tls,host,path,timeout,&counter,budget,&r,err,sizeof err,
+        observer?observe_doh_tls:NULL,observer?&watcher:NULL);
+    r.rx_tls_wire_bytes=d2k_tls_rx_wire_bytes(tls)-before;
+    r.rx_tls_record_missing=d2k_tls_rx_record_missing(tls);
+    if(packets) {
+        long count=packets(ctx);
+        if(count>=0)r.data_packets=(unsigned)count;
+        else if(r.budget!=D2K_BUDGET_PASSED)r.budget_uncountable=1;
+    }
+    d2k_tls_free(tls);return r;
+}
+d2k_ver_result d2k_verify_doh_io(const d2k_tls_io *io,const char *host,const char *path,
+    int timeout,size_t wire,unsigned budget,long (*packets)(void *),void *ctx) {
+    return verify_doh_io(io,NULL,host,path,timeout,wire,budget,packets,ctx,NULL,NULL);
+}
+d2k_ver_result d2k_verify_doh_probe_io(const d2k_tls_io *io,const d2k_tls_probe_seed *seed,
+    const char *host,const char *path,int timeout,size_t wire,unsigned budget,long (*packets)(void *),void *ctx) {
+    if(!seed) {
+        d2k_ver_result r={0};r.fd=-1;r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"controlled TLS probe seed missing");return r;
+    }
+    return verify_doh_io(io,seed,host,path,timeout,wire,budget,packets,ctx,NULL,NULL);
+}
+d2k_ver_result d2k_verify_doh_observe_io(const d2k_tls_io *io,const d2k_tls_probe_seed *seed,
+    const char *host,const char *path,int timeout,size_t wire,d2k_doh_observer observer,void *ctx) {
+    if(!observer) {
+        d2k_ver_result r={0};r.fd=-1;r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"DoH observer missing");return r;
+    }
+    return verify_doh_io(io,seed,host,path,timeout,wire,0,NULL,NULL,observer,ctx);
+}
+
+static d2k_doh_tls_open_fn doh_tls_open;
+
+void d2k_verify_doh_set_tls(d2k_doh_tls_open_fn open_tls) {
+    doh_tls_open = open_tls;
+}
+
+static d2k_dot_probe_fn dot_probe;
+static d2k_plain_dns_probe_fn plain_dns_probe;
+
+void d2k_verify_plain_dns_set_probe(d2k_plain_dns_probe_fn probe) {
+    plain_dns_probe=probe;
+}
+
+d2k_ver_result d2k_verify_plain_dns_on(const char *ip,uint16_t port,uint8_t transport,
+    const char *question,uint16_t type,int timeout,uint32_t mark) {
+    if (plain_dns_probe)return plain_dns_probe(ip,port,transport,question,type,timeout,mark);
+    d2k_ver_result r={.fd=-1,.name_ok=-1,.unsupported=1};
+    snprintf(r.reason,sizeof r.reason,"plain DNS verifier unavailable");
+    return r;
+}
+
+void d2k_verify_dot_set_probe(d2k_dot_probe_fn probe) {
+    dot_probe=probe;
+}
+
+d2k_ver_result d2k_verify_dot_question_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,uint16_t version,uint32_t mark,const char *qname,uint16_t qtype) {
+    d2k_ver_result r={.fd=-1,.name_ok=-1};
+    uint8_t address[16];
+    char name[256];
+    int af=ip && strchr(ip,':') ? AF_INET6 : AF_INET;
+    if (!ip || inet_pton(af,ip,address)!=1 || !host ||
+        (inet_pton(AF_INET,host,address)!=1 && inet_pton(AF_INET6,host,address)!=1 &&
+            d2k_domain_normalize(host,name)) ||
+        !port || timeout<=0 || (version && version!=0x0303 && version!=0x0304)) {
+        if (fd>=0) close(fd);
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"invalid DoT endpoint");
+        return r;
+    }
+    if (!dot_probe) {
+        if (fd>=0) close(fd);
+        r.unsupported=1;
+        snprintf(r.reason,sizeof r.reason,"authenticated DoT verifier unavailable");
+        return r;
+    }
+    r.family=af==AF_INET6 ? 6 : 4;
+    int contact=verify_contact(fd,ip,port,mark,r.family,r.local_addr,&r.local_port,&r.fd);
+    if (contact) {
+        r.local_refusal=contact==-2;
+        snprintf(r.reason,sizeof r.reason,"%s",r.local_refusal ?
+            "cannot set DoT socket mark" : "DoT TCP connection failed");
+        return r;
+    }
+    if (r.family==4) memcpy(r.local_ip4,r.local_addr,4);
+    r.level=D2K_VER_TRANSPORT;
+    dot_probe(r.fd,host,version,timeout,qname,qtype,&r);
+    long packets=d2k_verify_packets_hook(r.fd);
+    r.data_packets=packets>0 ? (unsigned)packets : 0;
+    return r;
+}
+
+d2k_ver_result d2k_verify_dot_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,uint16_t version,uint32_t mark) {
+    return d2k_verify_dot_question_on(fd,ip,port,host,timeout,version,mark,NULL,0);
+}
+
+d2k_ver_result d2k_verify_doh_question_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,size_t wire,int tls12,uint32_t mark,const char *path,
+    const char *qname,uint16_t qtype) {
+    /* The authenticated client uses its own ClientHello. Only receipts on
+       this socket can attest to a candidate applied to this verification. */
+    (void)wire;
+    d2k_ver_result r = {.fd=-1, .name_ok=-1};
+    uint8_t address[16];
+    char identity[256], authority[262];
+    int ip_family = ip && strchr(ip, ':') ? AF_INET6 : AF_INET;
+    int name_family = host && strchr(host, ':') ? AF_INET6 : AF_INET;
+    int invalid = !path || !ip || !host || !port || timeout<=0 ||
+        !fetch_target_ok(path) || inet_pton(ip_family,ip,address)!=1;
+    if (!invalid) {
+        invalid = inet_pton(name_family,host,address)==1
+            ? inet_ntop(name_family,address,identity,sizeof identity)==NULL
+            : d2k_domain_normalize(host,identity)!=0;
+    }
+    if (invalid || d2k_dns_http_authority(identity,port,authority,sizeof authority)) {
+        if (fd>=0) close(fd);
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"invalid DoH endpoint");
+        return r;
+    }
+    if (!doh_tls_open) {
+        if (fd>=0) close(fd);
+        r.unsupported=1;
+        snprintf(r.reason,sizeof r.reason,"authenticated DoH TLS backend unavailable");
+        return r;
+    }
+    char question_name[256];
+    uint8_t question[272];
+    if (!qname) {
+        qtype=d2k_dns_probe_question_name(host,question_name);
+        qname=question_name;
+    }
+    size_t question_len=qtype ? dns_encode_question(qname,qtype,0,question,sizeof question) : 0;
+    if (!question_len) {
+        if(fd>=0)close(fd);
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"DoH endpoint has no valid DNS question");
+        return r;
+    }
+    r.family=ip_family==AF_INET6 ? 6 : 4;
+    int contact=verify_contact(fd,ip,port,mark,r.family,r.local_addr,&r.local_port,&r.fd);
+    if (contact) {
+        r.local_refusal=contact==-2;
+        snprintf(r.reason,sizeof r.reason,"%s",r.local_refusal ? "cannot set DoH socket mark" : "DoH TCP connection failed");
+        return r;
+    }
+    if (r.family==4) memcpy(r.local_ip4,r.local_addr,4);
+    r.level=D2K_VER_TRANSPORT;
+    uint16_t version=tls12<0 ? 0 : tls12 ? 0x0303 : 0x0304;
+    d2k_doh_tls_session session={0};
+    d2k_doh_tls_status status=doh_tls_open(r.fd,host,version,timeout,&session);
+    if (status!=D2K_DOH_TLS_OK) {
+        r.peer_auth_failed=status==D2K_DOH_TLS_AUTH;
+        r.local_refusal=status==D2K_DOH_TLS_LOCAL;
+        r.unsupported=status==D2K_DOH_TLS_PROTOCOL;
+        const char *why=r.peer_auth_failed ? "DoH TLS certificate or identity rejected" :
+            r.local_refusal ? "DoH TLS local trust setup failed" :
+            r.unsupported ? "DoH TLS protocol or HTTP ALPN rejected" :
+            "DoH TLS connection interrupted";
+        snprintf(r.reason,sizeof r.reason,"%s",why);
+        return r;
+    }
+    r.level=D2K_VER_HANDSHAKE;
+    r.name_ok=1;
+    r.peer_authenticated=1;
+    r.negotiated_tls=session.tls_version;
+    r.doh_http_version=session.http_version;
+    snprintf(r.reason,sizeof r.reason,"DoH TLS authenticated; DNS response pending");
+    char err[160]={0};
+    budget_io counters={fd_packets,fd_peer_spoke,&r.fd};
+    if (session.http_version==1)
+        request_doh_h1_session(&session,authority,path,question,question_len,timeout,&r);
+    else if (session.http_version==2)
+        request_doh_h2_question(session.io.read,session.io.write,session.io.context,authority,path,
+            question,question_len,timeout,&counters,g_verify_budget,&r,err,sizeof err,NULL,NULL);
+    else {
+        r.unsupported=1;
+        snprintf(r.reason,sizeof r.reason,"DoH HTTP protocol was not negotiated");
+    }
+    long packets=d2k_verify_packets_hook(r.fd);
+    r.data_packets=packets>0 ? (unsigned)packets : 0;
+    session.release(session.io.context);
+    return r;
+}
+
+d2k_ver_result d2k_verify_doh_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,size_t wire,int tls12,uint32_t mark,const char *path) {
+    return d2k_verify_doh_question_on(fd,ip,port,host,timeout,wire,tls12,mark,path,NULL,0);
+}
+
+d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,size_t wire,int tls12) {
+    (void)wire;
+    d2k_ver_result r={.fd=-1,.name_ok=-1};
+    uint8_t address[16];
+    int family=ip&&strchr(ip,':')?6:4;
+    if(!ip||!host||!*host||!port||timeout<=0||(tls12!=0&&tls12!=1)||
+        inet_pton(family==6?AF_INET6:AF_INET,ip,address)!=1) {
+        if(fd>=0)close(fd);r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"invalid preflight endpoint");return r;
+    }
+    if(!doh_tls_open) {
+        if(fd>=0)close(fd);r.unsupported=1;
+        snprintf(r.reason,sizeof r.reason,"authenticated preflight TLS backend unavailable");return r;
+    }
+    int contact=verify_contact(fd,ip,port,0,family,r.local_addr,&r.local_port,&r.fd);
+    if(contact) {
+        r.local_refusal=contact==-2;
+        snprintf(r.reason,sizeof r.reason,"%s",r.local_refusal?"cannot set preflight socket mark":"preflight TCP connection failed");
+        return r;
+    }
+    if(family==4)memcpy(r.local_ip4,r.local_addr,4);
+    r.family=family;r.level=D2K_VER_TRANSPORT;
+    d2k_doh_tls_session session={0};
+    uint16_t version=tls12?0x0303:0x0304;
+    d2k_doh_tls_status status=doh_tls_open(r.fd,host,version,timeout,&session);
+    if(status!=D2K_DOH_TLS_OK) {
+        r.peer_auth_failed=status==D2K_DOH_TLS_AUTH;
+        r.local_refusal=status==D2K_DOH_TLS_LOCAL;
+        r.unsupported=status==D2K_DOH_TLS_PROTOCOL;
+        snprintf(r.reason,sizeof r.reason,"%s",r.peer_auth_failed?"preflight TLS certificate or identity rejected":
+            r.local_refusal?"preflight TLS local trust setup failed":
+            r.unsupported?"preflight TLS protocol or HTTP ALPN rejected":"preflight TLS connection interrupted");
+        return r;
+    }
+    r.level=D2K_VER_HANDSHAKE;r.name_ok=1;r.peer_authenticated=1;
+    r.negotiated_tls=session.tls_version;r.http_version=session.http_version;
+    char authority[262],err[160]={0};
+    if(d2k_dns_http_authority(host,port,authority,sizeof authority)) {
+        r.local_refusal=1;r.level=D2K_VER_TRANSPORT;
+        snprintf(r.reason,sizeof r.reason,"invalid preflight HTTP authority");
+    } else if(session.http_version==1) {
+        budget_io counters={fd_packets,fd_peer_spoke,&r.fd};
+        request_page_budget(session.io.read,session.io.write,session.io.context,authority,0,"/",
+            timeout,0,&counters,0,&r,err,sizeof err,0);
+    } else if(session.http_version==2) {
+        static const uint8_t preface[]="PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        static const uint8_t settings[]={0,1,0,0,0,0,0,2,0,0,0,0};
+        if(session.io.write(session.io.context,preface,sizeof preface-1,err,sizeof err)) {
+            r.level=D2K_VER_HANDSHAKE;
+        } else {
+            doh_h2_io io={0};io.read=session.io.read;io.write=session.io.write;
+            io.session=session.io.context;io.wait_ms=timeout;
+            if(dh2_frame(&io,4,0,0,settings,sizeof settings,err,sizeof err) ||
+                dh2_get(&io,1,authority,"/",&r,err,sizeof err)) {
+                r.level=D2K_VER_HANDSHAKE;r.body_complete=0;
+                snprintf(r.reason,sizeof r.reason,"preflight HTTP/2 exchange incomplete: %.100s",err);
+            } else {
+                r.level=D2K_VER_APPLICATION;
+                snprintf(r.reason,sizeof r.reason,"authenticated preflight HTTP/2 response complete");
+            }
+        }
+    } else {
+        r.unsupported=1;r.level=D2K_VER_HANDSHAKE;
+        snprintf(r.reason,sizeof r.reason,"preflight HTTP protocol was not negotiated");
+    }
+    long packets=d2k_verify_packets_hook(r.fd);
+    r.data_packets=packets>0?(unsigned)packets:0;
+    session.release(session.io.context);
     return r;
 }

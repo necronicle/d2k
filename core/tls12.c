@@ -3,20 +3,22 @@
  *
  * РАСПИСАНИЕ КЛЮЧЕЙ (RFC 5246 §6.3, §8.1; RFC 5288 для AEAD) целиком:
  *
- *   pre_master  = X25519(наш секрет, открытый ключ сервера из SKE)
+ *   pre_master  = ECDHE(наш секрет, открытый ключ сервера из SKE)
  *   master      = PRF(pre_master, "master secret", cr + sr, 48)
- *   key_block   = PRF(master, "key expansion", sr + cr, 40)
- *                 = c_key[16] | s_key[16] | c_salt[4] | s_salt[4]
- *   verify_data = PRF(master, "client finished", SHA256(транскрипт), 12)
+ *   key_block   = PRF(master, "key expansion", sr + cr, 2*key_len + 2*iv_len)
+ *                 = c_key | s_key | c_iv | s_iv
+ *   verify_data = PRF(master, "client finished", Hash(транскрипт), 12)
  *
- * PRF здесь — P_SHA256 (RFC 5246 §5): в 1.2 хеш задаётся шифрнабором, и у
- * наших двух он SHA-256. Порядок случайных чисел в двух местах РАЗНЫЙ (cr+sr
- * для master, sr+cr для key_block) — это не опечатка, так в RFC.
+ * AES128-GCM: P_SHA256, ключи 16, IV 4; AES256-GCM: P_SHA384, ключи 32,
+ * IV 4; ChaCha20-Poly1305 (RFC 7905): P_SHA256, ключи 32, IV 12.
+ * Порядок cr+sr для master и sr+cr для key_block различается по RFC.
+ * Если форма предложила EMS и сервер принял, master выводится с меткой
+ * "extended master secret" по хэшу транскрипта до CKE включительно (RFC 7627).
  *
- * ЗАПИСЬ AEAD (RFC 5288 §3): на проводе едет явный одноразовый номер (8 байт,
- * у нас — номер записи), затем шифротекст и метка. Полный одноразовый номер
- * склеивается из соли key_block и явной части. AAD — номер записи, тип,
- * версия и ДЛИНА ОТКРЫТОГО текста.
+ * ЗАПИСЬ AEAD: GCM передаёт явный nonce (8 байт), затем шифротекст и тег;
+ * nonce = IV[4] || явная часть (RFC 5288). ChaCha не передаёт явную часть:
+ * nonce = IV[12] XOR (00000000 || seq[8]). AAD у обоих — seq, тип, версия,
+ * длина ОТКРЫТОГО текста (RFC 5246 §6.2.3.3).
  *
  * ТРАНСКРИПТ — сообщения рукопожатия без заголовков записей и без CCS, в том
  * порядке, в каком они были на проводе. ClientHello кладётся в него ПОСЛЕ
@@ -31,6 +33,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -42,6 +45,7 @@
 
 #include "d2k_crypto.h"
 #include "d2k_p256.h"
+#include "d2k_suite.h"
 #include "d2k_tls12.h"
 #include "d2k_tls13core.h"
 
@@ -75,28 +79,52 @@
    размер и та же причина, что у клиента 1.3. */
 #define TR_MAX (REC_MAX * 4)
 
-/* Шифрнаборы, которые зонд умеет. Больше — см. шапку заголовка: каждая лишняя
-   связка это ветка криптографии, которую придётся держать верной без повода. */
+/* Нормативные коды TLS 1.2, не параметры воздействия на коробку. */
 #define CS_ECDHE_RSA_AES128_GCM_SHA256   0xc02f
 #define CS_ECDHE_ECDSA_AES128_GCM_SHA256 0xc02b
 #define GROUP_X25519 0x001d
 
 struct d2k_tls12 {
     int      fd;
+    d2k_tls_io io;
+    int have_io;
     uint64_t rx_wire_bytes;
     uint32_t rx_record_missing;
-    uint8_t  c_key[16], s_key[16];
-    uint8_t  c_salt[4], s_salt[4];
+    d2k_suite suite;       /* hash/HMAC/AEAD family from suite.c */
+    size_t   iv_len;       /* GCM: 4; ChaCha20-Poly1305: 12 */
+    int      extended_master_secret;
+    uint8_t  c_key[D2K_AEAD_KEY_MAX], s_key[D2K_AEAD_KEY_MAX];
+    uint8_t  c_salt[12], s_salt[12];
     uint64_t c_seq, s_seq;
     uint8_t  master[48];
     uint8_t  c_random[32], s_random[32];
     uint8_t  transcript[TR_MAX];
     size_t   tr_len;
     int      peer_name;
+    char     alpn[32];     /* протокол, выбранный сервером в ServerHello (RFC 7301) */
     uint8_t  raw[REC_MAX], wire[REC_MAX + 5];
     uint8_t  plain[REC_MAX];
     size_t   plain_len, plain_off;
 };
+
+/* TLS 1.2 IDs select the same primitives as TLS 1.3, but NOT its
+ * record framing or key schedule (RFC 5289 / RFC 7905). */
+static int suite12_of(uint16_t id, d2k_tls12 *t) {
+    uint16_t primitive;
+    switch (id) {
+    case 0xc02b: case 0xc02f: primitive = 0x1301; break;
+    case 0xc02c: case 0xc030: primitive = 0x1302; break;
+    case 0xcca9: case 0xcca8: primitive = 0x1303; break;
+    default: return -1;
+    }
+    if (d2k_suite_of(primitive, &t->suite) != 0) return -1;
+    t->iv_len = primitive == 0x1303 ? 12 : 4;
+    return 0;
+}
+
+static size_t explicit_nonce_len(const d2k_tls12 *t) {
+    return t->suite.id == 0x1303 ? 0 : 8;
+}
 
 static void say(char *err, size_t cap, const char *fmt, ...) {
     if (!err || cap == 0) { return; }
@@ -124,6 +152,18 @@ static int read_exact(d2k_tls12 *t, uint8_t *buf, size_t n, int body, int64_t de
         if (left <= 0) {
             say(err, errcap, "не дождались %zu байт за отведённое время", n - got);
             return -1;
+        }
+        if(t->have_io) {
+            long r=t->io.read(t->io.context,buf+got,n-got,
+                (int)(left>INT_MAX?INT_MAX:left),err,errcap);
+            if(r<=0 || (size_t)r>n-got) {
+                if(!r)say(err,errcap,"measurement stream closed during TLS 1.2 record");
+                else if(r>0)say(err,errcap,"measurement stream exceeded read capacity");
+                return -1;
+            }
+            got+=(size_t)r;t->rx_wire_bytes+=(uint64_t)r;
+            if(body)t->rx_record_missing=(uint32_t)(n-got);
+            continue;
         }
         struct pollfd p;
         p.fd = t->fd; p.events = POLLIN; p.revents = 0;
@@ -168,8 +208,11 @@ static int write_all(int fd, const uint8_t *buf, size_t n, char *err, size_t err
     }
     return 0;
 }
+static int write_transport(d2k_tls12 *t,const uint8_t *buf,size_t n,char *err,size_t errcap) {
+    return t->have_io?t->io.write(t->io.context,buf,n,err,errcap):write_all(t->fd,buf,n,err,errcap);
+}
 
-/* P_SHA256 (RFC 5246 §5). Разворачивается ровно до нужной длины: лишние байты
+/* P_SHA256 / P_SHA384 (RFC 5246 §5). Разворачивается до нужной длины: байты
    последнего блока отбрасываются, как того и требует определение. */
 /* Предел «метка плюс затравка». Самая длинная пара у нас — "key expansion"
    (13 байт) с двумя случайными числами по 32; сорок байт запаса хватает с
@@ -179,10 +222,11 @@ static int write_all(int fd, const uint8_t *buf, size_t n, char *err, size_t err
    первом же рукопожатии (поймано ASan, а не сервером). */
 #define PRF_LS_MAX 128
 
-static void prf(const uint8_t *secret, size_t slen, const char *label,
+static void prf(const d2k_suite *s, const uint8_t *secret, size_t slen, const char *label,
                 const uint8_t *seed, size_t seed_len, uint8_t *out, size_t out_len) {
-    uint8_t a[32];
-    uint8_t buf[32 + PRF_LS_MAX];
+    uint8_t a[D2K_HASH_MAX];
+    uint8_t buf[D2K_HASH_MAX + PRF_LS_MAX];
+    size_t hlen = s->hash_len;
     size_t llen = strlen(label);
     size_t done = 0;
     /* A(1) = HMAC(secret, label + seed) */
@@ -196,24 +240,57 @@ static void prf(const uint8_t *secret, size_t slen, const char *label,
     }
     memcpy(ls, label, llen);
     memcpy(ls + llen, seed, seed_len);
-    d2k_hmac_sha256(secret, slen, ls, ls_len, a);
+    d2k_suite_hmac(s, secret, slen, ls, ls_len, a);
     while (done < out_len) {
-        uint8_t block[32];
+        uint8_t block[D2K_HASH_MAX];
         size_t n = out_len - done;
-        memcpy(buf, a, 32);
-        memcpy(buf + 32, ls, ls_len);
-        d2k_hmac_sha256(secret, slen, buf, 32 + ls_len, block);
-        if (n > 32) { n = 32; }
+        memcpy(buf, a, hlen);
+        memcpy(buf + hlen, ls, ls_len);
+        d2k_suite_hmac(s, secret, slen, buf, hlen + ls_len, block);
+        if (n > hlen) { n = hlen; }
         memcpy(out + done, block, n);
         done += n;
-        d2k_hmac_sha256(secret, slen, a, 32, a);
+        d2k_suite_hmac(s, secret, slen, a, hlen, a);
     }
 }
 
 void d2k_tls12_prf_for_test(const uint8_t *secret, size_t slen, const char *label,
                             const uint8_t *seed, size_t seed_len,
                             uint8_t *out, size_t out_len) {
-    prf(secret, slen, label, seed, seed_len, out, out_len);
+    d2k_suite s;
+    d2k_suite_of(0x1301, &s);
+    prf(&s, secret, slen, label, seed, seed_len, out, out_len);
+}
+
+/* RFC 5246 / RFC 7627. For EMS the transcript must include CKE. */
+static void derive_keys(d2k_tls12 *t, const uint8_t shared[32]) {
+    uint8_t seed[64];
+    if (t->extended_master_secret) {
+        d2k_suite_hash(&t->suite, t->transcript, t->tr_len, seed);
+        prf(&t->suite, shared, 32, "extended master secret", seed,
+            t->suite.hash_len, t->master, 48);
+    } else {
+        memcpy(seed, t->c_random, 32);
+        memcpy(seed + 32, t->s_random, 32);
+        prf(&t->suite, shared, 32, "master secret", seed, 64, t->master, 48);
+    }
+    /* Server random FIRST for key expansion (RFC 5246 section 6.3). */
+    memcpy(seed, t->s_random, 32);
+    memcpy(seed + 32, t->c_random, 32);
+    uint8_t kb[2 * D2K_AEAD_KEY_MAX + 2 * 12];
+    size_t k = t->suite.key_len, iv = t->iv_len;
+    prf(&t->suite, t->master, 48, "key expansion", seed, 64, kb, 2 * k + 2 * iv);
+    memcpy(t->c_key, kb, k);
+    memcpy(t->s_key, kb + k, k);
+    memcpy(t->c_salt, kb + 2 * k, iv);
+    memcpy(t->s_salt, kb + 2 * k + iv, iv);
+}
+
+static void client_finished(const d2k_tls12 *t, uint8_t fin[16]) {
+    uint8_t hash[D2K_HASH_MAX];
+    d2k_suite_hash(&t->suite, t->transcript, t->tr_len, hash);
+    fin[0] = HS_FINISHED; fin[1] = 0; fin[2] = 0; fin[3] = 12;
+    prf(&t->suite, t->master, 48, "client finished", hash, t->suite.hash_len, fin + 4, 12);
 }
 
 static void tr_add(d2k_tls12 *t, const uint8_t *msg, size_t n) {
@@ -229,6 +306,15 @@ static void nonce_of(const uint8_t salt[4], uint64_t seq, uint8_t out[12]) {
     for (int i = 0; i < 8; i++) {
         out[11 - i] = (uint8_t)(seq >> (8 * i));
     }
+}
+
+/* RFC 7905: IV XOR (four zero bytes || big-endian record sequence).
+ * GCM instead concatenates a four-byte salt with an explicit nonce. */
+static void record_nonce(const d2k_tls12 *t, const uint8_t *iv, uint64_t seq,
+                         uint8_t out[12]) {
+    if (explicit_nonce_len(t)) { nonce_of(iv, seq, out); return; }
+    memcpy(out, iv, 12);
+    for (int i = 0; i < 8; i++) out[11 - i] ^= (uint8_t)(seq >> (8 * i));
 }
 
 static void aad_of(uint64_t seq, uint8_t type, size_t plen, uint8_t out[13]) {
@@ -251,33 +337,29 @@ static int send_plain(d2k_tls12 *t, uint8_t type, const uint8_t *body, size_t n,
     t->wire[0] = type; t->wire[1] = 3; t->wire[2] = 3;
     put16(t->wire + 3, (uint16_t)n);
     memcpy(t->wire + 5, body, n);
-    return write_all(t->fd, t->wire, n + 5, err, errcap);
+    return write_transport(t, t->wire, n + 5, err, errcap);
 }
 
 static int send_sealed(d2k_tls12 *t, uint8_t type, const uint8_t *body, size_t n,
                        char *err, size_t errcap) {
     uint8_t nonce[12], aad[13];
-    size_t ct_len = 0;
-    if (n + 8 + 16 + 5 > sizeof t->wire) {
+    size_t explicit_len = explicit_nonce_len(t);
+    if (n > sizeof t->wire - 5 - explicit_len - 16) {
         say(err, errcap, "запись длиной %zu не помещается", n);
         return -1;
     }
-    nonce_of(t->c_salt, t->c_seq, nonce);
+    record_nonce(t, t->c_salt, t->c_seq, nonce);
     aad_of(t->c_seq, type, n, aad);
-    /* Явная часть номера едет открыто перед шифротекстом (RFC 5288 §3). */
-    for (int i = 0; i < 8; i++) {
-        t->wire[5 + i] = nonce[4 + i];
-    }
-    if (d2k_aes128_gcm_encrypt(t->c_key, nonce, aad, sizeof aad, body, n,
-                               t->wire + 5 + 8, t->wire + 5 + 8 + n) != 0) {
+    if (explicit_len) memcpy(t->wire + 5, nonce + 4, explicit_len);
+    if (d2k_suite_seal(&t->suite, t->c_key, nonce, aad, sizeof aad, body, n,
+                        t->wire + 5 + explicit_len) != 0) {
         say(err, errcap, "не зашифровалась запись");
         return -1;
     }
-    ct_len = n + 16;
     t->wire[0] = type; t->wire[1] = 3; t->wire[2] = 3;
-    put16(t->wire + 3, (uint16_t)(8 + ct_len));
+    put16(t->wire + 3, (uint16_t)(explicit_len + n + 16));
     t->c_seq++;
-    return write_all(t->fd, t->wire, 5 + 8 + ct_len, err, errcap);
+    return write_transport(t, t->wire, 5 + explicit_len + n + 16, err, errcap);
 }
 
 /* --- чтение --------------------------------------------------------------- */
@@ -318,22 +400,25 @@ static int read_record(d2k_tls12 *t, int encrypted, uint8_t *type,
         *len = rlen;
         return 0;
     }
-    if (rlen < 8 + 16) {
+    size_t explicit_len = explicit_nonce_len(t);
+    if (rlen < explicit_len + 16) {
         say(err, errcap, "зашифрованная запись короче служебных полей");
         return -1;
     }
     {
         uint8_t nonce[12], aad[13];
-        size_t body = rlen - 8;
+        size_t body = rlen - explicit_len;
         if (body < 16 || body - 16 > cap) {
             say(err, errcap, "запись длиной %zu не помещается в буфер", body);
             return -1;
         }
-        memcpy(nonce, t->s_salt, 4);
-        memcpy(nonce + 4, t->raw, 8);
+        if (explicit_len) {
+            memcpy(nonce, t->s_salt, 4);
+            memcpy(nonce + 4, t->raw, explicit_len);
+        } else record_nonce(t, t->s_salt, t->s_seq, nonce);
         aad_of(t->s_seq, hdr[0], body - 16, aad);
-        if (d2k_aes128_gcm_decrypt(t->s_key, nonce, aad, sizeof aad,
-                                   t->raw + 8, body, payload) != 0) {
+        if (d2k_suite_open(&t->suite, t->s_key, nonce, aad, sizeof aad,
+                            t->raw + explicit_len, body, payload) != 0) {
             say(err, errcap, "запись не расшифровалась (метка не сошлась)");
             return -1;
         }
@@ -407,7 +492,7 @@ static int hs_next(d2k_tls12 *t, hs_stream *hs, int encrypted, uint8_t *type,
 
 /* Собирает ClientHello старой формы: без supported_versions (по нему
    d2k_hello_shape и отличает старое приветствие от современного), с теми
-   двумя шифрнаборами, которые зонд умеет, и с X25519. Добивается до want_wire
+   шестью AEAD-шифрнаборами и группами X25519/P-256. Добивается до want_wire
    расширением padding (RFC 7685) — та же надобность, что у клиента 1.3:
    план, чьи куски помещаются в посылку на коротком приветствии, на длинном
    не помещается вовсе. */
@@ -420,9 +505,13 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
     *p++ = 3; *p++ = 3;                /* client_version = TLS 1.2 */
     memcpy(p, random, 32); p += 32;
     *p++ = 0;                          /* session_id пуст */
-    put16(p, 4); p += 2;
+    put16(p, 12); p += 2;
     put16(p, CS_ECDHE_ECDSA_AES128_GCM_SHA256); p += 2;
     put16(p, CS_ECDHE_RSA_AES128_GCM_SHA256); p += 2;
+    put16(p, 0xc02c); p += 2;
+    put16(p, 0xc030); p += 2;
+    put16(p, 0xcca9); p += 2;
+    put16(p, 0xcca8); p += 2;
     *p++ = 1; *p++ = 0;                /* compression: null */
 
     uint8_t *ext_len_at = p; p += 2;
@@ -435,9 +524,8 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
         put16(p, (uint16_t)sni_len); p += 2;
         memcpy(p, sni, sni_len); p += sni_len;
     }
-    /* ГРУППЫ: X25519 ПЕРВЫМ, но secp256r1 ТОЖЕ ОБЪЯВЛЕН.
-       Обмен ключами зонд умеет только X25519 и первым предлагает его, поэтому
-       сервер его и выберет. Но в TLS 1.2 список групп ограничивает ещё и
+    /* ГРУППЫ: X25519 и secp256r1 — обмен на обеих реализован.
+       В TLS 1.2 список групп ограничивает ещё и
        КРИВУЮ СЕРТИФИКАТА (RFC 4492 §5.1): сервер с сертификатом на P-256,
        не увидев её в списке, отвечает handshake_failure — проверено на
        openssl s_server, тревога 40 на приветствии с одним лишь X25519.
@@ -446,7 +534,7 @@ static size_t ch12_build(const char *sni, const uint8_t random[32],
     put16(p, 8); p += 2;
     put16(p, 6); p += 2;
     put16(p, GROUP_X25519); p += 2;
-    put16(p, 0x0017); p += 2;   /* secp256r1 — ради сертификатов на ней */
+    put16(p, 0x0017); p += 2;   /* secp256r1 — обмен и сертификаты */
     put16(p, 0x0018); p += 2;   /* secp384r1 — та же причина */
     put16(p, 11); p += 2;                          /* ec_point_formats */
     put16(p, 2); p += 2;
@@ -488,19 +576,30 @@ void (*d2k_tls12_test_barrier)(void);
 static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
                         hs_stream *hs_in, d2k_tls12 **out, char *err, size_t errcap);
 
-int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire,
-                      d2k_tls12 **out, char *err, size_t errcap) {
+size_t d2k_tls12_probe_hello(const uint8_t random[32],const char *sni,size_t want_wire,
+    uint8_t *out,size_t cap) {
+    if(!random || !sni || !out)return 0;
+    return ch12_build(sni,random,want_wire,out,cap);
+}
+static int connect_transport(int fd,const d2k_tls_io *io,const uint8_t random[32],
+    const char *sni,int deadline_ms,size_t want_wire,d2k_tls12 **out,char *err,size_t errcap) {
     if (!out) { say(err, errcap, "некуда положить сессию"); return -1; }
+    *out=NULL;
+    if(!sni || (io && (!io->read || !io->write || !random))) {
+        say(err,errcap,"invalid TLS 1.2 measurement transport");return -1;
+    }
     d2k_tls12 *t = calloc(1, sizeof *t);
     if (!t) { say(err, errcap, "нет памяти"); return -1; }
     t->fd = fd;
+    if(io){t->io=*io;t->have_io=1;}
     t->peer_name = -1;
     int64_t deadline = now_ms() + (deadline_ms > 0 ? deadline_ms : 5000);
 
     /* Буфер приветствия — в структуре соединения, не static: connect идёт
        из нескольких рабочих потоков, общий буфер смешал бы чужие SNI. */
     uint8_t *ch = t->wire;
-    if (d2k_t13_random(t->c_random, 32) != 0) {
+    if(random)memcpy(t->c_random,random,32);
+    else if (d2k_t13_random(t->c_random, 32) != 0) {
         say(err, errcap, "нет случайных байт");
         free(t);
         return -1;
@@ -512,11 +611,19 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
         return -1;
     }
     if (d2k_tls12_test_barrier) { d2k_tls12_test_barrier(); }
-    if (write_all(fd, ch, hello_len, err, errcap) != 0) { free(t); return -1; }
+    if (write_transport(t, ch, hello_len, err, errcap) != 0) { free(t); return -1; }
     tr_add(t, ch + 5, hello_len - 5);
     hs_stream hs;
     memset(&hs, 0, sizeof hs);
     return tls12_finish(t, sni, deadline, &hs, out, err, errcap);
+}
+int d2k_tls12_connect(int fd,const char *sni,int timeout,size_t wire,d2k_tls12 **out,char *err,size_t cap) {
+    return connect_transport(fd,NULL,NULL,sni,timeout,wire,out,err,cap);
+}
+int d2k_tls12_connect_probe(const d2k_tls_io *io,const uint8_t random[32],const char *sni,
+    int timeout,size_t wire,d2k_tls12 **out,char *err,size_t cap) {
+    if(!io){if(out)*out=NULL;say(err,cap,"missing TLS 1.2 measurement transport");return -1;}
+    return connect_transport(-1,io,random,sni,timeout,wire,out,err,cap);
 }
 
 /* ПРОДОЛЖЕНИЕ ПОСЛЕ ПРИВЕТСТВИЯ 1.3, НА КОТОРОЕ СЕРВЕР ОТВЕТИЛ 1.2.
@@ -527,14 +634,16 @@ int d2k_tls12_connect(int fd, const char *sni, int deadline_ms, size_t want_wire
  * 1.2 (как браузер); выбрал сервер 1.2 — рукопожатие доводит этот клиент.
  * srv — открытые байты рукопожатия сервера, уже прочитанные клиентом 1.3,
  * начиная с ServerHello (запись может нести и следующие сообщения). */
-int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
+static int resume_on(int fd, const d2k_tls_io *io, const char *sni, int deadline_ms,
                      const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
                      const uint8_t *srv, size_t srv_len,
                      d2k_tls12 **out, char *err, size_t errcap) {
     if (!out || !c_random || !ch_msg || !srv) { say(err, errcap, "нечем продолжать"); return -1; }
+    if (io && (!io->read || !io->write)) { say(err, errcap, "invalid TLS 1.2 transport"); return -1; }
     d2k_tls12 *t = calloc(1, sizeof *t);
     if (!t) { say(err, errcap, "нет памяти"); return -1; }
     t->fd = fd;
+    if (io) { t->io = *io; t->have_io = 1; }
     t->peer_name = -1;
     memcpy(t->c_random, c_random, 32);
     if (ch_len > TR_MAX || srv_len > TR_MAX) { say(err, errcap, "рукопожатие длиннее предела"); free(t); return -1; }
@@ -545,6 +654,25 @@ int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
     memcpy(hs.buf, srv, srv_len);
     hs.len = srv_len;
     return tls12_finish(t, sni, deadline, &hs, out, err, errcap);
+}
+
+int d2k_tls12_resume(int fd, const char *sni, int deadline_ms,
+                     const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
+                     const uint8_t *srv, size_t srv_len,
+                     d2k_tls12 **out, char *err, size_t errcap) {
+    return resume_on(fd, NULL, sni, deadline_ms, c_random, ch_msg, ch_len, srv, srv_len,
+                     out, err, errcap);
+}
+
+/* То же через транспорт исполнителя плеча (свой разрез потока): форма клиента,
+   на которую сервер ответил TLS 1.2 (поле 11.11, flibusta.is). */
+int d2k_tls12_resume_io(const d2k_tls_io *io, const char *sni, int deadline_ms,
+                        const uint8_t c_random[32], const uint8_t *ch_msg, size_t ch_len,
+                        const uint8_t *srv, size_t srv_len,
+                        d2k_tls12 **out, char *err, size_t errcap) {
+    if (!io) { say(err, errcap, "нет транспорта"); return -1; }
+    return resume_on(-1, io, sni, deadline_ms, c_random, ch_msg, ch_len, srv, srv_len,
+                     out, err, errcap);
 }
 
 /* Флайт сервера и всё до Finished. hs — поток сообщений (может быть уже
@@ -579,14 +707,44 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
             i += 1 + b[i];
             if (i + 2 > n) { say(err, errcap, "ServerHello обрезан на шифре"); free(t); return -1; }
             suite = get16(b + i);
-            if (suite != CS_ECDHE_RSA_AES128_GCM_SHA256 &&
-                suite != CS_ECDHE_ECDSA_AES128_GCM_SHA256) {
-                /* Утверждение О НАС, а не о коробке: сервер вправе выбрать
-                   что угодно из предложенного клиентом, а зонд умеет одно. */
-                say(err, errcap, "сервер выбрал шифрнабор 0x%04x — зонд умеет только "
-                                 "ECDHE+AES128-GCM-SHA256", (unsigned)suite);
+            if (suite12_of(suite, t) != 0) {
+                say(err, errcap, "сервер выбрал шифрнабор 0x%04x — зонд умеет "
+                    "ECDHE+AES128-GCM-SHA256, AES256-GCM-SHA384 и CHACHA20-POLY1305-SHA256",
+                    (unsigned)suite);
                 free(t);
                 return -1;
+            }
+            i += 3;
+            if (i < n) {
+                if (n - i < 2 || get16(b + i) != n - i - 2) {
+                    say(err, errcap, "ServerHello обрезан на расширениях"); free(t); return -1;
+                }
+                i += 2;
+                while (i < n) {
+                    if (n - i < 4 || get16(b + i + 2) > n - i - 4) {
+                        say(err, errcap, "ServerHello: расширение обрезано"); free(t); return -1;
+                    }
+                    size_t el = get16(b + i + 2);
+                    if (get16(b + i) == 23) {
+                        if (el != 0) {
+                            say(err, errcap, "ServerHello: extended_master_secret не пуст"); free(t); return -1;
+                        }
+                        t->extended_master_secret = 1;
+                    }
+                    /* ALPN (RFC 7301 §3.1): сервер выбирает ровно один
+                       протокол. Без него прикладной уровень не знает, h2 это
+                       или HTTP/1.1 (поле 11.11, flibusta.is: h2 по TLS 1.2). */
+                    if (get16(b + i) == 16) {
+                        const uint8_t *e = b + i + 4;
+                        if (el < 3 || get16(e) != el - 2 || e[2] != el - 3 || e[2] == 0) {
+                            say(err, errcap, "ServerHello: ALPN не по грамматике"); free(t); return -1;
+                        }
+                        size_t pl = e[2] < sizeof t->alpn ? e[2] : sizeof t->alpn - 1;
+                        memcpy(t->alpn, e + 3, pl);
+                        t->alpn[pl] = 0;
+                    }
+                    i += 4 + el;
+                }
             }
         } else if (type == HS_CERTIFICATE) {
             if (sni && sni[0]) {
@@ -656,21 +814,7 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
         free(t);
         return -1;
     }
-    {
-        uint8_t seed[64];
-        memcpy(seed, t->c_random, 32);
-        memcpy(seed + 32, t->s_random, 32);
-        prf(shared, 32, "master secret", seed, 64, t->master, 48);
-        /* Порядок ОБРАТНЫЙ: сперва серверное, потом клиентское (RFC 5246 §6.3). */
-        memcpy(seed, t->s_random, 32);
-        memcpy(seed + 32, t->c_random, 32);
-        uint8_t kb[40];
-        prf(t->master, 48, "key expansion", seed, 64, kb, sizeof kb);
-        memcpy(t->c_key, kb, 16);
-        memcpy(t->s_key, kb + 16, 16);
-        memcpy(t->c_salt, kb + 32, 4);
-        memcpy(t->s_salt, kb + 36, 4);
-    }
+
 
     /* --- ClientKeyExchange, CCS, Finished --- */
     {
@@ -686,16 +830,14 @@ static int tls12_finish(d2k_tls12 *t, const char *sni, int64_t deadline,
         }
         tr_add(t, cke, cke_len);
     }
+    derive_keys(t, shared);
     {
         uint8_t ccs = 1;
         if (send_plain(t, REC_CCS, &ccs, 1, err, errcap) != 0) { free(t); return -1; }
     }
     {
-        uint8_t hash[32], fin[4 + 12];
-        d2k_sha256(t->transcript, t->tr_len, hash);
-        fin[0] = HS_FINISHED;
-        fin[1] = 0; fin[2] = 0; fin[3] = 12;
-        prf(t->master, 48, "client finished", hash, 32, fin + 4, 12);
+        uint8_t fin[4 + 12];
+        client_finished(t, fin);
         if (send_sealed(t, REC_HANDSHAKE, fin, sizeof fin, err, errcap) != 0) {
             free(t);
             return -1;
@@ -790,6 +932,8 @@ long d2k_tls12_read(d2k_tls12 *t, uint8_t *buf, size_t cap, int wait_ms,
 }
 
 int d2k_tls12_peer_name(const d2k_tls12 *t) { return t ? t->peer_name : -1; }
+
+const char *d2k_tls12_alpn(const d2k_tls12 *t) { return t ? t->alpn : ""; }
 
 void d2k_tls12_free(d2k_tls12 *t) { free(t); }
 

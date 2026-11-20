@@ -86,6 +86,8 @@ jobs:
         run: make -C core gcc-warn GCC=gcc
       - name: telegram
         run: make -C telegram gcc-warn
+      - name: model
+        run: make -C model gcc-warn MIPSEL_CC=gcc
 
   # ── Stage 2: build and unit tests ─────────────────────────────────────────
 
@@ -146,6 +148,7 @@ jobs:
           - { component: core-compose, run: 'sh scripts/ci-core-shard.sh compose-measured' }
           - { component: core-rest,    run: 'sh scripts/ci-core-shard.sh rest' }
           - { component: detect,       run: 'make -C detect check' }
+          - { component: model,        run: 'make -C model check' }
           - { component: panel,        run: 'make -C panel test' }
           - { component: telegram,     run: 'make -C telegram test' }
           - { component: relay-enroll, run: 'make -C relay-enroll test' }
@@ -311,7 +314,10 @@ jobs:
     # cancels this run with the rest of CI (concurrency above): its own run
     # releases the newer head, and publish itself refuses a commit main has left.
     needs: ci-ok
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Выпуск закрыт, пока владелец не откроет его переменной репозитория
+    # (решение 11.11.2026: первая сборка нового движка выходит готовым
+    # продуктом вместе с лицензией, в открытый necronicle/d2k).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.D2K_RELEASE_ENABLED == 'true'
     permissions:
       contents: write
     # The signing key is a secret of the d2k-signing environment, and only

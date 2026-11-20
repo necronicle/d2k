@@ -57,7 +57,7 @@ int d2k_udp_plan_build(const char *text,const d2k_conn *c,uint32_t id,
         if(e->poison & D2K_POISON_IPID_ZERO)goto done;
         if(e->ipfrag) {
             d2k_ipfrag_plan shape;
-            if(e->kind!=D2K_EMIT_PAYLOAD || e->pre_len || e->seq_shift ||
+            if(e->kind!=D2K_EMIT_PAYLOAD || e->pre_len || e->seq_shift || e->ack_shift ||
                e->poison || e->wire_profile || d2k_ipfrag_shape(e->ipfrag,&shape))goto done;
             if(c->family==6)n=d2k_udpfrag6_build_ex(c->src_ip6,c->dst_ip6,
                 ntohs(c->src_port),ntohs(c->dst_port),e->bytes,e->len,&shape,id,

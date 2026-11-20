@@ -14,10 +14,10 @@ DIRTY=0
 for ARCH in $ARCHES; do
     . "$ROOT/scripts/build-target.sh"
     echo "=== $ARCH ($TARGET $TARGET_FLAGS) ==="
+    ARCH="$ARCH" ZIG="$BUILD_ZIG" OUT="$OUT" sh "$ROOT/scripts/build-openssl-tg.sh"
     for component in datapath core panel; do
         make -C "$ROOT/$component" release ARCH="$ARCH" TARGET="$TARGET" \
             TARGET_FLAGS="$TARGET_FLAGS" ZIG="$BUILD_ZIG" BUILDDIR="$OUT" \
             COMMIT="$COMMIT" BUILT="$BUILT" DIRTY="$DIRTY" RELEASE_ID="${RELEASE_ID:-dev}" VERSION="${VERSION:-0.1.0-mvp}"
     done
-    ARCH="$ARCH" ZIG="$BUILD_ZIG" OUT="$OUT" sh "$ROOT/scripts/build-openssl-tg.sh"
 done

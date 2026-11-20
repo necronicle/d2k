@@ -131,7 +131,7 @@ static int differs_on_the_wire(d2k_poison a, d2k_poison b)
         return differs_on_the_wire(a, b);
     }
     return a.ttl != b.ttl || a.badsum != b.badsum || a.seq_shift != b.seq_shift ||
-           a.md5 != b.md5 || a.decoy_hello != b.decoy_hello ||
+           a.md5 != b.md5 || a.md5_ts != b.md5_ts || a.decoy_hello != b.decoy_hello ||
            a.disorder != b.disorder || a.disorder_pos != b.disorder_pos ||
            a.tcp_ts != b.tcp_ts ||
            a.ip_id_zero != b.ip_id_zero || a.syn_data != b.syn_data ||
@@ -401,6 +401,28 @@ static void test_compose_follows_the_vector(void)
     }
 }
 
+static void test_md5ts_hypothesis_context(void)
+{
+    int n, found = 0, legacy = 0;
+    const d2k_poison *ps = d2k_poisons(&n);
+    d2k_trigger tr = {0};
+    tr.client_tcp_known = 1;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(ps[i].name, "md5")) legacy += ps[i].md5 && !ps[i].md5_ts;
+        if (!ps[i].md5_ts) continue;
+        found++;
+        if (ps[i].md5 || !d2k_poison_has_fake(&ps[i])) fail("MD5_TS must be a separate fake hypothesis");
+        if (d2k_trigger_allows_poison(&tr, &ps[i])) fail("MD5_TS offered without client timestamp");
+        memcpy(tr.client_tcp_options, (uint8_t[]){1,1,8,10,0,1,2,3,0,4,5,6}, 12);
+        tr.client_tcp_options_len = 12;
+        if (!d2k_trigger_allows_poison(&tr, &ps[i])) fail("MD5_TS absent with client timestamp");
+        tr.client_tcp_options[3] = 9;
+        if (d2k_trigger_allows_poison(&tr, &ps[i])) fail("MD5_TS accepted malformed timestamp");
+        tr.client_tcp_options_len = 0;
+    }
+    if (found != 1 || legacy != 1) fail("expected one distinct MD5_TS and preserved legacy MD5 (%d/%d)", found, legacy);
+}
+
 int main(void)
 {
     {
@@ -429,6 +451,7 @@ int main(void)
             fail("family filtering did not exercise IPv4-only IPID");
     }
     printf("перенос: инварианты без сети\n");
+    test_md5ts_hypothesis_context();
     test_no_duplicate_hypotheses();
     test_repeats_reach_the_strategy();
     test_fooling_flags_reach_the_strategy();

@@ -277,13 +277,17 @@ int main(int argc, char **argv) {
        же план, что к потоку браузера, — ради этого инструмент и сделан.
        Для голой линии нужен --mark, совпадающий с MEASURE_MARK в правилах
        роутера (штатно 0x2f). Произвольная метка обхода очереди не гарантирует.
-       «/» задаётся как NULL: у probe_path непустой путь — это свидетель-
-       таблица стилей со своей проверкой допустимости, и «/» она отвергает. */
+       Явный путь проверяется как HTTP request-target; он не становится
+       автоматически найденной подсказкой для каталога. */
     const char *req = (path && path[0] && strcmp(path, "/")) ? path : NULL;
+    /* Вопрос прибора — «страница целиком?»: тело HTTP/3 читается до FIN в
+       рамках срока, а не до предела этапа данных плеча (поле 24.10.2026:
+       139 КБ от www.cloudflare.com считались обрывом на 32 КиБ). */
+    if (quic) { d2k_verify_quic_read_all_set(1); }
     d2k_ver_result r = quic
-        ? d2k_verify_probe_quic_path_mark_on(-1, ip, port, name, deadline, wire, mark, req)
-        : d2k_verify_probe_path_on(-1, ip, port, name, deadline,
-                                   wire, tls12, 0, mark, req);
+        ? d2k_verify_fetch_quic_on(-1, ip, port, name, deadline, wire, mark, req)
+        : d2k_verify_fetch_tcp_on(-1, ip, port, name, deadline,
+                                   wire, tls12, mark, req);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
 

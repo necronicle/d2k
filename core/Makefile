@@ -23,6 +23,7 @@ CC      ?= cc
 # контракта у compose.c, см. её шапку, а не отсюда).
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Werror -Iinclude -I../datapath/include
 RELEASE_ID ?= dev
+CFLAGS += -I../model/include
 CFLAGS += -DD2K_RELEASE_ID='"$(RELEASE_ID)"'
 LDFLAGS ?=
 # Стенд в тестах поднимает петлю-мишень в отдельном потоке; самому оракулу
@@ -45,13 +46,24 @@ MIPS_CC    ?= mips-unknown-linux-gnu-gcc
 MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
 MIPS_LE_ZIG ?= -target mipsel-linux-musleabi -mcpu=mips32+soft_float
 
-SRC     = stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicsnap.c quicsnap_reseal.c verify_quic_replay.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c tls12.c p256.c volume.c sched.c quichello.c verify.c
+SRC     = ../synthesis/verification.c stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicsnap.c quicsnap_reseal.c verify_quic_replay.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c volume.c sched.c stunprobe.c stuntrial.c quichello.c verify.c
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicsnap.h include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
           include/d2k_verify.h include/d2k_arm.h include/d2k_stun.h include/d2k_net4.h include/d2k_voice.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
+HDR += ../datapath/include/d2k_rawmeasure.h ../datapath/include/d2k_rawmeasure_wire.h
 HDR += ../datapath/include/d2k_http_response.h ../datapath/include/d2k_http_request_stream.h
+HDR += ../synthesis/verification_status.h
+HDR += include/d2k_boxprops.h include/d2k_shadow_queue.h include/d2k_doh_contract.h include/d2k_shadow_workers.h
+HDR += include/d2k_stunprobe.h
+HDR += include/d2k_stuntrial.h
 HDR += ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h include/d2k_p256.h include/d2k_udpruntime.h
+# Заголовки датапата, которые объекты ядра включают через d2k_ctl.h/d2k_ctlsrv.h
+# (список снят с `cc -MM` по всем SRC, не угадан): без них правка d2k_track.h
+# или d2k_session.h оставляла link.o/sched.o со старой раскладкой структур.
+HDR += ../datapath/include/d2k_addr.h ../datapath/include/d2k_ctq.h ../datapath/include/d2k_http80.h \
+       ../datapath/include/d2k_journal.h ../datapath/include/d2k_plans.h ../datapath/include/d2k_raw.h \
+       ../datapath/include/d2k_session.h ../datapath/include/d2k_track.h ../datapath/include/d2k_wire.h
 
 # Общий стенд тестов (петля-мишень в потоке, режимы 0-4). Один на test_meas и
 # test_verdict — второй, отдельный стенд не заводится нигде (см. его шапку).
@@ -84,7 +96,19 @@ HDR += include/d2k_http_reply.h
 HDR += include/d2k_domain.h include/d2k_groups.h
 HDR += include/d2k_diagnostics.h ../runtime/d2k_diagnostics_files.h
 diagnostics.o: diagnostics.c include/d2k_diagnostics.h
-SRC += diagnostics.c domain.c groups.c udpplan.c udpruntime.c
+SRC += diagnostics.c domain.c groups.c udpplan.c udpruntime.c shadow_queue.c dns_upstreams.c
+HDR += include/d2k_dns_upstreams.h sched_dns.inc
+NEWCHAIN_SRC = ../model/fact.c ../model/box.c newchain.c ../model/store.c ../model/program.c ../model/context.c ../model/tls.c ../model/experiment.c ../model/codes.c
+NEWCHAIN_OBJ = $(NEWCHAIN_SRC:.c=.o)
+SRC += $(NEWCHAIN_SRC)
+HDR += include/d2k_newchain.h ../model/include/d2km_store.h
+# boxprops.c — И В ОБЩЕМ СПИСКЕ, И В ЯВНЫХ ПЕРЕЧИСЛЕНИЯХ НИЖЕ. Его зовёт sched.c,
+# поэтому он нужен каждой цели, которая линкует планировщик. В SRC он затем, что
+# test_catalog_sync линкует $(SRC:.c=.o) — без этого он не собирался, и нашлось
+# это только линковкой в свежем дереве, где нет старых объектных файлов. В
+# SCHED_TEST_OBJ, all и d2kc он тоже назван: это СВОИ списки, из SRC не
+# производные, и попытка убрать его оттуда сломала линковку test_sched.
+SRC += boxprops.c
 domain.o: domain.c include/d2k_domain.h profiles/psl_index.h
 groups.o: groups.c include/d2k_groups.h include/d2k_domain.h
 
@@ -104,12 +128,15 @@ TESTHDR = test_stand.h
 # настоящий ctlprobe (как и test_compose/test_link) — но stand ей тоже нужен
 # (петля-мишень test_stand.h, mode 0), поэтому TESTHDR всё равно указан.
 TESTS   = test_p256 test_stun test_voice test_meas test_verdict test_crypto test_h3 test_quicwire test_quic test_quichello test_quicprobe test_quic_fresh_repeats test_quic_arm_data test_quic_arms test_ipfrag test_quic_original_arms test_quic_run_order test_hello test_catalog test_match test_compose test_link test_d2kask test_plantlv test_sched test_verify test_measured
+TESTS += test_boxprops
+TESTS += test_stunprobe
+TESTS += test_stuntrial
 TESTS += test_ech test_sched_summary
 TESTS += test_domain test_groups
 TESTS += test_groups_catalog
 TESTS += test_http_reply
-HTTP_READ_SRC = verify.c quicconn.c h3.c tls12.c p256.c compose.c measured.c hello.c meas.c link.c tls13.c tls13core.c x25519.c
-HTTP_READ_OBJ = verify.o quicconn.o h3.o tls12.o p256.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o
+HTTP_READ_SRC = verify.c dns_upstreams.c domain.c quicconn.c h3.c tls12.c p256.c compose.c measured.c hello.c meas.c link.c tls13.c suite.c mlkem.c keccak.c tls13core.c x25519.c
+HTTP_READ_OBJ = dns_upstreams.o domain.o verify.o quicconn.o h3.o tls12.o p256.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o
 # Поиск обхода открытого HTTP (задача 51, шаг 4): исполнитель — настоящий
 # датапатовский, планы кандидатов проверяются на нём.
 TESTS += test_httpsearch
@@ -134,14 +161,14 @@ test-http-compare-failure: test_http_compare_failure
 TESTS += test_httpsprobe
 check: test-httpsprobe
 .PHONY: test-httpsprobe
-test_httpsprobe: test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o p256.o tls13core.o x25519.o crypto.o include/d2k_httpsprobe.h
-	$(CC) $(CFLAGS) -o $@ test_httpsprobe.c httpsprobe.c hello.o tls13.o tls12.o p256.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_httpsprobe: test_httpsprobe.c httpsprobe.c hello.o tls13.o suite.o mlkem.o keccak.o tls12.o p256.o tls13core.o x25519.o crypto.o include/d2k_httpsprobe.h
+	$(CC) $(CFLAGS) -o $@ test_httpsprobe.c httpsprobe.c hello.o tls13.o suite.o mlkem.o keccak.o tls12.o p256.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
 test-httpsprobe: test_httpsprobe
 	./test_httpsprobe
 
 # Ловушка MIPS: системный pipe там возвращает первый дескриптор (fd[0]) в v0, а
 # не нуль, и обёртка musl отдаёт это значение как есть (см. шапку
-# test_mips_pipe.c и d2k_sched_new в sched.c). Проверка на ХОСТЕ: те же два
+# test_mips_pipe.c и d2k_sched_new в sched.c stunprobe.c). Проверка на ХОСТЕ: те же два
 # конструктора с побудочной трубой компилируются с подменённой обёрткой — тот
 # же приём, что у httpsearch_compare_test.o. Без этого ловушку видит только
 # настоящий mips/mipsel-роутер, которого в проверках нет.
@@ -184,8 +211,8 @@ check: test-verify-http
 .PHONY: test-verify-http
 test-verify-http: test_verify_http
 	./test_verify_http
-test_verify_http: test_verify_http.c verify.c quicconn.c tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify_http: test_verify_http.c verify.c quicconn.c tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(TEST_LDFLAGS)
 check: test-http-reply
 .PHONY: test-http-reply
 test-http-reply: test_http_reply
@@ -200,8 +227,8 @@ test-groups-catalog: test_groups_catalog
 test_groups_catalog: test_groups_catalog.c catalog.o groups.o domain.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< catalog.o groups.o domain.o $(LDFLAGS)
 
-test_ech: test_ech.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_ech: test_ech.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(TEST_LDFLAGS)
 
 .PHONY: test-ech
 test-ech: test_ech
@@ -211,7 +238,7 @@ check: test-ech d2kfetch
 
 .PHONY: all check san gcc-warn cross clean d2kask-aarch64 d2kc-linux-arm64 d2kvoice-linux-arm64 test-meas test-verdict test-crypto test-quicwire test-h3 test-quic test-quichello test-quicprobe test-quic-fresh-repeats test-quic-arm-data test-quic-arms test-ipfrag test-quic-original-arms test-quic-run-order test-hello test-catalog test-match test-compose test-link test-d2kask test-plantlv test-sched test-rst-trigger test-voice-sched test-verify FORCE
 
-all: meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o tls13core.o volume.o sched.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
+all: boxprops.o meas.o verdict.o crypto.o quic.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o plantlv.o x25519.o tls13.o suite.o mlkem.o keccak.o tls13core.o volume.o sched.o stunprobe.o stuntrial.o quichello.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o d2kask d2kc d2kvoice
 
 
 meas.o: meas.c $(HDR)
@@ -317,6 +344,8 @@ quichello.o: quichello.c $(HDR)
 # Go-панель (см. шапку d2k_catalog.h). Ни от одного другого модуля ядра не
 # зависит и ни один не зависит от него — планировщик (задача 5) свяжет его
 # с остальными.
+boxprops.o: boxprops.c $(HDR)
+
 catalog.o: catalog.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -339,6 +368,14 @@ x25519.o: x25519.c $(HDR)
 tls13.o: tls13.c tls12.c tls13core.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Шифры 0x1302/0x1303 и ML-KEM-768 для рукопожатия на форме клиента.
+suite.o: suite.c include/d2k_suite.h $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+mlkem.o: mlkem.c include/d2k_mlkem.h include/d2k_keccak.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+keccak.o: keccak.c include/d2k_keccak.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 tls12.o: tls12.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -356,7 +393,7 @@ h3.o: h3.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Проба на блокировку по объёму (перенос internal/volume): качает объём внутри
-# настоящей TLS-сессии, отсюда зависимость от tls13.o tls13core.o.
+# настоящей TLS-сессии, отсюда зависимость от tls13.o suite.o mlkem.o keccak.o tls13core.o.
 volume.o: volume.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -364,8 +401,8 @@ volume.o: volume.c $(HDR)
 # длина приветствия браузерные, обращение непомеченное, поэтому датапат
 # применяет к нему тот же план. Нужен полю вместо curl, чьё короткое
 # приветствие под браузерный план не подходит.
-D2KFETCH_OBJ = verify.o verify_quic_replay.o quicconn.o quicwire.o h3.o \
-	compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o tls12.o \
+D2KFETCH_OBJ = dns_upstreams.o domain.o verify.o verify_quic_replay.o quicconn.o quicwire.o h3.o \
+	compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o tls12.o \
 	p256.o x25519.o crypto.o quic.o quicsnap.o quicsnap_reseal.o quicprobe.o \
 	quicarms.o quichello.o volume.o ipfrag.o net4.o props.o
 
@@ -390,7 +427,7 @@ plantlv.o: plantlv.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Уровни доказательства (проверка без ложного успеха): зонд ведёт СВОЁ
-# рукопожатие TLS 1.3 (tls13.o tls13core.o) своим ключом и доводит дело до настоящего
+# рукопожатие TLS 1.3 (tls13.o suite.o mlkem.o keccak.o tls13core.o) своим ключом и доводит дело до настоящего
 # ответа приложения, а обращается к цели тем же непомеченным сокетом с
 # открытым наружу дескриптором, что и опрос свойств — d2k_props_contact из
 # compose.o (её же оговорки про метку и про FIN, см. d2k_compose_internal.h).
@@ -399,7 +436,10 @@ plantlv.o: plantlv.c $(HDR)
 verify.o: verify.c quicconn.c quicwire.c h3.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sched.o: sched.c $(HDR)
+../synthesis/verification.o: ../synthesis/verification.c ../synthesis/verification.h $(HDR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+sched.o: sched.c sched_dns.inc dns_question_wire.inc ../synthesis/verification.h $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Узнавание коробки (задача 2): сравнение d2k_cat_fp с допуском поверх типов
@@ -505,9 +545,14 @@ test_quic_arms: ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wi
 
 test_p256: test_p256.c p256.o tls13core.o crypto.o x25519.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_p256.c p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+# test_p256 состоял в TESTS (san-loop, clean), но check его не запускал.
+.PHONY: test-p256
+check: test-p256
+test-p256: test_p256
+	./test_p256
 
-test_tls12: test_tls12.c tls12.o p256.o tls13core.o crypto.o x25519.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ test_tls12.c tls12.o p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test_tls12: test_tls12.c tls12.o suite.o p256.o tls13core.o crypto.o x25519.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_tls12.c tls12.o suite.o p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
 
 .PHONY: test-tls12
 test-tls12: test_tls12
@@ -536,6 +581,9 @@ test_catalog: test_catalog.c catalog.o groups.o domain.o $(HDR)
 # Проверка каталога d2k_catalog_load настоящим testdata/catalog-real.json
 # (задача 2, шаг "поиск по каталогу находит и не находит") — вот откуда
 # catalog.o groups.o domain.o в этом связывании, а не только match.o.
+test_boxprops: test_boxprops.c boxprops.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_boxprops.c boxprops.o $(TEST_LDFLAGS)
+
 test_match: test_match.c match.o catalog.o groups.o domain.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ test_match.c match.o catalog.o groups.o domain.o $(TEST_LDFLAGS)
 
@@ -678,7 +726,9 @@ test-measured: test_measured
 # -Wno-format-truncation: при -O1 GCC на Linux иначе предупреждает об
 # обрезке в каждом snprintf подписей для человека; эта сборка ловит ошибки
 # времени выполнения, а обрезка snprintf безопасна по определению.
-SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+# Выпуск — тот же, что в CFLAGS: link.c сверяет приветствие датапата по
+# D2K_RELEASE_ID (задание 02, 28.10.2026), и санитайзерная сборка обязана его знать.
+SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -DD2K_RELEASE_ID='"$(RELEASE_ID)"' \
            -fno-omit-frame-pointer -Wall -Wextra -Werror -Wno-format-truncation -Iinclude -I../datapath/include
 # ../datapath/ctlprobe и ../datapath/planlab — test_link и test_compose здесь
 # не просто собираются, а сразу ЗАПУСКАЮТСЯ (см. цикл ниже), значит нужны
@@ -754,14 +804,20 @@ SAN_LOOP = $(filter-out test_probe_plan test_measured test_httpsearch test_volum
 .PHONY: san-loop san-list
 san-list:
 	@echo $(filter-out test_probe_plan test_measured test_httpsearch test_volume_context $(SAN_SKIP),$(TESTS))
-san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datapath/planlab d2kask
+san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datapath/planlab d2kask d2kshadow
 	@set -e; for t in $(SAN_LOOP); do \
 		echo "== $$t =="; \
 		srcs=$$(echo "$(SRC) $(SAN_EXTRA_SRC)" | tr ' ' '\n' | grep -v '^$$'); \
 		for inc in $$(grep -o '#include "[A-Za-z0-9_]*\.c"' $$t.c | sed 's/#include "//; s/"//'); do \
 			srcs=$$(echo "$$srcs" | grep -vx "$$inc" || true); \
 		done; \
-		$(CC) $(SANFLAGS) -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
+		if [ "$$t" = test_shadow ]; then srcs="shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c"; fi; \
+		if [ "$$t" = test_shadow_parallel ]; then srcs="shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c"; fi; \
+		if [ "$$t" = test_netarm ]; then srcs="$(NETARM_SRC) tls13core.c tls12.c p256.c x25519.c crypto.c"; fi; \
+		if [ "$$t" = test_exp_local ]; then srcs="$(filter-out exp_task.c netarm.c,$(D2KEXP_COMMON_SRC))"; fi; \
+		if [ "$$t" = test_doh_contract ]; then srcs=""; fi; \
+		if [ "$$t" = test_shadow_daemon ]; then srcs="shadow_queue.c"; fi; \
+		$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
 		if [ "$$t" = test_d2kask ]; then \
 			echo "== d2kask (санитайзер самой утилиты, не только теста) =="; \
@@ -782,7 +838,7 @@ GCC ?= mipsel-unknown-linux-gnu-gcc
 # на нём, не дойдя до самих предупреждений.
 gcc-warn: hello_profiles.inc tcp1620_whitelist.inc
 	@for f in $(SRC) d2kask.c $(TESTS:=.c); do \
-		$(GCC) $(CFLAGS) -I../detect/include -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
+		$(GCC) $(CFLAGS) -I../detect/include -I../model/include -c -o /tmp/d2k-core-gccwarn.o $$f || exit 1; \
 	done
 	@echo "чужой компилятор: предупреждений нет"
 
@@ -860,14 +916,14 @@ cross: hello_profiles.inc tcp1620_whitelist.inc
 		test_quichello.c quichello.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c hello.c tls13core.c crypto.c x25519.c quicconn.c meas.c -lpthread || exit 1
 	@echo "== test_catalog целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_catalog-a64 \
-		test_catalog.c catalog.c groups.c domain.c -lpthread || exit 1
+		test_catalog.c catalog.c groups.c domain.c plantlv.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_catalog-mipsel \
-		test_catalog.c catalog.c groups.c domain.c -lpthread || exit 1
+		test_catalog.c catalog.c groups.c domain.c plantlv.c -lpthread || exit 1
 	@echo "== test_match целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_match-a64 \
-		test_match.c match.c catalog.c groups.c domain.c -lpthread || exit 1
+		test_match.c match.c catalog.c plantlv.c groups.c domain.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_match-mipsel \
-		test_match.c match.c catalog.c groups.c domain.c -lpthread || exit 1
+		test_match.c match.c catalog.c plantlv.c groups.c domain.c -lpthread || exit 1
 	@echo "== test_compose целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_compose-a64 \
 		test_compose.c compose.c measured.c hello.c meas.c link.c udpplan.c -lpthread || exit 1
@@ -894,13 +950,13 @@ cross: hello_profiles.inc tcp1620_whitelist.inc
 		../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c -lpthread || exit 1
 	@echo "== test_sched целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_sched-a64 \
-		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		test_sched.c boxprops.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c dns_upstreams.c verify_quic_replay.c quicconn.c h3.c $(filter-out test_sched.c sched.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_sched-mipsel \
-		test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(filter-out test_sched.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		test_sched.c boxprops.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c dns_upstreams.c verify_quic_replay.c quicconn.c h3.c $(filter-out test_sched.c sched.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@echo "== d2kask целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-d2kask-a64 \
 		d2kask.c compose.c measured.c hello.c meas.c link.c || exit 1
@@ -908,20 +964,20 @@ cross: hello_profiles.inc tcp1620_whitelist.inc
 		d2kask.c compose.c measured.c hello.c meas.c link.c || exit 1
 	@echo "== test_verify целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_verify-a64 \
-		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c dns_upstreams.c domain.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c crypto.c \
 		udpplan.c -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-core-test_verify-mipsel \
-		test_verify.c verify.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c tls12.c p256.c tls13core.c x25519.c crypto.c \
+		test_verify.c verify.c dns_upstreams.c domain.c quicconn.c quicwire.c h3.c compose.c measured.c hello.c meas.c link.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c crypto.c \
 		udpplan.c -lpthread || exit 1
 	@echo "== d2kc целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-a64 \
-		d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		d2kc.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) boxprops.c ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c dns_upstreams.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) $(filter-out d2kc.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@$(MIPSEL_CC) $(CFLAGS) -I../detect/include -o /tmp/d2k-core-d2kc-mipsel \
-		d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
-		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c \
-		verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(filter-out d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
+		d2kc.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) boxprops.c ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c \
+		props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c \
+		verify.c dns_upstreams.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) $(filter-out d2kc.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c,$(UDP_ENGINE_SRC)) -lpthread || exit 1
 	@echo "== test_measured целиком =="
 	@$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-core-test_measured-a64 \
 		test_measured.c compose.c measured.c plantlv.c hello.c meas.c link.c quic.c quicwire.c crypto.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c udpplan.c -lpthread || exit 1
@@ -966,8 +1022,20 @@ BUILDDIR ?= ../builds
 # Исходники перенесённого измерителя перечислены здесь по именам, а не
 # подтянуты его Makefile: кросс-сборка идёт ОДНОЙ командой в статический
 # бинарник, и промежуточные объектники host-сборки сюда не годятся.
+SYNTH_SRC = ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_archive.c ../synthesis/raw_tape.c ../synthesis/application_model.c ../synthesis/application_trial.c ../synthesis/application_owner.c ../synthesis/raw_tls.c ../synthesis/tracking.c ../synthesis/state_question.c ../synthesis/path_work.c ../synthesis/path_run.c ../synthesis/experiment.c \
+            ../synthesis/stream.c ../synthesis/lower.c ../synthesis/tls_decode.c \
+            ../synthesis/tls_observe.c ../synthesis/continuous.c ../synthesis/alternatives.c \
+            ../synthesis/evidence.c ../synthesis/distinguish.c ../synthesis/joint.c ../synthesis/search.c
+SYNTH_SRC += ../synthesis/application_refine.c ../synthesis/prefix_refine.c
+SYNTH_SRC += ../synthesis/application_late.c
+SYNTH_SRC += ../synthesis/token_content.c
+SYNTH_SRC += ../synthesis/application_history.c
+SYNTH_OBJ = $(SYNTH_SRC:.c=.o)
+$(SYNTH_OBJ): ../synthesis/%.o: ../synthesis/%.c $(wildcard ../synthesis/*.h) $(HDR)
+	$(CC) $(CFLAGS) -I../detect/include -c $< -o $@
+
 DETECT_SRC = ../detect/bridge.c ../detect/classify.c ../detect/poison.c \
-             ../detect/props.c ../detect/raw.c ../detect/trigger.c ../detect/response.c
+             ../detect/props.c ../detect/raw.c ../detect/trigger.c ../detect/response.c ../detect/preflight.c
 
 # Голосовой замер под роутер. Статикой и на musl — по той же причине, что
 # d2kc: на коробке нет ни glibc, ни наших библиотек.
@@ -981,21 +1049,51 @@ d2kvoice-linux-arm64:
 TARGET ?= aarch64-linux-musl
 TARGET_FLAGS ?=
 ARCH ?= arm64
+D2KC_MAIN ?= d2kc.c
+OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || printf '%s' '-lssl -lcrypto')
+ROUTER_OPENSSL ?= ../build/telegram/openssl-$(ARCH)
+ROUTER_SSL_LIBDIR = $(patsubst %/,%,$(dir $(firstword $(wildcard $(ROUTER_OPENSSL)/lib/libssl.a $(ROUTER_OPENSSL)/lib64/libssl.a))))
+DOH_TLS_SRC = trusted_tls/trusted_tls.c trusted_tls/trusted_dot.c trusted_tls/trusted_dot_tls.c dns_message.c \
+              dns_exchange.c flow_io.c dns_plain.c dns_capture.c provider_ips.c
+DOH_TLS_HDR = include/d2k_trusted_tls.h include/d2k_trusted_dot.h include/d2k_dns_message.h dns_question_wire.inc \
+              include/d2k_dns_exchange.h include/d2k_flow_io.h include/d2k_dns_capture.h include/d2k_dns_plain.h include/d2k_provider_ips.h
+D2KC_OUTPUT ?= d2kc
+.PHONY: application-probe-release
+application-probe-release: D2KC_MAIN=d2kapplication.c
+application-probe-release: D2KC_OUTPUT=d2kapplication
+application-probe-release: release
+.PHONY: test-application-probe
+test-application-probe: test_d2kapplication
+	./test_d2kapplication
+test_d2kapplication: test_d2kapplication.c ../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_search.h ../synthesis/application_policy.c ../synthesis/application_policy.h d2kapplication.c $(HDR) ../synthesis/application_archive.h ../synthesis/application_trial.h ../synthesis/path_work.h
+	$(CC) $(CFLAGS) -I../detect/include -o $@ test_d2kapplication.c ../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_late.c ../synthesis/token_content.c ../synthesis/lower.c ../synthesis/application_history.c plantlv.c $(TEST_LDFLAGS)
+test_d2kapplication: ../synthesis/application_late.c ../synthesis/application_late.h plantlv.c ../synthesis/token_content.c ../synthesis/token_content.h
+test_d2kapplication: ../synthesis/lower.c ../synthesis/lower.h
+test_d2kapplication: ../synthesis/application_history.c ../synthesis/application_history.h
+TESTS += test_d2kapplication
+check: test-application-probe
 .PHONY: release check-release
 d2kc-linux-arm64: release
-release: fetch-release hello_profiles.inc tcp1620_whitelist.inc
+.PHONY: router-openssl
+router-openssl:
+	@if ! test -f "$(ROUTER_SSL_LIBDIR)/libssl.a" || ! test -f "$(ROUTER_SSL_LIBDIR)/libcrypto.a"; then \
+		ARCH="$(ARCH)" ZIG="$(ZIG)" LIBS_ONLY=1 OPENSSL_PREFIX="$(abspath $(ROUTER_OPENSSL))" \
+			sh ../scripts/build-openssl-tg.sh; \
+	fi
+release: fetch-release shadow-release hello_profiles.inc tcp1620_whitelist.inc router-openssl
 	@mkdir -p $(BUILDDIR)
-	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -static -Wl,-S \
-		-o $(BUILDDIR)/d2kc-linux-$(ARCH) d2kc.c diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c quichello.c plantlv.c verdict.c meas.c \
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -I"$(ROUTER_OPENSSL)/include" -DD2K_TRUSTED_DOH -static -Wl,-S,--gc-sections \
+		-o $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH) $(D2KC_MAIN) $(DOH_TLS_SRC) dns_upstreams.c boxprops.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
-		volume.c tls13.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c udpplan.c udpruntime.c -lpthread
-	@ls -l $(BUILDDIR)/d2kc-linux-$(ARCH)
+		volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) ../datapath/wire_udp.c udpplan.c udpruntime.c -L"$(ROUTER_SSL_LIBDIR)" -lssl -lcrypto -ldl -lpthread
+	@ls -l $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH)
 
 # Check the deployment recipe itself, not a separately maintained test link.
 # A private output directory preserves existing (possibly uncommitted) builds.
 #
 # Big-endian mips линкуется ЗДЕСЬ, а не только в release.yml: это единственное
-# место, где весь контроллер (вместе с sched.c, httpsearch.c и httpsprobe.c —
+# место, где весь контроллер (вместе с sched.c stunprobe.c, httpsearch.c и httpsprobe.c —
 # тремя носителями ловушки pipe) компилируется с обратным порядком байт в
 # обычном `make check`. До 12.10.2026 big-endian не собирался ни одной локальной
 # проверкой и ни одним заданием CI.
@@ -1024,30 +1122,101 @@ test-plantlv: test_plantlv
 test_plantlv: test_plantlv.c plantlv.o compose.o measured.o hello.o meas.o link.o $(HDR) ../datapath/planlab
 	$(CC) $(CFLAGS) -o $@ $< plantlv.o compose.o measured.o hello.o meas.o link.o $(TEST_LDFLAGS)
 
-test-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
+# SHA-3 и ML-KEM-768 (FIPS 202/203) для гибридной группы TLS X25519MLKEM768.
+test_mlkem: test_mlkem.c keccak.c mlkem.c include/d2k_keccak.h include/d2k_mlkem.h
+	$(CC) $(CFLAGS) -o $@ test_mlkem.c keccak.c mlkem.c
+TESTS += test_mlkem
+check: test-mlkem
+.PHONY: test-mlkem
+test-mlkem: test_mlkem
+	./test_mlkem
+
+# Шифры TLS 1.3 0x1302 и 0x1303 (FIPS 180-4, SP 800-38D, RFC 8439).
+test_suite: test_suite.c suite.c crypto.o include/d2k_suite.h
+	$(CC) $(CFLAGS) -o $@ test_suite.c suite.c crypto.o
+TESTS += test_suite
+check: test-suite
+.PHONY: test-suite
+test-suite: test_suite
+	./test_suite
+
+# Прикладная проверка на сессии TLS: разбор :status HPACK (без сети).
+test_appget: test_appget.c appget.c ../model/check.c include/d2k_appget.h
+	$(CC) $(CFLAGS) -I../model/include -o $@ test_appget.c ../model/check.c
+TESTS += test_appget
+check: test-appget
+.PHONY: test-appget
+test-appget: test_appget
+	./test_appget
+
+# Исполнитель плеча опыта (d2km_net для роутера) на loopback-сокетах.
+NETARM_SRC = netarm.c appget.c doh_contract.c ../model/check.c ../model/tls.c ../model/experiment.c ../model/context.c tls13.c suite.c mlkem.c keccak.c
+test_netarm: test_netarm.c $(NETARM_SRC) tls13core.o tls12.o p256.o x25519.o crypto.o include/d2k_netarm.h
+	$(CC) $(CFLAGS) -I../model/include -o $@ test_netarm.c $(NETARM_SRC) tls13core.o tls12.o p256.o x25519.o crypto.o -lpthread
+TESTS += test_netarm
+check: test-netarm
+.PHONY: test-netarm
+test-netarm: test_netarm
+	./test_netarm
+
+# d2kexp: новая цепочка для одной цели (ТЗ §4.1) — инструмент поля.
+MODEL_LIB_SRC = $(filter-out ../model/test_% ../model/sim.c,$(wildcard ../model/*.c))
+D2KEXP_COMMON_SRC = exp_task.c netarm.c appget.c doh_contract.c link.c hello.c plantlv.c tls13.c suite.c mlkem.c keccak.c tls13core.c tls12.c p256.c x25519.c crypto.c $(MODEL_LIB_SRC)
+D2KEXP_SRC = d2kexp.c $(D2KEXP_COMMON_SRC)
+D2KSHADOW_SRC = d2kshadow.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC)
+d2kexp: $(D2KEXP_SRC) $(HDR)
+	$(CC) $(CFLAGS) -I../model/include -o $@ $(D2KEXP_SRC) -lpthread
+d2kexp-linux-arm64: $(D2KEXP_SRC) $(HDR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../model/include -static -Wl,-S -o $@ $(D2KEXP_SRC) -lpthread
+
+# Программа новой модели исполнима нынешним датапатом (model/ → plantlv → plan_load).
+MODEL_SRC = ../model/context.c ../model/program.c ../model/tls.c
+test_model_plan: test_model_plan.c plantlv.o $(MODEL_SRC) $(HDR) ../model/include/d2km_program.h ../model/include/d2km_tls.h
+	$(CC) $(CFLAGS) -I../model/include -o $@ $< plantlv.o $(MODEL_SRC) $(TEST_LDFLAGS)
+TESTS += test_model_plan
+check: test-model-plan
+.PHONY: test-model-plan
+test-model-plan: test_model_plan
+	./test_model_plan
+
+test-sched: test_sched sched.o stunprobe.o stuntrial.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
 	./test_sched
 
-test-rst-trigger: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
+test-rst-trigger: test_sched sched.o stunprobe.o stuntrial.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
 	./test_sched --rst-only
 
-test-voice-sched: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
+test-voice-sched: test_sched sched.o stunprobe.o stuntrial.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
 	./test_sched --voice-only
 
 # Все режимы test_sched входят в check (задача 44, раунд 1): режим --groups-only
 # месяц стоял красным, потому что check его не запускал.
-SCHED_MODES = --voice-only --rst-only --rx-volume-only --admission-only --question-only --shape-only --groups-only --retire-only --recheck-only --lifecycle-only --own-first-only --measured-only --ech-only
+SCHED_MODES = --voice-only --rst-only --rx-volume-only --admission-only --question-only --shape-only --groups-only --retire-only --recheck-only --lifecycle-only --own-first-only --measured-only --ech-only --measure-only
 .PHONY: test-sched-modes
-test-sched-modes: test_sched sched.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
+test-sched-modes: test_sched sched.o stunprobe.o stuntrial.o quichello.o plantlv.o verify.o tls12.o p256.o quicconn.o quicwire.o h3.o
 	@for m in $(SCHED_MODES); do echo "== test_sched $$m =="; ./test_sched $$m || exit 1; done
 
 # verify.o tls12.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
-SCHED_TEST_OBJ = httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o \
+SCHED_TEST_OBJ = dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) boxprops.o ../synthesis/verification.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o \
     quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
-    hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o \
+    hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o \
     x25519.o verify.o tls12.o p256.o quicconn.o h3.o
 TESTS += test_sched_trial
+TESTS += test_application_request
+test_application_request: test_application_request.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+check: test-application-request
+.PHONY: test-application-request
+test-application-request: test_application_request
+	./test_application_request
+TESTS += test_sched_raw_refine
+check: test-sched-raw-refine
+.PHONY: test-sched-raw-refine
+test_sched_raw_refine: test_sched_raw_refine.c test_sched.c $(SCHED_TEST_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
+test-sched-raw-refine: test_sched_raw_refine
+	./test_sched_raw_refine
 check: test-sched-trial
 .PHONY: test-sched-trial
 test_sched_trial: test_sched_trial.c test_sched.c $(SCHED_TEST_OBJ) $(HDR)
@@ -1058,7 +1227,7 @@ test-sched-trial: test_sched_trial
 test_sched: test_sched.c $(SCHED_TEST_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
 
-test_sched_summary: test_sched_summary.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_summary: test_sched_summary.c sched.c stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: test-sched-summary
 test-sched-summary: test_sched_summary
@@ -1071,8 +1240,8 @@ check: test-sched-summary
 # связывании — тем же расписанием ключей, что у клиента, стенд работает с
 # другой стороны. compose.o тянет за собой hello.o/meas.o/link.o: зонд зовёт
 # d2k_props_contact, а она живёт там же, где остальной опрос свойств.
-test_verify: test_verify.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o tls13core.o x25519.o crypto.o $(TEST_LDFLAGS)
+test_verify: test_verify.c verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< verify.o tls12.o p256.o quicconn.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(TEST_LDFLAGS)
 
 test-verify: test_verify
 	./test_verify
@@ -1145,8 +1314,8 @@ check: test-volume-context
 test-volume-context: test_volume_context
 	./test_volume_context
 
-test_volume: test_volume.c volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o $(TEST_LDFLAGS)
+test_volume: test_volume.c volume.o verify.o tls13.o suite.o mlkem.o keccak.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< volume.o verify.o tls13.o suite.o mlkem.o keccak.o tls13core.o tls12.o p256.o x25519.o crypto.o compose.o measured.o meas.o hello.o link.o quicconn.o quicwire.o h3.o dns_upstreams.o domain.o $(TEST_LDFLAGS)
 
 test-volume: test_volume
 	./test_volume
@@ -1169,7 +1338,7 @@ test_ip6frag_send_live: test_ip6frag_send_live.c ipfrag.c include/d2k_ip6frag_se
 
 # d2kc — процесс контроллера на C: цикл событий поверх планировщика.
 DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
-             ../detect/props.o ../detect/raw.o ../detect/trigger.o ../detect/response.o
+             ../detect/props.o ../detect/raw.o ../detect/trigger.o ../detect/response.o ../detect/preflight.o
 
 # Перенесённый измеритель собирается своим Makefile: у него свои флаги и своя
 # кросс-проверка, и второй рецепт сборки тех же файлов здесь означал бы два
@@ -1177,15 +1346,16 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
-      hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-      $(DETECT_OBJ) $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+d2kc: d2kc.c $(DOH_TLS_SRC) $(DOH_TLS_HDR) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
+      hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
+      $(DETECT_OBJ) $(HDR) $(D2KC_CT_SRC)
+	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -DD2K_TRUSTED_DOH -o $@ $< $(DOH_TLS_SRC) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
+		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
+		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c \
+		$(D2KC_CT_SRC) $(OPENSSL_LIBS) $(TEST_LDFLAGS)
 
 clean:
-	rm -f *.o $(TESTS) d2kask d2kc d2kfetch hello_profiles.inc libd2k_udp.a
+	rm -f *.o $(TESTS) test_tls12 test_d2kc_proto d2kask d2kc d2kfetch hello_profiles.inc tcp1620_whitelist.inc libd2k_udp.a
 	rm -rf .udp-engine
 
 test_quic_original_arms: test_quic_original_arms.c quicarms.o $(HDR)
@@ -1254,6 +1424,9 @@ measured.o: measured.c $(HDR) profiles/rx_fake.h
 
 # Shared UDP compiler/executor archive. Selective extraction avoids duplicate
 # plan/wire objects in tests which already link those runtime sources directly.
+# Наблюдение потоков по conntrack в d2kc (этап 37): разбор ctnetlink — те же
+# файлы датапата, что и у его детекторов; одно место для всех сборок d2kc.
+D2KC_CT_SRC = ../datapath/ctq.c ../datapath/nl.c
 UDP_ENGINE_SRC = udpplan.c udpruntime.c plantlv.c ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c ipfrag.c quic.c quicsnap.c quicwire.c crypto.c
 UDP_ENGINE_OBJ = $(addprefix .udp-engine/,$(notdir $(UDP_ENGINE_SRC:.c=.o)))
 UDP_ENGINE_HDR = $(HDR) $(wildcard ../datapath/include/*.h) ../datapath/plan_internal.h
@@ -1265,7 +1438,11 @@ libd2k_udp.a: $(UDP_ENGINE_SRC) $(UDP_ENGINE_HDR)
 	ar rcs $@ $(UDP_ENGINE_OBJ)
 LDFLAGS += libd2k_udp.a
 
-UDP_SESSION_SRC = httpup_logic.c ../datapath/http80.c ../datapath/hold.c ../datapath/capture.c ../datapath/nat.c ../datapath/ctq.c ../datapath/nl.c ../datapath/track.c ../datapath/tls.c ../datapath/journal.c ../datapath/plans.c ../core/stun.c
+# session.c is also included by test_udp_runtime.c (and test_quic_sink.c).
+# Keep its FSM dependency in the shared native/sanitizer/cross source group.
+UDP_SESSION_SRC = ../datapath/preflight.c ../datapath/preflight_lease.c httpup_logic.c ../datapath/http80.c ../datapath/hold.c ../datapath/capture.c ../datapath/nat.c ../datapath/ctq.c ../datapath/nl.c ../datapath/track.c ../datapath/tls.c ../datapath/journal.c ../datapath/plans.c ../core/stun.c
+# Include-chain and header changes must also invalidate the runtime gates.
+test_udp_runtime test_quic_sink test_http_runtime test_http_live: ../datapath/session.c ../datapath/include/d2k_preflight.h ../datapath/include/d2k_preflight_lease.h ../datapath/include/d2k_preflight_plan.h ../datapath/include/d2k_session.h ../datapath/plan_internal.h
 TESTS += test_udp_runtime
 check: test-udp-runtime
 .PHONY: test-udp-runtime
@@ -1309,20 +1486,29 @@ test-quic-sink: test_quic_sink
 # give them dedicated sanitizer links rather than linking a second copy.
 SAN_SKIP += test_udp_runtime test_quic_sink test_http_runtime test_http_live
 SAN_EXTRA_SRC += $(filter-out $(SRC),$(UDP_ENGINE_SRC))
-.PHONY: san-udp-runtime
-san: san-udp-runtime
-san-udp-runtime: hello_profiles.inc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-udp-runtime test_udp_runtime.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c -lpthread
+# Separate links from execution so socket-restricted builders can verify them.
+.PHONY: san-udp-runtime san-http-live san-runtime-build
+san: san-udp-runtime san-http-live
+san-runtime-build: /tmp/d2k-san-udp-runtime /tmp/d2k-san-quic-sink /tmp/d2k-san-http-runtime /tmp/d2k-san-http-live
+san-udp-runtime: /tmp/d2k-san-udp-runtime /tmp/d2k-san-quic-sink /tmp/d2k-san-http-runtime
 	/tmp/d2k-san-udp-runtime
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-quic-sink test_quic_sink.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c quicconn.c h3.c net4.c props.c quicsnap_reseal.c -lpthread
 	/tmp/d2k-san-quic-sink
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
 	/tmp/d2k-san-http-runtime
-.PHONY: san-http-live
-san: san-http-live
-san-http-live: hello_profiles.inc d2kc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-live test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+san-http-live: /tmp/d2k-san-http-live
 	/tmp/d2k-san-http-live
+.PHONY: /tmp/d2k-san-udp-runtime
+/tmp/d2k-san-udp-runtime: hello_profiles.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-udp-runtime test_udp_runtime.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c -lpthread
+.PHONY: /tmp/d2k-san-quic-sink
+/tmp/d2k-san-quic-sink: hello_profiles.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-quic-sink test_quic_sink.c $(UDP_SESSION_SRC) $(filter-out udpruntime.c,$(UDP_ENGINE_SRC)) quicarms.c quichello.c hello.c tls13core.c x25519.c meas.c quicconn.c h3.c net4.c props.c quicsnap_reseal.c -lpthread
+.PHONY: /tmp/d2k-san-http-runtime
+/tmp/d2k-san-http-runtime: hello_profiles.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-runtime test_http_runtime.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+.PHONY: /tmp/d2k-san-http-live
+/tmp/d2k-san-http-live: hello_profiles.inc d2kc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-http-live test_http_live.c httpsearch.c $(UDP_SESSION_SRC) ../datapath/session.c ../datapath/ctl.c ../datapath/ctlsrv.c $(filter-out udpruntime.c udpplan.c,$(UDP_ENGINE_SRC)) $(HTTP_READ_SRC) -lpthread
+
 .PHONY: cross-runtime-gates
 cross: cross-runtime-gates
 cross-runtime-gates: hello_profiles.inc
@@ -1336,24 +1522,33 @@ cross-runtime-gates: hello_profiles.inc
 
 # TLS record progress is observable independently of successful decryption.
 TESTS += test_tls_rx12
+# Живое рукопожатие TLS 1.2 без имени против openssl s_server на петле (этап 15).
+TESTS += test_tls12_live
+check: test-tls12-live
+.PHONY: test-tls12-live
+test-tls12-live: test_tls12_live
+	./test_tls12_live
+test_tls12_live: test_tls12_live.c verify.o quicconn.o h3.o tls12.o p256.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o quicwire.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_tls12_live.c verify.o quicconn.o h3.o tls12.o p256.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o quicwire.o dns_upstreams.o domain.o $(TEST_LDFLAGS)
+SAN_SKIP += test_tls12_live
 check: test-tls-rx12
 .PHONY: test-tls-rx12 san-tls-rx12 cross-tls-rx12
-test_tls_rx12: test_tls_rx12.c tls12.c include/d2k_tls12.h p256.o tls13core.o crypto.o x25519.o libd2k_udp.a
-	$(CC) $(CFLAGS) -o $@ $< p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test_tls_rx12: test_tls_rx12.c tls12.c include/d2k_tls12.h suite.o p256.o tls13core.o crypto.o x25519.o libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< suite.o p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
 test-tls-rx12: test_tls_rx12
 	./test_tls_rx12
 SAN_SKIP += test_tls_rx12
 san: san-tls-rx12
 san-tls-rx12:
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-tls-rx12 test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-tls-rx12 test_tls_rx12.c suite.c p256.c tls13core.c crypto.c x25519.c -lpthread
 	/tmp/d2k-san-tls-rx12
 cross: cross-tls-rx12
 cross-tls-rx12:
-	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-tls-rx12-a64 test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
-	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-tls-rx12-mipsel test_tls_rx12.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -o /tmp/d2k-tls-rx12-a64 test_tls_rx12.c suite.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-tls-rx12-mipsel test_tls_rx12.c suite.c p256.c tls13core.c crypto.c x25519.c -lpthread
 
 # A blocked QUIC question sequence must yield a measurement slot to TCP.
-test_sched_quic_yield: test_sched_quic_yield.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_quic_yield: test_sched_quic_yield.c sched.c stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: test-sched-quic-yield
 test-sched-quic-yield: test_sched_quic_yield
@@ -1374,7 +1569,7 @@ san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
 # test_ip6frag_send_live) не получали её вовсе. Последовательная сборка этого
 # не замечала — библиотека успевала собраться раньше. `make -j` падал за
 # секунду: «no such file or directory: libd2k_udp.a».
-$(TESTS) d2kask d2kc d2kvoice d2kfetch test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a
+# (объявление перенесено в конец файла — см. там же почему)
 
 .PHONY: test-diagnostics
 check: test-diagnostics
@@ -1391,8 +1586,346 @@ clean-diagnostics:
 check: test-diagnostics-runtime
 test-diagnostics-runtime: test_diagnostics_runtime
 	./test_diagnostics_runtime
-test_diagnostics_runtime: test_diagnostics_runtime.c d2kc.c diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) libd2k_udp.a $(HDR)
-	$(CC) $(CFLAGS) -o $@ $< diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(TEST_LDFLAGS)
+# d2kc.c читает conntrack (этап 37) — тот же список, что у сборок d2kc.
+test_diagnostics_runtime: test_diagnostics_runtime.c $(SYNTH_OBJ) d2kc.c diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) libd2k_udp.a $(HDR) $(D2KC_CT_SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(SYNTH_OBJ) diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) $(TEST_LDFLAGS)
+test_application_provider: test_application_provider.c $(SYNTH_OBJ) d2kc.c diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) libd2k_udp.a $(HDR) $(D2KC_CT_SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(SYNTH_OBJ) diagnostics.o $(SCHED_TEST_OBJ) $(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) $(TEST_LDFLAGS)
+TESTS += test_application_provider
+.PHONY: test-application-provider
+check: test-application-provider
+test-application-provider: test_application_provider
+	./test_application_provider
 clean-diagnostics-runtime:
 	$(RM) test_diagnostics_runtime
 clean: clean-diagnostics-runtime
+
+# Address-only STUN transaction; no Discord or QUIC context is substituted.
+.PHONY: test-stunprobe
+check: test-stunprobe
+test-stunprobe: test_stunprobe
+	./test_stunprobe
+test_stunprobe: test_stunprobe.c stunprobe.c stun.o meas.o tls13core.o crypto.o x25519.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_stunprobe.c stunprobe.c stun.o meas.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+
+stunprobe.o: stunprobe.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+# Без явного правила stuntrial.o шёл встроенным правилом make — без единой
+# зависимости от заголовков (d2k_stuntrial.h, d2k_link.h, d2k_ctl.h).
+stuntrial.o: stuntrial.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+.PHONY: test-stuntrial
+check: test-stuntrial
+test-stuntrial: test_stuntrial
+	./test_stuntrial
+
+test_stuntrial: test_stuntrial.c stuntrial.c stunprobe.c link.o stun.o meas.o tls13core.o crypto.o x25519.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_stuntrial.c stuntrial.c stunprobe.c link.o stun.o meas.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+
+# Отказ calloc в d2k_stun_trial_open: stuntrial.c собирается с подменой
+# calloc (приём san-mips-pipe), поэтому в общий san-loop тест не идёт —
+# у него своя san-цель ниже.
+TESTS += test_stuntrial_oom
+SAN_SKIP += test_stuntrial_oom
+check: test-stuntrial-oom
+.PHONY: test-stuntrial-oom san-stuntrial-oom
+test-stuntrial-oom: test_stuntrial_oom
+	./test_stuntrial_oom
+test_stuntrial_oom: test_stuntrial_oom.c stuntrial.c stunprobe.o link.o stun.o meas.o tls13core.o crypto.o x25519.o $(HDR)
+	$(CC) $(CFLAGS) -Dcalloc=d2k_test_calloc -o $@ test_stuntrial_oom.c stuntrial.c stunprobe.o link.o stun.o meas.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+san: san-stuntrial-oom
+san-stuntrial-oom:
+	@set -eu; oom_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/d2k-stuntrial-oom-san.XXXXXX"); \
+		trap 'rm -rf "$$oom_dir"' EXIT HUP INT TERM; \
+		$(CC) $(SANFLAGS) -Dcalloc=d2k_test_calloc -o "$$oom_dir/test" test_stuntrial_oom.c stuntrial.c stunprobe.c link.c stun.c meas.c tls13core.c crypto.c x25519.c -lpthread; \
+		"$$oom_dir/test"
+
+TESTS += test_stun_cleanup
+check: test-stun-cleanup
+.PHONY: test-stun-cleanup
+test-stun-cleanup: test_stun_cleanup
+	./test_stun_cleanup
+test_stun_cleanup: test_stun_cleanup.c $(SCHED_TEST_OBJ) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
+
+TESTS += test_stun_candidate
+check: test-stun-candidate
+.PHONY: test-stun-candidate
+test-stun-candidate: test_stun_candidate
+	./test_stun_candidate
+test_stun_candidate: test_stun_candidate.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_service_confirmation
+check: test-service-confirmation
+.PHONY: test-service-confirmation
+test-service-confirmation: test_service_confirmation
+	./test_service_confirmation
+test_service_confirmation: test_service_confirmation.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_voice_proof_context
+check: test-voice-proof-context
+.PHONY: test-voice-proof-context
+test-voice-proof-context: test_voice_proof_context
+	./test_voice_proof_context
+test_voice_proof_context: test_voice_proof_context.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_raw_measure_sched
+
+TESTS += test_sched_gate
+
+.PHONY: test-raw-measure-sched
+test_raw_measure_sched: test_raw_measure_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+test-raw-measure-sched: test_raw_measure_sched
+	./test_raw_measure_sched
+check: test-raw-measure-sched
+
+verify.o test_verify_http: doh_h2.inc dns_question_wire.inc
+TESTS += test_verify_doh test_doh_h2
+.PHONY: test-dns-journal
+TESTS += test_dns_journal
+check: test-dns-journal
+test-dns-journal: test_dns_journal
+	./test_dns_journal
+test_dns_journal: test_dns_journal.c dns_journal.inc domain.c include/d2k_domain.h profiles/psl_index.h
+	$(CC) $(CFLAGS) -o $@ test_dns_journal.c domain.c
+d2kc: dns_journal.inc
+release: dns_journal.inc
+.PHONY: test-verify-doh test-doh-h2
+check: test-verify-doh test-doh-h2
+test-verify-doh: test_verify_doh
+	./test_verify_doh
+TESTS += test_verify_https_io
+check: test-verify-https-io
+.PHONY: test-verify-https-io
+test-verify-https-io: test_verify_https_io
+	./test_verify_https_io
+test_verify_https_io: test_verify_https_io.c verify.c doh_h2.inc quicconn.c tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o libd2k_udp.a dns_upstreams.o domain.o $(TEST_LDFLAGS)
+test_verify_doh: test_verify_doh.c verify.c doh_h2.inc quicconn.c tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o dns_upstreams.o domain.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls12.o p256.o quicwire.o h3.o compose.o measured.o hello.o meas.o link.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o crypto.o libd2k_udp.a dns_upstreams.o domain.o $(TEST_LDFLAGS)
+test-doh-h2: test_doh_h2
+	./test_doh_h2
+test_doh_h2: test_doh_h2.c verify.c doh_h2.inc $(filter-out verify.o,$(D2KFETCH_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out verify.o,$(D2KFETCH_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_tls_sh_records
+check: test-tls-sh-records
+.PHONY: test-tls-sh-records
+test_tls_sh_records: test_tls_sh_records.c tls13.o suite.o mlkem.o keccak.o tls12.o p256.o tls13core.o crypto.o x25519.o libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< tls13.o suite.o mlkem.o keccak.o tls12.o p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test-tls-sh-records: test_tls_sh_records
+	./test_tls_sh_records
+
+plantlv.o compose.o: ../datapath/include/d2k_preflight_plan.h
+
+libd2k_udp.a: ../datapath/include/d2k_preflight_plan.h ../datapath/plan_internal.h
+
+# No listeners: preflight facts and strict malformed-frame rejection.
+test_preflight_event: test_preflight_event.c link.o quicsnap.o quic.o quicwire.o crypto.o libd2k_udp.a $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_preflight_event.c link.o quicsnap.o quic.o quicwire.o crypto.o $(TEST_LDFLAGS)
+test-preflight-event: test_preflight_event
+	./test_preflight_event
+check: test-preflight-event
+.PHONY: test-preflight-event clean-preflight-event
+clean: clean-preflight-event
+clean-preflight-event:
+	rm -f test_preflight_event
+
+TESTS += test_preflight_verify
+test_preflight_verify: test_preflight_verify.c verify.c doh_h2.inc $(filter-out verify.o,$(D2KFETCH_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out verify.o,$(D2KFETCH_OBJ)) $(TEST_LDFLAGS)
+test-preflight-verify: test_preflight_verify
+	./test_preflight_verify
+check: test-preflight-verify
+.PHONY: test-preflight-verify
+
+# Gate lifecycle, socketpair and existing verifier hooks; no listeners.
+test_sched_gate: test_sched_gate.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+test-sched-gate: test_sched_gate
+	./test_sched_gate
+check: test-sched-gate
+.PHONY: test-sched-gate
+.PHONY: san-sched-gate
+san-sched-gate: hello_profiles.inc tcp1620_whitelist.inc
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-gate test_sched_gate.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
+	/tmp/d2k-san-sched-gate
+
+# Offline memory ownership diagnostics: real lifecycle/storage, no network.
+TESTS += test_memory_accounting test_httpsearch_memory
+.PHONY: test-memory-accounting
+check: test-memory-accounting
+test_memory_accounting: test_memory_accounting.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+test_httpsearch_memory: test_httpsearch_memory.c httpsearch.c $(HTTP_READ_OBJ) httpup_logic.c plantlv.o quic.o quicwire.o crypto.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
+test-memory-accounting: test_memory_accounting test_httpsearch_memory
+	./test_memory_accounting
+	./test_httpsearch_memory
+
+TESTS += test_sched_force
+.PHONY: test-sched-force
+test_sched_force: test_sched_force.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+test-sched-force: test_sched_force
+	./test_sched_force
+check: test-sched-force
+
+# TLS 1.2 PRF/AEAD wire format regression; memory transport, no sockets.
+TESTS += test_tls12_suites
+check: test-tls12-suites
+.PHONY: test-tls12-suites
+test_tls12_suites: test_tls12_suites.c test_tls12_vectors.h tls12.c tls13.o mlkem.o keccak.o suite.o p256.o tls13core.o crypto.o x25519.o $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< tls13.o mlkem.o keccak.o suite.o p256.o tls13core.o crypto.o x25519.o $(TEST_LDFLAGS)
+test-tls12-suites: test_tls12_suites
+	./test_tls12_suites
+SAN_SKIP += test_tls12_suites
+san: san-tls12-suites
+.PHONY: san-tls12-suites
+san-tls12-suites:
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-tls12-suites test_tls12_suites.c tls13.c suite.c mlkem.c keccak.c p256.c tls13core.c crypto.c x25519.c -lpthread
+	/tmp/d2k-san-tls12-suites
+
+# Shadow observer and shared single-target task assembly.
+EXP_HDR = include/d2k_exp_task.h include/d2k_netarm.h $(wildcard ../model/include/*.h)
+SHADOW_HDR = include/d2k_shadow.h include/d2k_shadow_queue.h $(EXP_HDR)
+d2kexp d2kexp-linux-arm64 d2kshadow d2kshadow-linux-arm64 test_shadow test_shadow_parallel test_netarm: doh_h2.inc $(EXP_HDR)
+d2kshadow: $(D2KSHADOW_SRC) $(HDR) $(SHADOW_HDR)
+	$(CC) $(CFLAGS) -I../model/include -o $@ $(D2KSHADOW_SRC) -lpthread
+d2kshadow-linux-arm64: $(D2KSHADOW_SRC) $(HDR) $(SHADOW_HDR)
+	$(ZIG) cc -target aarch64-linux-musl $(CFLAGS) -I../model/include -static -Wl,-S -o $@ $(D2KSHADOW_SRC) -lpthread
+.PHONY: shadow-release
+shadow-release: $(D2KSHADOW_SRC) $(HDR) $(SHADOW_HDR)
+	@mkdir -p $(BUILDDIR)
+	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../model/include -static -Wl,-S -o $(BUILDDIR)/d2kshadow-linux-$(ARCH) $(D2KSHADOW_SRC) -lpthread
+
+test_shadow_queue: test_shadow_queue.c shadow_queue.c include/d2k_shadow_queue.h
+	$(CC) $(CFLAGS) -o $@ test_shadow_queue.c shadow_queue.c
+test_shadow: test_shadow.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c $(SHADOW_HDR) $(HDR)
+	$(CC) $(CFLAGS) -I../model/include -o $@ test_shadow.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c -lpthread
+test_shadow_sched: test_shadow_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+TESTS += test_shadow_queue test_shadow test_shadow_sched
+.PHONY: test-shadow
+check: test-shadow
+test-shadow: test_shadow_queue test_shadow test_shadow_sched test_shadow_daemon
+	./test_shadow_queue
+	./test_shadow
+	./test_shadow_sched
+	./test_shadow_daemon
+
+test_shadow_daemon: test_shadow_daemon.c shadow_queue.c include/d2k_shadow_queue.h d2kshadow
+	$(CC) $(CFLAGS) -o $@ test_shadow_daemon.c shadow_queue.c
+TESTS += test_shadow_daemon
+
+# Real control framing over socketpair; no bind or network dependency.
+test_newchain: test_newchain.c $(NEWCHAIN_SRC) link.c plantlv.c $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_newchain.c $(NEWCHAIN_SRC) link.c plantlv.c $(TEST_LDFLAGS)
+TESTS += test_newchain
+check: test-newchain
+.PHONY: test-newchain
+test-newchain: test_newchain test_newchain_sched
+	./test_newchain
+	./test_newchain_sched
+
+test_newchain_sched: test_newchain_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+TESTS += test_newchain_sched
+
+test_doh_contract: test_doh_contract.c doh_contract.c doh_h2.inc include/d2k_doh_contract.h
+	$(CC) $(CFLAGS) -o $@ test_doh_contract.c
+check: test-doh-contract
+.PHONY: test-doh-contract
+test-doh-contract: test_doh_contract
+	./test_doh_contract
+TESTS += test_doh_contract
+
+test_shadow_parallel: test_shadow_parallel.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c $(SHADOW_HDR) $(HDR)
+	$(CC) $(CFLAGS) -I../model/include -o $@ test_shadow_parallel.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c -lpthread
+check: test-shadow-parallel
+.PHONY: test-shadow-parallel
+test-shadow-parallel: test_shadow_parallel
+	./test_shadow_parallel
+TESTS += test_shadow_parallel
+
+.PHONY: san-shadow-parallel san-doh-contract
+san-shadow-parallel: $(SHADOW_HDR) $(HDR)
+	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k25-san-shadow-parallel test_shadow_parallel.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c -lpthread
+	/tmp/d2k25-san-shadow-parallel
+san-doh-contract:
+	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k25-san-doh-contract test_doh_contract.c
+	/tmp/d2k25-san-doh-contract
+
+# No network: mocked OS/control boundary with the real arm and task code.
+test_exp_local: test_exp_local.c exp_task.c netarm.c $(D2KEXP_COMMON_SRC) $(EXP_HDR) $(HDR)
+	$(CC) $(CFLAGS) -I../model/include -o $@ test_exp_local.c $(filter-out exp_task.c netarm.c,$(D2KEXP_COMMON_SRC)) -lpthread
+TESTS += test_exp_local
+.PHONY: test-exp-local san-exp-local
+check: test-exp-local
+test-exp-local: test_exp_local
+	./test_exp_local
+san-exp-local: test_exp_local.c exp_task.c netarm.c $(D2KEXP_COMMON_SRC) $(EXP_HDR) $(HDR)
+	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k26-san-exp-local test_exp_local.c $(filter-out exp_task.c netarm.c,$(D2KEXP_COMMON_SRC)) -lpthread
+	/tmp/d2k26-san-exp-local
+
+TESTS += test_dns_upstreams
+.PHONY: test-dns-upstreams
+test_dns_upstreams: test_dns_upstreams.c dns_upstreams.c domain.c include/d2k_dns_upstreams.h include/d2k_domain.h
+	$(CC) $(CFLAGS) -o $@ test_dns_upstreams.c dns_upstreams.c domain.c $(filter-out libd2k_udp.a,$(LDFLAGS))
+test-dns-upstreams: test_dns_upstreams
+	./test_dns_upstreams
+check: test-dns-upstreams
+
+TESTS += test_sched_dns
+.PHONY: test-sched-dns
+test_sched_dns: test_sched_dns.c sched.c sched_dns.inc dns_question_wire.inc $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+test-sched-dns: test_sched_dns test-dns-upstreams
+	./test_sched_dns
+check: test-sched-dns
+
+TESTS += test_doh_authority
+.PHONY: test-doh-authority
+check: test-doh-authority
+test-doh-authority: test_doh_authority
+	./test_doh_authority
+test_doh_authority: test_doh_authority.c verify.c doh_h2.inc $(filter-out verify.o,$(D2KFETCH_OBJ)) $(HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out verify.o,$(D2KFETCH_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_dns_service
+TESTS += test_dns_capture
+TESTS += test_provider_ips
+.PHONY: test-provider-ips
+test-provider-ips: test_provider_ips
+	./test_provider_ips
+test_provider_ips: test_provider_ips.c provider_ips.c include/d2k_provider_ips.h
+	$(CC) $(CFLAGS) -o $@ test_provider_ips.c provider_ips.c
+check: test-provider-ips
+.PHONY: test-dns-capture
+test-dns-capture: test_dns_capture
+	./test_dns_capture
+test_dns_capture: test_dns_capture.c dns_capture.c include/d2k_dns_capture.h
+	$(CC) $(CFLAGS) -o $@ test_dns_capture.c dns_capture.c
+check: test-dns-capture
+.PHONY: test-dns-service
+check: test-dns-service
+test-dns-service: test_dns_service
+	./test_dns_service
+test_dns_service: test_dns_service.c sched.c sched_dns.inc dns_question_wire.inc $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+
+TESTS += test_doh_health_route
+.PHONY: test-doh-health-route
+check: test-doh-health-route
+test-doh-health-route: test_doh_health_route
+	./test_doh_health_route
+test_doh_health_route: test_doh_health_route.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
+
+# Keep this after every TESTS +=: the target list expands immediately.
+$(TESTS) d2kask d2kc d2kvoice d2kfetch test_tls12 test_d2kc_proto test_ip6frag_send_live: libd2k_udp.a

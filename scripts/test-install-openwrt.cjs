@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const engineFixture = require('./test-engine-fixture.cjs');
 const root = path.resolve(__dirname, '..');
 const tmp = fs.mkdtempSync('/tmp/install-openwrt-test.');
 const sh = (body) => `#!/bin/sh\n${body}\n`;
@@ -110,8 +111,13 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, sh('exit 0'));
   fixture('builds/d2kpanel-linux-amd64', sh('echo features=telegram-control'));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
-  fixture('builds/d2kd-linux-amd64', sh('exit 0'));
-  fixture('builds/d2kc-linux-amd64', sh('exit 2'));
+  fixture('builds/d2kd-linux-amd64', engineFixture('d2kd'));
+  fixture('builds/d2kshadow-linux-amd64', sh('exit 2'));
+  for (const profile of ['modern', 'legacy']) {
+    const file = `core/profiles/${profile}.hex`;
+    fixture(file, fs.readFileSync(path.join(root, file)));
+  }
+  fixture('builds/d2kc-linux-amd64', engineFixture('d2kc'));
   fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch dev'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
@@ -248,7 +254,7 @@ echo "/dev/root 100692 18544 $avail 19% /"`));
 
   // 3-5. Refusals keep the working install: no stop, no replaced binary.
   const before = fs.readFileSync(d2kd);
-  put(path.join(src, 'builds/d2kd-linux-amd64'), sh('# next release\nexit 0'));
+  put(path.join(src, 'builds/d2kd-linux-amd64'), engineFixture('d2kd') + '# next release\n');
   const refuse = (extra, pattern, what) => {
     reset();
     const r = run('install', extra);

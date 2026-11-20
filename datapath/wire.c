@@ -120,10 +120,15 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
     if (e->ipfrag || (e->wire_profile != 0 && e->wire_profile != D2K_WIRE_DETECT_TCP &&
                       e->wire_profile != D2K_WIRE_TCP_TEMPLATE)) { return 0; }
     int measured = e->wire_profile == D2K_WIRE_DETECT_TCP;
-    if ((e->poison & D2K_POISON_MD5) && !measured) { return 0; }
+    /* MD5 и комбо MD5+метка синтезируют опции сами — только измеренный профиль
+       detect-tcp-v1. На потоковом профиле tcp-template-v1 опции берутся из
+       самого клиента, подделать их сборкой нельзя: отказ, а не тихая подмена
+       (контекст клиента отсутствует). */
+    if ((e->poison & (D2K_POISON_MD5 | D2K_POISON_MD5_TS)) && !measured) { return 0; }
     int native = e->wire_profile == D2K_WIRE_TCP_TEMPLATE;
     uint8_t native_options[40];
-    size_t opt_len = (e->poison & D2K_POISON_MD5) ? 20
+    size_t opt_len = (e->poison & D2K_POISON_MD5_TS) ? 28
+        : (e->poison & D2K_POISON_MD5) ? 20
         : (e->poison & D2K_POISON_TCPTS_BACK) ? TS_OPT_LEN : 0;
     if (native) {
         opt_len = c->tcp_options_len;
@@ -175,6 +180,27 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
             }
         }
     }
+    /* Комбо MD5+метка несёт РЕАЛЬНУЮ согласованную метку потока, а не
+       синтетическую: ищем опцию 8/10 в опциях соединения (измеритель кладёт её
+       из SYN-ACK — detect/raw.c; датапат — из опций клиента, session.c). Нет
+       опции или она кривая — контекст отсутствует, явный отказ, а не подделка
+       метки. MD5-одиночка (D2K_POISON_MD5) опций потока не читает и не
+       меняется. */
+    const uint8_t *md5ts_ts = NULL;
+    if (e->poison & D2K_POISON_MD5_TS) {
+        size_t off = 0;
+        while (off + 1 < (size_t)c->tcp_options_len) {
+            uint8_t kind = c->tcp_options[off];
+            if (kind == 0) { break; }
+            if (kind == 1) { off++; continue; }
+            if (off + 2 > (size_t)c->tcp_options_len) { break; }
+            uint8_t ol = c->tcp_options[off + 1];
+            if (ol < 2 || off + ol > (size_t)c->tcp_options_len) { break; }
+            if (kind == 8 && ol == 10) { md5ts_ts = c->tcp_options + off; break; }
+            off += ol;
+        }
+        if (!md5ts_ts) { return 0; }
+    }
     /* TTL по пути считается ОДИН раз на посылку: оба заголовка берут его. */
     uint8_t auto_hl = e->autottl ? auto_ttl(e, c->rev_ttl) : 0;
     if (e->pre_len > 65535u || e->len > 65535u - e->pre_len) { return 0; }
@@ -224,7 +250,7 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
        окно сервера и отбрасывается им, а коробка, окна не считающая, его
        берёт. */
     wr32(t + 4, e->seq + (uint32_t)e->seq_shift);
-    wr32(t + 8, c->ack);
+    wr32(t + 8, c->ack + (uint32_t)e->ack_shift);
     t[12] = (uint8_t)(((TCP_HDR + opt_len) / 4) << 4);
     t[13] = (uint8_t)(0x18 | (e->urgent ? 0x20 : 0)); /* PSH | ACK | URG? */
     wr16(t + 14, measured ? 65535 : c->window);
@@ -233,6 +259,16 @@ size_t d2k_wire_build(const d2k_conn *c, const d2k_emit *e,
 
     if (native && opt_len) {
         memcpy(t + TCP_HDR, native_options, opt_len);
+    } else if (e->poison & D2K_POISON_MD5_TS) {
+        /* nfqws1 tcp_md5_first + метка: MD5 (kind 19, len 18) ПЕРВОЙ, за ней
+         * РЕАЛЬНАЯ метка потока (kind 8, len 10), скопированная дословно из
+         * опций соединения (md5ts_ts найдена выше). 18+10 = 28, кратно
+         * четырём, добивки NOP не нужно. 16 байт подписи MD5 намеренно нули,
+         * как у MD5-одиночки: подделку бракует сервер по подписи, метка —
+         * настоящая, как и просит донорская раскладка. */
+        uint8_t *o = t + TCP_HDR;
+        o[0] = 19; o[1] = 18;            /* MD5, далее 16 нулей */
+        memcpy(o + 18, md5ts_ts, 10);    /* 08 0a + TSval + TSecr потока */
     } else if (e->poison & D2K_POISON_MD5) {
         /* raw.c: MD5 replaces timestamp/options, not an appended option.
          * Header was zeroed: the 16-byte signature is deliberately zero. */

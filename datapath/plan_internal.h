@@ -48,7 +48,12 @@ enum {
        REC_POISON: старый исполнитель обязан отказаться громко, а не исполнить
        план без autottl — он поставил бы фальшивку с нашим константным TTL,
        то есть другое воздействие. Гейт — minexec 13. */
-    REC_AUTOTTL   = 0x0111
+    REC_AUTOTTL   = 0x0111,
+    REC_STREAM_OFFSET = 0x0112,
+    REC_AFTER_SPLIT = 0x0113,
+    REC_PREFLIGHT = 0x0114,
+    REC_PREFLIGHT_RESYN = 0x0115,
+    REC_HANDOVER_APPLY = 0x0116
 };
 
 /* Якоря семантических позиций. */
@@ -61,7 +66,8 @@ enum {
     /* Середина ИМЕНИ хоста (sni_off + sni_len/2), а не середина пакета —
        см. anchor_offset в plan_apply.c и reorderPlan в
        internal/classify/properties.go. */
-    ANCHOR_SNI_MIDDLE    = 5
+    ANCHOR_SNI_MIDDLE    = 5,
+    ANCHOR_SLD_MIDDLE    = 6
 };
 
 enum { PLACE_BEFORE = 0, PLACE_BETWEEN = 1 };
@@ -78,6 +84,7 @@ struct d2k_poison {
     uint8_t  ttl;
     uint8_t  flags;
     int32_t  seq_shift;
+    int32_t  ack_shift;
     /* autottl: 1 — TTL считается на исполнении по TTL ответной стороны
        потока, delta/min/max из записи REC_AUTOTTL. */
     /* tcp_ts_up: поднять опцию метки времени в начало (см. d2k_plan.h). */
@@ -117,6 +124,8 @@ struct d2k_plan {
     uint64_t binding_generation;
     uint8_t binding_trial_id[16];
     uint8_t binding_kind, binding_family, binding_shape, binding_temporary;
+    uint8_t binding_exact_shape; /* installation scope, never program content/hash */
+    uint16_t preflight_trial_sport; /* network order, zero for an unscoped trial */
     uint16_t schema;
     uint16_t minexec;
     uint8_t  id[D2K_PLAN_ID_LEN];
@@ -129,6 +138,19 @@ struct d2k_plan {
     uint32_t segment_size;
     uint8_t wire_profile;
     uint8_t input_tls;
+    uint8_t has_stream_offset;
+    uint32_t stream_offset;
+    uint32_t after_offset,after_length,after_cut;
+    uint8_t preflight, pf_wscale, pf_pieces, pf_hello_own;
+    uint16_t pf_window, pf_data;
+    uint8_t pf_handover_apply;
+    const uint8_t *pf_hello; /* aliases the referenced immutable payload */
+    size_t pf_hello_len;
+    uint32_t pf_timeout_ms;
+    uint32_t pf_resyn_timeout_ms;
+    uint16_t pf_resyn_delay_ms;
+    uint8_t pf_resyn_sends;
+    char pf_name[254];
     uint8_t ipfrag;
     uint8_t oob_enabled;
     uint16_t oob_anchor;

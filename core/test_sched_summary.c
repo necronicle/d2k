@@ -1,7 +1,9 @@
 /* Exercise production terminal/reset paths without creating a network worker. */
 #define pthread_create summary_thread_create
 #define d2k_verify_probe_ech_origin_on summary_ech_probe
+#define d2k_verify_doh_on summary_doh_probe
 #include "sched.c"
+#undef d2k_verify_doh_on
 #undef d2k_verify_probe_ech_origin_on
 #undef pthread_create
 #include "d2k_quic_arms.h"
@@ -11,7 +13,8 @@ static int capture_spawn;
 int summary_thread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg) {
     (void)thread; (void)attr; (void)start; (void)arg;
-    if (capture_spawn) { free(arg); return 0; }
+    /* Аргумент — слот планировщика (d2k_sched.wargs): не освобождается. */
+    if (capture_spawn) { (void)arg; return 0; }
     return EAGAIN;
 }
 
@@ -200,7 +203,8 @@ static void ech_challenge_witness(d2k_sched *s, int mode) {
         CHECK(!strcmp(t->plans[0], "tcp split pos=1") && !strcmp(t->plans[1], "tcp split pos=2"));
         CHECK(!t->report_closed);
         rows[0] = 0;
-        search_report(s, t, 901, "probe-confirmed", "property");
+        search_report(s, t, 901, "probe-confirmed", "property",
+                      "кандидат подтверждён собственным зондом на проводе");
         CHECK(strstr(rows, "outcome=probe-confirmed") != NULL);
     } else {
         CHECK(strstr(rows, "через другого свидетеля") == NULL);
@@ -234,7 +238,7 @@ static void verify_reselects_witness(d2k_sched *s, int mode) {
     d2k_sched_ech_resolve_hook = summary_resolve;
     worker_arg *arg = calloc(1, sizeof *arg);
     arg->s = s; arg->t = t; arg->use_fd = -1;
-    worker_run(arg);
+    worker_run(arg);free(arg);
     CHECK(!t->ech_reselect);
     if (mode == 0) {
         CHECK(probe_calls == 1 && !strcmp(probed_origin, "third.example"));
@@ -247,7 +251,7 @@ static void verify_reselects_witness(d2k_sched *s, int mode) {
         /* The next candidate has the same task but no reselect flag. */
         worker_arg *next = calloc(1, sizeof *next);
         next->s = s; next->t = t; next->use_fd = -1;
-        worker_run(next);
+        worker_run(next);free(next);
         CHECK(probe_calls == 0);
         fprintf(stderr, "after exhaustion: probe_calls=%d origin=%s\n", probe_calls, probed_origin);
     }
@@ -398,21 +402,822 @@ static void tx_ladder_requires_volume_proof(int passed) {
 
 static int diag_calls;
 static void diag_observe(void *ctx,const d2k_diag_event *e) {
-    (void)ctx; CHECK(!strcmp(e->outcome,"failed")); CHECK(e->id==999);diag_calls++;
+    (void)ctx; CHECK(!strcmp(e->outcome,"failed")); CHECK(e->id==999);
+    /* ПРИЧИНА ИТОГА — СВОЯ, А НЕ ПОСЛЕДНЯЯ ФРАЗА КЛАССИФИКАТОРА. В диагностике
+       владельца 23.10 они противоречили друг другу в 18 событиях из 61:
+       «probe-confirmed» с текстом «замер брошен», «failed» с текстом
+       «дальнейшие вопросы не нужны». Здесь итог объясняет себя сам. */
+    CHECK(e->outcome_reason && strstr(e->outcome_reason, "кандидаты кончились") != NULL);
+    /* Идентичность решения едет рядом: пусто, когда решения нет. */
+    CHECK(e->plan_id != NULL && e->box_id != NULL);
+    diag_calls++;
 }
+
+#define REPORT_OBSERVE_MAX 4
+static int report_calls;
+static uint64_t report_ids[REPORT_OBSERVE_MAX];
+static int64_t report_units[REPORT_OBSERVE_MAX], report_elapsed[REPORT_OBSERVE_MAX];
+static char report_outcomes[REPORT_OBSERVE_MAX][32];
+static void report_observe(void *ctx, const d2k_diag_event *e) {
+    (void)ctx;
+    if (report_calls < REPORT_OBSERVE_MAX) {
+        int i = report_calls;
+        report_ids[i] = e->id;
+        report_units[i] = e->probe_units;
+        report_elapsed[i] = e->elapsed_ms;
+        snprintf(report_outcomes[i], sizeof report_outcomes[i], "%s", e->outcome);
+    }
+    report_calls++;
+}
+
+static void rx_short_reports_only_final_cumulative(d2k_sched *s) {
+    task *t = fixture(s);
+    t->state = T_ASKING; t->rx_volume_only = 1; t->res_ready = 1;
+    t->trigger_code = D2K_SUSPECT_FIN_RETRY;
+    t->res.verdict = D2K_V_INCONCLUSIVE;
+    t->vol.verdict = D2K_VOL_PASSED; t->vol.rx_short = 1; t->vol.rx_short_bytes = 243;
+    t->probes = 2; t->ask_probes = 3;
+    uint64_t id = t->report_id;
+    report_calls = 0;
+    d2k_sched_diagnostics(s, report_observe, NULL);
+    s->sync_pending = 0; s->measure_start_seen = 0;
+    capture_spawn = 1;
+    (void)d2k_sched_tick(s, 900);
+    capture_spawn = 0;
+    CHECK(t->state == T_RESTING && !t->th_live);
+    CHECK(t->report_closed && t->report_id == id);
+    CHECK(report_calls == 1);
+    search_report(s, t, 1000, "unknown", "none", "fixture");
+    CHECK(report_calls == 1);
+    if (report_calls > 0) {
+        CHECK(report_ids[0] == id);
+        CHECK(!strcmp(report_outcomes[0], "inconclusive"));
+        CHECK(report_units[0] == 5);
+        CHECK(report_elapsed[0] == 800);
+    }
+    if (fails) fprintf(stderr, "RX-short reports=%d closed=%d id=%llu/%llu\n%s\n",
+        report_calls, t->report_closed, (unsigned long long)id,
+        (unsigned long long)t->report_id, rows);
+    d2k_sched_diagnostics(s, NULL, NULL);
+    task_reset(s, t);
+}
+
+static int doh_calls, doh_mode, doh_classify_calls;
+static int doh_protocol_response;
+static int doh_force_local;
+static int doh_second_mode=-1;
+static uint32_t doh_last_mark;
+static d2k_vres doh_classify(const char *ip,uint16_t port,d2k_hello a,d2k_hello b,
+    uint32_t mark,int repeats,uint32_t gap,uint32_t wait,const volatile sig_atomic_t *stop,const d2k_sched_tcp_extra *extra) {
+    (void)extra;
+    (void)ip;(void)port;(void)a;(void)b;(void)mark;(void)repeats;(void)gap;(void)wait;(void)stop;
+    doh_classify_calls++; d2k_vres r={0};
+    r.verdict=doh_protocol_response?D2K_V_INCONCLUSIVE:D2K_V_CLEAR;
+    r.protocol_response=doh_protocol_response;return r;
+}
+d2k_ver_result summary_doh_probe(int fd,const char *ip,uint16_t port,const char *name,
+    int wait,size_t wire,int tls12,uint32_t mark,const char *path) {
+    (void)ip;(void)port;(void)name;(void)wait;(void)wire;(void)tls12;(void)mark;
+    CHECK(!strcmp(path,"/dns-query")); doh_calls++;doh_last_mark=mark;
+    d2k_ver_result r={0};r.fd=fd;
+    int mode=doh_calls>1 && doh_second_mode>=0?doh_second_mode:doh_mode;
+    r.level=mode==0 ? D2K_VER_APPLICATION : D2K_VER_HANDSHAKE;
+    r.status=mode==0 ? 200 : mode==2 ? 503 : 0;
+    r.body_complete=mode==0 || mode==2;
+    r.peer_authenticated=1;
+    if(mode==0){r.budget=D2K_BUDGET_PASSED;r.doh_replies=20;}
+    if(mode>=3){r.level=D2K_VER_APPLICATION;r.status=200;r.budget=D2K_BUDGET_CUT;r.budget_packets=mode==4?40:24;}
+    if(mode==6){r.status=0;r.budget_requests=5;r.doh_replies=4;}
+    if(mode==7){r.status=0;r.budget_packets=32;r.budget_requests=6;r.doh_replies=5;}
+    r.local_refusal=doh_force_local || mode==5;
+    return r;
+}
+static void doh_service_gate(d2k_sched *s) {
+    d2k_ver_result late={0};late.level=D2K_VER_APPLICATION;
+    late.budget=D2K_BUDGET_CUT;late.budget_packets=24;late.budget_requests=5;late.doh_replies=4;
+    CHECK(doh_measured_cut(&late));
+    late.doh_replies=0;CHECK(!doh_measured_cut(&late));
+    late.doh_replies=4;late.local_refusal=1;CHECK(!doh_measured_cut(&late));
+    char name[]="/tmp/d2k-doh-targets-XXXXXX";
+    int config_fd=mkstemp(name);CHECK(config_fd>=0);
+    const char *config="dns.example 443 /dns-query 192.0.2.1\n";
+    CHECK(write(config_fd,config,strlen(config))==(ssize_t)strlen(config));close(config_fd);
+    CHECK(d2k_sched_doh_load(s,name)==1);
+    CHECK(s->n_doh==1 && !strcmp(s->doh[0].path,"/dns-query"));
+    unlink(name);s->n_doh=0;
+
+    d2k_sched_tcp_fn old=d2k_sched_tcp_hook;
+    d2k_sched_tcp_hook=doh_classify;
+    for (doh_mode=0;doh_mode<4;doh_mode++) {
+        task *t=fixture(s);t->state=T_ASKING;t->job=JOB_CLASSIFY;
+        strcpy(t->doh_path,"/dns-query");t->skip_volume_once=1;
+        doh_calls=doh_classify_calls=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=t;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(doh_calls==(doh_mode==3?2:1) && t->res_ready);
+        if (doh_mode==0) {
+            CHECK(t->res.verdict==D2K_V_CLEAR && t->vol.rx_direct_complete);
+            CHECK(!doh_classify_calls && !t->doh_trial);
+        } else if (doh_mode==1) {
+            CHECK(doh_classify_calls==1 && t->doh_trial);
+            d2k_vres r={0};r.verdict=D2K_V_CLEAR;
+            verdict_to_plans(s,t,&r);
+            CHECK(t->n_plans>0);
+        } else if(doh_mode==3) {
+            CHECK(!doh_classify_calls && t->vol.rx_cut && t->vol.rx_cut_packets==24);
+            CHECK(t->res.verdict==D2K_V_INCONCLUSIVE);
+        } else CHECK(!doh_classify_calls && !t->doh_trial);
+        task_reset(s,t);
+    }
+    for(int second=0;second<6;second++) {
+        task *t=fixture(s);t->state=T_ASKING;t->job=JOB_CLASSIFY;
+        strcpy(t->doh_path,"/dns-query");t->skip_volume_once=1;
+        doh_mode=3;doh_second_mode=second;doh_calls=doh_classify_calls=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=t;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(doh_calls==2 && t->res_ready);
+        CHECK(t->vol.rx_cut==(second==3));
+        if(second==5)CHECK(t->res.verdict==D2K_V_INCONCLUSIVE && !doh_classify_calls);
+        task_reset(s,t);
+    }
+    doh_second_mode=-1;
+    {
+        task *late_task=fixture(s);late_task->state=T_ASKING;late_task->job=JOB_CLASSIFY;
+        strcpy(late_task->doh_path,"/dns-query");late_task->skip_volume_once=1;
+        doh_mode=6;doh_calls=doh_classify_calls=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=late_task;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(doh_calls==2 && !doh_classify_calls && late_task->vol.rx_cut && late_task->res_ready);
+        task_reset(s,late_task);
+    }
+    {
+        task *late_task=fixture(s);late_task->state=T_ASKING;late_task->job=JOB_CLASSIFY;
+        strcpy(late_task->doh_path,"/dns-query");late_task->skip_volume_once=1;
+        doh_mode=6;doh_second_mode=7;doh_calls=doh_classify_calls=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=late_task;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(doh_calls==2 && !doh_classify_calls && late_task->vol.rx_cut);
+        CHECK(late_task->doh_failure_query==6);
+        CHECK(!late_task->vol.rx_wire_basis && !late_task->vol.rx_cut_packets);
+        CHECK(late_task->res.verdict==D2K_V_INCONCLUSIVE);
+        task_reset(s,late_task);doh_second_mode=-1;
+    }
+    d2k_sched_tcp_hook=old;
+    task *health=fixture(s);health->job=JOB_DOH_HEALTH;
+    strcpy(health->doh_path,"/dns-query");
+    uint32_t saved_mark=s->mark;s->mark=0x72f;
+    doh_calls=0;doh_mode=0;
+    worker_arg *health_arg=calloc(1,sizeof *health_arg);
+    health_arg->s=s;health_arg->t=health;health_arg->use_fd=-1;
+    worker_run(health_arg);free(health_arg);
+    CHECK(doh_calls==1 && doh_last_mark==0 && health->res_ready);
+    s->mark=saved_mark;task_reset(s,health);
+    strcpy(s->doh[0].host,"summary.example");s->doh[0].port=443;s->n_doh=1;
+    task *t=fixture(s);t->trigger_code=D2K_SUSPECT_LATE_SILENCE;
+    cooldown_record(s,t,3);
+    int64_t left=0;
+    CHECK(!cooldown_blocks(s,t->name,6,4,t->trigger_code,&left));
+    s->n_doh=0;
+    CHECK(cooldown_blocks(s,t->name,6,4,t->trigger_code,&left));
+    cooldown_clear(s,t->name,6,4);task_reset(s,t);    t=fixture(s);t->state=T_DOH_HEALTH;t->res_ready=1;
+    strcpy(t->doh_path,"/dns-query");
+    strcpy(s->doh[0].host,t->name);strcpy(s->doh[0].ip,t->ip);strcpy(s->doh[0].path,t->doh_path);
+    s->doh[0].port=t->port;s->n_doh=1;
+    t->ver.level=D2K_VER_APPLICATION;t->ver.budget=D2K_BUDGET_PASSED;
+    t->ver.peer_authenticated=1;t->ver.body_complete=1;t->ver.doh_replies=20;
+    CHECK(doh_health_complete(s,t)==1 && t->state==T_WATCHING);
+    t->state=T_DOH_HEALTH;t->res_ready=1;t->ver.budget=D2K_BUDGET_CUT;
+    capture_spawn=1;
+    CHECK(doh_health_complete(s,t)==1 && t->state==T_ASKING && t->job==JOB_CLASSIFY);
+    capture_spawn=0;t->th_live=0;t->worker_owner=NULL;s->n_doh=0;task_reset(s,t);
+    strcpy(s->doh[0].host,"startup-dns.example");
+    strcpy(s->doh[0].ip,"192.0.2.55");strcpy(s->doh[0].path,"/dns-query");
+    s->doh[0].port=443;s->doh[0].next_ms=0;s->n_doh=1;
+    int saved_sync_active=s->sync_active,saved_sync_pending=s->sync_pending;
+    s->sync_active=0;s->sync_pending=1;capture_spawn=1;
+    doh_health_tick(s);
+    CHECK(!task_of(s,"startup-dns.example",6,4));
+    s->sync_pending=0;
+    doh_health_tick(s);
+    task *startup=task_of(s,"startup-dns.example",6,4);
+    CHECK(startup && startup->state==T_DOH_HEALTH && startup->job==JOB_DOH_HEALTH);
+    CHECK(startup && !strcmp(startup->ip,"192.0.2.55") && !strcmp(startup->doh_path,"/dns-query"));
+    capture_spawn=0;
+    if(startup){startup->th_live=0;startup->worker_owner=NULL;task_reset(s,startup);}
+    s->sync_active=saved_sync_active;s->sync_pending=saved_sync_pending;s->n_doh=0;
+    t=fixture(s);strcpy(t->doh_path,"/dns-query");t->vol.rx_cut=1;
+    t->n_plans=2;t->next_plan=1;t->ver.level=D2K_VER_APPLICATION;
+    t->ver.budget=D2K_BUDGET_CUT;t->ver.budget_packets=24;t->ver.budget_need=50;
+    snprintf(t->plans[0],sizeof t->plans[0],"proto tcp tls\nsplit payload_start +1\norder forward\n");
+    budget_cut_reject(s,t,900);
+    CHECK(t->state==T_PLANNING && !t->partial_valid && t->next_plan==1);
+    CHECK(!partial_finish(s,t,900));task_reset(s,t);
+
+}
+static void protocol_response_reaches_application(d2k_sched *s) {
+    d2k_sched_tcp_fn old=d2k_sched_tcp_hook;
+    d2k_sched_tcp_hook=doh_classify;doh_protocol_response=1;
+    for(int mode=0;mode<7;mode++) {
+        task *t=fixture(s);t->state=T_ASKING;t->job=JOB_CLASSIFY;
+        if(mode!=4)strcpy(t->doh_path,"/dns-query");
+        t->doh_checked=1;t->doh_trial=mode!=4;t->skip_volume_once=1;t->stop=mode==6;
+        doh_mode=mode==5?0:mode;doh_force_local=mode==5;
+        doh_calls=doh_classify_calls=0;doh_last_mark=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=t;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(t->res_ready && t->res.protocol_response==(mode!=3) && doh_classify_calls==1);
+        CHECK(doh_calls==(mode==3?2:mode<4 || mode==5?1:0));
+        CHECK(t->vol.rx_cut==(mode==3));
+        if(mode==3)CHECK(t->vol.rx_wire_basis && t->vol.rx_cut_packets==24);
+        if(doh_calls)CHECK(doh_last_mark==s->measure_mark);
+        CHECK(t->res.verdict==(mode==0?D2K_V_CLEAR:D2K_V_INCONCLUSIVE));
+        CHECK(t->vol.rx_direct_complete==(mode==0));
+        CHECK(!t->res.program_len && !t->res.have_arm);
+        task_reset(s,t);
+    }
+    for(int second=0;second<6;second++) {
+        task *t=fixture(s);t->state=T_ASKING;t->job=JOB_CLASSIFY;
+        strcpy(t->doh_path,"/dns-query");
+        t->doh_checked=1;t->doh_trial=1;t->skip_volume_once=1;
+        doh_mode=3;doh_second_mode=second;doh_force_local=0;
+        doh_calls=doh_classify_calls=0;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=t;a->use_fd=-1;
+        worker_run(a);free(a);
+        CHECK(doh_calls==2 && doh_classify_calls==1 && t->res_ready);
+        CHECK(t->vol.rx_cut==(second==3));
+        CHECK(t->res.verdict==(second==0?D2K_V_CLEAR:D2K_V_INCONCLUSIVE));
+        CHECK(t->vol.rx_direct_complete==(second==0));
+        CHECK(!t->res.program_len && !t->res.have_arm);
+        task_reset(s,t);
+    }
+    doh_second_mode=-1;
+    doh_protocol_response=doh_force_local=0;d2k_sched_tcp_hook=old;
+}
+static int direct_http_calls,direct_http_mode,direct_http_tls12;
+static uint32_t direct_http_mark;
+static d2k_ver_result direct_http_probe(int fd,const char *ip,uint16_t port,const char *name,
+    int wait,size_t wire,int tls12,int encoding,uint32_t mark,const char *path) {
+    (void)ip;(void)port;(void)name;(void)wait;(void)wire;
+    CHECK(fd==-1 && !encoding && !strcmp(path,"/observed-resource"));
+    direct_http_calls++;direct_http_tls12=tls12;direct_http_mark=mark;
+    d2k_ver_result r={0};r.fd=-1;r.level=D2K_VER_APPLICATION;r.status=200;r.body_complete=1;
+    if(direct_http_mode==1)r.body_complete=0;
+    if(direct_http_mode==2)r.local_refusal=1;
+    if(direct_http_mode==3)r.level=D2K_VER_CHALLENGE;
+    if(direct_http_mode==4)r.budget=D2K_BUDGET_CUT;
+    if(direct_http_mode==9)r.budget=D2K_BUDGET_PASSED;
+    if(direct_http_mode==10)r.status=404;
+    return r;
+}
+static void protocol_response_http_context(d2k_sched *s) {
+    d2k_sched_path_ver_fn old=d2k_sched_path_ver_hook;d2k_sched_path_ver_hook=direct_http_probe;
+    for(int legacy=0;legacy<2;legacy++)for(int mode=0;mode<12;mode++) {
+        task *t=fixture(s);strcpy(t->measure_path,"/observed-resource");
+        uint8_t hello[4096];size_t n=0;
+        CHECK(d2k_hello_from_profile(legacy?D2K_SHAPE_LEGACY:D2K_SHAPE_MODERN,t->name,hello,sizeof hello,&n)==0);
+        d2k_hello trigger={hello,n,NULL,0,0,0};
+        if(mode==5)t->measure_path[0]=0;
+        if(mode==6)t->by_addr=1;
+        if(mode==7)t->ech_offer=1;
+        if(mode==8 || mode==9)t->trigger_code=5;
+        if(mode==11)trigger.len=0;
+        direct_http_mode=mode;direct_http_calls=0;direct_http_mark=0;
+        d2k_vres result={0};result.protocol_response=1;result.verdict=D2K_V_INCONCLUSIVE;
+        worker_protocol_response(s,t,trigger,&result);
+        int asked=mode!=5 && mode!=6 && mode!=7 && mode!=11;
+        CHECK(direct_http_calls==asked);
+        if(asked)CHECK(direct_http_tls12==legacy && direct_http_mark==s->measure_mark);
+        int success=mode==0 || mode==9;
+        CHECK(result.verdict==(success?D2K_V_CLEAR:D2K_V_INCONCLUSIVE));
+        CHECK(t->vol.rx_direct_complete==success);
+        CHECK(!result.program_len && !result.have_arm);task_reset(s,t);
+    }
+    d2k_sched_path_ver_hook=old;
+}
+
+static void exact_program_candidate(d2k_sched *s)
+{
+    task *t=fixture(s);
+    d2k_vres *r=calloc(1,sizeof *r);CHECK(r!=NULL);if(!r)return;
+    r->verdict=D2K_V_INCONCLUSIVE;r->owns_search=1;
+    snprintf(r->program,sizeof r->program,
+        "d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +13\nsplit payload_start +37\norder forward\n");
+    r->program_len=strlen(r->program);
+    verdict_to_plans(s,t,r);
+    CHECK(t->n_plans==1 && !strcmp(t->plans[0],r->program));
+    CHECK(t->next_plan==0 && t->n_known==0);
+    strcpy(s->force_suffixes[0],"summary.example");s->n_force=1;
+    tried_add(t,(uint32_t)fnv1a(r->program));
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    s->n_force=0;
+    r->verdict=D2K_V_CLEAR;verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    r->verdict=D2K_V_OPAQUE;r->program_len--;
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    r->program_len++;
+    uint8_t transport=t->transport;t->transport=17;
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);t->transport=transport;
+    r->program[10]=0;
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    strcpy(r->program,"invalid program");r->program_len=strlen(r->program);
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    r->program_len=sizeof r->program;
+    verdict_to_plans(s,t,r);CHECK(t->n_plans==0);
+    free(r);task_reset(s,t);
+}
+
+
+static int synthesis_feedback_calls;
+static void synthesis_feedback_observe(void *ctx,const d2k_synthesis_feedback *e) {
+    int *applied=ctx;
+    CHECK(e->generation==77 && e->search_id!=0);
+    CHECK(!strcmp(e->target,"summary.example") && !strcmp(e->ip,"127.0.0.1"));
+    CHECK(e->port==443 && e->transport==6 && e->family==4 && !e->by_addr);
+    CHECK(!strcmp(e->program,"exact candidate"));
+    if(e->trial_id[0]==10) {
+        CHECK(!e->verification_available && !e->applied && !e->flow.transport);
+        synthesis_feedback_calls++;return;
+    }
+    CHECK(e->trial_id[0]==9 && e->flow.transport==6);
+    CHECK(e->verification_available && e->level==D2K_VER_APPLICATION);
+    CHECK(e->status==200 && e->body_complete && e->applied==*applied);
+    synthesis_feedback_calls++;
+}
+static void synthesis_retirement_feedback(d2k_sched *s) {
+    int applied=0;
+    d2k_sched_synthesis_observer(s,synthesis_feedback_observe,&applied);
+    for(applied=0;applied<2;applied++) {
+        task *t=fixture(s);
+        d2k_vres r={.verdict=D2K_V_INCONCLUSIVE,.synthesis_generation=77};
+        snprintf(r.program,sizeof r.program,"d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +1\norder forward\n");
+        r.program_len=strlen(r.program);
+        verdict_to_plans(s,t,&r);
+        CHECK(t->synthesis_generation==77 && t->n_plans==1);
+        t->next_plan=1;
+        strcpy(t->plans[0],"exact candidate");
+        t->trial_installed=1;t->trial_ack_id[0]=9;
+        t->synthesis_ver_trial_id[0]=9;
+        t->ver_flow.transport=6;t->ver.local_port=1234;
+        t->ver.level=D2K_VER_APPLICATION;t->ver.status=200;t->ver.body_complete=1;
+        t->ver_ok=applied;
+        candidate_retire(s,t);candidate_retire(s,t);
+        CHECK(synthesis_feedback_calls==applied+1);
+        task_reset(s,t);
+    }
+    task *stale=fixture(s);
+    stale->synthesis_generation=77;stale->next_plan=stale->n_plans=1;
+    strcpy(stale->plans[0],"exact candidate");
+    stale->trial_installed=1;stale->trial_ack_id[0]=10;
+    stale->synthesis_ver_trial_id[0]=9;
+    stale->ver.local_port=1234;stale->ver.level=D2K_VER_APPLICATION;
+    stale->ver.status=200;stale->ver.body_complete=1;stale->ver_ok=1;
+    stale->ver_flow.transport=6;
+    candidate_retire(s,stale);
+    CHECK(synthesis_feedback_calls==3);
+    stale->synthesis_generation=0;stale->trial_installed=1;
+    candidate_retire(s,stale);
+    CHECK(synthesis_feedback_calls==3);
+    task_reset(s,stale);
+    d2k_sched_synthesis_observer(s,NULL,NULL);
+}
+static int retained_feedback_calls;
+static int retained_feedback(void *ctx,const d2k_synthesis_feedback *e,d2k_verification_status outcome) {
+    (void)ctx;CHECK(e->generation==7);CHECK(outcome==D2K_VF_UNKNOWN);retained_feedback_calls++;return 0;
+}
+static void retained_release(void *ctx) {(*(int *)ctx)++;}
+static void synthesis_continuation_lifetime(d2k_sched *s)
+{
+    int released=0;
+    CHECK(!d2k_sched_synthesis_retain(7,&released,retained_release,NULL));
+    task *t=fixture(s);
+    progress_sink saved=g_progress_sink;g_progress_sink=(progress_sink){s,t};
+    CHECK(d2k_sched_synthesis_retain(7,&released,retained_release,retained_feedback)==1);
+    CHECK(!d2k_sched_synthesis_retain(8,&released,retained_release,NULL));
+    g_progress_sink=saved;
+    CHECK(!released);
+    uint64_t generation=0;
+    g_progress_sink=(progress_sink){s,t};
+    CHECK(d2k_sched_synthesis_take(NULL,&generation)==NULL);
+    CHECK(d2k_sched_synthesis_take(retained_release,&generation)==&released && generation==7);
+    CHECK(!released);
+    CHECK(d2k_sched_synthesis_retain(7,&released,retained_release,retained_feedback)==1);
+    g_progress_sink=saved;
+    t->synthesis_generation=7;
+t->n_plans=t->next_plan=1;
+    strcpy(t->plans[0],"pending candidate");t->trial_installed=1;
+    candidate_retire(s,t);candidate_retire(s,t);
+    CHECK(retained_feedback_calls==1);
+    t->synthesis_generation=8;t->trial_installed=1;candidate_retire(s,t);
+    CHECK(retained_feedback_calls==1);
+    task_reset(s,t);CHECK(released==1);
+    task_reset(s,t);CHECK(released==1);
+    d2k_catalog other_catalog={0};
+    d2k_sched *other=d2k_sched_new(&other_catalog,-1,0x2d);CHECK(other!=NULL);
+    if(other) {
+        g_progress_sink=(progress_sink){other,&other->tasks[0]};
+        CHECK(d2k_sched_synthesis_retain(9,&released,retained_release,NULL)==1);
+        g_progress_sink=saved;
+        d2k_sched_free(other);CHECK(released==2);
+    }
+}
+static void synthesis_resume_launch(d2k_sched *s)
+{
+    int released=0;task *t=fixture(s);t->state=T_PLANNING;
+    progress_sink saved=g_progress_sink;g_progress_sink=(progress_sink){s,t};
+    strcpy(t->measure_path,"/resource");
+    CHECK(d2k_sched_synthesis_retain(17,&released,retained_release,NULL)==1);
+    g_progress_sink=saved;
+    CHECK(!synthesis_resume(s,t));
+    t->synthesis_resume_pending=1;t->n_plans=t->next_plan=1;
+    capture_spawn=1;
+    CHECK(synthesis_resume(s,t)==1);
+    CHECK(t->state==T_ASKING && t->job==JOB_CLASSIFY && t->th_live);
+    CHECK(t->skip_volume_once && !t->synthesis_resume_pending && !t->n_plans);
+    CHECK(t->synthesis_context==&released && !released);
+    t->th_live=0;capture_spawn=0;
+    strcpy(t->measure_path,"/other");g_progress_sink=(progress_sink){s,t};
+    uint64_t generation=0;
+    CHECK(d2k_sched_synthesis_take(retained_release,&generation)==NULL);
+    CHECK(released==1 && !t->synthesis_context);
+    g_progress_sink=saved;task_reset(s,t);CHECK(released==1);
+}
+static int resume_feedback_calls;
+static int request_resume_after_failure(void *ctx,const d2k_synthesis_feedback *e,d2k_verification_status result)
+{
+    (void)ctx;CHECK(e->generation==92 && e->status==403);
+    CHECK(result==D2K_VF_APP_NOT_MET);resume_feedback_calls++;return 0;
+}
+static void synthesis_owned_results(d2k_sched *s) {
+    for(int mode=0;mode<17;mode++) {
+        task *t=fixture(s);
+        strcpy(t->measure_path,"/measured-resource");
+        if(mode>=7 && mode<15)strcpy(t->doh_path,"/dns-query");
+        if(mode>=15)t->measure_path[0]=0;
+        d2k_vres r={.verdict=D2K_V_INCONCLUSIVE,.synthesis_generation=92};
+        snprintf(r.program,sizeof r.program,"d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +1\norder forward\n");
+        r.program_len=strlen(r.program);
+        verdict_to_plans(s,t,&r);
+        CHECK(t->synthesis_owner!=NULL);
+        int released=0;
+        if(mode==5) {
+            progress_sink saved=g_progress_sink;g_progress_sink=(progress_sink){s,t};
+            CHECK(d2k_sched_synthesis_retain(92,&released,retained_release,request_resume_after_failure)==1);
+            g_progress_sink=saved;
+        }
+        t->next_plan=1;t->trial_installed=1;t->trial_shape=probe_shape(t);
+        t->trial_ack_id[0]=1;t->synthesis_ver_trial_id[0]=1;t->ver_plan_id[0]=2;
+        t->ver.local_port=1234;t->ver_flow.a_port=1234;t->ver_flow.b_port=443;
+        t->ver_flow.family=4;t->ver_flow.transport=6;
+        inet_pton(AF_INET,"127.0.0.1",t->ver_flow.b_ip);
+        t->ver.level=D2K_VER_APPLICATION;t->ver.status=200;t->ver.body_complete=1;
+        t->ver_ok=1;
+        if(mode>=8) {
+            t->ver.budget=D2K_BUDGET_PASSED;t->ver.budget_need=50;
+            t->ver.budget_packets=52;t->ver.budget_requests=11;
+        }
+        if(mode>=9 && mode<15) {
+            t->ver.budget=D2K_BUDGET_CUT;t->ver.body_complete=0;t->ver.budget_packets=24;
+            if(mode==9)t->ver.budget_need=0;
+            if(mode==10)t->ver.budget_packets=0;
+            if(mode==11)t->ver.budget_requests=0;
+            if(mode==12)t->ver.status=0;
+            if(mode==13)t->ver.status=503;
+        }
+        if(mode==1)t->synthesis_ver_trial_id[0]=2;
+        if(mode==2)t->ver_ok=0;
+        if(mode==3)t->ver.body_complete=0;
+        if(mode==4)strcpy(t->measure_path,"/other-resource");
+        if(mode==5)t->ver.status=403;
+        if(mode==6)t->synthesis_generation=93;
+        if(mode==16)t->ver.status=302;
+        d2k_verification_status expected=mode==14?D2K_VF_NOT_MET:(mode==0 || mode==8 || mode==15)?D2K_VF_OBSERVED:
+            (mode==4 || mode==6)?D2K_VF_FOREIGN:(mode==5 || mode==16)?D2K_VF_APP_NOT_MET:D2K_VF_UNKNOWN;
+        if(mode==14){strcpy(s->force_suffixes[0],"summary.example");s->n_force=1;}
+        CHECK(synthesis_report(s,t,0)==expected);
+        if(mode==14){CHECK(t->n_tried==1 && t->tried[0]==(uint32_t)fnv1a(t->plans[0]));s->n_force=0;}
+        if(mode==0)CHECK(synthesis_report(s,t,0)==D2K_VF_OBSERVED);
+        candidate_retire(s,t);
+        CHECK(t->synthesis_result==expected);
+        if(mode==5)CHECK(t->synthesis_resume_pending==0 && resume_feedback_calls==1);
+        /* A new verdict must discard evidence even for identical plan text. */
+        r.synthesis_generation=94;
+        verdict_to_plans(s,t,&r);
+        CHECK(t->synthesis_result==D2K_VF_UNKNOWN);
+        task_reset(s,t);
+        CHECK(t->synthesis_owner==NULL);
+        CHECK(released==(mode==5));
+    }
+}
+static void synthesis_missing_owner_cannot_confirm(d2k_sched *s) {
+    task *t=fixture(s);
+    t->synthesis_generation=91;t->next_plan=t->n_plans=1;
+    strcpy(t->plans[0],"d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +1\norder forward\n");
+    t->ver.level=D2K_VER_APPLICATION;t->ver.status=200;
+    t->ver.body_complete=1;t->ver_ok=1;
+    verify_confirm(s,t,1000);
+    CHECK(t->state==T_PLANNING);
+    CHECK(!t->bound_plan_id[0]);
+    task_reset(s,t);
+}
+/* A known failed catalog plan must not return just because another plan
+   appeared. Also cover a fresh plan beyond the first catalog batch. */
+static void retry_remembers_failed_plans(int failed_count, int spawn_failure) {
+    d2k_catalog cat;
+    d2k_cat_box box;
+    memset(&cat, 0, sizeof cat);
+    memset(&box, 0, sizeof box);
+    d2k_cat_plan plans[9];
+    d2k_cat_binding binds[9];
+    memset(plans, 0, sizeof plans);
+    memset(binds, 0, sizeof binds);
+    char texts[9][80];
+    size_t n = (size_t)failed_count + 1;
+    cat.boxes = &box; cat.n_boxes = 1;
+    box.plans = plans; box.n_plans = n; box.binds = binds; box.n_binds = n;
+    strcpy(box.id, "box-retry");
+    for (size_t i = 0; i < n; i++) {
+        snprintf(texts[i], sizeof texts[i], "d2k-plan 1 %zu\nproto tcp tls\n", i + 1);
+        snprintf(plans[i].id, sizeof plans[i].id, "plan-%zu", i);
+        strcpy(plans[i].proto, "tls"); plans[i].enabled = 1; plans[i].text = texts[i];
+        strcpy(binds[i].plan_id, plans[i].id); strcpy(binds[i].kind, "name");
+        snprintf(binds[i].target, sizeof binds[i].target, "donor%zu.example", i);
+        binds[i].enabled = 1; binds[i].level = 3;
+        binds[i].transport = 6; binds[i].family = 4; binds[i].shape = SCHED_PROBE_SHAPE;
+        binds[i].confirmed = 100 - (int64_t)i;
+    }
+    d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
+    CHECK(s != NULL);
+    if (!s) return;
+    s->now_ms = 1000;
+    target_cooldown *c = &s->cooldowns[0];
+    c->used = c->exhausted = 1; c->transport = 6; c->family = 4;
+    c->port = 443; c->until_ms = 600000;
+    strcpy(c->name, "retry.example"); strcpy(c->ip, "192.0.2.1");
+    for (int i = 0; i < failed_count; i++) c->failed_plans[c->n_failed_plans++] = fnv1a(texts[i]);
+    d2k_sched_tcp_fn saved = d2k_sched_tcp_base_hook;
+    d2k_sched_tcp_base_hook = d2k_sched_tcp_hook;
+    capture_spawn = 1; /* capture launch only; no network or real worker */
+    int started = plan_news_recheck(s, c, 1000);
+    capture_spawn = 0;
+    CHECK(started == 1);
+    task *t = task_of(s, c->name, 6, 4);
+    if (t) {
+        t->th_live = 0; /* captured pthread_create did not create a thread */
+        size_t offered = own_first_plans(s, t, 1);
+        CHECK(offered == 1);
+        CHECK(!strcmp(t->plans[0], texts[failed_count]));
+        if (spawn_failure) {
+            t->own_first = 2; t->n_plans = t->n_known = t->next_plan = 1;
+            t->state = T_TRIAL_SETTLE; t->trial_acked = 1;
+            /* summary_thread_create returns EAGAIN: no verifier exists. */
+            d2k_sched_tick(s, 1010);
+            CHECK(t->state == T_PLANNING);
+            d2k_sched_tick(s, 1020);
+            CHECK(c->n_failed_plans == 0);
+            CHECK(c->until_ms == 600000);
+            /* The unmeasured plan must still be eligible next time. */
+            capture_spawn = 1;
+            CHECK(plan_news_recheck(s, c, 1030) == 1);
+            capture_spawn = 0;
+            t = task_of(s, c->name, 6, 4);
+            if (t) t->th_live = 0;
+        }
+    }
+    d2k_sched_tcp_base_hook = saved;
+    d2k_sched_free(s); /* catalog entries are stack-owned */
+}
+
+static int retry_offer(const char *name, size_t payload, uint8_t *out,
+                                 size_t cap, size_t *len) {
+    size_t n = 0;
+    if (d2k_hello_from_profile(D2K_SHAPE_MODERN, name, out, cap, &n) != 0) return -1;
+    size_t p = 9 + 2 + 32;
+    p += 1 + out[p];
+    p += 2 + ((size_t)out[p] << 8 | out[p + 1]);
+    p += 1 + out[p];
+    size_t ext_len_off = p;
+    const size_t enc = 32, elen = 10 + enc + payload;
+    if (n + 4 + elen > cap) return -1;
+    uint8_t *e = out + n;
+    e[0] = 0xfe; e[1] = 0x0d; e[2] = (uint8_t)(elen >> 8); e[3] = (uint8_t)elen;
+    e[4] = 0; e[5] = 0; e[6] = 1; e[7] = 0; e[8] = 1; e[9] = 0x5a;
+    e[10] = 0; e[11] = (uint8_t)enc;
+    for (size_t i = 0; i < enc; i++) e[12 + i] = (uint8_t)(i * 7 + 3);
+    e[12 + enc] = (uint8_t)(payload >> 8); e[13 + enc] = (uint8_t)payload;
+    for (size_t i = 0; i < payload; i++) e[14 + enc + i] = (uint8_t)(i * 13 + 1);
+    n += 4 + elen;
+    size_t ext = ((size_t)out[ext_len_off] << 8 | out[ext_len_off + 1]) + 4 + elen;
+    out[ext_len_off] = (uint8_t)(ext >> 8); out[ext_len_off + 1] = (uint8_t)ext;
+    size_t hs = n - 9, rec = n - 5;
+    out[6] = (uint8_t)(hs >> 16); out[7] = (uint8_t)(hs >> 8); out[8] = (uint8_t)hs;
+    out[3] = (uint8_t)(rec >> 8); out[4] = (uint8_t)rec;
+    *len = n;
+    return 0;
+}
+
+/* Field 08.11: recheck must retain the form and resolved GREASE context. */
+static void retry_keeps_client_context(int completed_retry) {
+    for (int legacy=0;legacy<2;legacy++) {
+        d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        task *t=fixture(s);t->trigger_shape=legacy?D2K_SHAPE_LEGACY:D2K_LINK_SHAPE_ECH_TCP;
+        t->ech_grease=!legacy;t->trigger_code=D2K_SUSPECT_RST;
+        if(!legacy) {
+            CHECK(!retry_offer(t->name,144,t->trig,sizeof t->trig,&t->trig_len));
+            t->trig_snapped=1;
+            strcpy(s->ech_inputs[0].name,t->name);s->ech_inputs[0].family=4;
+            s->ech_inputs[0].observed_ms=s->now_ms;
+            memcpy(s->ech_inputs[0].bytes,t->trig,t->trig_len);
+            s->ech_inputs[0].len=t->trig_len;
+        }
+        d2k_cat_box *b=box_ensure(&cat,"retry-box");
+        const char *text="d2k-plan 1 5\nproto tcp tls\nsplit payload_start +1\norder forward\n";
+        CHECK(bind_confirmed(&cat,b->id,"retry-plan",text,"tls","donor.example","name",6,4,
+            legacy?D2K_SHAPE_LEGACY:D2K_SHAPE_MODERN,0,D2K_VERBY_PROBE,0,1,NULL,NULL,NULL)==0);
+        cooldown_record(s,t,2);target_cooldown *c=cooldown_find(s,t->name,6,4);
+        t->state=T_RESTING;
+        d2k_sched_tcp_fn saved=d2k_sched_tcp_base_hook;
+        d2k_sched_tcp_base_hook=d2k_sched_tcp_hook;
+        capture_spawn=1;
+        if(completed_retry) {
+            task *watch=&s->tasks[1];task_reset(s,watch);
+            watch->state=T_WATCHING;watch->plan_retry=1;
+            strcpy(watch->name,"already-confirmed.example");
+            s->plan_news=1;s->plan_gen=1;
+            plan_news_tick(s,1000);
+            CHECK(s->tasks[0].state==T_ASKING);
+        } else CHECK(plan_news_recheck(s,c,1000)==1);
+        capture_spawn=0;
+        t=task_of(s,"summary.example",6,4);
+        CHECK(t && t->trigger_shape==(legacy?D2K_SHAPE_LEGACY:D2K_LINK_SHAPE_ECH_TCP));
+        CHECK(t && t->ech_grease==!legacy);
+        CHECK(t && t->own_first==1 && !t->ech_offer);
+        CHECK(t && d2k_hello_shape(t->trig,t->trig_len)==(legacy?D2K_SHAPE_LEGACY:D2K_SHAPE_MODERN));
+        if(t)t->th_live=0;
+        d2k_sched_tcp_base_hook=saved;d2k_sched_free(s);d2k_catalog_free(&cat);
+    }
+}
+
+static int rx_worker_calls, generic_worker_calls;
+static d2k_ver_result rx_worker_probe(int fd,const char *ip,uint16_t port,
+    uint8_t transport,const char *name,int deadline,size_t wire,uint8_t shape) {
+    (void)fd;(void)ip;(void)port;(void)transport;(void)name;(void)deadline;(void)wire;(void)shape;
+    rx_worker_calls++;return (d2k_ver_result){.fd=-1};
+}
+static d2k_ver_result generic_worker_probe(int fd,const char *ip,uint16_t port,
+    uint8_t transport,const char *name,int deadline,size_t wire,uint8_t shape) {
+    (void)fd;(void)ip;(void)port;(void)transport;(void)name;(void)deadline;(void)wire;(void)shape;
+    generic_worker_calls++;return (d2k_ver_result){.fd=-1};
+}
+static void synthesis_worker_measures_identity(void) {
+    d2k_sched_ver_fn rx=d2k_sched_rx_ver_hook,generic=d2k_sched_ver_hook;
+    d2k_sched_rx_ver_hook=rx_worker_probe;d2k_sched_ver_hook=generic_worker_probe;
+    for(int mode=0;mode<3;mode++) {
+        d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        task *t=fixture(s);t->trigger_shape=mode==2?D2K_SHAPE_LEGACY:D2K_SHAPE_MODERN;
+        CHECK(!fill_hellos(s,t));t->res.verdict=D2K_V_INCONCLUSIVE;
+        t->res.program_len=mode!=1;t->job=JOB_VERIFY;
+        worker_arg *a=calloc(1,sizeof *a);a->s=s;a->t=t;a->use_fd=-1;
+        memcpy(a->trig,t->trig,t->trig_len);a->trig_len=t->trig_len;
+        rx_worker_calls=generic_worker_calls=0;worker_run(a);free(a);
+        CHECK(t->res_ready && rx_worker_calls==(mode==0) && generic_worker_calls==(mode!=0));
+        d2k_sched_free(s);d2k_catalog_free(&cat);
+    }
+    d2k_sched_rx_ver_hook=rx;d2k_sched_ver_hook=generic;
+}
+
+/* A ServerHello synthesis candidate exposes the same residual RX question
+   as an opaque-handshake candidate. One cut is not yet an RX fingerprint. */
+static void synthesis_candidate_opens_rx_ladder(void) {
+    for(int negative=0;negative<5;negative++) {
+        d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        cat.net.searched=1;strcpy(cat.net.name,"white.example");
+        if(negative==4) {cat.net.searched=0;cat.net.name[0]=0;}
+        task *t=fixture(s);t->trigger_shape=D2K_SHAPE_MODERN;
+        CHECK(fill_hellos(s,t)==0);
+        d2k_vres r={.verdict=D2K_V_INCONCLUSIVE,.synthesis_generation=98,.owns_search=1};
+        strcpy(r.program,"d2k-plan 1 5\nproto tcp tls\nsplit payload_start +1\norder forward\n");
+        r.program_len=strlen(r.program);t->res=r;
+        verdict_to_plans(s,t,&r);t->next_plan=1;
+        if(negative==3) {
+            t->own_first=2;t->plan_retry=1;t->vol.rx_tls_unavailable=1;
+            t->res.program_len=0;t->res.verdict=D2K_V_OPAQUE;
+        }
+        for(int phase=0;phase<3;phase++) {
+            t->ver=(d2k_ver_result){.fd=-1,.level=D2K_VER_APPLICATION,.status=200,
+                .body_framing_valid=1,.body_has_length=1,.body_expected=30000,
+                .body_bytes=20000,.data_packets=24};
+            if(phase==2) {
+                t->ver.body_encoding=1;t->ver.body_bytes=4000;
+                t->ver.body_complete=negative!=1;t->ver.data_packets=0;
+            }
+            t->ver_seen=negative==2?0:1;
+            t->ver_flow.family=4;t->ver_flow.transport=6;
+            t->ver_flow.a_port=1234;t->ver_flow.b_port=443;
+            t->ver_early[0]=(d2k_flowkey){.family=4,.transport=6,.a_port=1234,.b_port=443};
+            if(!layered_rx_result(s,t,1000+phase*1000)) {
+                CHECK(negative==2);break;
+            }
+            if(phase<2) {CHECK(!t->vol.rx_cut);CHECK(t->rx_phase==(unsigned)phase+1);t->next_plan=1;}
+        }
+        if(!negative || negative==3 || negative==4) {
+            CHECK(!t->plan_retry && t->own_first!=2);
+            CHECK(t->vol.rx_cut && t->vol.rx_at_kb==19);
+            CHECK(t->n_plans>0 && strcmp(t->plans[0],r.program));
+            CHECK(!t->synthesis_generation && !t->synthesis_owner);
+            if(negative==4) {
+                CHECK(t->rx_volume_candidate_pending);
+                size_t before=t->net_probe_next;
+                t->n_plans=t->next_plan=0;
+                CHECK(refill_from_fallback(s,t)>0 && t->net_probe_next>before);
+                CHECK(!t->fb_next);
+            } else CHECK(t->rx_volume_next_variant>0);
+        } else CHECK(!t->vol.rx_cut);
+        d2k_sched_free(s);d2k_catalog_free(&cat);
+    }
+}
+
+/* A failed continuation must leave the target discoverable by plan news.
+   Catalog compatibility is tested by a new baseline/trial, across boxes. */
+static void failed_synthesis_waits_for_new_own_plan(void) {
+    d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+    task *t=fixture(s);t->trigger_shape=D2K_SHAPE_MODERN;
+    t->trigger_code=D2K_SUSPECT_RST;t->state=T_PLANNING;
+    strcpy(t->box_id,"box-old-measurement");
+    int context=0;t->synthesis_context=&context;t->synthesis_resume_pending=-1;
+    CHECK(synthesis_resume(s,t)==1);
+    target_cooldown *c=cooldown_find(s,"summary.example",6,4);
+    CHECK(c && c->exhausted);
+    d2k_cat_box *b=box_ensure(&cat,"box-new-measurement");
+    const char *text="d2k-plan 1 5\nproto tcp tls\nsplit payload_start +1\norder forward\n";
+    CHECK(!bind_confirmed(&cat,b->id,"new-plan",text,"tls","donor.example","name",6,4,
+        D2K_SHAPE_MODERN,0,D2K_VERBY_PROBE,0,1,NULL,NULL,NULL));
+    d2k_sched_tcp_fn saved=d2k_sched_tcp_base_hook;
+    d2k_sched_tcp_base_hook=d2k_sched_tcp_hook;
+    capture_spawn=1;s->plan_news=1;s->plan_gen=1;plan_news_tick(s,1000);capture_spawn=0;
+    t=task_of(s,"summary.example",6,4);
+    CHECK(t && t->state==T_ASKING && t->own_first==1);
+    if(t)t->th_live=0;
+    d2k_sched_tcp_base_hook=saved;d2k_sched_free(s);d2k_catalog_free(&cat);
+}
+
+static void measurement_timeout_does_not_cooldown(void) {
+    for(int typed=0;typed<2;typed++) {
+        d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        task *t=fixture(s);t->state=T_ASKING;t->res_ready=1;
+        t->res.verdict=typed?D2K_V_FLAKY:D2K_V_INCONCLUSIVE;
+        t->res.dial_deadline=typed;
+        d2k_sched_tick(s,1000);
+        CHECK((cooldown_find(s,"summary.example",6,4)!=NULL)==!typed);
+        CHECK(!cat.n_boxes && !t->n_plans);
+        d2k_sched_free(s);d2k_catalog_free(&cat);
+    }
+}
+
 int main(void) {
+    synthesis_worker_measures_identity();
+    synthesis_candidate_opens_rx_ladder();
+    failed_synthesis_waits_for_new_own_plan();
+    retry_keeps_client_context(0);
+    retry_keeps_client_context(1);
+    measurement_timeout_does_not_cooldown();
+    retry_remembers_failed_plans(1, 0);
+    retry_remembers_failed_plans(8, 0);
+    retry_remembers_failed_plans(0, 1);
     d2k_catalog cat = {0};
     d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
     d2k_sched_diagnostics(s,diag_observe,NULL);
     task diag_task={0};diag_task.report_id=999;
-    search_report(s,&diag_task,10,"failed","none");
-    search_report(s,&diag_task,11,"failed","none");
+    search_report(s,&diag_task,10,"failed","none","кандидаты кончились, ни один не подтверждён зондом");
+    search_report(s,&diag_task,11,"failed","none","кандидаты кончились, ни один не подтверждён зондом");
     CHECK(diag_calls==1); /* observation independent of human log; exactly once */
     d2k_sched_diagnostics(s,NULL,NULL);
 
     CHECK(s != NULL);
     if (!s) return 1;
+    synthesis_continuation_lifetime(s);
+    synthesis_resume_launch(s);
+    synthesis_owned_results(s);
+    synthesis_missing_owner_cannot_confirm(s);
+    synthesis_retirement_feedback(s);
     d2k_sched_set_say(s, collect, NULL);
+    exact_program_candidate(s);
+    doh_service_gate(s);
+    protocol_response_reaches_application(s);
+    protocol_response_http_context(s);
+    rx_short_reports_only_final_cumulative(s);
+    {
+        task *q = fixture(s);
+        q->report_id = 42; q->family = 6;
+        CHECK(d2k_hello_from_profile(D2K_SHAPE_MODERN, q->name, q->trig,
+              sizeof q->trig, &q->trig_len) == 0);
+        d2k_vres result = {.verdict = D2K_V_OPAQUE, .have_arm = 1};
+        result.arm.badsum = 1;
+        result.arm_input.trigger_len = q->trig_len;
+        strcpy(result.arm_name, "badsum"); strcpy(result.arm_path, "свойство");
+        verdict_to_plans(s, q, &result);
+        CHECK(q->n_plans > 0);
+        CHECK(strstr(rows, "НАЙДЕН замером (путь: свойство) search=42 protocol=tcp family=6") != NULL);
+        task_reset(s, q);
+    }
     challenge_exclusions_survive_cache_eviction(s);
     tx_ladder_requires_volume_proof(0);
     tx_ladder_requires_volume_proof(1);
@@ -432,7 +1237,8 @@ int main(void) {
         verdict_to_plans(s,q,&result);CHECK(q->n_plans==1);
         q->next_plan=1;
         CHECK(!strcmp(candidate_path(q),ladder?"перебор":"свойство"));
-        search_report(s,q,900,"probe-confirmed",NULL);
+        search_report(s,q,900,"probe-confirmed",NULL,
+                      "кандидат подтверждён собственным зондом на проводе");
         CHECK(strstr(rows,ladder?"path=fallback":"path=property"));
     }
     task *t = fixture(s);
@@ -440,6 +1246,10 @@ int main(void) {
     CHECK(launch_task(s, t) == 0);
     CHECK(strstr(rows, "итог поиска:") != NULL);
     CHECK(strstr(rows, "elapsed_ms=800 queue_ms=150") != NULL);
+    /* Строка журнала несёт причину итога и идентичность решения: без них
+       «own-plan подтверждён» по одиннадцати именам не сверить с каталогом. */
+    CHECK(strstr(rows, "why=") != NULL);
+    CHECK(strstr(rows, "box=") != NULL && strstr(rows, "plan=") != NULL);
 
     t = fixture(s);
     task_done(s, t); /* cancellation while requeued, without launch */

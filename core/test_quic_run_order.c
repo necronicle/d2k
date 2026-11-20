@@ -4,6 +4,7 @@
 #include "d2k_quichello.h"
 #include "d2k_quic.h"
 static int calls, fails, lose_base_mark, junk16_asks, all_pass;
+static int base_pass_short; /* прямой Initial отвечает 2/3 (поле 24.10.2026, katzauction.com) */
 static int fragment_calls, arm_second_stalls;
 static int candidate_passed, diagnostics_after_pass;
 static size_t first_prefix;
@@ -17,6 +18,7 @@ static size_t resolve(const char *sni,char out[][D2K_QUIC_ADDR_LEN],size_t cap) 
 static d2k_tally answer(int n,int *sent) {
     d2k_tally t={0}; t.marked=1; if(sent)*sent=n;
     if(lose_base_mark && calls==0)t.marked=0;
+    if(base_pass_short && calls==1){ calls++; t.pass=n-1; t.fail=1; return t; } /* второй опрос — прямой Initial (первый — контроль) */
     if(calls++==1 && !all_pass) t.fail=n; else t.pass=n;
     return t;
 }
@@ -280,6 +282,36 @@ static void stall_machine(void) {
     CHECK(d2k_qbudget_ok(&bg, 842229, 513, 200, 5000, 4990, 1000) == 0);
 }
 
+/* Поле 24.10.2026 (h3-1024, класс C): katzauction.com, rua.gr, enimerosi.com —
+   рукопожатие QUIC проходит, запрос HTTP/3 остаётся без ответа (pcap: после
+   0.146 с сервер молчит совсем), а поиск кончался «прямой зонд не
+   воспроизводится: 2/3» и подбор не открывался. Вопрос подозрения — о данных
+   после рукопожатия; одна потерянная датаграмма Initial из трёх на него не
+   отвечает и не вправе его снимать. Без признака обрыва данных строгость
+   рукопожатия прежняя: 2/3 — FLAKY. */
+static void flaky_initial_keeps_data_question(void) {
+    uint8_t tb[1500],cb[1500];size_t tn=0,cn=0;
+    CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
+    CHECK(d2k_quic_probe_initial("neutral.example",cb,sizeof cb,&cn)==0);
+    d2k_quic_arm_data_wire_fn saved=d2k_quic_arm_data_hook;
+    d2k_quic_arm_data_hook=data_cut;
+    all_pass=1; base_pass_short=1;
+    d2k_quic_arm arm;
+    memset(&arm,0,sizeof arm); arm.data_cut=1; calls=0; data_calls=direct_data_calls=0; direct_cut=1;
+    memset(direct_seq,0,sizeof direct_seq); ctl_verdict=D2K_QAD_PASS;
+    d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
+    CHECK(r.verdict==D2K_V_OPAQUE && direct_data_calls==2);
+    CHECK(strstr(r.reason,"2/3")!=NULL && strstr(r.reason,"после рукопожатия")!=NULL);
+    /* Без признака обрыва данных — как прежде. */
+    memset(&arm,0,sizeof arm); calls=0; data_calls=direct_data_calls=0;
+    r=d2k_quic_run("127.0.0.1",443,"target.example",
+        (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
+    CHECK(r.verdict==D2K_V_FLAKY && direct_data_calls==0);
+    base_pass_short=0; all_pass=0; direct_cut=0;
+    d2k_quic_arm_data_hook=saved;
+}
+
 static void post_handshake_stall(void) {
     uint8_t tb[1500],cb[1500];size_t tn=0,cn=0;
     CHECK(d2k_quic_probe_initial("target.example",tb,sizeof tb,&tn)==0);
@@ -441,11 +473,12 @@ int main(void) {
     d2k_vres r=d2k_quic_run("127.0.0.1",443,"target.example",
         (d2k_hello){tb, tn, NULL, 0, 0, 0},(d2k_hello){cb, cn, NULL, 0, 0, 0},0,&arm);
     CHECK(r.verdict==D2K_V_OPAQUE);
-    CHECK(first_prefix==1200); /* quic5 before properties' 16-byte junk */
-    CHECK(arm_hello_count==1); /* first complete arm ends search */
-    CHECK(arm.original && arm.len==1200 && arm.ttl==0 && arm.copies==1);
+    CHECK(first_prefix==1200); /* приманка 1200 байт раньше 16-байтного «мусора» свойств */
+    CHECK(arm_hello_count==1); /* первое полное плечо кончает поиск */
+    CHECK(arm.original && arm.len==1200 && arm.ttl==0 && arm.copies==1 &&
+          !strcmp(arm.blob_name,"quic5"));
     CHECK(fragment_calls==0 && arm.frag_kind==0 && arm.frag_survives==D2K_PROP_UNKNOWN);
-    CHECK(data_calls==1); /* quic5 passed; no copies/TTL/fragment refinements */
+    CHECK(data_calls==1); /* первое плечо прошло; копий/TTL/фрагментов не понадобилось */
     CHECK(strategy_calls==4 && arm.strategy==D2K_QS_LADDER); /* два вопроса, по одному повтору */
     /* Круг 1: заданное до предела повторов не задаётся снова — ни приманкой
        0x00…0 перебора, ни «мусором»/«кадрами» вопросника. */
@@ -512,6 +545,7 @@ int main(void) {
     lose_base_mark=0; calls=0;
     stall_machine();
     post_handshake_stall();
+    flaky_initial_keeps_data_question();
     if(fails)return 1;
     puts("original Run order: passed");return 0;
 }

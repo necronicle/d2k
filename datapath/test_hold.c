@@ -25,7 +25,28 @@ static int verdict(void *ctx, uint32_t id, uint32_t v) {
     (void)ctx; sent[nsent]=id; verdicts[nsent++]=v;
     return id == 2 ? -1 : 0;
 }
+static void exact_request(void) {
+    d2k_hold *h=d2k_hold_new();CHECK(h!=NULL);if(!h)return;
+    uint8_t p[1600],bytes[]={99,88,77,66,55,44,33,22,11};
+    d2k_hold_batch batch;uint32_t anchor=UINT32_MAX-3;
+    size_t n=packet(p,2400,anchor+4,bytes+4,4);
+    CHECK(d2k_hold_feed(h,100,p,n,1,1,D2K_HOLD_EXACT(8),anchor,1,release,NULL,&batch)==1);
+    n=packet(p,2400,anchor,bytes,4);
+    CHECK(d2k_hold_feed(h,101,p,n,2,1,0,anchor,1,release,NULL,&batch)==2);
+    CHECK(batch.count==2 && batch.len==48 && !memcmp(batch.packet+40,bytes,8));
+    CHECK(batch.orig_count==2 && batch.orig[0][40]==99 && batch.orig[1][40]==55);
+    n=packet(p,2401,anchor,bytes,4);
+    CHECK(d2k_hold_feed(h,102,p,n,3,1,D2K_HOLD_EXACT(8),anchor,1,release,NULL,&batch)==1);
+    n=packet(p,2401,anchor+4,bytes+4,5);
+    CHECK(d2k_hold_feed(h,103,p,n,4,1,0,anchor,1,release,NULL,&batch)==1);
+    CHECK(!batch.count && nreleased==2);
+    n=packet(p,2402,anchor,bytes,4);
+    CHECK(d2k_hold_feed(h,104,p,n,5,1,D2K_HOLD_EXACT(8),anchor,0,release,NULL,&batch)==1);
+    CHECK(!batch.count && nreleased==3);
+    d2k_hold_flush(h,6,1,1,release,NULL);d2k_hold_free(h);nreleased=0;
+}
 int main(void) {
+    exact_request();
     {
         uint8_t pkt6[64] = {0x60};
         pkt6[5]=24; pkt6[6]=6; pkt6[7]=64;

@@ -61,24 +61,44 @@ const char *d2k_hs_answer_name(d2k_hs_answer a) {
 
 d2k_hs_answer d2k_hs_judge(const char *host, const char *head, size_t n,
                            int64_t rtt_us, int64_t reply_us) {
-    if (!head || n < 12 || memcmp(head, "HTTP/1.", 7) != 0 ||
-        (head[7] != '0' && head[7] != '1') || head[8] != ' ' ||
-        head[9] < '1' || head[9] > '5' || head[10] < '0' || head[10] > '9' ||
-        head[11] < '0' || head[11] > '9') {
-        return D2K_HS_GARBAGE;
+    /* Пропускаем ведущие промежуточные ответы 1xx (100 Continue, 103 Early
+       Hints): они предшествуют ОКОНЧАТЕЛЬНОМУ ответу того же запроса, и судить
+       надо его. Без этого «HTTP/1.1 100 …» перед финальным 421/400 читалось бы
+       как код 100 и объявлялось ответом сервера. 101 — переключение протокола,
+       не «продолжение», и финальным не считается. */
+    size_t at = 0, end = 0;
+    int code = 0;
+    for (;;) {
+        if (n - at < 12 || memcmp(head + at, "HTTP/1.", 7) != 0 ||
+            (head[at + 7] != '0' && head[at + 7] != '1') || head[at + 8] != ' ' ||
+            head[at + 9] < '1' || head[at + 9] > '5' ||
+            head[at + 10] < '0' || head[at + 10] > '9' ||
+            head[at + 11] < '0' || head[at + 11] > '9') {
+            return D2K_HS_GARBAGE;
+        }
+        size_t e = 0;
+        for (size_t i = at; i + 3 < n; i++) if (!memcmp(head + i, "\r\n\r\n", 4)) { e = i + 4; break; }
+        if (!e) return D2K_HS_GARBAGE; /* status alone can precede a portal Location */
+        code = (head[at + 9] - '0') * 100 + (head[at + 10] - '0') * 10 + (head[at + 11] - '0');
+        if (code >= 100 && code < 200 && code != 101) {
+            at = e;                       /* interim head; the final one follows */
+            if (at + 12 > n) { return D2K_HS_GARBAGE; }
+            continue;
+        }
+        end = e;
+        break;
     }
-    size_t end=0;
-    for(size_t i=0;i+3<n;i++) if(!memcmp(head+i,"\r\n\r\n",4)) { end=i+4; break; }
-    if(!end) return D2K_HS_GARBAGE; /* status alone can precede a portal Location */
+    (void)end;
     char portal[256];
-    if (host && d2k_httpup_portal_location(host, head, n, portal, sizeof portal)) {
+    /* Portal detection judges the FINAL response (head+at), so a legitimate
+       interim 1xx prefix cannot hide an injected 30x to a provider portal. */
+    if (host && d2k_httpup_portal_location(host, head + at, n - at, portal, sizeof portal)) {
         return D2K_HS_INJECTED;
     }
     /* ПРИМАНКА ДОШЛА ДО СЕРВЕРА (повторное ревью I-A): сервер принял её
        байты за начало запроса и ответил на склейку — 400/421 или ответ про
        имя приманки. Это не ответ цели, и подтверждать по нему план нельзя:
        такой план отдавал бы серверу приманку вместо каждого запроса. */
-    int code = (head[9] - '0') * 100 + (head[10] - '0') * 10 + (head[11] - '0');
     if (code == 400 || code == 421) { return D2K_HS_DECOY; }
     {
         static const char decoy[] = HS_DECOY;
@@ -107,7 +127,9 @@ static int hs_path_ok(const char *path) {
     return n>0;
 }
 
-typedef struct { int fd; int64_t first_us; struct timespec sent; char head[4096]; size_t used; } hs_reader;
+/* The capture is as large as the response reader's header limit: a real
+   response with large headers must not look like garbage to the judge. */
+typedef struct { int fd; int64_t first_us; struct timespec sent; char *head; size_t cap, used; } hs_reader;
 static long hs_read(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err, size_t errcap) {
     hs_reader *s=ctx; int64_t until=mono_ms()+wait_ms;
     for(;;) {
@@ -122,15 +144,118 @@ static long hs_read(void *ctx, uint8_t *buf, size_t cap, int wait_ms, char *err,
             struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
             s->first_us=(int64_t)(t.tv_sec-s->sent.tv_sec)*1000000+(t.tv_nsec-s->sent.tv_nsec)/1000;
         }
-        if(n>0&&s->used<sizeof s->head-1) {
-            size_t take=(size_t)n;if(take>sizeof s->head-1-s->used)take=sizeof s->head-1-s->used;
+        if(n>0&&s->used<s->cap-1) {
+            size_t take=(size_t)n;if(take>s->cap-1-s->used)take=s->cap-1-s->used;
             memcpy(s->head+s->used,buf,take);s->used+=take;s->head[s->used]=0;
         }
         return n;
     }
 }
 
+/* Bytes the judge scans: the whole header block, and no more body than the
+   original 4 KiB capture did (the decoy name is searched there too). */
+#define HS_JUDGE_SCAN 4095
+
+static size_t hs_header_end(const char *h, size_t from, size_t n) {
+    for (size_t i = from; i + 3 < n; i++)
+        if (!memcmp(h + i, "\r\n\r\n", 4)) return i + 4;
+    return 0;
+}
+
+/* Start and end offsets of the FINAL response header, skipping leading
+ * interim 1xx (not 101) that precede it. 0 end if there is no complete final
+ * header. The judge, the capture clamp and the reported status all key off the
+ * final response, never the interim one. */
+static size_t hs_final_header(const char *h, size_t n, size_t *start) {
+    size_t at = 0;
+    *start = 0;
+    for (;;) {
+        if (n - at < 12 || memcmp(h + at, "HTTP/1.", 7) != 0 ||
+            (h[at + 7] != '0' && h[at + 7] != '1') || h[at + 8] != ' ' ||
+            h[at + 9] < '1' || h[at + 9] > '5' ||
+            h[at + 10] < '0' || h[at + 10] > '9' ||
+            h[at + 11] < '0' || h[at + 11] > '9') { return 0; }
+        size_t end = hs_header_end(h, at, n);
+        if (!end) { return 0; }
+        int code = (h[at + 9] - '0') * 100 + (h[at + 10] - '0') * 10 + (h[at + 11] - '0');
+        if (code >= 100 && code < 200 && code != 101) { at = end; continue; }
+        *start = at;
+        return end;
+    }
+}
+
+/* The server itself ended the connection after this complete response:
+   explicit body framing (Content-Length, chunked, or 204/304) and an
+   announced close (a "close" token, or HTTP/1.0 without "keep-alive"). A
+   close-delimited body is never counted: an injected FIN looks the same. */
+static int hs_announced_close(const char *h, size_t n) {
+    size_t at = 0;
+    for (;;) {
+        size_t end = hs_header_end(h, at, n);
+        if (!end || end - at < 16 || memcmp(h + at, "HTTP/1.", 7) || (h[at + 7] != '0' && h[at + 7] != '1') ||
+            h[at + 8] != ' ' || h[at + 9] < '1' || h[at + 9] > '5' || h[at + 10] < '0' || h[at + 10] > '9' ||
+            h[at + 11] < '0' || h[at + 11] > '9') return 0;
+        int code = (h[at + 9] - '0') * 100 + (h[at + 10] - '0') * 10 + (h[at + 11] - '0');
+        if (code < 200) { at = end; continue; }   /* interim head precedes the final one */
+        int http10 = h[at + 7] == '0', tok_close = 0, tok_keep = 0, length = 0, chunked = 0;
+        const char *line = memchr(h + at, '\n', end - at);
+        while (line && (size_t)(line + 1 - h) < end - 2) {
+            const char *p = line + 1, *e = memchr(p, '\r', (size_t)(h + end - p));
+            if (!e) break;
+            const char *colon = memchr(p, ':', (size_t)(e - p));
+            if (colon) {
+                size_t k = (size_t)(colon - p);
+                const char *v = colon + 1;
+                if (k == 10 && !strncasecmp(p, "Connection", 10)) {
+                    while (v < e) {
+                        while (v < e && (*v == ' ' || *v == '\t' || *v == ',')) v++;
+                        const char *t = v;
+                        while (v < e && *v != ',') v++;
+                        const char *te = v;
+                        while (te > t && (te[-1] == ' ' || te[-1] == '\t')) te--;
+                        if (te - t == 5 && !strncasecmp(t, "close", 5)) tok_close = 1;
+                        if (te - t == 10 && !strncasecmp(t, "keep-alive", 10)) tok_keep = 1;
+                    }
+                } else if (k == 14 && !strncasecmp(p, "Content-Length", 14)) {
+                    length = 1;
+                } else if (k == 17 && !strncasecmp(p, "Transfer-Encoding", 17)) {
+                    while (v < e && (*v == ' ' || *v == '\t')) v++;
+                    const char *te = e;
+                    while (te > v && (te[-1] == ' ' || te[-1] == '\t')) te--;
+                    chunked = te - v == 7 && !strncasecmp(v, "chunked", 7);
+                }
+            }
+            line = memchr(e, '\n', (size_t)(h + end - e));
+        }
+        int framed = code == 204 || code == 304 || length || chunked;
+        return framed && (tok_close || (http10 && !tok_keep));
+    }
+}
+
+/* A successful exchange under the probe: two complete responses on one
+   keep-alive connection, or one complete response after which the server
+   itself announced the end of the connection (no second request possible). */
+static int hs_exchange_ok(const d2k_hs_result *r) {
+    return r->answer == D2K_HS_REAL &&
+        (r->complete_responses >= 2 ||
+         (r->server_closed && r->complete_responses == 1 && r->requests_sent == 1));
+}
+
+static void probe_run(const d2k_hs_job *job, d2k_hs_result *r, char *capture, size_t cap);
 void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
+    size_t cap = D2K_VERIFY_HEADER_LIMIT + 1;
+    char *capture = malloc(cap);
+    if (!capture) {
+        memset(r, 0, sizeof *r);
+        r->answer = D2K_HS_NONE; r->fd = job ? job->fd : -1; r->seq = job ? job->seq : 0;
+        snprintf(r->why, sizeof r->why, "local: no memory for the response capture");
+        return;
+    }
+    probe_run(job, r, capture, cap);
+    free(capture);
+}
+
+static void probe_run(const d2k_hs_job *job, d2k_hs_result *r, char *capture, size_t cap) {
     memset(r, 0, sizeof *r);
     r->answer = D2K_HS_CONNECT_FAIL;
     r->fd = job ? job->fd : -1;
@@ -206,7 +331,8 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
         const char *path=(request||job->cut)&&job->repeat_path[0]?job->repeat_path:"/";
         int rl=snprintf(req,sizeof req,"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",path,job->host);
         if(rl<=0||(size_t)rl>=sizeof req){r->answer=D2K_HS_GARBAGE;return;}
-        hs_reader reader={0};reader.fd=fd;clock_gettime(CLOCK_MONOTONIC,&reader.sent);
+        hs_reader reader={0};reader.fd=fd;reader.head=capture;reader.cap=cap;capture[0]=0;
+        clock_gettime(CLOCK_MONOTONIC,&reader.sent);
         int64_t until=mono_ms()+d2k_hs_probe_ms;size_t sent=0;
         while(sent<(size_t)rl) {
             ssize_t n=send(fd,req+sent,(size_t)rl-sent,
@@ -229,11 +355,24 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
         d2k_http_read_response(hs_read,&reader,d2k_hs_probe_ms,&response,r->why,sizeof r->why);
         r->reply_us=reader.first_us;
         if(!reader.used){r->answer=strstr(r->why,"timeout")?D2K_HS_SILENT:D2K_HS_CLOSED;return;}
-        r->answer=d2k_hs_judge(job->host,reader.head,reader.used,r->rtt_us,r->reply_us);
+        if(response.local_limit) {
+            /* Our reader's own limit: says nothing about the path. Never a cut. */
+            char why[sizeof r->why];snprintf(why,sizeof why,"%s",r->why);
+            snprintf(r->why,sizeof r->why,"local response limit: %.120s",why);
+            r->answer=D2K_HS_NONE;return;
+        }
+        /* Judge the FINAL header in full (a large final Location must never be
+           truncated by clamping to the interim 100's header), plus a bounded
+           slice of body for the decoy-name scan. */
+        size_t fstart=0, fend=hs_final_header(reader.head,reader.used,&fstart);
+        size_t base=fend?fend:reader.used, judge_n=base;
+        if(reader.used-base>HS_JUDGE_SCAN)judge_n=base+HS_JUDGE_SCAN; else judge_n=reader.used;
+        r->answer=d2k_hs_judge(job->host,reader.head,judge_n,r->rtt_us,r->reply_us);
         if(response.reply.outcome==D2K_HTTP_BLOCKED)r->answer=D2K_HS_INJECTED;
+        /* Status reflects the FINAL response, not an interim 100. */
         snprintf(r->status,sizeof r->status,"HTTP/1.1 %d",response.status);
-        const char *eol=strstr(reader.head,"\r\n");
-        if(eol){size_t n=(size_t)(eol-reader.head);if(n>=sizeof r->status)n=sizeof r->status-1;memcpy(r->status,reader.head,n);r->status[n]=0;}
+        const char *line=reader.head+fstart,*eol=fend?memchr(line,'\r',reader.used-fstart):NULL;
+        if(eol){size_t n=(size_t)(eol-line);if(n>=sizeof r->status)n=sizeof r->status-1;memcpy(r->status,line,n);r->status[n]=0;}
         if(r->answer!=D2K_HS_REAL)return;
         if(!response.complete) {
             /* Заголовки настоящего ответа пришли, тело — нет: обрыв, не мусор. */
@@ -241,7 +380,11 @@ void d2k_hs_probe_run(const d2k_hs_job *job, d2k_hs_result *r) {
         }
         r->complete_responses++;
         if(response.connection_close) {
-            snprintf(r->why,sizeof r->why,"server closed connection: keep-alive not confirmed");return;
+            r->server_closed=hs_announced_close(reader.head,reader.used);
+            snprintf(r->why,sizeof r->why,"%s",r->server_closed
+                ? "server announced the end of the connection after a complete framed response"
+                : "server closed connection: keep-alive not confirmed");
+            return;
         }
     }
 }
@@ -389,6 +532,21 @@ typedef struct {
 
 typedef struct { char host[256]; uint8_t family, addr[16]; } pend;
 
+/* ПРЕДЕЛЫ HTTP-СОСТОЯНИЯ — ПО ЖИЗНЕННОМУ ЦИКЛУ, А НЕ БЮДЖЕТ ПОИСКА.
+   Поиск HTTP ведёт одну цель за раз, остальные ждут в очереди. Ждущих целей
+   и записей без знания больше, чем задач у планировщика (SCHED_MAX_TASKS),
+   держать незачем: столько целей система одновременно не ведёт, а цель,
+   которой не хватило места, вернётся со следующим событием портала или
+   обрыва. Переполнение — отказ «нет ресурсов» в журнале, не рост памяти.
+   Записи со знанием (подтверждённый ключ, в том числе отозванный до
+   перепроверки) не вытесняются никогда: это знание, а не ожидание. */
+#define HS_PENDING_MAX 64
+/* Провалы одной записи: (программа, адрес). Их держат, чтобы не вернуться к
+   провалившейся паре. Больше 32 разных провалов у одного имени — запись уже
+   не держит знание; дальше честнее признать свидетельство потерянным
+   (evidence_lost → repro_gap, перепроверка с нуля), чем расти без конца. */
+#define HS_FAILURES_MAX 32
+
 enum { PH_IDLE = 0, PH_BASE, PH_ACK, PH_RUN, PH_APPLIED };
 enum { HQ_OWN=0, HQ_SPLIT, HQ_CHECKSUM, HQ_PRODUCT, HQ_FALLBACK, HQ_END };
 
@@ -474,9 +632,48 @@ static rec *rec_find(const d2k_httpsearch *hs, const char *host, uint8_t family)
     return NULL;
 }
 
+static int queued(const d2k_httpsearch *hs, const char *host, uint8_t family) {
+    for (size_t i = 0; i < hs->n_q; i++)
+        if (hs->q[i].family == family && !strcasecmp(hs->q[i].host, host)) return 1;
+    return 0;
+}
+
+static int is_current(const d2k_httpsearch *hs, const rec *r) {
+    return hs->cur.phase != PH_IDLE && hs->cur.family == r->family &&
+           !strcasecmp(hs->cur.host, r->host);
+}
+
+/* Вытесняет одну запись без знания, которая не ведётся и не ждёт: ту, чей
+   запрет повтора истёк раньше всех. 0 — освободила место, -1 — нечего. */
+static int rec_evict(d2k_httpsearch *hs) {
+    size_t victim = hs->n_recs;
+    for (size_t i = 0; i < hs->n_recs; i++) {
+        const rec *r = &hs->recs[i];
+        if (r->key[0] || is_current(hs, r) || queued(hs, r->host, r->family)) continue;
+        if (victim == hs->n_recs || r->no_before_ms < hs->recs[victim].no_before_ms) victim = i;
+    }
+    if (victim == hs->n_recs) return -1;
+    free(hs->recs[victim].failures);
+    memmove(&hs->recs[victim], &hs->recs[victim + 1],
+            (hs->n_recs - victim - 1) * sizeof *hs->recs);
+    hs->n_recs--;
+    /* Ёмкость, которая больше не нужна, отдаётся. */
+    if (hs->cap_recs > 16 && hs->n_recs * 4 <= hs->cap_recs) {
+        rec *nv = realloc(hs->recs, hs->cap_recs / 2 * sizeof *nv);
+        if (nv) { hs->recs = nv; hs->cap_recs /= 2; }
+    }
+    return 0;
+}
+
 static rec *rec_get(d2k_httpsearch *hs, const char *host, uint8_t family) {
     rec *r = rec_find(hs, host, family);
     if (r) { return r; }
+    size_t unknown = 0;
+    for (size_t i = 0; i < hs->n_recs; i++) unknown += !hs->recs[i].key[0];
+    if (unknown >= HS_PENDING_MAX && rec_evict(hs) != 0) {
+        say(hs, "HTTP %s: нет ресурсов — %d целей без знания уже ведутся или ждут", host, HS_PENDING_MAX);
+        return NULL;
+    }
     if (hs->n_recs == hs->cap_recs) {
         size_t nc = hs->cap_recs ? hs->cap_recs * 2 : 16;
         rec *nv = realloc(hs->recs, nc * sizeof *nv);
@@ -517,6 +714,7 @@ static int remember_live_failure(rec *r,const uint8_t *addr,
     const d2k_binding_context *binding,uint64_t execution,int64_t request_ms) {
     if(failed_live(r,r->key,addr))return 0;
     if(r->evidence_lost)return -1;
+    if(r->n_failures>=HS_FAILURES_MAX){r->evidence_lost=1;return -1;}
     live_failure *v=realloc(r->failures,(r->n_failures+1)*sizeof *v);
     if(!v)return -1;
     r->failures=v;
@@ -636,7 +834,17 @@ const char *d2k_httpsearch_plan_of(const d2k_httpsearch *hs, const char *host, u
 static void start_next(d2k_httpsearch *hs, int64_t now);
 
 void d2k_httpsearch_diagnostic_counts(d2k_httpsearch *hs,d2k_diag_counts *c) {
-    if(hs && c){c->http_records=hs->n_recs;c->http_queued=hs->n_q;}
+    if(!c)return;
+    c->http_records=hs?hs->n_recs:0;c->http_queued=hs?hs->n_q:0;
+    c->memory.http_records_capacity=hs?hs->cap_recs:0;
+    c->memory.http_records_bytes=hs?hs->cap_recs*sizeof *hs->recs:0;
+    c->memory.http_queue_capacity=hs?hs->cap_q:0;
+    c->memory.http_queue_bytes=hs?hs->cap_q*sizeof *hs->q:0;
+    c->memory.http_failures=0;c->memory.http_failures_bytes=0;
+    if(hs)for(size_t i=0;i<hs->n_recs;i++) {
+        c->memory.http_failures+=hs->recs[i].n_failures;
+        c->memory.http_failures_bytes+=hs->recs[i].n_failures*sizeof(live_failure);
+    }
 }
 void d2k_httpsearch_diagnostics(d2k_httpsearch *hs,d2k_diag_observer fn,void *ctx) {
     if(hs){hs->diagnostic=fn;hs->diagnostic_ctx=ctx;}
@@ -812,12 +1020,13 @@ static void confirmed(d2k_httpsearch *hs, int64_t now) {
     r->no_before_ms = now + D2K_HS_RECHECK_MS;
     if (hs->ops.changed) { hs->ops.changed(hs->ops.ctx); }
     if(hs->cur.question>=HQ_SPLIT && hs->cur.question<=HQ_PRODUCT)
-        say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два опыта с повтором keep-alive без вставки",
+        say(hs,"HTTP %s: путь: свойство — %s; тот же запрос, APPLIED и два опыта с полными ответами без вставки",
             hs->cur.host,hs->cur.question==HQ_PRODUCT ?
             (hs->cur.split_no && hs->cur.checksum_no ? "разрез и checksum-приманка вместе после двух отрицательных контролей" :
              "разрез и checksum-приманка вместе после живого отказа одиночного приёма; парные контроли зонда не доказаны") :
             hs->cur.question==HQ_CHECKSUM ? "checksum-приманка перед целым запросом" : "разрез имени");
-    say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с двумя полными ответами keep-alive под пробным "
+    say(hs, "HTTP %s: обход найден — «%s», %d опыта подряд с полными ответами (два по keep-alive либо один, "
+            "после которого сервер сам объявил закрытие) под пробным "
             "планом; отправлен на установку (HTTP), живая приёмка ещё не подтверждена", hs->cur.host, key, HS_CONFIRM);
     finish(hs,now,"probe-confirmed","probe-confirmed-live-unknown");
 }
@@ -844,9 +1053,9 @@ static void judge_trial(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t now)
         next_candidate(hs, now);
         return;
     }
-    if ((r->answer == D2K_HS_REAL && r->complete_responses >= 2) || r->answer == D2K_HS_INJECTED ||
+    if (hs_exchange_ok(r) || r->answer == D2K_HS_INJECTED ||
         r->answer == D2K_HS_CUT) { hs->cur.judged++; }
-    if (r->answer == D2K_HS_REAL && r->complete_responses >= 2) {
+    if (hs_exchange_ok(r)) {
         hs->cur.cand_had_real = 1;
         hs->cur.any_had_real = 1;
         hs->cur.ok++;
@@ -1024,6 +1233,11 @@ static void start(d2k_httpsearch *hs, const char *host, uint8_t family, const ui
                   : "вставка провайдера, HTTPS у имени нет — поиск обхода HTTP");
 }
 
+/* Опустевшая очередь отдаёт память: всплеск порталов не держит её навсегда. */
+static void queue_trim(d2k_httpsearch *hs) {
+    if (hs->n_q == 0 && hs->q) { free(hs->q); hs->q = NULL; hs->cap_q = 0; }
+}
+
 static void start_next(d2k_httpsearch *hs, int64_t now) {
     while (hs->cur.phase == PH_IDLE && hs->n_q) {
         pend p = hs->q[0];
@@ -1032,6 +1246,7 @@ static void start_next(d2k_httpsearch *hs, int64_t now) {
         rec *r = rec_find(hs, p.host, p.family);
         start(hs, p.host, p.family, p.addr, r && r->key[0], now);
     }
+    queue_trim(hs);
 }
 
 static rec *live_owner(d2k_httpsearch *hs,const char *host,uint8_t family,
@@ -1137,6 +1352,10 @@ void d2k_httpsearch_portal(d2k_httpsearch *hs, const char *host, uint8_t family,
     if (r && (!r->key[0] || r->revoked) && now < r->no_before_ms) { return; }
     if (hs->cur.phase == PH_IDLE) {
         start(hs, host, family, addr, r && r->key[0], now);
+        return;
+    }
+    if (hs->n_q >= HS_PENDING_MAX) {
+        say(hs, "HTTP %s: нет ресурсов — очередь из %d целей полна, цель вернётся со следующим событием", host, HS_PENDING_MAX);
         return;
     }
     if (hs->n_q == hs->cap_q) {
@@ -1292,6 +1511,15 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
             drop_socket(hs);
         }
         rec *rr = rec_get(hs, hs->cur.host, hs->cur.family);
+        if (r->answer == D2K_HS_NONE) {
+            /* Our own limit (headers beyond the reader, no memory): not measured. */
+            if (rr) { rr->no_before_ms = now + D2K_HS_INCONCLUSIVE_MS; }
+            say(hs, "HTTP %s: база не измерена — местный предел зонда (%s); о коробке это не "
+                    "говорит ничего, повтор не раньше чем через %lld мин", hs->cur.host, r->why,
+                (long long)(D2K_HS_INCONCLUSIVE_MS / 60000));
+            finish(hs, now, "inconclusive", "baseline-local-limit");
+            return;
+        }
         int local = r->answer == D2K_HS_CONNECT_FAIL;
         if (rr) {
             rr->no_before_ms = now + (local ? D2K_HS_INCONCLUSIVE_MS : D2K_HS_RECHECK_MS);
@@ -1308,7 +1536,7 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
                 "не начат (подозрение не равно блокировке)", hs->cur.host,
             d2k_hs_answer_name(r->answer), r->status[0] ? ", " : "", r->status,
             hs->cur.cut ? "обрыв" : "вставка");
-        finish(hs,now,r->answer==D2K_HS_REAL && r->complete_responses>=2 ?
+        finish(hs,now,hs_exchange_ok(r) ?
             "probe-direct":"inconclusive","baseline-not-reproduced");
         return;
     }

@@ -24,7 +24,7 @@ PATH=$TEST_DIR/bin:$PATH
 DIR=$TEST_DIR/d2k; RUN=$DIR/run; LOG=$DIR/log; STATE_DIR=$DIR/state
 RUNTIME_DIR=$TEST_DIR/runtime; LIVE=$RUNTIME_DIR/live.json
 CONF=$DIR/config; SOCK=$RUN/socket
-DP_PID=$RUN/dp.pid; CT_PID=$RUN/ct.pid; PN_PID=$RUN/panel.pid
+DP_PID=$RUN/dp.pid; CT_PID=$RUN/ct.pid; PN_PID=$RUN/panel.pid; SH_PID=$RUN/shadow.pid
 HU_PID=$RUN/http.pid; HL_PID=$RUN/heal.pid; LM_PID=$RUN/log-maintenance.pid
 TG_PID=$RUN/tg.pid; TG_WD_PID=$RUN/tg-watchdog.pid; DNS_SCHED_PID=$RUN/dns-scheduler.pid
 TG_STATUS=$STATE_DIR/telegram.status; TG_FIREWALL=$TEST_DIR/no-tg-firewall
@@ -33,6 +33,9 @@ HEAL=$TEST_DIR/no-heal; LOG_MAINTENANCE=$TEST_HELPER
 FASTNAT=$TEST_DIR/no-fastnat
 mkdir -p "$RUN" "$LOG" "$STATE_DIR"
 running() { [ -f "$1" ]; }
+pid_stamp() { :; }
+load_modules() { :; }; fastnat_off() { :; }; flowoffload_off() { :; }
+legacy_http_stop() { :; }; late_chains_down() { :; }; rst_rules_down() { :; }
 fw_up() { :; }; fw_down() { :; }; fw_installed() { :; }
 awk() { printf '123\n'; }
 start_engine

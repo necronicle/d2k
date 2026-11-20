@@ -1182,6 +1182,33 @@ int main(int argc,char **argv) {
         stand_cert_name = NULL;
     }
 
+    /* 451 ОТ ВЛАДЕЛЬЦА ИМЕНИ — ВСЁ ТАКИ ОТКАЗ САЙТА. Та же мишень, тот же
+       ответ, разница только в сертификате: имя совпало — отвечал владелец
+       имени, и решение прежнее (D2K_VER_DENIED, поиск закрывается). Без этой
+       пары правка 24.10.2026 читалась бы как «451 больше ничего не значит». */
+    {
+        struct { const char *cert; int denied; const char *what; } who[] = {
+            { "отказ.пример", 1, "имя совпало — отказ сайта" },
+            { "чужой.пример", 0, "имя чужое — не отказ сайта" },
+            { NULL,           0, "сертификата нет — не отказ сайта" },
+        };
+        for (size_t i = 0; i < sizeof who / sizeof who[0]; i++) {
+            struct stand s;
+            stand_cert_name = who[i].cert;
+            /* 27 — индекс фикстуры 451 в replies[]; стенд выбирает ответ по
+               роли (ROLE_APP + индекс), см. stand_serve. */
+            uint16_t port = stand_start(&s, ROLE_APP + 27);
+            CHECK(port != 0, "стенд 451 не поднялся");
+            d2k_ver_result r = d2k_verify_probe("127.0.0.1", port, "отказ.пример", 3000, 0);
+            CHECK(r.status == 451, "стенд 451 ответил не 451");
+            CHECK((r.level == D2K_VER_DENIED) == who[i].denied,
+                  "451: решение об отказе сайта не зависит от подтверждения имени");
+            d2k_verify_close(&r);
+            stand_stop(&s);
+        }
+        stand_cert_name = NULL;
+    }
+
     /* RFC 5280 iPAddress SAN is an OCTET STRING inside GeneralNames, not a
        dNSName containing the textual IP. QUIC address targets have no SNI,
        so verification must bind the certificate to the literal IP. */
@@ -1298,7 +1325,12 @@ int main(int argc,char **argv) {
              strstr(replies[i].text, "Location: https://other.example/\r\n") != NULL ||
              strstr(replies[i].text, "Location: https://warning.rt.ru.evil.example/\r\n") != NULL) &&
             !replies[i].cloudflare_challenge;
-        int block_fixture = replies[i].status == 451 ||
+        /* 451 БЕЗ ПОДТВЕРЖДЁННОГО ИМЕНИ — НЕ ОТКАЗ САЙТА (24.10.2026). Стенд
+           этих случаев сертификата не присылает (stand_cert_name == NULL), то
+           есть собеседник имени не подтвердил; отказом сайта такой 451 не
+           считается, и поиск обязан продолжиться. Случай с подтверждённым
+           именем — отдельным блоком ниже. */
+        int block_fixture =
             strstr(replies[i].text, "Location: https://warning.rt.ru/\r\n") != NULL ||
             strstr(replies[i].text, "Location: //eais.rkn.gov.ru/blocked\r\n") != NULL ||
             (replies[i].status == 403 &&
@@ -1308,7 +1340,16 @@ int main(int argc,char **argv) {
               strstr(replies[i].text, "blocked by rkn\r\n0") != NULL));
         if (block_fixture) expected_application = 0;
         CHECK(!block_fixture || strstr(r.reason, "HTTP отказ:") != NULL,
-              "явная заглушка/451 не получили отдельную причину отказа");
+              "явная заглушка не получила отдельную причину отказа");
+        if (replies[i].status == 451) {
+            expected_application = 0;
+            CHECK(r.level != D2K_VER_DENIED,
+                  "451 без подтверждённого имени записан отказом сайта");
+            CHECK(strstr(r.reason, "не подтвердил имя сертификатом") != NULL,
+                  "451 без имени не объяснил, почему это не отказ сайта");
+            CHECK(r.http_outcome == D2K_HTTP_NEUTRAL,
+                  "451 без имени оставил исход «юридический отказ»");
+        }
         CHECK((r.level == D2K_VER_APPLICATION) == expected_application,
               "полный HTTPS redirect потерян либо неполный/невалидный ответ засчитан");
         CHECK(r.body_complete == replies[i].body_complete,

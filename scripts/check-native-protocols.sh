@@ -7,7 +7,7 @@ if [ "${1:-}" != --inside ]; then
     WORK=$(mktemp -d /tmp/d2k-native-protocols.XXXXXX)
     trap 'rm -rf "$WORK"' EXIT INT TERM
     cd "$ROOT"
-    tar -cf - core/include datapath/include core/verify.c core/tls13.c core/tls12.c core/p256.c \
+    tar -cf - core/include datapath/include runtime/d2k_protocol.h core/profiles/psl_index.h core/profiles/rx_fake.h core/tcp1620_whitelist.inc core/doh_h2.inc core/dns_question_wire.inc core/verify.c core/dns_upstreams.c core/domain.c core/suite.c core/mlkem.c core/keccak.c core/tls13.c core/tls12.c core/p256.c \
         core/tls13core.c core/x25519.c core/crypto.c core/hello.c core/hello_profiles.inc \
         core/meas.c core/link.c core/compose.c core/measured.c core/quicconn.c core/quicwire.c core/h3.c \
         tests/native-protocol-probe.c tests/native-h3-server.py scripts/check-native-protocols.sh \
@@ -18,8 +18,8 @@ fi
 
 apt-get update -qq
 apt-get install -y -qq openssl python3-aioquic >/dev/null
-cc -std=c99 -O2 -Wall -Wextra -Werror -Icore/include -Idatapath/include \
-    -o /tmp/native-probe tests/native-protocol-probe.c core/verify.c core/tls13.c \
+cc -std=c99 -O2 -DD2K_RELEASE_ID='"dev"' -Wall -Wextra -Werror -Icore/include -Idatapath/include \
+    -o /tmp/native-probe tests/native-protocol-probe.c core/verify.c core/dns_upstreams.c core/domain.c core/suite.c core/mlkem.c core/keccak.c core/tls13.c \
     core/tls12.c core/p256.c core/tls13core.c core/x25519.c core/crypto.c core/hello.c core/meas.c \
     core/link.c core/compose.c core/measured.c core/quicconn.c core/quicwire.c core/h3.c
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \

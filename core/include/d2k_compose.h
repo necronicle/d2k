@@ -34,9 +34,12 @@
 #define D2K_COMPOSE_H
 
 #include "d2k_arm.h"
+#include "d2k_boxprops.h"
+#include "d2k_catalog.h"
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_preflight_candidate.h"
 
 #include "d2k_hello.h"
 #include "d2k_meas.h"  /* d2k_hello */
@@ -150,6 +153,7 @@ int d2k_arm_plan_measured_cap(const d2k_arm *arm, const d2k_arm_input *input,
 int d2k_fallback_plan(size_t idx, d2k_shape shape, const char *decoy,
                       size_t send_cap,
                       char *buf, size_t cap);
+int d2k_compose_gv_reference(size_t send_cap, char *buf, size_t cap);
 
 /* Точечная лестница для подтверждённого обрыва входящего TLS identity-body.
  * Fake TLS hcaptcha.com идёт перед настоящим ClientHello, который всегда
@@ -356,5 +360,18 @@ d2k_props d2k_props_ask(int link_fd, const char *ip, uint16_t port,
  * то, что должно покрыть, и помещаться в канал. */
 size_t d2k_compose(const d2k_props *pr, d2k_shape target_shape, const char *decoy,
                    size_t send_cap, char out[][4096], size_t cap);
+
+/* 1: program built; 0: insufficient/inapplicable evidence (reason in err);
+ * -1: invalid output/buffer. Caller must use SET_ENDPOINT_BOUND, IPv4 TCP.
+ * probe_name and window_scale identify the alternate ClientHello and
+ * advertised window used by the measurement.
+ * hello is the measured target trigger for own, or d2k_white_decoy_hello(probe_name)
+ * for white, supplied by the caller. Bytes are copied to the text payload unchanged. */
+int d2k_compose_preflight_from_props(const d2k_box_props *, const char *probe_name,
+    uint8_t window_scale, uint8_t family, uint8_t transport, const uint8_t *hello, size_t hello_len,
+    char *, size_t, char *, size_t);
+/* Explicit fallback proposal; does not assert a positive direct-carry property. */
+int d2k_compose_preflight_candidate(const d2k_preflight_candidate *,uint8_t family,
+    uint8_t transport,char *,size_t,char *,size_t);
 
 #endif /* D2K_COMPOSE_H */

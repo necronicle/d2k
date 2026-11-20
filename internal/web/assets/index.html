@@ -40,6 +40,7 @@
       <a href="#now" data-nav="now"><span>Сейчас</span><b id="nav-now"></b></a>
       <a href="#families" data-nav="families"><span>Семейства</span><b id="nav-families"></b></a>
       <a href="#boxes" data-nav="boxes"><span>Коробки</span><b id="nav-boxes"></b></a>
+      <a href="#policies" data-nav="policies"><span>Политика обработки</span></a>
       <a href="#telegram" data-nav="telegram"><span>Telegram-туннель</span><b id="nav-telegram"></b></a>
       <a href="#updates" data-nav="updates"><span>Обновления</span><b id="nav-updates"></b></a>
       <a href="#diagnostics" data-nav="diagnostics"><span>Диагностика</span><b id="nav-diagnostics"></b></a>
@@ -76,6 +77,25 @@
           <p>Коробка — измеренное поведение блокировки. Для совместимой коробки сначала проверяется уже найденный план.</p>
         </header>
         <div id="boxes-body"></div>
+      </section>
+
+      <section class="sheet" id="policies" aria-labelledby="policies-title">
+        <header class="sheet-head">
+          <h2 id="policies-title">Политика обработки</h2>
+          <p>Выберите, трафик каких устройств может обрабатывать D2K. Состав устройств задаётся в политике доступа Keenetic.</p>
+        </header>
+        <form id="policy-form" class="policy-form">
+          <div class="policy-field">
+            <label for="policy-select">Устройства для D2K</label>
+            <select id="policy-select" aria-describedby="policy-note policy-status" disabled><option>Получаем политики…</option></select>
+          </div>
+          <div class="policy-actions">
+            <button class="btn" data-variant="primary" id="policy-apply" type="submit" disabled>Сохранить и применить</button>
+            <button class="btn" data-variant="ghost" id="policy-refresh" type="button">Обновить список</button>
+          </div>
+          <p class="policy-note" id="policy-note">Применение перезапустит движок. Соединения могут кратковременно прерваться.</p>
+          <p class="policy-status" id="policy-status" role="status" aria-live="polite">Получаем политики Keenetic…</p>
+        </form>
       </section>
 
       <section class="sheet sheet-telegram" id="telegram" aria-labelledby="telegram-title">

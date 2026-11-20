@@ -58,6 +58,7 @@
 
 #include "d2k_arm.h"
 #include "d2k_meas.h"
+#include "d2k_preflight_candidate.h"
 
 typedef enum {
     D2K_V_CLEAR,        /* триггер целиком проходит с подтверждённой меткой — обходить нечего */
@@ -99,7 +100,8 @@ typedef enum {
      * — 188.186.154.79. Объявить тут «режут адрес» значит быть неправым
      * полностью: провайдер ни при чём. */
     D2K_V_NO_QUIC,
-    D2K_V_LOCAL_ADDRESS
+    D2K_V_LOCAL_ADDRESS,
+    D2K_V_RESPONSE_GATE /* подтверждённый блок ответа с переносом через RST */
 } d2k_verdict;
 
 /* Длина причины. 256 хватало, пока причина описывала только ВЫВОД; теперь она
@@ -160,9 +162,10 @@ typedef struct {
     int8_t  outcome;               /* D2K_PROP_* — как это легло в свойство */
 } d2k_quic_step;
 
-#define D2K_PROP_UNKNOWN 0
-#define D2K_PROP_NO      1
-#define D2K_PROP_YES     2
+/* Тройственные коды D2K_PROP_* и вектор свойств коробки — в d2k_boxprops.h:
+   каталогу нужны они одни, без плеча и QUIC-свойств этого заголовка. Здесь
+   они по-прежнему доступны всем читателям d2k_verdict.h. */
+#include "d2k_boxprops.h"
 
 typedef struct {
     int8_t residual_blocking;
@@ -258,6 +261,16 @@ typedef struct {
     uint32_t rtt_ms;
     uint8_t  ttl_in;
     int      direct_asked, direct_err, direct_marked;
+    /* ОТВЕТЫ ВОПРОСОВ О СВОЙСТВАХ ПРЕРВАННОГО ПРОГОНА (этап 25). Прогон тем же
+     * входом (цель, порт, байты триггера — тот же ключ, что у базы) был
+     * прерван уступкой или отменой после этих вопросов; перезапуск берёт их
+     * исходы, а не спрашивает заново. Только измеренные ответы (YES/NO);
+     * «не измерено» переспрашивается. props_repeats — повторов у того прогона:
+     * при другом числе повторов ответы не применяются. */
+    int      props_valid;
+    int      props_repeats;
+    int      nprops;
+    d2k_quic_step props[D2K_QTRACE_MAX];
 } d2k_base_seed;
 
 typedef struct {
@@ -265,6 +278,7 @@ typedef struct {
     char        reason[D2K_REASON_MAX]; /* заполняется ВСЕГДА и по-человечески — иначе вердикт нечитаем */
     int         split_pos;   /* точка разреза для D2K_V_PREFIX; 0, если разрез не предлагается */
     int         probes;      /* сколько опытов всего задействовал прогон (сумма по всем вопросам) */
+    int         repeats;     /* повторов на вопрос у этого прогона (0 — поставщик не сказал); нужен для переиспользования трассы (этап 25) */
     int         marked;      /* 1 — метка запрошена И подтверждена на каждом опыте прогона */
     /* НАЙДЕННОЕ ПЛЕЧО. Заполняется измерителем, который не только называет
      * класс блокировки, но и находит конкретное воздействие, её снимающее
@@ -275,6 +289,17 @@ typedef struct {
      * have_arm=0 не различает «не найдено» и «этот поставщик лишь
      * классифицирует». Это различие хранится в owns_search: только для
      * старого классификатора допустим старый внешний подбор. */
+    /* Owned exact candidate program. Existing scheduler text capacity,
+       including NUL. Nonzero length never implies application success. */
+    size_t      program_len;
+    char        program[4096];
+    uint64_t    synthesis_generation; /* provider-owned episode, zero for legacy */
+    /* Direct protocol prefix observed, application still unverified. Must
+       retain this across worker handoff; never equivalent to CLEAR. */
+    int         protocol_response;
+    /* Measurement generated its own application handshake, even when its
+       wire length came from a captured client hello. */
+    int         generated_input;
     int         have_arm;
     /* This provider owns the whole domain-search workflow, including its
      * fallback probes. A missing arm is NOT permission for a second search. */
@@ -296,6 +321,14 @@ typedef struct {
      * Пусто — не назван. Журнал печатает его рядом с находкой: доля
      * «перебора» в поле — мера того, чего классификатор ещё не знает (§0.1). */
     char        arm_path[32];
+    /* ВЕКТОР СВОЙСТВ КОРОБКИ, ИЗМЕРЕННЫЙ ЭТИМ ПРОГОНОМ (23.10.2026).
+     * Не вердикт и не план: знание о коробке, которое планировщик сливает в
+     * её запись каталога, чтобы следующая её цель не спрашивала заново
+     * (d2k_boxprops.h). Нули означают «не измерено» (§2.4). */
+    d2k_box_props box_props;
+    char gate_probe_name[256]; /* SNI of the alternative ClientHello tested for this result. */
+    uint8_t gate_probe_wscale; /* advertised window scale of the successful experiment */
+    d2k_preflight_candidate gate_candidate;
     /* Свойства коробки по QUIC (см. d2k_quic_props выше). Заполняет только
      * вопросник d2k_quic_classify; у всех прочих поставщиков вердикта поле
      * остаётся нулевым, что и означает «не измерено». */

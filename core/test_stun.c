@@ -141,8 +141,7 @@ int main(void) {
               "объявленная длина атрибутов больше пакета — принято");
 
         /* Длина ОДНОГО атрибута уводит за границу: разбор обязан
-           остановиться, а не читать за буфером. Адреса тогда нет, но ответ
-           наш — это не отказ (см. d2k_stun.h). */
+           отклонить пакет, а не читать за буфером или засчитать ответ. */
         memcpy(bad, vec_v4, sizeof bad);
         bad[22] = 0xff; bad[23] = 0xf0; /* длина SOFTWARE */
         family = -1;
@@ -184,6 +183,27 @@ int main(void) {
         CHECK(d2k_stun_parse_response(bare, sizeof bare, vec_txid, ip, &family, &port) == 0,
               "ответ без атрибутов не признан ответом");
         CHECK(family == 0, "адреса не было, а семейство выставлено");
+    }
+
+    /* Matching transaction ID cannot make a malformed attribute list valid.
+       Check damage both before and after the mapped address. */
+    {
+        uint8_t bad[sizeof vec_v4];
+        memcpy(bad, vec_v4, sizeof bad);
+        bad[22] = 0xff; bad[23] = 0xf0;
+        CHECK(d2k_stun_parse_response(bad, sizeof bad, vec_txid,
+                                      ip, &family, &port) != 0,
+              "truncated first attribute accepted as STUN evidence");
+        memcpy(bad, vec_v4, sizeof bad);
+        bad[50] = 0xff; bad[51] = 0xf0;
+        CHECK(d2k_stun_parse_response(bad, sizeof bad, vec_txid,
+                                      ip, &family, &port) != 0,
+              "malformed attribute after mapped address accepted");
+        memcpy(bad, vec_v4, sizeof bad);
+        bad[3]--;
+        CHECK(d2k_stun_parse_response(bad, sizeof bad, vec_txid,
+                                      ip, &family, &port) != 0,
+              "unaligned STUN message length accepted");
     }
 
     /* --- сборка запроса: свой идентификатор на каждый вызов -------------- */

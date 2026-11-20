@@ -55,6 +55,33 @@ static void test_judge(void) {
     static const char to_decoy[] = "HTTP/1.1 301 Moved\r\nLocation: https://disk.rzd.ru/\r\n\r\n";
     CHECK(d2k_hs_judge("rutracker.org", to_decoy, sizeof to_decoy - 1, 98000, 99000) == D2K_HS_DECOY,
           "ответ с именем приманки принят за ответ цели");
+    /* Задача 62: промежуточный 1xx предшествует ОКОНЧАТЕЛЬНОМУ ответу того же
+       запроса — судить надо финальный, а не «100». */
+    static const char cont200[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", cont200, sizeof cont200 - 1, 98000, 99000) == D2K_HS_REAL,
+          "финальный 200 после промежуточного 100 не признан ответом сервера");
+    static const char cont421[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 421 Misdirected Request\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", cont421, sizeof cont421 - 1, 98000, 99000) == D2K_HS_DECOY,
+          "финальный 421 после промежуточного 100 ошибочно признан ответом сервера");
+    static const char hints204[] = "HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", hints204, sizeof hints204 - 1, 98000, 99000) == D2K_HS_REAL,
+          "финальный 204 после 103 не признан ответом сервера");
+    static const char cont_only[] = "HTTP/1.1 100 Continue\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", cont_only, sizeof cont_only - 1, 98000, 99000) == D2K_HS_GARBAGE,
+          "один промежуточный 100 без финального принят за ответ");
+    /* Большой Location (портал с длинным адресом за пределами буфера хоста)
+       не крэшит и не выдаётся за портальную вставку. */
+    static char biglow[700];
+    { int k = snprintf(biglow, sizeof biglow, "HTTP/1.1 302 Found\r\nLocation: http://");
+      for (int i = 0; i < 400; i++) biglow[k++] = 'a';
+      snprintf(biglow + k, sizeof biglow - (size_t)k, ".lawfilter.example/\r\n\r\n"); }
+    d2k_hs_answer big = d2k_hs_judge("rutracker.org", biglow, strlen(biglow), 98000, 99000);
+    CHECK(big == D2K_HS_REAL, "непомерный Location ошибочно признан порталом или уронил судью");
+    /* Финальный 100-перед-порталом: портал всё равно узнаётся (его статус 30x
+       финальный, не промежуточный). */
+    static const char cont_portal[] = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 302 Found\r\nLocation: http://lawfilter.ertelecom.ru/\r\n\r\n";
+    CHECK(d2k_hs_judge("rutracker.org", cont_portal, sizeof cont_portal - 1, 98000, 99000) != D2K_HS_REAL,
+          "портал после промежуточного 100 принят за ответ сервера");
     static const char misdirected[] = "HTTP/1.1 421 Misdirected Request\r\n\r\n";
     CHECK(d2k_hs_judge("rutracker.org", misdirected, sizeof misdirected - 1, 98000, 99000) == D2K_HS_DECOY,
           "421 принят за ответ цели");
@@ -1269,7 +1296,117 @@ static void test_base_silence_on_cut_is_not_absence(void) {
     d2k_httpsearch_free(hs);
 }
 
+
+/* ---- task 62: intentional close, local limits, large headers ---------- */
+static void test_probe_interim_large_header(void) {
+    /* A real probe through a loopback server: an interim 100 precedes a final
+       200 whose header is larger than the old 4 KiB judge clamp, with a marker
+       (the decoy name) only in that late part. Before the fix the judge was
+       clamped to the interim header and reported REAL with status "100"; now
+       it scans the full final header and reports the final status. */
+    static char resp[8192];
+    int k = snprintf(resp, sizeof resp, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nX-Pad: ");
+    for (int i = 0; i < 5000; i++) resp[k++] = 'a';
+    k += snprintf(resp + k, sizeof resp - (size_t)k,
+                  "\r\nX-Echo: disk.rzd.ru\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    d2k_hs_result r = keepalive_local(resp, NULL);
+    CHECK(r.answer == D2K_HS_DECOY,
+          "late decoy name beyond 4 KiB in the final header not seen (clamp truncated to interim 100)");
+    CHECK(!strcmp(r.status, "HTTP/1.1 200 OK"),
+          "status reported the interim 100 instead of the final 200");
+    /* Same shape, no marker: the large final header is a plain real response,
+       and the status is still the final 200, not the interim 100. */
+    k = snprintf(resp, sizeof resp, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nX-Pad: ");
+    for (int i = 0; i < 5000; i++) resp[k++] = 'b';
+    k += snprintf(resp + k, sizeof resp - (size_t)k,
+                  "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    r = keepalive_local(resp, NULL);
+    CHECK(r.answer == D2K_HS_REAL && !strcmp(r.status, "HTTP/1.1 200 OK"),
+          "large final header after interim 100 not a plain real response with final status");
+    CHECK(r.complete_responses == 1 && r.server_closed,
+          "interim 100 + final close counted wrong");
+}
+static void test_server_close_probe(void) {
+    /* Announced close after an explicitly framed complete response. */
+    d2k_hs_result r=keepalive_local("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\none",NULL);
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==1&&r.requests_sent==1&&r.server_closed,
+          "Connection: close with Content-Length is the server's own end of connection");
+    r=keepalive_local("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: Close\r\n\r\n3\r\none\r\n0\r\n\r\n",NULL);
+    CHECK(r.answer==D2K_HS_REAL&&r.server_closed,"chunked + close token is an announced close");
+    r=keepalive_local("HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\none",NULL);
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==1&&r.server_closed,"HTTP/1.0 without keep-alive closes by protocol");
+    r=keepalive_local("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\none",NULL);
+    CHECK(r.answer==D2K_HS_REAL&&r.server_closed,"final head after an interim one decides the close");
+    /* A close-delimited body can be cut by an injected FIN: never a success. */
+    r=keepalive_local("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody",NULL);
+    CHECK(r.answer==D2K_HS_REAL&&!r.server_closed,"close-delimited body is not proven complete");
+    const char *ka10="HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 3\r\n\r\none";
+    r=keepalive_local(ka10,ka10);
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==2&&!r.server_closed,"HTTP/1.0 keep-alive is a keep-alive proof");
+    /* Large but valid headers: a real response, not garbage. */
+    static char big[8192],huge[70000];
+    int n=snprintf(big,sizeof big,"HTTP/1.1 200 OK\r\nX-Big: ");
+    memset(big+n,'a',6000);snprintf(big+n+6000,sizeof big-(size_t)n-6000,"\r\nContent-Length: 3\r\n\r\none");
+    r=keepalive_local(big,big);
+    CHECK(r.answer==D2K_HS_REAL&&r.complete_responses==2,"6 KB of headers judged as a real response");
+    /* Beyond the reader's own limit: our limit, not path evidence. */
+    n=snprintf(huge,sizeof huge,"HTTP/1.1 200 OK\r\nX-Big: ");
+    memset(huge+n,'a',68000);snprintf(huge+n+68000,sizeof huge-(size_t)n-68000,"\r\nContent-Length: 3\r\n\r\none");
+    r=keepalive_local(huge,NULL);
+    CHECK(r.answer==D2K_HS_NONE&&!r.complete_responses,"local header limit is not a cut or garbage");
+}
+static d2k_hs_result closed_res(fake *f,int requests) {
+    d2k_hs_result r=res(f,D2K_HS_REAL);
+    r.requests_sent=(unsigned)requests;r.complete_responses=1;r.server_closed=1;
+    r.fd=f->job.fd;r.seq=f->job.seq;return r;
+}
+static void test_server_close_confirmation(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_portal(hs,"closer.example",4,IP,now);base_injected(hs,&f,&now);
+    for(int i=0;i<2;i++) {
+        d2k_httpsearch_ack(hs,f.trial,1,now+=10);applied_pair(hs,&f);
+        d2k_hs_result r=closed_res(&f,1);
+        d2k_httpsearch_result(hs,&r,now+=100);
+    }
+    CHECK(f.set_plan_n==1,"two trials ending in the server's announced close confirm the candidate");
+    d2k_httpsearch_free(hs);
+    memset(&f,0,sizeof f);ops=ops_of(&f);hs=d2k_httpsearch_new(&ops);now=1;
+    d2k_httpsearch_portal(hs,"closer2.example",4,IP,now);base_injected(hs,&f,&now);
+    for(int i=0;i<2;i++) {
+        d2k_httpsearch_ack(hs,f.trial,1,now+=10);applied_pair(hs,&f);
+        d2k_hs_result r=closed_res(&f,2); /* contradictory: a second request was sent */
+        d2k_httpsearch_result(hs,&r,now+=100);
+    }
+    CHECK(!f.set_plan_n,"server_closed with a second request sent is not a success");
+    d2k_httpsearch_free(hs);
+}
+static unsigned base_direct,base_inconclusive;
+static void base_capture(void *ctx,const d2k_diag_event *e) {
+    (void)ctx;
+    if(!strcmp(e->outcome,"probe-direct"))base_direct++;
+    if(!strcmp(e->outcome,"inconclusive"))base_inconclusive++;
+}
+static void test_baseline_close_and_local(void) {
+    fake f={0};d2k_hs_ops ops=ops_of(&f);d2k_httpsearch *hs=d2k_httpsearch_new(&ops);int64_t now=1;
+    d2k_httpsearch_diagnostics(hs,base_capture,NULL);base_direct=base_inconclusive=0;
+    d2k_httpsearch_portal(hs,"direct-close.example",4,IP,now);
+    d2k_hs_result r=closed_res(&f,1);
+    d2k_httpsearch_result(hs,&r,now+=100);
+    CHECK(!f.set_probe_n&&base_direct==1&&!base_inconclusive,
+          "valid response with an announced close is direct, not a reason to search");
+    d2k_httpsearch_portal(hs,"limit.example",4,IP,now+=1000);
+    r=res(&f,D2K_HS_NONE);r.fd=f.job.fd;r.seq=f.job.seq;
+    snprintf(r.why,sizeof r.why,"local response limit");
+    d2k_httpsearch_result(hs,&r,now+=100);
+    CHECK(!f.set_probe_n&&base_inconclusive==1&&strstr(f.said,"местный предел"),
+          "local limit at baseline is unmeasured: no search, no verdict");
+    d2k_httpsearch_free(hs);
+}
 int main(void) {
+    test_probe_interim_large_header();
+    test_server_close_probe();
+    test_server_close_confirmation();
+    test_baseline_close_and_local();
     test_base_silence_on_cut_is_not_absence();
     test_base_connect_fail_is_unmeasured();
     test_silent_base_after_portal();

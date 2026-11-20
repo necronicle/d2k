@@ -244,9 +244,9 @@ int main(void) {
     CHECK(r.copies == 11 && !r.ttl && !strcmp(r.blob_name, "fake_default_quic"));
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
     CHECK(r.frag_survives == D2K_PROP_NO && !r.frag_kind);
-    /* 3 вопроса стратегии; приманки ×1 без 0x00…0 (4), копии quic5 ×6/×11 и
+    /* 3 вопроса стратегии; приманки ×1 без 0x00…0 (5, включая последнюю nofix), копии quic5 ×6/×11 и
        fake_default_quic ×6/×11 (4); после PASS TTL не задаётся. */
-    CHECK(calls == 4 + 8 && ladder_calls == 1 + 8 && r.n_trace == 12);
+    CHECK(calls == 4 + 9 && ladder_calls == 1 + 9 && r.n_trace == 13);
     {
         int controls = 0, benign = 0;
         for (int i = 0; i < calls && i < 64; i++) {
@@ -255,6 +255,22 @@ int main(void) {
         }
         CHECK(controls == 1 && benign == 1);
     }
+    /* cce1631 retains nofix as the last intrinsic question. It costs one
+       question only after every earlier intrinsic fake failed; it must not
+       replace or repeat another question, or move ahead of the donor fakes. */
+    {
+        size_t nofix_len = 0, default_len = 0;
+        const uint8_t *nofix = d2k_quic_original_blob(5, &nofix_len, NULL);
+        const uint8_t *def = d2k_quic_original_blob(3, &default_len, NULL);
+        int nofix_count = 0;
+        for (int i = 0; i < calls && i < 64; i++)
+            if (seen[i].blob == nofix) nofix_count++;
+        CHECK(nofix_count == 1 && nofix_len == 1200 && nofix[0] == 0x80);
+        CHECK(seen[7].blob == def && seen[7].blob_len == default_len);
+        CHECK(seen[8].blob == nofix && seen[8].blob_len == nofix_len &&
+              seen[8].copies == 1 && !seen[8].ttl && !seen[8].frag);
+        CHECK(seen[9].copies == D2K_QUIC_COPIES_A);
+    }
     CHECK(strstr(r.reason, "fake_default_quic") != NULL);
     fake_ok_blob = -1; fake_ok_copies = 0;
 
@@ -262,7 +278,7 @@ int main(void) {
           — после перебора, а не вместо него. */
     r = run("N", "N", 0, 1);
     CHECK(r.kind == D2K_QA_NOT_FOUND && !r.incomplete && r.strategy == D2K_QS_LADDER);
-    CHECK(calls == 4 + 12 && ladder_calls == 1 + 12 && data_calls == 0);
+    CHECK(calls == 4 + 13 && ladder_calls == 1 + 13 && data_calls == 0);
     CHECK(seen[3].control && r.frag_survives == D2K_PROP_NO);
 
     /* 3а. Финальное ревью core, I1: клиенту разрез CRYPTO неприменим
@@ -279,7 +295,7 @@ int main(void) {
         CHECK(i_split == 0 && !r.split_asked && r.split_crypto == D2K_PROP_UNKNOWN);
         for (int i = 0; i < calls && i < 64; i++) CHECK(!seen[i].split);
         CHECK(r.kind == D2K_QA_NOT_FOUND && seen[2].control && strstr(r.reason, "неприменим"));
-        CHECK(r.strategy == D2K_QS_LADDER && calls == 3 + 12);
+        CHECK(r.strategy == D2K_QS_LADDER && calls == 3 + 13);
     }
 
     /* 3б. Оба «нет», фрагменты доживают и форма 3 проходит — план из ответа. */
@@ -292,7 +308,7 @@ int main(void) {
 
     /* 4. Фильтр прошёл, а поток оборван — это решающее «нет», не повтор. */
     r = run("C", "C", 0, 1);
-    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 4 + 12 && data_calls == 2 && ladder_calls == 1 + 12);
+    CHECK(r.kind == D2K_QA_NOT_FOUND && calls == 4 + 13 && data_calls == 2 && ladder_calls == 1 + 13);
     CHECK(r.clearance == D2K_PROP_NO && r.split_crypto == D2K_PROP_NO);
 
     /* 5. Неустойчивый ответ — один повтор; решающий второй ответ принимается. */
@@ -307,10 +323,10 @@ int main(void) {
     /* Круг 1: вопрос, заданный до предела повторов, перебор не задаёт снова
        (0x00…0 ×1 — тот же вопрос). */
     CHECK(r.clearance_asked && r.split_asked);
-    CHECK(ladder_calls == 13 && calls == 4 + 13);
+    CHECK(ladder_calls == 14 && calls == 4 + 14);
     CHECK(r.strategy == D2K_QS_LADDER && r.kind == D2K_QA_NOT_FOUND);
-    CHECK(r.n_trace == 4 + 13 && r.n_trace <= D2K_QUIC_ARM_STEPS);
-    CHECK(r.probes == 3 * (4 + 13));
+    CHECK(r.n_trace == 4 + 14 && r.n_trace <= D2K_QUIC_ARM_STEPS);
+    CHECK(r.probes == 3 * (4 + 14));
     for (int i = 3; i < calls && i < 64; i++)
         CHECK(!(seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl));
 
@@ -326,7 +342,7 @@ int main(void) {
            задаёт заново тот же вопрос (16 нулей ×1 перед Initial). */
     r = run("N", "EE", 0, 1);
     CHECK(r.clearance == D2K_PROP_NO && r.strategy == D2K_QS_LADDER);
-    CHECK(ladder_calls == 13 && calls == 4 + 13);
+    CHECK(ladder_calls == 14 && calls == 4 + 14);
     for (int i = 3; i < calls && i < 64; i++)
         CHECK(!(seen[i].blob_len == 16 && seen[i].copies == 1 && !seen[i].ttl));
 

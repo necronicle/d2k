@@ -114,6 +114,9 @@ else
         fail "package-release.sh cannot package $worst_arch"
     mkdir "$stage/tree" || fail "no room to unpack"
     tar -xzf "$stage/out/d2k-$worst_arch.tar.gz" -C "$stage/tree" || fail "release archive does not unpack"
+    for notice in LICENSE LICENSE-BINARY.md THIRD_PARTY_NOTICES.md licenses/Apache-2.0.txt; do
+        cmp -s "$ROOT/$notice" "$stage/tree/$notice" || fail "release archive is missing or changes $notice"
+    done
     tree_kb=$(du -sk "$stage/tree" | awk '{ print $1 }')
     gz_kb=$(du -k "$stage/out/d2k-$worst_arch.tar.gz" | awk '{ print $1 }')
     # Два пика: архив рядом с распакованным деревом, затем дерево рядом с
@@ -133,4 +136,3 @@ for name in $(sed -n 's/^install_atomic "\$TMP\/[^"]*" "\$DIR\/\([^"]*\.sh\)"$/\
 done
 echo "PASS: uninstall.sh removes every installed helper"
 echo "install manifest: all checks passed"
-

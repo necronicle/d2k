@@ -62,6 +62,10 @@ fi
 if [ -f "$DIR/run/d2ktg.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2ktg.pid" 2>/dev/null || true
 fi
+if [ -f "$DIR/run/d2kshadow.pid" ]; then
+    # Match both PID and executable: a stale PID must not stop a foreign process.
+    start-stop-daemon -K -q -p "$DIR/run/d2kshadow.pid" -x "$SBIN/d2kshadow" 2>/dev/null || true
+fi
 if [ -f "$DIR/run/d2k-http.pid" ]; then
     start-stop-daemon -K -q -p "$DIR/run/d2k-http.pid" 2>/dev/null || true
 fi
@@ -183,7 +187,7 @@ say "правила сняты"
 # Хук NDM снимается ПЕРВЫМ: оставленный, он будет звать сторожа, которого уже
 # нет, на каждое изменение netfilter — мусор в журнале на ровном месте.
 rm -f "$PREFIX/etc/ndm/netfilter.d/001-d2k.sh"
-rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
+rm -f "$PREFIX/etc/init.d/S99d2k" "$PREFIX/etc/init.d/S98d2k-update" "$SBIN/d2k" "$SBIN/d2kpanel" "$SBIN/d2kc" "$SBIN/d2kshadow" "$SBIN/d2kfetch" "$SBIN/d2kd" "$SBIN/d2ktg" "$SBIN/d2khttp"
 # Remove only d2kc snapshots explicitly named as D2K pre-install/work backups.
 # These were created during router development and are not user configuration.
 rm -f "$SBIN"/d2kc.before-d2k-* "$SBIN"/d2kc.pre-goal-* "$SBIN"/d2kc.pre-sched-*
@@ -191,7 +195,7 @@ rm -f "$DIR/d2k-ppe-deoffload.sh" "$DIR/d2k-fw-heal.sh"
 rm -f "$DIR/d2k-tg-firewall.sh" "$DIR/d2k-tg-watchdog.sh" "$DIR/d2k-instagram-dns.sh" \
     "$DIR/d2k-instagram-dns-scheduler.sh" "$DIR/d2k-log-maintenance.sh" "$DIR/d2k-update.sh" \
     "$DIR/release-id" "$DIR/release-arch" \
-    "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem"
+    "$DIR/files/meta-ranges.txt" "$DIR/files/tg-roots.pem" "$DIR/files/modern.hex"
 rm -rf "$DIR/run" "$DIR/log" "$DIR/panel" "$DIR/.update"
 # Рабочий каталог обновления на OpenWrt без USB — в RAM (d2k-update.sh).
 rm -rf /tmp/d2k-update
@@ -225,7 +229,9 @@ cleanup_runtime() (
     done
     [ -d "$runtime" ] || return 0
     rm -f "$runtime/live.json" "$runtime/d2kd.health" "$runtime/d2kc.health" \
-        "$runtime/d2kpanel.health" "$runtime/d2ktg.health"
+        "$runtime/d2kpanel.health" "$runtime/d2ktg.health" \
+        "$runtime/shadow.queue" "$runtime/shadow.queue.seen" \
+        "$runtime/shadow.queue.seen.new" "$runtime/shadow.queue.consumer"
     if [ "$runtime" = /tmp/d2k-diagnostics ]; then
         rm -f "$runtime/enabled" "$runtime/report.json" "$runtime/report.new"
     fi
