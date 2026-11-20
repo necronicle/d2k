@@ -282,6 +282,7 @@ int main(void) {
     worker->s=s;worker->t=t;worker->trig_len=hello_length;memcpy(worker->trig,hello,hello_length);
     assert(!pthread_create(&thread,NULL,worker_run,worker));
     assert(!pthread_join(thread,NULL));
+    free(worker);
     assert(read(s->wake[0],&wake,1)==1);
     assert(application_calls==3 && t->res_ready && t->doh_synthesis_owned && t->res.owns_search);
     assert(t->vol.rx_cut && !t->n_plans);

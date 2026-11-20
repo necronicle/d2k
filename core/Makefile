@@ -818,8 +818,9 @@ san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datap
 		if [ "$$t" = test_doh_contract ]; then srcs=""; fi; \
 		if [ "$$t" = test_appget ]; then srcs="../model/check.c"; fi; \
 		if [ "$$t" = test_d2kapplication ]; then srcs="../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_late.c ../synthesis/token_content.c ../synthesis/lower.c ../synthesis/application_history.c plantlv.c"; fi; \
+		if [ "$$t" = test_application_provider ]; then srcs="$$(printf '%s\n' $(SYNTH_SRC) diagnostics.c $(SCHED_TEST_OBJ:.o=.c) $(DETECT_OBJ:.o=.c) $(UDP_ENGINE_SRC) $(D2KC_CT_SRC) provider_ips.c | sort -u | tr '\n' ' ')"; fi; \
 		if [ "$$t" = test_shadow_daemon ]; then srcs="shadow_queue.c"; fi; \
-		$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
+		$(CC) $(SANFLAGS) -I../model/include -I../detect/include -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
 		if [ "$$t" = test_d2kask ]; then \
 			echo "== d2kask (санитайзер самой утилиты, не только теста) =="; \
@@ -1560,7 +1561,7 @@ TESTS += test_sched_quic_yield
 .PHONY: san-sched-quic-yield
 san: san-sched-quic-yield
 san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
+	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
 	/tmp/d2k-san-sched-quic-yield
 
 # В САМОМ КОНЦЕ, И ЭТО ВАЖНО. LDFLAGS выше несёт libd2k_udp.a в каждую

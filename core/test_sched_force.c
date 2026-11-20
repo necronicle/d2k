@@ -57,8 +57,7 @@ int main(void) {
         CHECK(t && t->doh_failure_query==2 && t->vol.rx_cut);
         task_reset(s,q);task_reset(s,t);
     }
-    /* Even an unplanned suspicion rechecks a forced confirmed DoH service
-       with the application verifier before replacing its measured watcher. */
+    /* Client suspicion does not start a configured DNS recovery search. */
     e=event("tenant.gateway.example.test");d2k_sched_event(s,&e);
     t=task_of(s,"tenant.gateway.example.test",6,4);
     if(t) {
@@ -67,7 +66,7 @@ int main(void) {
         e=event(t->name);e.kind=D2K_EV_SUSPECT;e.code=D2K_SUSPECT_SILENT;
         e.planned=D2K_LINK_PLANNED_NO;
         on_suspect_as(s,&e,t->name,0);
-        CHECK(t->job==JOB_DOH_HEALTH && t->state==T_WATCHING);
+        CHECK(t->job!=JOB_DOH_HEALTH && t->state==T_WATCHING);
         t->state=T_QUEUED;
     }
     /* Packet counters are optional for a repeatable protocol query cut. */
@@ -96,7 +95,7 @@ int main(void) {
         if(s->tasks[i].state!=T_FREE && force_name(s,s->tasks[i].name))endpoints++;
     CHECK(endpoints==2 && first && first->state==T_WATCHING);
     for(size_t i=0;i<SCHED_MAX_TASKS;i++)task_reset(s,&s->tasks[i]);
-    /* A cold/recreated watcher must check the confirmed own solution first. */
+    /* A cold watcher remains idle until the Keenetic journal reports failure. */
     const char *host="tenant.gateway.example.test";
     CHECK(!bind_confirmed(&c,"force-box","force-plan","tcp split pos=1","tls",
         host,"name",6,4,D2K_SHAPE_MODERN,0,D2K_VERBY_PROBE,D2K_INPUT_PROFILE,100,NULL,NULL,NULL));
@@ -104,10 +103,9 @@ int main(void) {
     strcpy(s->doh[0].ip,"192.0.2.53");s->doh[0].port=443;
     s->n_forced=1;
     force_tick(s);t=task_of(s,host,6,4);
-    CHECK(t && t->state==T_WATCHING && t->job==JOB_DOH_HEALTH);
-    if(t)task_done(s,t);
-    force_tick(s);t=task_of(s,host,6,4);
-    CHECK(t && t->state==T_WATCHING && t->job==JOB_DOH_HEALTH);
+    CHECK(!t);
+    CHECK(d2k_sched_dns_journal_error(s,host)==0); /* durable solution */
+    CHECK(!task_of(s,host,6,4));
     s->n_force=0;d2k_sched_free(s);d2k_catalog_free(&c);
     return fails?1:0;
 }

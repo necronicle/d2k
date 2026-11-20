@@ -11170,8 +11170,8 @@ static void raw_confirm(d2k_sched *s, task *t, int64_t now_ms) {
 /* found/noname — имя потока и «TLS без имени»: у событий датапата из кольца
    приветствий (on_suspect), у поздней тишины — из записи наблюдения, которая
    живёт дольше кольца (этап 49). */
-/* Suspicion of an explicitly forced DoH endpoint asks the durable
-   application question first, including a flow with no observable name. */
+/* Client suspicion never starts configured DNS recovery. The router journal
+   starts that work, including for a flow with no observable TLS name. */
 static int force_doh_suspect(d2k_sched *s,const d2k_ev *ev,const char *name) {
     if(ev->transport!=6)return 0;
     char ip[INET6_ADDRSTRLEN];uint16_t port;server_of(ev,ip,sizeof ip,&port);
@@ -14168,8 +14168,7 @@ static task *force_task_of(d2k_sched *s,const force_target *f) {
     }
     return NULL;
 }
-/* Configured encrypted resolvers already have a periodic application check,
-   including when no client event has been seen. */
+/* Configured encrypted resolvers are handled by the journal event path. */
 static void force_tick(d2k_sched *s) {
     for(size_t i=0;i<s->n_forced;i++) {
         force_target f=s->forced[i];
