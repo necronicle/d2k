@@ -59,5 +59,7 @@ int main(void) {
     CHECK(!d2k_pf_lease_set(&t,&full,2300,2700,one,plan()),"expired capacity is reusable at deadline");
     CHECK(d2k_pf_lease_find(&t,&other_client,2300)!=NULL,"reclaim kept unrelated live lease");
     d2k_pf_lease_free(&t);
-    if(fails)return 1;puts("preflight lease table: all checks passed");return 0;
+    if(fails)return 1;
+    puts("preflight lease table: all checks passed");
+    return 0;
 }
