@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2016,SC2034 # dynamic shell fixtures or runtime config
 # router-round.sh <label> : прогон поля ЦЕЛИКОМ с роутера, без браузеров (решение
 # владельца 17.10.2026). Чистый каталог, затем curl-impersonate по каждой цели: обучающие
 # запросы в t0, t0+60, t0+120 с, контрольный — через WAIT с от t0. Итог по каждой

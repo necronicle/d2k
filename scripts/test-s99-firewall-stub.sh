@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2016,SC2094 # dynamic shell fixtures or runtime config
 # Unit-level check of files/S99d2k firewall bookkeeping with a stateful
 # iptables/ip6tables double: IPv4-only start when ip6tables mangle is
 # unusable (I4), and removal of leftover d2k-rst: RST-drop rules on stop.
