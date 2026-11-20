@@ -592,6 +592,18 @@ D2K вырос из «Поиска по домену» проекта z2k и р�
 - USDT (ERC20): `0xA1D6d7d339f05C1560ecAF0c5CB8c4dc80Dc46A9`
 - USDT (TRC20): `TVtWDryrowtb4MYGGtA8Q2yCAei4VFh5g5`
 
+### ♥ Спасибо за поддержку
+
+> Проект развивается благодаря вам.
+>
+> **SupWgeneral** · **Alexey** · **Jet_sk_ya** · **Suharik39** · **ZyaK<-** · **Алексей Стрельцов**<br>
+> **Diman86RUS** · **Alex** · **GRM** · **Dez** · **hoaxx** · **Mansurchick**<br>
+> **Dkarloff - SEO отец** · **KIBERPANK** · **olmer2002** · **TiaMax** · **Denis** · **Mega Man**<br>
+> **TheGreatYogo** · **logistik77** · **b11d11** · **BloodKnife39** · **SIGogelon** · **yozh**<br>
+> **Altaec** · **DIDIQ Rawa** · **GregMSK** · **Кожевников** · **bootnet** · **ewgen911**<br>
+> **cmfifty** · **Ret80** · **Шулепов Александр** · **Андрюшка** · **Marshmalick** · **Mustang**<br>
+> **Роман Борисович** · **zelenewruan** · **Den** · **WanTBeeR**
+
 ## Лицензия
 
 Исходный код D2K и новые сборки распространяются по лицензии MIT. При распространении
