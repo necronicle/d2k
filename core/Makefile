@@ -819,6 +819,7 @@ san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datap
 		if [ "$$t" = test_appget ]; then srcs="../model/check.c"; fi; \
 		if [ "$$t" = test_d2kapplication ]; then srcs="../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_late.c ../synthesis/token_content.c ../synthesis/lower.c ../synthesis/application_history.c plantlv.c"; fi; \
 		if [ "$$t" = test_application_provider ]; then srcs="$$(printf '%s\n' $(SYNTH_SRC) diagnostics.c $(SCHED_TEST_OBJ:.o=.c) $(DETECT_OBJ:.o=.c) $(UDP_ENGINE_SRC) $(D2KC_CT_SRC) provider_ips.c | sort -u | tr '\n' ' ')"; fi; \
+		if [ "$$t" = test_provider_ips ]; then srcs="provider_ips.c"; fi; \
 		if [ "$$t" = test_shadow_daemon ]; then srcs="shadow_queue.c"; fi; \
 		$(CC) $(SANFLAGS) -I../model/include -I../detect/include -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \

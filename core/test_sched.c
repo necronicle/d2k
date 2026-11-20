@@ -17691,6 +17691,16 @@ own_first_test:
                     uint16_t port = last_name_probe_port("rx-second.own");
                     d2k_ev ap = ev_applied(6, port);
                     if (installed <= 4) own_rx_install_diag(installed, pid, port, &ap);
+                    if (!port || port == 42151 || !memcmp(ap.trial_id, (uint8_t[16]){0}, 16)) {
+                        fprintf(stderr, "own-first RX invalid install=%u sent_len=%zu port=%u plan=",
+                                installed, sent_len, port);
+                        for (size_t j = 0; j < sizeof ap.plan_id; j++)
+                            fprintf(stderr, "%02x", ap.plan_id[j]);
+                        fprintf(stderr, " trial=");
+                        for (size_t j = 0; j < sizeof ap.trial_id; j++)
+                            fprintf(stderr, "%02x", ap.trial_id[j]);
+                        fprintf(stderr, "\n");
+                    }
                     CHECK(port && port != 42151 && memcmp(ap.trial_id, (uint8_t[16]){0}, 16),
                           "own-first RX: missing isolated flow/trial");
                     CHECK(memcmp(ap.trial_id, previous_trial, 16),

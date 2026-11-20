@@ -76,7 +76,13 @@ int main(void) {
     snprintf(logpath,sizeof logpath,"%s/log",dir);snprintf(why,sizeof why,"%s/why",dir);
     d2km_store_init(&store);assert(!d2km_journal_open(&journal,why,1u<<20));
     test_worker workers[TEST_WORKERS]={0};pthread_t threads[TEST_WORKERS];
-    pthread_attr_t attr;assert(!pthread_attr_init(&attr));assert(!pthread_attr_setstacksize(&attr,1024u*1024u));
+    pthread_attr_t attr;assert(!pthread_attr_init(&attr));
+    /* ASan redzones inflate each frame; the production worker still uses 1 MiB. */
+#if defined(__SANITIZE_ADDRESS__)
+    assert(!pthread_attr_setstacksize(&attr,4u*1024u*1024u));
+#else
+    assert(!pthread_attr_setstacksize(&attr,1024u*1024u));
+#endif
     for(unsigned i=0;i<TEST_WORKERS;i++) {
         workers[i].sim=(d2km_sim){.blocked_suffix="example",.reads_name=1,.reassembles=0,.box_hop=5,.server_hop=12};
         workers[i].net=d2km_sim_net(&workers[i].sim);
