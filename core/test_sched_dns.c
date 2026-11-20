@@ -622,8 +622,12 @@ static void journal_driven_dns(void) {
     assert(d2k_sched_dns_journal_error(s,"unrelated.org")==0);
     assert(d2k_sched_dns_journal_error(s,"gw.example.com")==1);
     d2k_sched_tick(s,7000);assert(started==before);
-    write_file(addresses,"gw.example.com 192.0.2.55 443\n");
+    /* Router bootstrap survives the resolver outage that triggered recovery. */
+    write_file(config,"upstream https://gw.example.com/dns-query\n"
+        "static_a = other.example.com 192.0.2.99 0\n"
+        "static_a = gw.example.com 192.0.2.55 0\n");
     assert(d2k_sched_doh_discover(s,config,addresses)==1);
+    assert(!strcmp(s->doh[0].ip,"192.0.2.55"));
     d2k_sched_tick(s,7100);
     assert(started==before+1);
     cat.boxes=calloc(1,sizeof *cat.boxes);assert(cat.boxes);cat.n_boxes=cat.cap_boxes=1;

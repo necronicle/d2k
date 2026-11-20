@@ -402,6 +402,7 @@ printf 'dns_server = 127.0.0.1:40508 . # https://doh.test/dns-query@dnsm\n'
 printf 'dns_server = 127.0.0.1:40500 . # 9.9.9.9:853@dns.quad9.net\n'
 printf 'dns_server = 192.0.2.53:5353 .\n'
 printf 'static_a = my.keenetic.net 198.51.100.11 1\n'
+[ ! -f "$NSL_FAIL" ] || printf 'static_a = doh.test 198.51.100.9 0\n'
 NDMC
 cat > "$TMP/bin/nslookup" <<'NSL'
 #!/bin/sh
@@ -448,6 +449,8 @@ if rules ip6tables mangle | grep -q '2001:db8::7'; then fail "a stale IPv6 DoH a
 S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
 dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -m mark ! --mark 0x2e -j RETURN" \
     || fail "a failed lookup removed the DoH exclusion"
+dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.9 --dport 443 -m mark ! --mark 0x2e -j RETURN" \
+    || fail "the configured bootstrap address was lost when DNS failed"
 rm -f "$TMP/nsl-fail"
 # Сброс извне снёс исключение — круг сторожа его возвращает.
 FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 9.9.9.9 --dport 853 -m mark ! --mark 0x2e -j RETURN
