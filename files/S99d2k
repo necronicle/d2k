@@ -1601,6 +1601,7 @@ dns_local_routes_down() (
             while IFS= read -r dns_cleanup_line; do
                 case "$dns_cleanup_line" in
                     "-A $dns_cleanup_chain "*' --comment d2k-dns-route '*)
+                        # shellcheck disable=SC2086 # parsed iptables-save words
                         set -- $dns_cleanup_line;shift
                         "$dns_cleanup_tool" -t mangle -D "$@" || exit 1 ;;
                 esac
@@ -1663,7 +1664,7 @@ dns_local_routes_prune() (
             sed 's/"d2k-dns-route"/d2k-dns-route/g' |
             while IFS= read -r dns_prune_line; do
                 case "$dns_prune_line" in "-A $dns_prune_chain "*' --comment d2k-dns-route '*) ;; *) continue ;; esac
-                dns_prune_ip= dns_prune_port= dns_prune_proto= dns_prune_prev=
+                dns_prune_ip='' dns_prune_port='' dns_prune_proto='' dns_prune_prev=''
                 for dns_prune_word in $dns_prune_line; do
                     case "$dns_prune_prev" in
                         -s|-d) dns_prune_ip=$dns_prune_word ;;
@@ -1679,6 +1680,7 @@ dns_local_routes_prune() (
                        'NF==4 && $2==a && $3==p && $4==protocol {f=1} END {exit !f}' "${DNS_ROUTES_INPUT:-$RUN/dns-routes}"; then
                     continue
                 fi
+                # shellcheck disable=SC2086 # parsed iptables-save words
                 set -- $dns_prune_line;shift
                 "$dns_prune_tool" -t mangle -D "$@" || exit 1
             done || exit 1

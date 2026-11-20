@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC1090 # dynamic shell fixtures or runtime config
 # Автообновление D2K.
 #
 #   check    узнать, есть ли новый выпуск (подпись обязательна)

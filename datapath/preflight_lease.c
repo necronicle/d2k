@@ -21,7 +21,9 @@ static int valid(const d2k_pf_scope *s) {
         d2k_pf_name_valid((const uint8_t *)s->name,strlen(s->name));
 }
 int d2k_pf_lease_init(d2k_pf_lease_table *t,size_t cap) {
-    if(!t)return -1;memset(t,0,sizeof *t);if(!cap)return -1;
+    if(!t)return -1;
+    memset(t,0,sizeof *t);
+    if(!cap)return -1;
     t->entries=calloc(cap,sizeof *t->entries);if(!t->entries)return -1;t->cap=cap;
     FILE *entropy=fopen("/dev/urandom","rb");
     if(entropy) {if(fread(t->identity.epoch,1,16,entropy)!=16)memset(t->identity.epoch,0,16);fclose(entropy);}
@@ -38,7 +40,10 @@ static void expire(d2k_pf_lease_table *t, uint64_t now_ns) {
     }
 }
 void d2k_pf_lease_free(d2k_pf_lease_table *t) {
-    if(!t)return;while(t->used)remove_at(t,t->used-1);free(t->entries);memset(t,0,sizeof *t);
+    if(!t)return;
+    while(t->used)remove_at(t,t->used-1);
+    free(t->entries);
+    memset(t,0,sizeof *t);
 }
 static void metadata(d2k_pf_lease_table *t,d2k_pf_lease *e) {
     d2k_plan *p=e->plan;

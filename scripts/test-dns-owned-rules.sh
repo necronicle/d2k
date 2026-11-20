@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC1091,SC2034 # dynamic shell fixtures or runtime config
 set -eu
 task_tmp=$(mktemp -d)
 trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
@@ -70,7 +71,7 @@ dns_excl_apply() {
 printf '%s\n' "$first" 'missing.example.test 192.0.2.54 53 tcp' > "$RUN/dns-routes"
 dns_excl_sync_unlocked
 [ "$(cat "$RUN/dns-routes.applied")" = "$first" ]
-! cmp -s "$RUN/dns-routes" "$RUN/dns-routes.reconciled"
+if cmp -s "$RUN/dns-routes" "$RUN/dns-routes.reconciled"; then exit 1; fi
 dns_excl_sync_unlocked
 [ "$(cat "$RUN/dns-routes.applied")" = "$second" ]
 cmp -s "$RUN/dns-routes" "$RUN/dns-routes.reconciled"
