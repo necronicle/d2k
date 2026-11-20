@@ -1707,8 +1707,11 @@ dns_excl_apply() { # [fresh] — цепочки только что собран
                 $1 == "static_aaaa" && $2 == "=" && $3 == h && $4 ~ /^[0-9a-fA-F:]+$/ { print $4 }
             ' "$RUN/dns-upstreams")
         fi
-        dx_ips=$(nslookup "$dx_h" 127.0.0.1 2>/dev/null |
-            awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
+        dx_ips=
+        if [ -z "$dx_static_ips" ]; then
+            dx_ips=$(nslookup "$dx_h" 127.0.0.1 2>/dev/null |
+                awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
+        fi
         for dx_ip in $dx_static_ips $dx_ips; do echo "$dx_h $dx_ip $dx_p"; done
         if [ -z "$dx_ips" ]; then
             if [ -f "$dx_state" ]; then

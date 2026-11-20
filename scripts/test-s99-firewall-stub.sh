@@ -407,7 +407,10 @@ NDMC
 cat > "$TMP/bin/nslookup" <<'NSL'
 #!/bin/sh
 [ "$1" = doh.test ] || exit 1
-[ -f "$NSL_FAIL" ] && exit 1
+if [ -f "$NSL_FAIL" ]; then
+    [ -z "${NSL_CALLED:-}" ] || : > "$NSL_CALLED"
+    exit 1
+fi
 printf 'Server:    127.0.0.1\nAddress 1: 127.0.0.1 localhost\n\nName:      doh.test\n'
 i=1; for a in $(cat "$NSL_ADDRS"); do printf 'Address %d: %s\n' $i "$a"; i=$((i+1)); done
 NSL
@@ -446,11 +449,12 @@ if rules iptables mangle | grep -q '198.51.100.7'; then fail "a stale DoH addres
 if rules ip6tables mangle | grep -q '2001:db8::7'; then fail "a stale IPv6 DoH address stayed excluded"; fi
 # Имя сейчас не разрешилось — прежнее исключение остаётся.
 : > "$TMP/nsl-fail"
-S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail"
+S99_SNIPPET='dns_excl_sync' s99 NSL_ADDRS="$TMP/nsl-addrs" NSL_FAIL="$TMP/nsl-fail" NSL_CALLED="$TMP/nsl-called"
 dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.8 --dport 443 -m mark ! --mark 0x2e -j RETURN" \
     || fail "a failed lookup removed the DoH exclusion"
 dns_before_queue iptables D2K_OUT "-p tcp -d 198.51.100.9 --dport 443 -m mark ! --mark 0x2e -j RETURN" \
     || fail "the configured bootstrap address was lost when DNS failed"
+[ ! -e "$TMP/nsl-called" ] || fail "bootstrap address must not depend on the failed resolver"
 rm -f "$TMP/nsl-fail"
 # Сброс извне снёс исключение — круг сторожа его возвращает.
 FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D D2K_OUT -p tcp -d 9.9.9.9 --dport 853 -m mark ! --mark 0x2e -j RETURN
