@@ -913,7 +913,7 @@ static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
     char line[512];
     if(st.st_size>16384){
         if(fseek(f,st.st_size-16384,SEEK_SET)){buf_puts(b,"null");return;}
-        (void)fgets(line,sizeof line,f);
+        if(!fgets(line,sizeof line,f)){buf_puts(b,"null");return;}
     }
     char records[24][128]; unsigned count=0;
     off_t left=st.st_size<16384?st.st_size:16384;
