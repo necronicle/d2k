@@ -579,7 +579,7 @@ static void test_diagnostic_history_controls_and_download(void) {
     const char *enable="POST /api/diagnostics?enable HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n";
     request(&cfg,enable,reply,sizeof reply);assert(strstr(reply,"200 OK"));assert(strstr(reply,"\"enabled\":true"));
     request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
-    assert(strstr(reply,"503 Service Unavailable"));assert(strstr(reply,"\"pending\":true"));
+    assert(strstr(reply,"200 OK"));assert(strstr(reply,"\"pending\":true"));assert(strstr(reply,"\"router_at_download\":"));
     snprintf(path,sizeof path,"%s/report.json",dir);FILE *f=fopen(path,"w");assert(f);fputs("{\"schema\":1,\"enabled\":true,\"samples\":[]}",f);fclose(f);
     request(&cfg,"GET /api/diagnostics?download HTTP/1.1\r\nHost: localhost\r\n\r\n",reply,sizeof reply);
     assert(strstr(reply,"200 OK"));assert(strstr(reply,"Content-Disposition: attachment"));assert(strstr(reply,"\"samples\":[]"));

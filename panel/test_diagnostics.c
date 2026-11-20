@@ -4,6 +4,15 @@
 #include "server.c"
 #include <assert.h>
 int main(void) {
+ FILE *fixture=tmpfile();assert(fixture);
+ fputs("2026-11-20 18:25:01 d2k-tg-watchdog: probe failed: curl_rc=28 http=000 secret-string\n",fixture);
+ fputs("2026-11-20 18:25:02 arbitrary secret-string\n",fixture);rewind(fixture);
+ char output[4096]={0};panel_buf b={.p=output,.cap=sizeof output};
+ diagnostic_tunnel_events(&b,fixture);fclose(fixture);
+ assert(strstr(output,"18:25:01")&&strstr(output,"curl_rc=28")&&!strstr(output,"secret-string"));
+ fixture=tmpfile();assert(fixture);fputs("2000 52 3 2 65535 4 5 100 1\n",fixture);rewind(fixture);
+ b.len=0;diagnostic_queue(&b,fixture,2000);fclose(fixture);
+ assert(strstr(output,"\"bound\":true")&&strstr(output,"\"userspace_drops\":5"));
  char dir[]="/tmp/d2k-diag-panel-XXXXXX";assert(mkdtemp(dir));
  d2k_panel_config c={.control_enabled=1,.diagnostics_dir=dir};
  int sv[2];assert(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);

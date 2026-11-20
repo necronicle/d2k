@@ -882,6 +882,95 @@ static int diagnostic_response(int fd,int code,const char *reason,const char *ty
 }
 #include "policies.h"
 
+/* Keep the controller history intact and add a snapshot taken at download time. */
+static void diagnostic_queue(panel_buf *b, FILE *f, int queue) {
+    char line[256];
+    unsigned id, peer, queued, dropped, user_dropped, sequence;
+    while (f && fgets(line,sizeof line,f)) {
+        if (sscanf(line,"%u %u %u %*u %*u %u %u %u",&id,&peer,&queued,
+                   &dropped,&user_dropped,&sequence)==6 && id==(unsigned)queue) {
+            buf_printf(b,"{\"bound\":true,\"peer\":%u,\"queued\":%u,\"kernel_drops\":%u,"
+                       "\"userspace_drops\":%u,\"packet_sequence\":%u}",peer,queued,dropped,user_dropped,sequence);
+            return;
+        }
+    }
+    buf_puts(b,f && !ferror(f) ? "{\"bound\":false}" : "null");
+}
+
+/* Export known events only. Arbitrary relay messages and log lines can contain
+ * network addresses or credentials. Scan at most the last 16 KiB. */
+static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
+    static const char *const events[]={
+        "d2k-tg-watchdog: probe failed", "d2k-tg-watchdog: probe recovered",
+        "d2k-tg-watchdog: restart requested", "d2k-tg-watchdog: restart command completed",
+        "d2k-tg-watchdog: restart command failed", "d2ktg: relay session authenticated",
+        "d2ktg: relay session ended", "d2ktg: relay authentication failed",
+        "d2ktg: verified relay WSS connection failed", "d2ktg: cannot bind",
+        "d2ktg: relay identity registration failed"
+    };
+    struct stat st;
+    if(!f || fstat(fileno(f),&st) || !S_ISREG(st.st_mode)){buf_puts(b,"null");return;}
+    char line[512];
+    if(st.st_size>16384){
+        if(fseek(f,st.st_size-16384,SEEK_SET)){buf_puts(b,"null");return;}
+        (void)fgets(line,sizeof line,f);
+    }
+    char records[24][128]; unsigned count=0;
+    off_t left=st.st_size<16384?st.st_size:16384;
+    while(left>0 && fgets(line,sizeof line,f)){
+        size_t n=strlen(line);left-=(off_t)n;
+        if(!n)break;
+        if(n<21 || line[19]!=' ' || strspn(line,"0123456789- :")!=20)continue;
+        for(size_t i=0;i<sizeof events/sizeof events[0];i++){
+            if(strncmp(line+20,events[i],strlen(events[i])))continue;
+            char *record=records[count++%24];
+            snprintf(record,128,"%.19s %s",line,events[i]);
+            int rc;
+            if(i==0 && sscanf(line+20,"d2k-tg-watchdog: probe failed: curl_rc=%d",&rc)==1){
+                size_t used=strlen(record);snprintf(record+used,128-used," curl_rc=%d",rc);
+            }
+            break;
+        }
+    }
+    buf_puts(b,"[");
+    unsigned start=count>24?count-24:0;
+    for(unsigned i=start;i<count;i++){if(i!=start)buf_puts(b,",");buf_json_string(b,records[i%24]);}
+    buf_puts(b,"]");
+}
+
+static int download_diagnostics(int fd,const d2k_panel_config *cfg,char *body,size_t len) {
+    if (!cfg || !json_valid_object(body,body+len))
+        return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
+    while (len && body[len-1]!='}') len--;
+    size_t end=len-1;
+    while (end && strchr(" \r\n\t",body[end-1])) end--;
+    panel_buf b={.p=body,.len=len-1,.cap=len+4096};
+    buf_puts(&b,body[end-1]=='{' ? "" : ",");
+    buf_printf(&b,"\"router_at_download\":{\"epoch\":%lld,\"engine_running\":%s,\"controller_running\":%s,"
+               "\"queue_id\":%d,\"nfqueue\":",(long long)time(NULL),
+               engine_pid_running(cfg,NULL)?"true":"false",controller_pid_running(cfg)?"true":"false",cfg->queue_num);
+    FILE *q=fopen("/proc/net/netfilter/nfnetlink_queue","r");
+    diagnostic_queue(&b,q,cfg->queue_num);
+    if(q)fclose(q);
+    char policy[256],state[24];int enabled=0,configured=0,running=0;
+    buf_puts(&b,",\"configured_policy\":");
+    if(cfg->config_path && !policy_config_read(cfg->config_path,policy,sizeof policy))buf_json_string(&b,policy);
+    else buf_puts(&b,"null");
+    buf_puts(&b,",\"mode\":");buf_json_string(&b,cfg->mode);
+    telegram_config_flags(cfg,&enabled,&configured);
+    telegram_status_value(cfg,enabled,configured,&running,state);
+    buf_printf(&b,",\"telegram_running\":%s,\"telegram_state\":",running?"true":"false");
+    buf_json_string(&b,state);
+    buf_puts(&b,",\"telegram_recent_events\":");
+    FILE *log=fopen("/opt/d2k/log/telegram.log","r");
+    diagnostic_tunnel_events(&b,log);
+    if(log)fclose(log);
+    buf_puts(&b,"}}");
+    if(b.failed)return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
+    return response_ex(fd,200,"OK","application/json; charset=utf-8",
+        "Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"d2k-diagnostics.json\"\r\n",body,b.len);
+}
+
 static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
                            const char *method,const char *action) {
     const char *dir=cfg&&cfg->diagnostics_dir?cfg->diagnostics_dir:D2K_DIAG_DIR;
@@ -901,17 +990,24 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     char path[512];struct stat st;
     if(d2k_diag_path(path,sizeof path,dir,"report.json"))return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     int in=open(path,O_RDONLY|O_NOFOLLOW);
-    if(in<0)return diagnostic_response(fd,503,"Service Unavailable","application/json","{\"enabled\":true,\"pending\":true}",31);
+    if(in<0){
+        if(errno==ENOENT && !strcmp(action,"download")){
+            char empty[4300]="{\"enabled\":true,\"pending\":true,\"events\":[],\"samples\":[]}";
+            return download_diagnostics(fd,cfg,empty,strlen(empty));
+        }
+        return diagnostic_response(fd,503,"Service Unavailable","application/json","{\"enabled\":true,\"pending\":true}",31);
+    }
     if(fstat(in,&st)||!S_ISREG(st.st_mode)||st.st_size<0||(uint64_t)st.st_size>D2K_DIAG_REPORT_MAX) {
         close(in);return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     }
-    size_t len=(size_t)st.st_size,off=0;char *body=malloc(len+1);
+    size_t len=(size_t)st.st_size,off=0;char *body=malloc(len+4096);
     if(!body){close(in);return diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);}
     while(off<len){ssize_t n=read(in,body+off,len-off);if(n<0&&errno==EINTR)continue;if(n<=0)break;off+=(size_t)n;}
     close(in);
-    int rc=off==len?response_ex(fd,200,"OK","application/json; charset=utf-8",
-        !strcmp(action,"download")?"Cache-Control: no-store\r\nContent-Disposition: attachment; filename=\"d2k-diagnostics.json\"\r\n":"Cache-Control: no-store\r\n",body,len):
-        diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);
+    int rc;
+    if(off!=len)rc=diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);
+    else if(!strcmp(action,"download"))rc=download_diagnostics(fd,cfg,body,len);
+    else rc=diagnostic_response(fd,200,"OK","application/json; charset=utf-8",body,len);
     free(body);return rc;
 }
 

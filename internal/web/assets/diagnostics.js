@@ -56,7 +56,7 @@
       }).then(function (r) {
         enabled = r.enabled === true;
         toggle.textContent = enabled ? "Выключить и удалить историю" : "Включить сбор";
-        download.hidden = !enabled || !!r.pending;
+        download.hidden = !enabled;
         render(r);
       }).catch(function () { status.textContent = "Не удалось прочитать состояние диагностики."; });
     }
