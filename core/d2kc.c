@@ -296,7 +296,8 @@ static void *dns_journal_run(void *context) {
             if(valid && status==0) {
                 reader->cursor=next;
                 for(size_t i=0;i<hits.count;i++)
-                    (void)write(reader->output,hits.names[i],sizeof hits.names[i]);
+                    if(write(reader->output,hits.names[i],sizeof hits.names[i])!=
+                       (ssize_t)sizeof hits.names[i])break;
             }
         }
         for(int i=0;i<50 && !reader->halt;i++) {
