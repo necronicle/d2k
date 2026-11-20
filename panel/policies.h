@@ -64,7 +64,7 @@ static int policy_openwrt_parse(char *text,policy_item *items,size_t *count) {
 }
 static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items,size_t *count) {
     int openwrt=access("/etc/openwrt_release",F_OK)==0;
-    int pipes[2];if(pipe(pipes))return -1;
+    int pipes[2];if(pipe(pipes)<0)return -1;
     pid_t pid=fork();if(pid<0){close(pipes[0]);close(pipes[1]);return -1;}
     if(!pid){
         if(setpgid(0,0))_exit(125);

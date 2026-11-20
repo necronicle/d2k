@@ -1,7 +1,15 @@
 #define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <sys/socket.h>
+#include <unistd.h>
+
+/* This MIPS libc reports successful pipe creation with the read descriptor. */
+static int mips_pipe(int fds[2]) {
+    return pipe(fds) < 0 ? -1 : fds[0];
+}
+#define pipe mips_pipe
 #include "server.c"
+#undef pipe
 #include <assert.h>
 static void put(const char *p,const char *s){FILE*f=fopen(p,"w");assert(f);assert(fputs(s,f)>=0);assert(!fclose(f));}
 static void request(d2k_panel_config *cfg,const char *method,const char *headers,int code,const char *expected){

@@ -1050,7 +1050,7 @@ int main(int argc, char **argv) {
     int64_t dns_reload_at=0;
     int journal_pipe[2]={-1,-1};pthread_t journal_thread;int journal_started=0;
     dns_journal_reader journal_reader={.output=-1};
-    if(dns_configuration && access("/bin/ndmc",X_OK)==0 && !pipe(journal_pipe)) {
+    if(dns_configuration && access("/bin/ndmc",X_OK)==0 && pipe(journal_pipe)>=0) {
         journal_reader.output=journal_pipe[1];
         int flags=fcntl(journal_pipe[0],F_GETFL,0);
         int output_flags=fcntl(journal_pipe[1],F_GETFL,0);
