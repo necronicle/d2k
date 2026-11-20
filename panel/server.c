@@ -906,7 +906,7 @@ static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
         "d2k-tg-watchdog: restart command failed", "d2ktg: relay session authenticated",
         "d2ktg: relay session ended", "d2ktg: relay authentication failed",
         "d2ktg: verified relay WSS connection failed", "d2ktg: cannot bind",
-        "d2ktg: relay identity registration failed"
+        "d2ktg: relay identity registration failed", "d2k-tg-watchdog: probe unavailable"
     };
     struct stat st;
     if(!f || fstat(fileno(f),&st) || !S_ISREG(st.st_mode)){buf_puts(b,"null");return;}
@@ -926,7 +926,7 @@ static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
             char *record=records[count++%24];
             snprintf(record,128,"%.19s %s",line,events[i]);
             int rc;
-            if(i==0 && sscanf(line+20,"d2k-tg-watchdog: probe failed: curl_rc=%d",&rc)==1){
+            if(sscanf(line+20+strlen(events[i]),": curl_rc=%d",&rc)==1){
                 size_t used=strlen(record);snprintf(record+used,128-used," curl_rc=%d",rc);
             }
             break;
