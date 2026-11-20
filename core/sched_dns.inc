@@ -69,10 +69,11 @@ static uint32_t named_client_interface(const uint8_t *client,uint8_t family) {
     freeifaddrs(all);return found;
 }
 #ifdef __linux__
-static int dns_route_attr(struct nlmsghdr *h,size_t cap,uint16_t type,const void *p,size_t n) {
+static int dns_route_attr(void *buffer,size_t cap,uint16_t type,const void *p,size_t n) {
+    struct nlmsghdr *h=buffer;
     size_t at=NLMSG_ALIGN(h->nlmsg_len),need=at+RTA_ALIGN(RTA_LENGTH(n));
     if(need>cap)return -1;
-    struct rtattr *a=(struct rtattr *)((uint8_t *)h+at);a->rta_type=type;a->rta_len=RTA_LENGTH(n);
+    struct rtattr *a=(struct rtattr *)((uint8_t *)buffer+at);a->rta_type=type;a->rta_len=RTA_LENGTH(n);
     memcpy(RTA_DATA(a),p,n);h->nlmsg_len=(uint32_t)need;return 0;
 }
 /* Ask the forwarding route table with the observed client and LAN ingress.
@@ -85,9 +86,9 @@ static uint32_t dns_route_path(const d2k_dns_answer *a,const uint8_t *server,uin
     q.h.nlmsg_flags=NLM_F_REQUEST;q.h.nlmsg_seq=1;q.r.rtm_family=family==4?AF_INET:AF_INET6;
     q.r.rtm_dst_len=q.r.rtm_src_len=family==4?32:128;
     size_t width=family==4?4:16;
-    if(dns_route_attr(&q.h,sizeof q,RTA_DST,server,width) ||
-       dns_route_attr(&q.h,sizeof q,RTA_SRC,a->client,width) ||
-       dns_route_attr(&q.h,sizeof q,RTA_IIF,&a->ingress,sizeof a->ingress)){close(fd);return 0;}
+    if(dns_route_attr(&q,sizeof q,RTA_DST,server,width) ||
+       dns_route_attr(&q,sizeof q,RTA_SRC,a->client,width) ||
+       dns_route_attr(&q,sizeof q,RTA_IIF,&a->ingress,sizeof a->ingress)){close(fd);return 0;}
     struct timeval tv={0,200000};struct sockaddr_nl kernel={.nl_family=AF_NETLINK};socklen_t peer_len=sizeof kernel;
     if(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv)||
        sendto(fd,&q,q.h.nlmsg_len,0,(struct sockaddr *)&kernel,sizeof kernel)!=(ssize_t)q.h.nlmsg_len){close(fd);return 0;}

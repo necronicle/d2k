@@ -8304,7 +8304,8 @@ static int preflight_lease_event(d2k_sched *s,const d2k_ev *ev) {
                 l->scope.name,(unsigned)l->scope.family,(unsigned)l->scope.path,(unsigned)l->scope.shape);
         } else {
             say(s,"по %s preflight: датапат отказал привязке клиента, код %u",l->scope.name,(unsigned)(ev->num&255));
-            if(owner)owner->gate_lease_failed=1;memset(l,0,sizeof *l);
+            if(owner)owner->gate_lease_failed=1;
+            memset(l,0,sizeof *l);
         }
         return 1;
     }
