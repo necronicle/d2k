@@ -556,7 +556,24 @@ static void check_ghash_fast_path(void) {
     check_one_ghash_vector("AAD пуст, CT ровно 64 байта", h_ff, NULL, 0, big, 64);
 }
 
+static void check_streaming_sha256(void) {
+    uint8_t data[257],expected[32],got[32];
+    for(size_t i=0;i<sizeof data;i++)data[i]=(uint8_t)i;
+    for(size_t n=0;n<=sizeof data;n++) {
+        d2k_sha256(data,n,expected);
+        for(size_t split=0;split<=n;split++) {
+            d2k_sha256_ctx ctx;d2k_sha256_init(&ctx);
+            d2k_sha256_update(&ctx,data,split);
+            d2k_sha256_update(&ctx,NULL,0);
+            d2k_sha256_update(&ctx,data+split,n-split);
+            d2k_sha256_final(&ctx,got);
+            CHECK(!memcmp(got,expected,32),"streamed SHA256 changed across chunk/padding boundary");
+        }
+    }
+}
+
 int main(void) {
+    check_streaming_sha256();
     uint8_t initial_secret[32], cis[32];
     d2k_hkdf_extract(initial_salt, sizeof initial_salt, dcid, sizeof dcid, initial_secret);
 

@@ -7,6 +7,10 @@
 #include <poll.h>
 
 #define TG_WS_MAX_MESSAGE (2u * 1024u * 1024u)
+/* Исходный буфер приёма. Кадры MTProto обычно укладываются в него; буфер
+   растёт только под больший кадр (до TG_WS_MAX_MESSAGE) и сжимается обратно,
+   когда разобранных данных в нём не осталось. */
+#define TG_WS_RX_BASE (16u * 1024u)
 #define TG_WS_BINARY 0x2u
 #define TG_WS_CLOSE 0x8u
 #define TG_WS_PING 0x9u

@@ -109,6 +109,17 @@ uint8_t d2k_aes_sbox_byte(uint8_t x);
 void d2k_ghash_for_test(const uint8_t h[16], const uint8_t *aad, size_t aad_len,
                         const uint8_t *c, size_t c_len, uint8_t out[16]);
 
+/* Bounded streaming SHA-256 state; final consumes the state. */
+typedef struct {
+    uint32_t h[8];
+    uint8_t buf[64];
+    size_t buf_len;
+    uint64_t total_len;
+} d2k_sha256_ctx;
+void d2k_sha256_init(d2k_sha256_ctx *ctx);
+void d2k_sha256_update(d2k_sha256_ctx *ctx, const uint8_t *data, size_t n);
+void d2k_sha256_final(d2k_sha256_ctx *ctx, uint8_t out[32]);
+
 /* SHA-256 (FIPS 180-4) от произвольного числа байт. */
 void d2k_sha256(const uint8_t *in, size_t n, uint8_t out[32]);
 

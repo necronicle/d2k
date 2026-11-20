@@ -17,6 +17,8 @@
 #define D2K_DETECT_H
 
 #include "d2k_arm.h"
+#include "d2k_boxprops.h" /* d2k_box_props — знание о коробке из каталога */
+#include "d2k_preflight_candidate.h"
 #include <stddef.h>
 #include <sys/types.h>
 #include <stdint.h>
@@ -84,7 +86,8 @@ typedef enum {
     D2K_DV_POISONABLE,   /* "poisonable"   буфер пересборки травится */
     D2K_DV_FLAKY,        /* "flaky"        не воспроизводится */
     D2K_DV_UNREACHABLE,  /* "unreachable"  нет даже TCP */
-    D2K_DV_RESPONSE      /* "response"     режут ОТВЕТ (TLS 1.2) */
+    D2K_DV_RESPONSE,     /* "response"     режут ОТВЕТ (TLS 1.2) */
+    D2K_DV_RESPONSE_GATE /* ACKed hello, small-window response, carry over RST */
 } d2k_verdict_t;
 
 const char *d2k_verdict_name(d2k_verdict_t v);
@@ -142,6 +145,7 @@ typedef struct {
     size_t        client_tcp_options_len;
 } d2k_trigger;
 
+size_t d2k_trigger_prefix_size(const d2k_trigger *t);
 int d2k_trigger_accepts(const d2k_trigger *t, const uint8_t *b, size_t n);
 
 /* poison — чем отравляем буфер пересборки. Смысл каждого варианта один:
@@ -162,6 +166,8 @@ typedef struct {
     int     badsum;        /* испортить контрольную сумму TCP */
     int32_t seq_shift;     /* сдвинуть номер последовательности за окно */
     int     md5;           /* добавить опцию TCP-MD5, которой сервер не ждёт */
+    int     md5_ts;        /* MD5 первой + метка времени (раскладка nfqws1
+                              tcp_md5_first); отдельная ось от md5-одиночки */
     int     decoy_hello;   /* приманка — правдоподобное приветствие, а не набивка */
     const uint8_t *decoy;  /* готовые байты приманки */
     size_t  decoy_len;
@@ -205,6 +211,22 @@ int d2k_poison_same(const d2k_poison *a, const d2k_poison *b);
 /* Pure conversion shared by raw execution and the scheduler bridge. */
 int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 
+typedef struct {
+    int response_gate, pieces_pass;
+    uint16_t window;
+    uint8_t window_scale;
+    unsigned pieces_needed;
+    int carry_over_rst, hello_own;
+    char white_name[256];
+    uint32_t rtt_ms;
+    uint16_t probes; /* Connections for questions 2–3, excludes ACK baselines. */
+    uint8_t baseline_probes; /* Fresh normal-window controls actually opened. */
+    uint32_t baseline_acked; /* Observed ACK bytes, not inferred delivery. */
+    uint32_t small_response_bytes;
+    d2k_preflight_candidate candidate;
+    char reason[160]; /* Why the carry question stopped without a plan. */
+} d2k_preflight_meas;
+
 /* Что удалось узнать о самой коробке. UNSET означает «не измерено». */
 typedef struct {
     d2k_tri reassembles;
@@ -223,6 +245,10 @@ typedef struct {
     /* Перекрытие длиной до конца имени взято: коробка оставляет первую копию
      * всей сигнатуры. Только по проходу. */
     d2k_tri overlap_covers_sni;
+    /* Учитывает ли коробка срочный байт TCP. Только по проходу: взяла зонд со
+     * срочным байтом в середине имени — значит имя прочла с лишним байтом и
+     * не узнала (гистограмма 23.10.2026: 111 из 124 попаданий перебора). */
+    d2k_tri handles_urgent;
     int     hop_ttl;
 } d2k_dprops;
 
@@ -235,7 +261,28 @@ typedef struct {
     int  pass;
     int  fail;
     char err[160];
+    /* ВОПРОС НЕ ЗАДАВАЛСЯ: ответ взят из знания о коробке (d2k_opts.known), и
+     * зондов он не стоил. Признаком, а не пометкой в имени: имя вопроса едет
+     * в трассу вердикта ярлыком (d2k_verdict.h, D2K_QLABEL_MAX), и приписка к
+     * нему обрезалась бы ровно на самых длинных вопросах. pass/fail при этом
+     * нули, и исход «вопрос не прошёл» читается как прежде. */
+    int  from_known;
+    /* Ответ взят из прежнего прогона того же входа (d2k_opts.known), зондов в
+     * этом прогоне не было (этап 25). Счёт pass/fail — прежнего прогона. */
+    int  seeded;
 } d2k_obs;
+
+/* ОТВЕТ ВОПРОСА О СВОЙСТВЕ, УЖЕ ПОЛУЧЕННЫЙ ТЕМ ЖЕ ВХОДОМ (этап 25): ярлык
+ * вопроса (как в трассе, без «свойство:»), счёт повторов. Применяется только
+ * при known_repeats == repeats прогона; локальные ошибки (UNKNOWN) сюда не
+ * кладутся — такие вопросы задаются заново. */
+#include "d2k_run_cache.h"
+#define D2K_KNOWN_MAX 16
+typedef struct {
+    char label[64];
+    int  pass;
+    int  fail;
+} d2k_known_prop;
 
 #define D2K_TRACE_MAX 512
 #define D2K_NOTES_MAX 8
@@ -296,6 +343,7 @@ typedef struct {
     int        has_hit;
     d2k_poison hit;
 
+    d2k_preflight_meas preflight;
     d2k_dprops props;
     /* Каким из трёх путей получен ответ: "свойство", "собрано", "перебор". */
     char path[32];
@@ -345,6 +393,10 @@ typedef struct {
     int  cross_check_tls12;
     int  no_raw;
     int  control_vouched;
+    int  preflight_auto; /* the raw gate measures its own baseline */
+    int  preflight_combined; /* permit explicit composed application trials */
+    int  preflight_ipv6; /* IPv6 path with the matching firewall rules */
+    const char *response_probe_name; /* name from a recent direct exchange */
     /* Метка SO_MARK для ВСЕХ сокетов прогона — и обычных, и сырых. Ноль
      * означает «взять D2K_BYPASS_MARK», а не «не метить»: непомеченный зонд
      * идёт сквозь наш обход, и «обходить нечего» в таком прогоне было бы
@@ -399,6 +451,21 @@ typedef struct {
     int  seed_pass;
     int  seed_fail;
     char seed_err[160];
+    /* ЗНАНИЕ О КОРОБКЕ, УЖЕ ИЗМЕРЕННОЕ РАНЬШЕ (23.10.2026). Вопрос, чей ответ
+     * здесь означает «приём НЕ проходит», не задаётся: он заведомо потратил бы
+     * повторы на уже известный промах. Вопрос, чей ответ означает «проходит»,
+     * задаётся ВСЁ РАВНО — прошедший вопрос и есть доказательство приёма на
+     * проводе (§0.1), а доказательство обязано быть свежим для этой сети.
+     * Нули — знания нет, и тогда опрос идёт как раньше. */
+    d2k_box_props known;
+    /* ОТВЕТЫ ВОПРОСОВ О СВОЙСТВАХ ИЗ ПРЕЖНЕГО ПРОГОНА ТОГО ЖЕ ВХОДА (этап 25):
+     * прогон, прерванный уступкой или отменой, успел измерить часть свойств;
+     * перезапуск тем же триггером берёт их исходы вместо повторных зондов.
+     * Контекст (цель, порт, байты триггера) сверяет вызывающий. */
+    d2k_known_prop known_answers[D2K_KNOWN_MAX];
+    int  nknown;
+    int  known_repeats;
+    d2k_run_cache *run_cache;
 } d2k_opts;
 
 void d2k_opts_defaults(d2k_opts *o);
@@ -406,6 +473,15 @@ int  d2k_opts_acceptable(const d2k_opts *o, const d2k_poison *p);
 int  d2k_opts_skipped(const d2k_opts *o, const char *name);
 /* Байты приманки прогона: opt->decoy, если задан, иначе opt->control. */
 const d2k_trigger *d2k_opts_decoy(const d2k_opts *o);
+
+/* РАССТОЯНИЕ ДО КОРОБКИ В ХОПАХ, двоичным поиском по отрезку прохода
+ * фальшивки (detect/props.c). Возвращает найденное число и пишет его в
+ * res->props.hop_ttl; 0 — НЕ ИЗМЕРЕНО: отрезка прохода нет, повторы
+ * разошлись либо зонд не ушёл (§2.4). Расстояние — свойство коробки, не
+ * цели: измеренное один раз, оно хранится в её записи каталога и следующей
+ * цели зондов не стоит. */
+int  d2k_hop_search(const uint8_t *ip4, uint8_t family, uint16_t port,
+                    const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res);
 
 /* ProbeResponse — не режут ли ОТВЕТ сервера (TLS 1.2, сертификат открытым
  * текстом). Зовётся только там, где запрос уже признан проходящим. */
@@ -479,6 +555,94 @@ int d2k_raw_probe_handshake_family(const uint8_t *ip, uint8_t family, uint16_t p
 int d2k_raw_probe_handshake_as(const uint8_t *ip, uint8_t family, uint16_t port,
     int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel, int offer_ts,
     char *err, size_t errcap);
+typedef enum {
+    D2K_RAW_OBS_LOCAL = 0, D2K_RAW_OBS_CONNECT_TIMEOUT,
+    D2K_RAW_OBS_CONNECT_RESET, D2K_RAW_OBS_CANCELLED,
+    D2K_RAW_OBS_RESPONSE_TIMEOUT, D2K_RAW_OBS_RESPONSE_RESET,
+    D2K_RAW_OBS_RESPONSE_BYTES, D2K_RAW_OBS_ACCEPTED,
+    D2K_RAW_OBS_RESPONSE_ACK, D2K_RAW_OBS_RESPONSE_FIN, D2K_RAW_OBS_RESPONSE_PACKET
+} d2k_raw_observation_kind;
+typedef struct {
+    uint64_t received_packets, received_payload_bytes, ack_packets, ack_advances;
+    uint32_t sent_end, acked_end;
+    uint16_t peer_window_raw;
+    uint8_t available, ack_seen, window_seen;
+} d2k_raw_transport;
+typedef struct {
+    d2k_raw_observation_kind kind;
+    /* Cumulative post-handshake observations on this owned episode. Payload
+       bytes include retransmissions; ACKs are observations, not origin proof.
+       Offsets cover at most the unambiguous TCP half-space. Window is unscaled. */
+    d2k_raw_transport transport;
+    uint32_t rtt_ms; /* SYN to SYN-ACK; zero if retransmitted/unknown */
+    int connected, sent;
+    size_t response_bytes;
+    /* Plan actions and successful socket submissions; not a delivery proof.
+       A partial execution must not train a model of the complete program. */
+    size_t program_packets, submitted_packets;
+} d2k_raw_observation;
+typedef struct d2k_raw_episode d2k_raw_episode;
+typedef struct {
+    uint8_t local[16],remote[16],family;
+    uint16_t local_port,remote_port;
+    uint32_t initial_seq;
+} d2k_raw_tuple;
+/* Actual connection coordinates, not a guessed flow or a plan identifier. */
+int d2k_raw_episode_tuple(const d2k_raw_episode *,d2k_raw_tuple *);
+/* One owned TCP connection, not a claim that a remote filter was reset.
+   Offsets are relative to our first data sequence number. The experiment
+   specifies send and next-ACK offsets explicitly, including retransmissions
+   and overlaps; this transport does not infer endpoint stream equivalence. */
+d2k_raw_episode *d2k_raw_episode_open(const uint8_t *, uint8_t, uint16_t,
+    int, uint32_t, int, const d2k_detect_stop *, char *, size_t, d2k_raw_observation *);
+/* Optional IPv4 probe shape. NULL preserves the legacy episode exactly.
+   Zero windows select 65535; scale -1 selects the legacy scale 7. */
+typedef struct {
+    uint16_t sport, syn_window;
+    int8_t syn_wscale;
+    uint16_t data_window;
+    uint8_t defer_response_ack; /* event(): ACK on next read, allowing RST instead. */
+    uint8_t initial_seq_known;
+    uint32_t initial_seq;
+    uint16_t syn_retry_ms; /* Both zero: ordinary exponential TCP retries. */
+    uint8_t syn_max_sends;
+} d2k_raw_shape;
+d2k_raw_episode *d2k_raw_episode_open_shaped(const uint8_t *, uint8_t, uint16_t,
+    int, uint32_t, int, const d2k_raw_shape *, const d2k_detect_stop *, char *, size_t,
+    d2k_raw_observation *);
+int d2k_raw_episode_set_window(d2k_raw_episode *, uint16_t);
+/* Sends current-sequence RST, then closes this episode (free still required).
+   Only its own RST suppression is lifted, for the duration of the send. */
+int d2k_raw_episode_reset(d2k_raw_episode *);
+int d2k_raw_episode_send(d2k_raw_episode *, uint32_t, uint32_t, const d2k_trigger *,
+    const char *, const d2k_detect_stop *, char *, size_t, d2k_raw_observation *);
+/* 0: requested prefix read; -1: timeout/reset/cancel/FIN; -2: local error.
+   have remains meaningful on a partial read. Timeout keeps the connection;
+   local error, cancellation, reset and FIN invalidate it. FIN accompanying
+   a complete prefix is reported with rc=0 and retained for the next read. */
+int d2k_raw_episode_read(d2k_raw_episode *, int, const d2k_detect_stop *,
+    uint8_t *, size_t, size_t *, size_t, d2k_raw_observation *);
+typedef struct {
+    uint8_t flags;
+    uint32_t sequence_offset, ack_offset;
+    int ack_in_sent_range;
+    size_t payload_len;
+} d2k_raw_packet_event;
+/* One received packet, including pure ACKs. Sequence coordinates belong to
+   this connection. In-range ACK is not proof of origin or application success.
+   Payload is copied without truncation; caller owns stream reassembly. */
+int d2k_raw_episode_event(d2k_raw_episode *, int, const d2k_detect_stop *,
+    uint8_t *, size_t, d2k_raw_packet_event *, d2k_raw_observation *);
+void d2k_raw_episode_free(d2k_raw_episode *);
+
+/* Execute an exact synthesized Plan through the same runtime as the
+ * datapath. A positive result is trigger acceptance, not application proof. */
+int d2k_raw_probe_program(const uint8_t *, uint8_t, uint16_t,
+    const d2k_trigger *, const char *, int, uint32_t,
+    const d2k_detect_stop *, char *, size_t, d2k_raw_observation *);
+int d2k_raw_probe_observed(const uint8_t *, uint8_t, uint16_t,
+    const d2k_trigger *, const d2k_poison *, int, uint32_t,
+    const d2k_detect_stop *, char *, size_t, d2k_raw_observation *);
 int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
     const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
     const d2k_detect_stop *cancel, char *err, size_t errcap);
@@ -486,6 +650,7 @@ int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port
  * датапата), чтобы измеренное уходило теми же сегментами, что исполненное
  * (поле 22.10.2026, issue #5/#7). 0 — вернуть прежние 1400 (D2K_ARM_SEGMENT_MAX). */
 void d2k_raw_set_segment_max(unsigned seg);
+unsigned d2k_raw_segment_max(void);
 /* Ответ вопроса о свойствах — большинством повторов (props.c): при N = 3 —
  * два прохода, при N = 1 — один. Общий для измерителя и моста (bridge.c). */
 static inline int d2k_prop_majority(int pass, int repeats)
@@ -530,6 +695,7 @@ int64_t d2k_now_ms(void);
 /* Сдвиг часов для теста (имитация долгого аптайма); в работе 0. */
 extern int64_t d2k_clock_offset_ms;
 void d2k_sleep_ms(int ms);
+int d2k_sleep_us(uint32_t us);
 d2k_obs *d2k_trace_add(d2k_result *res, const char *probe);
 void d2k_note(d2k_result *res, const char *fmt, ...);
 /* send без SIGPIPE: мёртвый пир даёт -1/EPIPE, а не гибель процесса. */

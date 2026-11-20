@@ -19,11 +19,11 @@ static int reject(d2k_capture *c, d2k_capture_slot *s) {
     return -1;
 }
 
-int d2k_capture_feed_ready(d2k_capture *c, const d2k_key *key, uint64_t generation,
+static int feed(d2k_capture *c, const d2k_key *key, uint64_t generation,
                      uint64_t now_ns, uint32_t seq, uint32_t anchor, int have_anchor,
                      const uint8_t *bytes,
                      size_t len, const uint8_t **hello, size_t *hello_len,
-                     uint32_t *hello_seq, d2k_capture_ready ready) {
+                     uint32_t *hello_seq, d2k_capture_ready ready,size_t exact) {
     *hello = NULL;
     *hello_len = 0;
     *hello_seq = 0;
@@ -51,6 +51,7 @@ int d2k_capture_feed_ready(d2k_capture *c, const d2k_key *key, uint64_t generati
         uint32_t off_from_anchor = seq - anchor;
         if ((int32_t)off_from_anchor < 0 || off_from_anchor >= D2K_CAPTURE_BYTES ||
             len > D2K_CAPTURE_BYTES - off_from_anchor) {
+            if(exact)return -1;
             have_anchor = 0;
         }
     }
@@ -95,7 +96,7 @@ int d2k_capture_feed_ready(d2k_capture *c, const d2k_key *key, uint64_t generati
     }
     size_t n = s->contiguous;
     const uint8_t *b = s->bytes;
-    int status=ready(b,n,s->high);
+    int status=exact?(s->high>exact?-1:n==exact):ready(b,n,s->high);
     if(status<0)return reject(c,s);
     if(!status)return 0;
     s->state = 3;
@@ -104,6 +105,19 @@ int d2k_capture_feed_ready(d2k_capture *c, const d2k_key *key, uint64_t generati
     *hello_len = n;
     *hello_seq = s->seq;
     return 1;
+}
+int d2k_capture_feed_ready(d2k_capture *c,const d2k_key *key,uint64_t generation,
+    uint64_t now,uint32_t seq,uint32_t anchor,int have_anchor,const uint8_t *bytes,
+    size_t len,const uint8_t **hello,size_t *hello_len,uint32_t *hello_seq,d2k_capture_ready ready) {
+    return feed(c,key,generation,now,seq,anchor,have_anchor,bytes,len,hello,hello_len,hello_seq,ready,0);
+}
+int d2k_capture_feed_exact(d2k_capture *c,const d2k_key *key,uint64_t generation,
+    uint64_t now,uint32_t seq,uint32_t anchor,const uint8_t *bytes,size_t len,
+    const uint8_t **data,size_t *data_len,uint32_t *data_seq,size_t exact) {
+    if(!exact || exact>D2K_CAPTURE_BYTES) {
+        *data=NULL;*data_len=0;*data_seq=0;return -1;
+    }
+    return feed(c,key,generation,now,seq,anchor,1,bytes,len,data,data_len,data_seq,NULL,exact);
 }
 
 static int tls_ready(const uint8_t *b,size_t n,size_t high) {

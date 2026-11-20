@@ -110,7 +110,7 @@ export PORTS VOICE_PORTS
 # shellcheck disable=SC1090
 . "$LIB"
 
-UDP="443,$VOICE_PORTS"
+UDP="0:65535"
 T="-m connskip --connskip 30 -m comment --comment d2k-ppe -j PPE"
 TH="-m connskip --connskip 1000000 -m comment --comment d2k-ppe -j PPE"
 
@@ -135,7 +135,7 @@ check "ensure: успех при цели PPE" [ "$rc" = 0 ]
 for fam in v4 v6; do
     check "$fam PREROUTING: TCP исходящее по --dports" \
         grep -qxF -- "-p tcp -m multiport --dports $PORTS $T" "$RULES/$fam.mangle.PREROUTING"
-    check "$fam PREROUTING: UDP 443+голос исходящее по --dports" \
+    check "$fam PREROUTING: UDP включая неизвестные приложения исходящее по --dports" \
         grep -qxF -- "-p udp -m multiport --dports $UDP $T" "$RULES/$fam.mangle.PREROUTING"
     check "$fam FORWARD: TCP исходящее по --dports" \
         grep -qxF -- "-p tcp -m multiport --dports $PORTS $T" "$RULES/$fam.mangle.FORWARD"
@@ -390,6 +390,17 @@ check "сторож спрашивает состояние один раз" [ "
 FAKE_RULES=0 INIT_SCRIPT=$TMP/fake-init HEAL_LOCK=$TMP/heal.lock HEAL_LAST=$TMP/heal.last \
     sh "$ROOT/files/d2k-fw-heal.sh" 2>/dev/null
 check "сторож при снесённой очереди делает reapply (он ставит и разгрузку)" grep -qx reapply "$HEAL_CALLS"
+
+# An explicit owner restriction must still override broad default coverage.
+reset_rules
+targets 1 1
+D2K_PPE_UDP_PORTS=27015 d2k_ppe_ensure
+for fam in v4 v6; do
+    check "$fam explicit UDP restriction retained" \
+        grep -qxF -- "-p udp -m multiport --dports 27015 $T" "$RULES/$fam.mangle.PREROUTING"
+    check "$fam explicit UDP restriction not widened" \
+        sh -c "! grep -qxF -- '-p udp -m multiport --dports 0:65535 $T' '$RULES/$fam.mangle.PREROUTING'"
+done
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

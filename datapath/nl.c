@@ -138,6 +138,9 @@ int d2k_nl_packet(const d2k_nl_msg *m, d2k_nl_pkt *out) {
                 }
             }
             break;
+        case D2K_NFQA_IFINDEX_INDEV:
+            if (vlen >= 4) out->indev = n32(val);
+            break;
         case D2K_NFQA_IFINDEX_OUTDEV:
             if (vlen >= 4) {
                 out->outdev = n32(val);
@@ -306,4 +309,38 @@ size_t d2k_nl_cfg_params(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
     }
     wh32(o, (uint32_t)pos);
     return pos;
+}
+
+size_t d2k_nl_verdict_payload_release(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                                      uint32_t id, uint32_t verdict, const uint8_t *payload,
+                                      size_t len, uint32_t mark, uint32_t bit) {
+    int repeat = bit && verdict == D2K_NF_ACCEPT;
+    size_t n = d2k_nl_verdict_payload(o, cap, queue, seq, id, repeat ? D2K_NF_REPEAT : verdict,
+                                      payload, len);
+    if (!n || !repeat) return n;
+    uint8_t value[4]; wn32(value, mark | bit);
+    n = put_attr(o, cap, n, D2K_NFQA_MARK, value, sizeof value);
+    if (n) wh32(o, (uint32_t)n);
+    return n;
+}
+
+size_t d2k_nl_verdict_release(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                             uint32_t id, uint32_t verdict, uint32_t mark, uint32_t bit) {
+    int repeat = bit && verdict == D2K_NF_ACCEPT;
+    size_t n = d2k_nl_verdict(o,cap,queue,seq,id,repeat ? D2K_NF_REPEAT : verdict);
+    if (!n || !repeat) return n;
+    uint8_t value[4]; wn32(value,mark | bit);
+    n=put_attr(o,cap,n,D2K_NFQA_MARK,value,sizeof value);
+    if (n) wh32(o,(uint32_t)n);
+    return n;
+}
+
+size_t d2k_nl_verdict_mark(uint8_t *o, size_t cap, uint16_t queue, uint32_t seq,
+                           uint32_t id, uint32_t mark) {
+    size_t n = d2k_nl_verdict(o, cap, queue, seq, id, D2K_NF_ACCEPT);
+    if (!n) return 0;
+    uint8_t value[4]; wn32(value, mark);
+    n = put_attr(o, cap, n, D2K_NFQA_MARK, value, sizeof value);
+    if (n) wh32(o, (uint32_t)n);
+    return n;
 }

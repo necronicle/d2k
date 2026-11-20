@@ -7,12 +7,30 @@
 
 static const uint8_t default_blob[620]={0x40};
 static const uint8_t zero_blob[16]={0};
+/* ИНИЦИАЛ, КОТОРЫЙ КОРОБКА ЧИТАЕТ, А СЕРВЕР ОБЯЗАН ОТБРОСИТЬ.
+ *
+ * Правило коробки измерено и опубликовано (NTC.Party «Ограничение HTTP/3»,
+ * ValdikSS 26.05.2022 и bolvan 27.07.2022): пакет считается QUIC Initial,
+ * если длина UDP не меньше 1200, установлен СТАРШИЙ бит первого байта
+ * (длинный заголовок) и байты 1…4 как uint32 BE дают версию QUIC. Про
+ * ФИКСИРОВАННЫЙ бит (0x40) в правиле нет ничего — bolvan приводит ровно такой
+ * пакет, «80 00 00 00 01 00 … 00» на 1200 байт, и он коробкой перехватывается.
+ *
+ * А сервер обязан отбросить его: RFC 9000 §17.3.1 — пакет с нулевым
+ * фиксированным битом не является допустимым пакетом этой версии и ДОЛЖЕН
+ * быть отброшен. Значит эта фальшивка читается коробкой как настоящая и при
+ * этом не заводит серверу соединения: ни гонки с настоящим Initial клиента,
+ * ни нужды топить копию укороченным TTL (а значит и ICMP-риска, поле 04.10,
+ * icmpguard). Этим она отличается от quic5/quic_google/quic_rutracker —
+ * настоящих перехваченных Initial, которым сервер отвечает (поле 24.10.2026,
+ * h3-1024: rutracker.org, nnmclub.to, kinozal.me, lostfilm.tv). */
+static const uint8_t nofix_blob[1200]={0x80,0x00,0x00,0x00,0x01};
 static const char *names[]={"quic5","quic_google","quic_rutracker","fake_default_quic",
-                           "0x00000000000000000000000000000000"};
+                           "0x00000000000000000000000000000000","quic_initial_nofix"};
 const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **name) {
-    static const uint8_t *const bytes[]={quic_donor_blob_0,quic_donor_blob_1,quic_donor_blob_2,default_blob,zero_blob};
-    static const size_t sizes[]={sizeof quic_donor_blob_0,sizeof quic_donor_blob_1,sizeof quic_donor_blob_2,sizeof default_blob,sizeof zero_blob};
-    if(index>=5 || !len) return NULL;
+    static const uint8_t *const bytes[]={quic_donor_blob_0,quic_donor_blob_1,quic_donor_blob_2,default_blob,zero_blob,nofix_blob};
+    static const size_t sizes[]={sizeof quic_donor_blob_0,sizeof quic_donor_blob_1,sizeof quic_donor_blob_2,sizeof default_blob,sizeof zero_blob,sizeof nofix_blob};
+    if(index>=D2K_QUIC_BLOBS || !len) return NULL;
     *len=sizes[index]; if(name) *name=names[index]; return bytes[index];
 }
 
@@ -142,8 +160,15 @@ static int ask(d2k_quic_arm_context *c, d2k_quic_arm *r, int blob, int copies,
 d2k_quic_arm d2k_quic_original_arms(d2k_quic_arm_context *c) {
     d2k_quic_arm r; memset(&r,0,sizeof r); r.kind=D2K_QA_NOT_FOUND; r.original=1;
     int chosen=-1, measured=0;
-    /* 1. All original intrinsic fakes, in original order. */
-    for(int b=0;b<5;b++) {
+    /* 1. Intrinsic fakes, донорский порядок, затем наша гипотеза
+       quic_initial_nofix — ПОСЛЕДНЕЙ. Поле 25.10.2026 (h3e-1): на этой линии
+       она дала 0/3 по семи целям и 1/3 по восьмой — коробка за Initial с
+       погашенным фиксированным битом настоящий Initial не пропускает. Вопрос
+       оставлен (на другой коробке правило может отличаться), но стоит в конце:
+       когда донорская приманка работает, он не стоит ни одного зонда. */
+    static const int step1[D2K_QUIC_BLOBS]={0,1,2,3,4,5};
+    for(int i=0;i<D2K_QUIC_BLOBS;i++) {
+        int b=step1[i];
         /* 0x00…0 ×1 — ровно вопрос «остаточное разрешение»; на него уже есть
            решающее «нет» (задача 40), второй раз он исхода не изменит. */
         if(b==4 && c && c->benign_answered) continue;

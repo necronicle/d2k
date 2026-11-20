@@ -25,8 +25,10 @@ builds/*
 /panel/test_header_deadline
 /panel/test_response_deadline
 /panel/test_status_cache
+/panel/test_policies
+/panel/test_policy_review
 
-# Планы реализации — локальные, как и в z2k: публикуется спека, а не план.
+# Планы реализации остаются локальными; требования публикуются отдельно.
 docs/superpowers/
 # Датапат: белый список вместо чёрного.
 #
@@ -49,6 +51,10 @@ datapath/*
 core/*
 !core/*.c
 !core/*.h
+!core/doh_h2.inc
+!core/dns_question_wire.inc
+!core/sched_dns.inc
+!core/dns_journal.inc
 !core/Makefile
 !core/include/
 # Профили холодного старта ОБЯЗАНЫ попасть в репозиторий: без них на другой
@@ -95,3 +101,20 @@ __pycache__/
 /core/test_diagnostics
 /core/test_diagnostics_runtime
 /panel/test_diagnostics
+# Compiler outputs and local tooling. Source and protocol registry data remain visible.
+/panel/test_observations
+!core/trusted_tls/
+core/trusted_tls/*
+!core/trusted_tls/*.c
+!core/trusted_tls/*.h
+!core/trusted_tls/Makefile
+!core/data/
+*.o
+*.a
+*.dSYM/
+/synthesis/test_*
+!/synthesis/test_*.c
+!/synthesis/test_*.h
+/model/test_*
+!/model/test_*.c
+!/model/test_*.h

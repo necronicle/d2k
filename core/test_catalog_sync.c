@@ -60,6 +60,51 @@ int main(void) {
             failed = 1;
         }
     }
+    for (size_t bi=0;bi<c.n_boxes;bi++) {
+        for (size_t j=0;j<c.boxes[bi].n_binds;j++) {
+            d2k_cat_binding *bd=&c.boxes[bi].binds[j];
+            strcpy(bd->kind,"service");
+            strcpy(bd->target,bd->family==6?"2001:db8::1":"192.0.2.1");
+            strcpy(bd->plan_id,"plan-test");
+            bd->server_port=443;bd->enabled=1;bd->level=3;
+        }
+    }
+    for (int mode=0;mode<3;mode++) {
+        d2k_cat_binding *newest=&c.boxes[0].binds[0];
+        newest->server_port=mode==1?8443:443;
+        newest->level=mode==2?0:3;
+        report[0]=0;
+        d2k_sched_sync(s);
+        for(int i=0;d2k_sched_sync_pending(s)&&i<10;i++) d2k_sched_sync_step(s);
+        if (!strstr(report,mode==1?"привязкам: 4":"привязкам: 3")) {
+            fprintf(stderr,"catalog-sync: service context collision or weak authority (%d): %s\n",mode,report);
+            failed=1;
+        }
+    }
+    /* Legacy RAW address authority has no measured port. Keep its candidate,
+       but do not reinstall it across every service after controller restart. */
+    for (size_t bi = 0; bi < c.n_boxes; bi++)
+        for (size_t j = 0; j < c.boxes[bi].n_binds; j++) c.boxes[bi].binds[j].enabled = 0;
+    for (unsigned tr = 6; tr <= 17; tr += 11) {
+        d2k_cat_binding *bd = &c.boxes[0].binds[0];
+        d2k_cat_plan *plan = &c.boxes[0].plans[0];
+        free(plan->text);
+        plan->text = strdup(tr == 6 ?
+            "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\norder forward\n" :
+            "d2k-plan 1 1\nid 00000000000000000000000000000000\nproto udp voice\norder forward\n");
+        bd->enabled = 1; bd->level = 3; bd->transport = tr; bd->shape = 8;
+        for (unsigned service = 0; service < 2; service++) {
+            strcpy(bd->kind, service ? "service" : "addr"); bd->server_port = service ? 443 : 0;
+            report[0] = 0;
+            d2k_sched_sync(s);
+            for (int i = 0; d2k_sched_sync_pending(s) && i < 10; i++) d2k_sched_sync_step(s);
+            if (!strstr(report, service ? "привязкам: 1" : "привязкам: 0") ||
+                !bd->enabled || !plan->enabled) {
+                fprintf(stderr, "catalog-sync: RAW scope or candidate retention failed (%u/%u): %s\n", tr, service, report);
+                failed = 1;
+            }
+        }
+    }
     d2k_sched_free(s); d2k_catalog_free(&c); close(sv[0]); close(sv[1]);
     if (failed) return 1;
     puts("catalog-sync: newest exact context, TLS versions and families preserved");

@@ -23,6 +23,40 @@ static uint16_t rd16(const uint8_t *p) {
 static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
+int d2k_stun_parse_error(const uint8_t *p,size_t n,const uint8_t *txid,unsigned *code) {
+    if(code)*code=0;
+    if(!p || !txid || !code || n<D2K_STUN_HDR_LEN || rd16(p)!=0x0111 ||
+       rd32(p+4)!=STUN_MAGIC || memcmp(p+8,txid,D2K_STUN_TXID_LEN))return -1;
+    size_t attrs=rd16(p+2);
+    if((attrs&3u) || attrs!=n-D2K_STUN_HDR_LEN)return -1;
+    unsigned found=0;
+    for(size_t at=D2K_STUN_HDR_LEN;at<n;) {
+        if(n-at<4)return -1;
+        unsigned type=rd16(p+at);size_t len=rd16(p+at+2);
+        size_t step=4+((len+3u)&~(size_t)3u);
+        if(step>n-at)return -1;
+        if(type==0x0009) {
+            if(len<4)return -1;
+            unsigned group=p[at+6]&7u,number=p[at+7];
+            if(group<3 || group>6 || number>99)return -1;
+            unsigned value=group*100+number;
+            if(found && found!=value)return -1;
+            found=value;
+        }
+        if(type==0x8028) {
+            if(len!=4 || at+step!=n)return -1;
+            uint32_t crc=UINT32_MAX;
+            for(size_t i=0;i<at;i++) {
+                crc^=p[i];
+                for(unsigned bit=0;bit<8;bit++)crc=(crc>>1)^((crc&1u)?UINT32_C(0xedb88320):0);
+            }
+            if((~crc^UINT32_C(0x5354554e))!=rd32(p+at+4))return -1;
+        }
+        at+=step;
+    }
+    if(!found)return -1;
+    *code=found;return 0;
+}
 
 size_t d2k_stun_request(uint8_t *out, size_t cap, uint8_t txid[D2K_STUN_TXID_LEN]) {
     if (!out || !txid || cap < D2K_STUN_HDR_LEN) { return 0; }
@@ -96,7 +130,19 @@ int d2k_stun_parse_response(const uint8_t *p, size_t n,
     if (memcmp(p + 8, txid, D2K_STUN_TXID_LEN) != 0) { return -1; }
 
     size_t attrs = rd16(p + 2);
-    if (D2K_STUN_HDR_LEN + attrs > n) { return -1; }
+    if ((attrs & 3u) || D2K_STUN_HDR_LEN + attrs > n) { return -1; }
+
+    /* Validate the entire attribute framing before publishing an address.
+       A matching transaction ID or an early valid XOR-MAPPED-ADDRESS does
+       not make a truncated later attribute a valid response. */
+    size_t off = 0;
+    while (off < attrs) {
+        if (attrs - off < 4) { return -1; }
+        size_t len = rd16(p + D2K_STUN_HDR_LEN + off + 2);
+        size_t step = 4 + ((len + 3u) & ~(size_t)3u);
+        if (step > attrs - off) { return -1; }
+        off += step;
+    }
 
     const uint8_t *b = p + D2K_STUN_HDR_LEN;
     size_t left = attrs;

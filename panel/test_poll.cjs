@@ -14,7 +14,7 @@ async function main() {
   });
   const document = {
     hidden: false, readyState: 'complete', body: stub(),
-    getElementById: () => stub(), createElement: () => stub(), createTextNode: () => stub(),
+    getElementById: id => id === "policy-form" ? null : stub(), createElement: () => stub(), createTextNode: () => stub(),
     querySelector: () => null,
     querySelectorAll: () => [],
     addEventListener(name, fn) { if (name === 'visibilitychange') visibility = fn; },
@@ -58,4 +58,47 @@ async function main() {
   assert.equal(updateCalls, 2, 'returning to the panel refreshes updates at once');
   console.log('panel polling: overlap, timeout and visibility passed');
 }
-main().catch(e => { console.error(e); process.exitCode = 1; });
+async function verifyPolicyConfirmation(requested, saved) {
+  const { App } = require('../internal/web/assets/panel.js');
+  const nodes = new Map();
+  const doc = {
+    getElementById(id) {
+      if (!nodes.has(id)) nodes.set(id, { setAttribute() {}, appendChild() {} });
+      return nodes.get(id);
+    },
+    createElement() { return {}; }
+  };
+  const timers = [];
+  const app = new App(doc, { setTimeout(fn) { timers.push(fn); } });
+  const select = app.$('policy-select');
+  select.value = requested;
+  let polls = 0;
+  app.updateRequest = async (path, post, headers) => {
+    assert.equal(path, '/api/policies');
+    if (post) {
+      assert.equal(headers['X-D2K-Policy'], requested);
+      return { ok: true };
+    }
+    const running = polls++ === 0;
+    return { ok: true, data: {
+      policies: [{ id: 'Policy7', name: 'Work' }], controls_enabled: true,
+      selected_id: running ? requested : saved, applied: !running,
+      apply_state: running ? 'running' : 'done'
+    } };
+  };
+  await app.applyPolicy();
+  for (let i = 0; i < 2; i++) {
+    assert.equal(timers.length, 1);
+    timers.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(app.policyBusy, false);
+  assert.equal(select.value, saved, 'show the policy the engine actually applied');
+  assert.equal(app.$('policy-status').textContent.includes('Выбранная политика применена'), requested === saved);
+}
+main().then(async () => {
+  for (const requested of ['', 'Policy7']) {
+    for (const saved of ['', 'Policy7']) await verifyPolicyConfirmation(requested, saved);
+  }
+  console.log('policy confirmation: submitted and applied IDs checked');
+}).catch(e => { console.error(e); process.exitCode = 1; });

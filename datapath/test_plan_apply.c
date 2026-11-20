@@ -166,6 +166,17 @@ static const uint8_t plan_fake_before[] = {
     0x01, 0x03, 0x00, 0x01, 0x00
 };
 
+/* РАЗРЕЗ ЗА ПРЕДЕЛАМИ СЕГМЕНТА. Один разрез, ANCHOR_PAYLOAD_START
+   (anchor=0) со смещением 1500 (0x05DC) — то есть измеренный на приветствии,
+   которое целиком уместилось в один сегмент. Нужен для одной проверки: на
+   более коротких пришедших байтах такой план обязан быть ОТВЕРГНУТ, а не
+   исполнен без своего разреза. */
+static const uint8_t plan_split_far[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
+    0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x05, 0xDC,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+
 /* Разрез по началу SNI и ничего больше. */
 static const uint8_t plan_split_sni[] = {
     'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 2,
@@ -560,6 +571,13 @@ static void test_own_after_fakes(void) {
         CHECK(d2k_plan_apply(p, &f, &in, &a) == 0 && a.n == 0 && a.fate == D2K_ORIG_PASS,
               "no fakes: nothing races the original, the kernel releases it");
         d2k_actions_free(&a);
+        in.emit_original=1;
+        CHECK(d2k_plan_apply(p,&f,&in,&a)==0 && a.n==1 && a.fate==D2K_ORIG_DROP,
+              "raw owner materializes unchanged original");
+        if(a.n==1)CHECK(a.v[0].seq==in.seq && a.v[0].len==in.payload_len &&
+                       !memcmp(a.v[0].bytes,in.payload,in.payload_len),
+                       "raw original has exact bytes and sequence");
+        d2k_actions_free(&a);
         d2k_plan_free(p);
     }
 }
@@ -721,6 +739,49 @@ static void test_pinned_input_prefix(void) {
     }
 }
 
+/* ПЛАН БЕЗ СВОЕГО РАЗРЕЗА — ЭТО ДРУГАЯ ПРОГРАММА (24.10.2026).
+ *
+ * split_points пропускает разрез за нагрузкой молча («разрез вне нагрузки не
+ * режет ничего»), и до этой правки план исполнялся без разреза и возвращался
+ * ПРИМЕНЁННЫМ. Так выглядит поток браузера: приветствие Chrome 1919–2015 байт
+ * при MSS 1388 уезжает в два сегмента (issue 28), и числовой разрез,
+ * измеренный на одном сегменте собственного зонда, в голову клиента не
+ * попадает. Коробка режет по-прежнему, а контроллер видит applied=1.
+ *
+ * Отказ — только когда не попал НИ ОДИН разрез: план, часть разрезов
+ * которого законно не попала, по-прежнему исполняется. */
+static void test_split_beyond_segment_refused(void) {
+    d2k_plan *p = NULL;
+    char err[160];
+    CHECK(d2k_plan_load(plan_split_far, sizeof plan_split_far, &p, err, sizeof err) == 0,
+          "план с далёким разрезом не загрузился");
+    if (!p) { return; }
+    uint8_t head[1388];
+    memset(head, 0x41, sizeof head);
+    d2k_actions a = {0};
+    d2k_pkt in = {0};
+    in.payload = head;
+    in.payload_len = sizeof head;   /* первый сегмент: разрез 1500 за его концом */
+    in.seq = 100;
+    CHECK(d2k_plan_apply(p, NULL, &in, &a) != 0,
+          "план без единого попавшего разреза применён — исполнилась другая программа");
+    CHECK(a.refuse_why && strstr(a.refuse_why, "ни один измеренный разрез"),
+          "отказ не назван: по журналу не отличить его от «плана нет»");
+    d2k_actions_free(&a);
+
+    /* Те же байты целиком: разрез попадает, и план исполняется как мерили. */
+    uint8_t whole[1600];
+    memset(whole, 0x41, sizeof whole);
+    memset(&a, 0, sizeof a);
+    in.payload = whole;
+    in.payload_len = sizeof whole;
+    CHECK(d2k_plan_apply(p, NULL, &in, &a) == 0,
+          "на целых байтах тот же план обязан исполниться");
+    CHECK(a.n == 2, "разрез на целых байтах дал не два куска");
+    d2k_actions_free(&a);
+    d2k_plan_free(p);
+}
+
 int main(void) {
     d2k_plan *p = NULL;
     char err[160];
@@ -729,6 +790,7 @@ int main(void) {
     d2k_actions a;
     d2k_pkt in;
 
+    test_split_beyond_segment_refused();
     test_tls_fake_modifiers();
     test_refusal_names_reason();
     test_pinned_input_prefix();

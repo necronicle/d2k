@@ -69,7 +69,7 @@ tick() {
     prepare_runtime || return 1
     # Enumerate exact owned names: never rotate unrelated or custom logs.
     for name in d2kd.log d2kc.log panel.log telegram.log d2khttp.log \
-                instagram-dns.log instagram-dns-scheduler.log update.log; do
+                instagram-dns.log instagram-dns-scheduler.log update.log shadow.log shadow-daemon.log; do
         rotate_one "$LOG/$name"
     done
 }

@@ -11,9 +11,18 @@
  * сдвиг назад сохраняет цепочку пробирования и не оставляет мусора вовсе.
  */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "d2k_track.h"
+
+/* All table mutations belong to the single packet-loop thread. Serial
+   survives slot reuse; the table epoch separates process/table lifetimes. */
+static uint64_t next_incarnation;
+static uint64_t fresh_incarnation(void) {
+    if (next_incarnation == UINT64_MAX) return 0;
+    return ++next_incarnation;
+}
 
 int d2k_key_make(d2k_key *k, uint8_t proto, const uint8_t *src_ip4, const uint8_t *dst_ip4,
                  const uint8_t *src_port_be, const uint8_t *dst_port_be) {
@@ -74,6 +83,7 @@ int d2k_key_make_addr(d2k_key *k, uint8_t proto,
 }
 
 struct d2k_table {
+    uint8_t flow_epoch[16];
     d2k_flow *slots;
     uint8_t  *state;
     size_t    cap;  /* степень двойки */
@@ -121,6 +131,12 @@ d2k_table *d2k_track_new(size_t capacity) {
     d2k_table *t = calloc(1, sizeof *t);
     if (!t) {
         return NULL;
+    }
+    FILE *entropy = fopen("/dev/urandom", "rb");
+    if (entropy) {
+        if (fread(t->flow_epoch, 1, sizeof t->flow_epoch, entropy) != sizeof t->flow_epoch)
+            memset(t->flow_epoch, 0, sizeof t->flow_epoch);
+        fclose(entropy);
     }
     t->cap = round_pow2(capacity);
     t->slots = calloc(t->cap, sizeof *t->slots);
@@ -219,6 +235,8 @@ d2k_flow *d2k_track_get(d2k_table *t, const d2k_key *k, uint64_t now_ns) {
         t->used++;
         memset(&t->slots[s], 0, sizeof t->slots[s]);
         t->slots[s].key = *k;
+        memcpy(t->slots[s].flow_epoch, t->flow_epoch, sizeof t->flow_epoch);
+        t->slots[s].incarnation = fresh_incarnation();
         t->slots[s].in_use = 1;
         t->slots[s].first_ns = now_ns;
         t->slots[s].last_ns = now_ns;
@@ -235,6 +253,8 @@ void d2k_track_new_connection(d2k_flow *f) {
     d2k_flow keep = *f;
     memset(f, 0, sizeof *f);
     f->key = keep.key;
+    memcpy(f->flow_epoch, keep.flow_epoch, sizeof f->flow_epoch);
+    f->incarnation = fresh_incarnation();
     f->in_use = keep.in_use;
     f->first_ns = keep.first_ns;
     f->last_ns = keep.last_ns;
@@ -292,6 +312,7 @@ size_t d2k_track_expire(d2k_table *t, uint64_t now_ns, uint64_t idle_ns,
            огромной — истечение молча снесло бы ВСЮ таблицу. Часы обязаны быть
            монотонными, но обязанность и гарантия — разные вещи. */
         while (t->state[s] == SLOT_USED &&
+               !t->slots[s].late_watch &&
                now_ns >= t->slots[s].last_ns &&
                now_ns - t->slots[s].last_ns >= idle_ns) {
             if (on_expire) {

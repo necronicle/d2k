@@ -705,6 +705,21 @@ static void send_ack_ok(int fd, uint16_t cmd) {
     send_event_frame(fd, D2K_EV_ACK, NULL, 0, NULL, 0, 0, rest, sizeof rest);
 }
 
+/* Приветствие — первое, что настоящий d2kd (и стенд ctlprobe) шлёт новому
+ * контроллеру: версия провода, предел посылки, выпуск. Поддельный сокет обязан
+ * здороваться так же, иначе он проверяет не того d2kask, что идёт в поле
+ * (d2kask сверяет пару, как d2kc; задание 02, 28.10.2026). */
+static void send_greeting(int fd) {
+    uint8_t rest[7 + 64];
+    size_t idlen = strlen(D2K_RELEASE_ID);
+    if (idlen > 64) { idlen = 64; }
+    memset(rest, 0, sizeof rest);
+    rest[0] = (uint8_t)(D2K_CTL_PROTO_VERSION >> 8); rest[1] = (uint8_t)D2K_CTL_PROTO_VERSION;
+    rest[4] = 0x05; rest[5] = 0xdc; /* предел 1500 */
+    rest[6] = (uint8_t)idlen; memcpy(rest + 7, D2K_RELEASE_ID, idlen);
+    send_event_frame(fd, D2K_EV_PROTO, NULL, 0, NULL, 0, 0, rest, 7 + idlen);
+}
+
 static const uint8_t FAKECTL_LOOPBACK4[4] = { 127, 0, 0, 1 };
 
 /* seen_types: бит appdata — (1<<(23-20))=0x08; бит "только рукопожатие" —
@@ -789,6 +804,7 @@ static void *fakectl_accept_and_run(void *arg) {
        must outlive that wait and scheduling overhead, not race it. */
     struct timeval tv = {15, 0};
     (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    send_greeting(cfd);
     fakectl_args fa;
     fa.ctl_fd = cfd; fa.ps = a->ps; fa.target_port = a->target_port;
     fa.outcomes = a->outcomes; fa.n = a->n;

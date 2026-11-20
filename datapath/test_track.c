@@ -161,6 +161,27 @@ int main(void) {
         d2k_track_free(s);
     }
 
+    {
+        d2k_table *s = d2k_track_new(16);
+        d2k_key held = mk(4101), ordinary = mk(4102);
+        d2k_flow *f = d2k_track_get(s, &held, 1000);
+        f->late_watch = 1;
+        d2k_track_get(s, &ordinary, 1000);
+        int expired = 0;
+        CHECK(d2k_track_expire(s, 121000, 120000, count_expired, &expired) == 1,
+              "active observation lost its flow during TCP retry gap");
+        f = d2k_track_find(s, &held);
+        CHECK(f != NULL && expired == 1, "active flow expired or ordinary flow retained");
+        if (f) {
+            CHECK(f->last_ns == 1000, "observation fabricated packet activity");
+            f->late_watch = 0;
+            CHECK(d2k_track_expire(s, 121001, 120000, count_expired, &expired) == 1,
+                  "released observation retained idle flow");
+        }
+        CHECK(d2k_track_count(s) == 0, "released flow leaked");
+        d2k_track_free(s);
+    }
+
     /* --- поиск без заведения --------------------------------------------- */
     d2k_key nope = mk(9999);
     CHECK(d2k_track_find(t, &nope) == NULL, "найден несуществующий поток");

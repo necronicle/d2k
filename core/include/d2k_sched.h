@@ -53,18 +53,89 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "../../synthesis/verification_status.h"
 
 #include "d2k_catalog.h"
 #include "d2k_link.h"
 #include "d2k_verdict.h"
 #include "d2k_quicprobe.h"
 #include "d2k_verify.h"
+#include "d2k_dns_plain.h"
+#include "d2k_dns_capture.h"
 #include "d2k_volume.h"
 #include "d2k_volprops.h"
 #include "d2k_voice.h"
+#include "d2k_stunprobe.h"
 
 #include "d2k_diagnostics.h"
 typedef struct d2k_sched d2k_sched;
+/* Passive transport observation, only a source of a content hypothesis. */
+typedef struct {
+    char name[256];
+    uint8_t epoch[16],low_ip[16],high_ip[16],family,transport;
+    uint16_t low_port,high_port;
+    uint64_t incarnation;
+    uint32_t bytes;
+} d2k_application_control;
+typedef struct {
+    uint64_t search_id;
+    char target[256],ip[64],resource[512],ech_origin[256];
+    uint16_t port;
+    uint8_t family,transport,shape,by_addr;
+    int doh,ech;
+    unsigned doh_failure_query; /* observed ordinal: question depth, not model evidence */
+    d2k_application_control control;
+} d2k_application_request;
+/* Worker-thread snapshot only; copies strings and never starts a probe.
+ * Returns 1 for this active task, 0 outside a task/after stop, -1 bad input.
+ * Identifies protocol context, NOT a blocking diagnosis or permission to
+ * promote a candidate. Unknown resources remain empty, including IP targets. */
+int d2k_sched_application_request(d2k_application_request *);
+/* Owned modern DoH synthesis. 0: current model exhausted, permit emergency
+ * fallback; 1: result owned by synthesizer (including local uncertainty).
+ * Installed before workers start. No callback means legacy behavior. */
+typedef int (*d2k_application_synthesis_fn)(const d2k_application_request *,size_t,int,
+    uint32_t,const volatile sig_atomic_t *,d2k_vres *);
+extern d2k_application_synthesis_fn d2k_sched_application_synthesis_hook;
+typedef struct {
+    uint64_t generation,search_id;
+    const char *target,*ip,*program,*resource;
+    int doh;
+    uint16_t port;
+    uint8_t by_addr,family,transport,shape;
+    uint8_t trial_id[D2K_TRIAL_ID_LEN],plan_id[D2K_PLAN_ID_LEN];
+    struct {
+        uint8_t a_ip[16],b_ip[16],family,transport;
+        uint16_t a_port,b_port;
+    } flow;
+    int applied,verification_available,events_lost;
+    unsigned execution_refusal;
+    d2k_ver_level level;
+    int status,body_complete,local_refusal,local_limit,unsupported;
+    int challenge,budget,budget_uncountable;
+    uint64_t body_bytes;
+    unsigned budget_need,budget_packets,budget_requests,doh_replies;
+} d2k_synthesis_feedback;
+/* Retirement observation, not a success verdict. No callback for legacy
+ * generation 0. Borrowed strings valid during callback only; copy if needed.
+ * Must not mutate/reenter scheduler. APPLIED and verifier evidence remain
+ * separate, including unknown/cancelled trials. No socket ownership passed. */
+typedef void (*d2k_synthesis_observer)(void *,const d2k_synthesis_feedback *);
+void d2k_sched_synthesis_observer(d2k_sched *,d2k_synthesis_observer,void *);
+/* Called by the active measurement worker. On 1, task owns ctx until reset or
+   shutdown; on 0, caller still owns it. Existing continuation is never replaced.
+   Feedback runs on controller thread after worker completion, only for the
+   same generation; it must not reenter/mutate scheduler. */
+typedef int (*d2k_synthesis_continuation_feedback)(void *,const d2k_synthesis_feedback *,
+    d2k_verification_status);
+int d2k_sched_synthesis_retain(uint64_t generation,void *ctx,void (*release)(void *),
+    d2k_synthesis_continuation_feedback feedback);
+
+/* Measurement worker only: transfer retained context to caller when release
+   matches its type. Changed application resource releases stale context.
+   Caller must recheck transport/input parameters before resuming. */
+void *d2k_sched_synthesis_take(void (*release)(void *),uint64_t *generation);
+
 void d2k_sched_diagnostics(d2k_sched *,d2k_diag_observer,void *);
 void d2k_sched_diagnostic_counts(d2k_sched *,d2k_diag_counts *);
 d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
@@ -90,11 +161,44 @@ d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
  * Измеритель, который отмену не умеет, просто не читает указатель — и тогда
  * join честно ждёт его столько, сколько тот идёт. Оба случая видны в коде, ни
  * один не притворяется другим. */
+/* ДОПОЛНЕНИЯ К ПОЛНОМУ ПРОГОНУ — ОДНОЙ СТРУКТУРОЙ, А НЕ ВАРИАНТАМИ КРЮЧКА.
+ *
+ * До 23.10.2026 каждое новое дополнение заводило свой крючок: прогон с
+ * ответом базы, прогон с белым именем, прогон с тем и другим — четыре
+ * сигнатуры и каскад выбора в планировщике. Пятое дополнение (знание о
+ * коробке) потребовало бы восьми. Дополнения ортогональны друг другу, поэтому
+ * едут вместе, а крючок остаётся один.
+ *
+ * NULL у поля (или нулевая длина) означает «дополнения нет», и прогон идёт
+ * как без него. Сам указатель extra может быть NULL — у базового вопроса
+ * дополнений не бывает. */
+typedef struct {
+    /* Белое имя сети целым ClientHello для вопроса «приветствие под меткой
+       времени»: имя из каталога, не из контроля. len == 0 — имени нет. */
+    d2k_hello            white;
+    const char          *response_probe_name; /* recent direct exchange on this family */
+    /* Ответ уже заданного базового вопроса — тот же вход, без повторного
+       опроса. NULL — прогон спрашивает базу сам. */
+    const d2k_base_seed *seed;
+    /* Знание о коробке из каталога: вопрос, чей записанный ответ означает
+       промах приёма, не задаётся (§0.1). NULL — знания нет. */
+    const d2k_box_props *known;
+    /* ОПРОВЕРГНУТЫЕ ПРИЁМЫ — ИМЕНА, КОТОРЫЕ ОПРОС БОЛЬШЕ НЕ ПРЕДЛАГАЕТ.
+       Опрос кончается на ПЕРВОМ прошедшем вопросе, и его приём становится
+       планом. Если план потом не подтвердился на применённом потоке, вопрос
+       всё равно остаётся отвеченным «да» — спрашивать его заново значит
+       получить тот же план. Имя кладётся сюда, и продолжение опроса идёт с
+       следующего вопроса. NULL/0 — опровергнутых нет. */
+    const char         (*refuted)[64];
+    int                  n_refuted;
+} d2k_sched_tcp_extra;
+
 typedef d2k_vres (*d2k_sched_tcp_fn)(const char *ip, uint16_t port,
                                      d2k_hello trigger, d2k_hello control,
                                      uint32_t mark, int repeats,
                                      uint32_t gap_us, uint32_t wait_ms,
-                                     const volatile sig_atomic_t *stop);
+                                     const volatile sig_atomic_t *stop,
+                                     const d2k_sched_tcp_extra *extra);
 typedef d2k_vres (*d2k_sched_quic_fn)(const char *ip, uint16_t port, const char *sni,
                                       d2k_hello trigger, d2k_hello control,
                                       uint32_t mark, d2k_quic_arm *arm);
@@ -158,6 +262,7 @@ typedef d2k_ver_result (*d2k_sched_ver_fn)(int use_fd, const char *ip, uint16_t 
                                            int deadline_ms, size_t hello_wire,
                                            uint8_t client_shape);
 extern d2k_sched_ver_fn  d2k_sched_ver_hook;
+extern d2k_sched_ver_fn  d2k_sched_preflight_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_ver_hook;
 extern d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook;
 /* Зонд с ALPN КЛИЕНТА для не-HTTP протокола (задача 37, F3): по умолчанию
@@ -169,6 +274,11 @@ typedef d2k_ver_result (*d2k_sched_alpn_ver_fn)(int use_fd, const char *ip, uint
                                                 size_t hello_wire,
                                                 const uint8_t *alpn_list, size_t alpn_len);
 extern d2k_sched_alpn_ver_fn d2k_sched_alpn_ver_hook;
+/* Зонд рукопожатия TLS 1.2 без имени (этап 15): по умолчанию
+ * d2k_verify_probe12_handshake_on; для адресной TCP-цели формы LEGACY. */
+typedef d2k_ver_result (*d2k_sched_ver12hs_fn)(int use_fd, const char *ip, uint16_t port,
+                                               const char *sni, int deadline_ms, size_t hello_wire);
+extern d2k_sched_ver12hs_fn d2k_sched_ver12hs_hook;
 typedef d2k_ver_result (*d2k_sched_path_ver_fn)(int, const char *, uint16_t,
     const char *, int, size_t, int, int, uint32_t, const char *);
 extern d2k_sched_path_ver_fn d2k_sched_path_ver_hook;
@@ -186,38 +296,6 @@ extern d2k_sched_quic_fn d2k_sched_quic_hook;
  * полный прогон, который затем идёт ровно как прежде. NULL (умолчание) — шага
  * нет: прежнее дерево (core/verdict.c) базового вопроса отдельно не умеет. */
 extern d2k_sched_tcp_fn  d2k_sched_tcp_base_hook;
-/* Полный прогон, берущий ответ уже заданного базового вопроса (seed — тот же
- * вход) вместо повторного опроса. NULL — прогон спрашивает базу сам. */
-typedef d2k_vres (*d2k_sched_tcp_seeded_fn)(const char *ip, uint16_t port,
-                                            d2k_hello trigger, d2k_hello control,
-                                            uint32_t mark, int repeats,
-                                            uint32_t gap_us, uint32_t wait_ms,
-                                            const volatile sig_atomic_t *stop,
-                                            const d2k_base_seed *seed);
-extern d2k_sched_tcp_seeded_fn d2k_sched_tcp_seeded_hook;
-/* ПОЛНЫЙ ПРОГОН С БЕЛЫМ ИМЕНЕМ СЕТИ ПРИМАНКОЙ (поле 10.10.2026). Тот же
- * прогон, что d2k_sched_tcp_hook, плюс белое имя сети (целый ClientHello) для
- * вопроса «приветствие под меткой времени»: имя — из каталога, не из контроля,
- * а сигнатуру основного крючка менять нельзя, поэтому отдельный крючок.
- * NULL — имя не известно, зовётся обычный крючок (вопрос не задаётся). */
-typedef d2k_vres (*d2k_sched_tcp_white_fn)(const char *ip, uint16_t port,
-                                           d2k_hello trigger, d2k_hello control,
-                                           d2k_hello white, uint32_t mark, int repeats,
-                                           uint32_t gap_us, uint32_t wait_ms,
-                                           const volatile sig_atomic_t *stop);
-extern d2k_sched_tcp_white_fn d2k_sched_tcp_white_hook;
-/* ПОЛНЫЙ ПРОГОН С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (поле 10.10.2026). У целей
- * семейства C профильный замер ловит ClientHello клиента и идёт SEEDED
- * (снятыми байтами), а seeded-крючок приманки не нёс — составной ECH-вопрос
- * не задавался. Этот крючок несёт И ответ базы (seed), И ECH-приманку, чтобы
- * вопрос задавался и на seeded-пути. NULL — зовётся обычный seeded-крючок. */
-typedef d2k_vres (*d2k_sched_tcp_seeded_white_fn)(const char *ip, uint16_t port,
-                                                  d2k_hello trigger, d2k_hello control,
-                                                  d2k_hello white, uint32_t mark, int repeats,
-                                                  uint32_t gap_us, uint32_t wait_ms,
-                                                  const volatile sig_atomic_t *stop,
-                                                  const d2k_base_seed *seed);
-extern d2k_sched_tcp_seeded_white_fn d2k_sched_tcp_seeded_white_hook;
 /* ПРИНИМАЕТ ЛИ АДРЕС ДАННЫЕ (задача 54, fix round 1 I2). Перепроверка
  * адреса, у которого есть вердикт address, начинается с этого вопроса ДО
  * любого зонда с триггером: один нейтральный байт, ожидание подтверждения TCP
@@ -247,11 +325,18 @@ extern d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook;
  * "question". Вне рабочего потока планировщика (CLI, тесты измерителя)
  * вызов ничего не делает. Не влияет ни на вердикт, ни на бюджет кандидатов. */
 void d2k_sched_progress_note(const char *question, int pass, int fail);
+#include "d2k_run_cache.h"
+d2k_run_cache *d2k_sched_measure_cache(void);
+void d2k_sched_measure_trace(const char *line);
 
 /* Голосовой измеритель блокирует на сетевых ответах и запускается
  * асинхронно; крючок позволяет проверить scheduler без сети. */
 typedef d2k_voice_res (*d2k_sched_voice_fn)(const d2k_voice_opt *opt);
 extern d2k_sched_voice_fn d2k_sched_voice_hook;
+typedef d2k_stun_probe_res (*d2k_sched_stun_fn)(const d2k_stun_probe_opt *opt);
+extern d2k_sched_stun_fn d2k_sched_stun_hook;
+typedef d2k_stun_probe_res (*d2k_sched_stun_run_fn)(d2k_stun_socket *socket);
+extern d2k_sched_stun_run_fn d2k_sched_stun_run_hook;
 
 /* HTTPS RR с ECHConfig (умолчание d2k_ech_resolve: один UDP-запрос, ответ
  * ждётся не дольше 1,5 с). По нему поиск с ECH offer отличает настоящий ECH
@@ -309,6 +394,25 @@ int d2k_sched_meminfo_parse(const char *text, uint64_t *avail_kb, uint64_t *tota
  * датапатом. Владения ни тем, ни другим НЕ берёт: каталог переживает
  * планировщик (его пишет на диск вызывающий, он же решает когда — см.
  * d2k_catalog_save), связь закрывает тот, кто открыл. */
+int d2k_sched_force_load(d2k_sched *s, const char *path);
+int d2k_sched_doh_load(d2k_sched *s, const char *path);
+/* Main-loop only. Merge configured DoH with owner additions and the router's
+ * own numeric address observations. Invalid/incomplete files keep the old
+ * registry; unresolved identities wait without lookup/provider substitution. */
+int d2k_sched_doh_discover(d2k_sched *,const char *configuration,const char *addresses);
+/* Keenetic journal error for a configured DNS provider's registrable domain.
+ * A saved authenticated answer suppresses any further active verification. */
+int d2k_sched_dns_journal_error(d2k_sched *,const char *domain);
+void d2k_sched_dns_observe_answer(d2k_sched *, const d2k_dns_answer *, int64_t now_ms);
+void d2k_sched_dns_observe_question(d2k_sched *,const char *,uint16_t,int64_t);
+/* Private volatile routing permissions for failed/proven configured DNS only.
+ * Returns row count, -1 on failure; atomically preserves prior file on error. */
+int d2k_sched_dns_routes(d2k_sched *,const char *path);
+void d2k_sched_dns_routed(d2k_sched *,const char *path);
+void d2k_sched_set_plain_trial(d2k_sched *,d2k_plain_prepare_fn,d2k_plain_run_fn);
+uint64_t d2k_sched_plain_dns_revision(const d2k_sched *);
+int d2k_sched_dns_save_pending(const d2k_sched *, uint64_t saved_catalog_revision);
+void d2k_sched_plain_dns_saved(d2k_sched *,uint64_t revision);
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark);
 
 /* Ставит датапату планы ВСЕХ подтверждённых привязок каталога.
@@ -347,10 +451,34 @@ int d2k_sched_sync_step(d2k_sched *s);
  * покрывать то, что должно покрыть, и помещаться в канал. Второе число знает
  * только датапат. */
 void d2k_sched_set_send_cap(d2k_sched *s, uint32_t cap);
+/* Disabled by default. This observer appends suspicions, never installs a
+ * shadow plan or waits for a queue lock. NULL disables filesystem access. */
+int d2k_sched_newchain_owned(const d2k_sched *,const char *,uint8_t,uint8_t,uint8_t);
+int d2k_sched_newchain_pending(const d2k_sched *);
+int d2k_sched_set_synthesis_only(d2k_sched *,int);
+int d2k_sched_set_newchain(d2k_sched *,const char *store);
+int d2k_sched_set_shadow(d2k_sched *s,const char *path);
+uint64_t d2k_sched_shadow_dropped(const d2k_sched *s);
+
 /* SO_MARK диагностических вопросов. По умолчанию равен mark из конструктора;
  * отдельное значение позволяет не возвращать собственное измерение в
  * NFQUEUE, оставив probe mark только verifier выбранного плана. */
 void d2k_sched_set_measure_mark(d2k_sched *s, uint32_t mark);
+
+/* Этап 37: счётчики записи conntrack по кортежу (orig: клиент → сервер).
+ * 0 — есть, 1 — записи нет (поток кончился), иное — недоступно. Не задан —
+ * наблюдения потоков нет. d2kc ставит настоящий ctnetlink; тесты — подмену. */
+#include "d2k_ctq.h"
+typedef int (*d2k_sched_flow_ct_fn)(const d2k_ct_tuple *t, d2k_ct_info *out);
+void d2k_sched_set_ct_query(d2k_sched *s, d2k_sched_flow_ct_fn fn);
+
+/* Этап 38: соседние потоки к тому же адресу, порту и транспорту сервера,
+ * кроме самого self (orig: клиент → сервер): сколько их, у скольких есть
+ * счётчики (judged — учёт conntrack включён) и скольким из них сервер отвечал.
+ * 0 — посчитано, иное — недоступно. Только чтение conntrack. */
+typedef int (*d2k_sched_peers_fn)(const d2k_ct_tuple *self, unsigned *flows, unsigned *judged,
+                                  unsigned *answered);
+void d2k_sched_set_ct_peers(d2k_sched *s, d2k_sched_peers_fn fn);
 
 /* Идёт ли проход по каталогу прямо сейчас. Цикл по этому признаку не засыпает:
  * порция обязана идти сразу за чтением событий, иначе смысл порций теряется. */

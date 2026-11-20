@@ -22,6 +22,7 @@
 #include "d2k_plantlv.h"
 #include "d2k_plan.h"
 #include "d2k_wire.h"
+#include "../datapath/plan_internal.h"
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("ПРОВАЛ: %s\n", (msg)); fails++; } } while (0)
@@ -130,7 +131,384 @@ static void autottl_end_to_end(void) {
           "autottl: кривой шаблон min>max принят");
 }
 
+/* A badseq fake needs independent SEQ and ACK changes. Verify the actual
+ * serialized TCP header; the genuine payload must retain its original ACK. */
+static void ackshift_end_to_end(void) {
+    const int32_t shifts[] = {-66000, 1, INT32_MIN, INT32_MAX};
+    for (size_t k = 0; k < sizeof shifts / sizeof shifts[0]; k++) {
+        char text[512], err[200]; uint8_t tlv[D2K_PLAN_TLV_MAX]; size_t n = 0;
+        snprintf(text, sizeof text,
+            "d2k-plan 1 14\nid 00000000000000000000000000000000\n"
+            "proto tcp tls\npayload 1 aabbcc\npoison 1 seqshift=0 ackshift=%ld\n"
+            "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\nsplit payload_start +1\norder forward\n",
+            (long)shifts[k]);
+        int rc = d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &n, err, sizeof err);
+        CHECK(rc == 0, "ackshift text rejected");
+        if (rc) continue;
+        d2k_plan *pl = NULL;
+        CHECK(d2k_plan_load(tlv,n,&pl,err,sizeof err)==0 && pl,"ackshift TLV rejected");
+        if (!pl) continue;
+        uint8_t hello[64] = {22,3,1,0,5,1,0,0,1,0};
+        d2k_pkt in = {0}; in.payload=hello; in.payload_len=sizeof hello; in.seq=100;
+        d2k_actions a = {0};
+        CHECK(d2k_plan_apply(pl,NULL,&in,&a)==0 && a.n==3,"ackshift actions");
+        for (int family=4; family<=6; family+=2) {
+            d2k_conn c={0}; c.family=(uint8_t)family; c.ack=17; c.window=1024;
+            for (size_t j=0;j<a.n;j++) {
+                uint8_t wire[256]; size_t w=d2k_wire_build(&c,&a.v[j],wire,sizeof wire);
+                size_t off=family==6?40:20;
+                CHECK(w>=off+20,"ackshift wire build"); if(w<off+20) continue;
+                uint32_t ack=(uint32_t)wire[off+8]<<24 | (uint32_t)wire[off+9]<<16 |
+                             (uint32_t)wire[off+10]<<8 | wire[off+11];
+                CHECK(ack==17u+(j==0?(uint32_t)shifts[k]:0u),"fake ACK shift or original ACK wrong");
+                CHECK(d2k_wire_tcp_checksum_ok(wire,w),"ACK shift checksum invalid");
+            }
+        }
+        d2k_actions_free(&a); d2k_plan_free(pl); pl=NULL;
+        /* The record must not be accepted under an older execution contract. */
+        tlv[7]=13;
+        CHECK(d2k_plan_load(tlv,n,&pl,err,sizeof err)!=0,"ACK shift accepted with minexec13");
+        d2k_plan_free(pl);
+    }
+    const char *invalid[] = {
+        "d2k-plan 1 13\nproto tcp tls\npoison 1 ackshift=-66000\n",
+        "d2k-plan 1 14\nproto udp quic\npoison 1 ackshift=-66000\n",
+        "d2k-plan 1 14\nproto tcp tls\npoison 1 ackshift=2147483648\n",
+        "d2k-plan 1 14\nproto tcp tls\npoison 1 ackshift=-2147483649\n"
+    };
+    for(size_t i=0;i<sizeof invalid/sizeof invalid[0];i++) {
+        uint8_t tlv[512];size_t n=0;char err[200];
+        CHECK(d2k_plan_text_to_tlv(invalid[i],tlv,sizeof tlv,&n,err,sizeof err)!=0,
+              "invalid ACK shift contract accepted");
+    }
+
+}
+
+
+/* Task 6a: preflight is a separate program, not a poison candidate. */
+#include "d2k_boxprops.h"
+#include "../datapath/include/d2k_capture.h"
+static const uint8_t pf_sample[]={0x16,3,1,0,0xff};
+
+static void test_preflight_outgoing_composition(void) {
+    const char *text="d2k-plan 1 20\nproto tcp tls\n"
+        "preflight window=1 wscale=1 pieces=1 hello=white name=white.example timeout=4000 data=2\n"
+        "payload 2 16030100ff\nhandover apply\n"
+        "wire tcp-template-v1\ninput tls-sni\nsplit payload_start +1\norder reverse\n";
+    uint8_t tlv[2048];size_t n=0;char err[200];
+    int rc=d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err);
+    CHECK(rc==0,"explicit preflight/outgoing composition must encode");
+    if(!rc) {
+        d2k_plan *p=NULL;
+        int loaded=d2k_plan_load(tlv,n,&p,err,sizeof err);
+        if(loaded)fprintf(stderr,"combined plan rejected: %s\n",err);
+        CHECK(loaded==0 && p,
+              "datapath must accept explicit preflight/outgoing composition");
+        if(p) {
+            CHECK(p->preflight && p->pf_data==2 && p->n_splits==1 && p->order,
+                  "composition must retain both programs");
+            d2k_plan_free(p);
+        }
+    }
+    const char *invalid[]={
+        "d2k-plan 1 20\nproto tcp tls\nhandover apply\norder forward\n",
+        "d2k-plan 1 19\nproto tcp tls\npreflight window=1 wscale=1 pieces=1 hello=own timeout=4000 data=1\npayload 1 16030100ff\nhandover apply\nsplit payload_start +1\n"
+    };
+    for(size_t i=0;i<sizeof invalid/sizeof invalid[0];i++)
+        CHECK(d2k_plan_text_to_tlv(invalid[i],tlv,sizeof tlv,&n,err,sizeof err)!=0,
+              "composition requires preflight and new executor capability");
+}
+static void test_preflight_directive_roundtrip(void) {
+    for (int own=0; own<2; own++) {
+        char text[512],err[200]; uint8_t tlv[1024]; size_t n=0;
+        snprintf(text,sizeof text,"d2k-plan 1 18\nproto tcp tls\n"
+            "preflight window=7 wscale=3 pieces=9 hello=%s%stimeout=2400 data=1\npayload 1 16030100ff\n",
+            own?"own":"white",own?" ":" name=white.example ");
+        int rc=d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err);
+        CHECK(rc==0,"test_preflight_directive_roundtrip: directive rejected");
+        if(rc)continue;
+        d2k_plan *pl=NULL;
+        CHECK(d2k_plan_load(tlv,n,&pl,err,sizeof err)==0 && pl,
+            "test_preflight_directive_roundtrip: datapath rejected TLV");
+        if(pl)CHECK(pl->preflight && pl->pf_window==7 && pl->pf_wscale==3 &&
+            pl->pf_pieces==9 && pl->pf_hello_own==own && pl->pf_timeout_ms==2400 &&
+            !strcmp(pl->pf_name,own?"":"white.example"),"datapath lost preflight parameters");
+        d2k_plan_free(pl);
+        int found=0;
+        for(size_t i=12;i+4<=n;) {
+            size_t len=(size_t)tlv[i+2]*256+tlv[i+3];
+            if(tlv[i]==1 && tlv[i+1]==0x14) {
+                const uint8_t *v=tlv+i+4;
+                CHECK(len==(own?11u:24u) && v[0]==0 && v[1]==7 && v[2]==3 &&
+                    v[3]==9 && v[4]==own && v[5]==0 && v[6]==0 && v[7]==9 && v[8]==96,
+                    "preflight wire parameters differ");
+                if(!own)CHECK(len==24 && !memcmp(v+11,"white.example",13),"white name lost");
+                found=1;
+            }
+            i+=4+len;
+        }
+        CHECK(found,"REC_PREFLIGHT missing");
+    }
+}
+static void test_preflight_composer_preserves_outgoing_payloads(void) {
+    const char *pf="d2k-plan 1 19\nproto tcp tls\npayload 1 160301\n"
+        "preflight window=1 wscale=1 pieces=1 hello=white name=white.example timeout=4000 data=1 resyn_delay=60 resyn_sends=6 resyn_timeout=1500\n";
+    const char *tx="d2k-plan 1 8\nproto tcp tls\nid 11111111111111111111111111111111\n"
+        "wire tcp-template-v1\ninput tls-sni\npayload 1 aabb\npoison 1 badsum\n"
+        "fake payload=1 poison=1 repeats=2 gap_us=0 place=before\nsplit payload_start +1\norder reverse\n";
+    char *joined=NULL,err[200];
+    CHECK(!d2k_plan_text_compose_preflight(pf,tx,&joined,err,sizeof err),"compose preflight with outgoing program");
+    if(joined) {
+        uint8_t tlv[2048];size_t n=0;d2k_plan *p=NULL;
+        CHECK(!d2k_plan_text_to_tlv(joined,tlv,sizeof tlv,&n,err,sizeof err),"composed text must encode");
+        CHECK(!d2k_plan_load(tlv,n,&p,err,sizeof err),"composed program must load");
+        if(p) {
+            CHECK(p->preflight && p->pf_handover_apply && p->pf_data!=1 && p->n_payloads==2,
+                  "preflight must not overwrite the outgoing fake payload");
+            CHECK(p->n_fakes==1 && p->n_splits==1 && p->pf_resyn_sends==6 && p->pf_resyn_delay_ms==60,
+                  "preserve outgoing operations and SYN handover timing");
+            d2k_plan_free(p);
+        }
+        char *nested=NULL;
+        CHECK(d2k_plan_text_compose_preflight(pf,joined,&nested,err,sizeof err)!=0 && !nested,
+              "cannot compose a second preflight into an existing program");
+        free(joined);
+    }
+}
+static void test_partial_candidate_is_not_a_carry_property(void) {
+    d2k_preflight_candidate c={.present=1,.window=1,.window_scale=1,.pieces=1,
+        .rtt_ms=173,.response_bytes=2,.name="observed.example"};
+    char text[8192],err[200];
+    CHECK(d2k_compose_preflight_candidate(&c,6,6,text,sizeof text,err,sizeof err)==1,
+          "small-window evidence may propose an explicit combined fallback");
+    CHECK(strstr(text,"origin=fallback") && strstr(text,"name=observed.example"),
+          "candidate origin and observed name must remain explicit");
+    CHECK(d2k_plan_text_requires_endpoint(text,err,sizeof err)==1,"candidate remains endpoint-bound");
+    c.present=0;
+    CHECK(d2k_compose_preflight_candidate(&c,4,6,text,sizeof text,err,sizeof err)==0 && !text[0],
+          "absent small-window evidence cannot produce a candidate");
+    c.present=1;c.response_bytes=0;
+    CHECK(d2k_compose_preflight_candidate(&c,4,6,text,sizeof text,err,sizeof err)==0 && !text[0],
+          "silence alone cannot produce a combined candidate");
+}
+static d2k_box_props gate_props(void) {
+    d2k_box_props p={0};p.response_gate=D2K_PROP_YES;p.gate_carry=D2K_PROP_YES;
+    p.gate_window=7;p.gate_pieces=9;p.gate_hello_own=D2K_PROP_YES;p.gate_rtt_ms=300;return p;
+}
+static void test_preflight_hello_roundtrip(void) {
+    for(int own=0;own<2;own++) {
+        uint8_t hello[D2K_CAPTURE_BYTES];size_t hello_len=0;
+        d2k_box_props props=gate_props();props.gate_hello_own=own?D2K_PROP_YES:D2K_PROP_NO;
+        d2k_net_whitelist net={0};strcpy(net.name,"white.example");
+        if(own) { memcpy(hello,pf_sample,sizeof pf_sample);hello_len=sizeof pf_sample; }
+        else CHECK(!d2k_white_decoy_hello(net.name,hello,sizeof hello,&hello_len),"white hello builder");
+        char text[2*D2K_CAPTURE_BYTES+512],err[200];uint8_t tlv[D2K_CAPTURE_BYTES+512];size_t n=0;
+        CHECK(d2k_compose_preflight_from_props(&props,net.name,0,4,6,hello,hello_len,text,sizeof text,err,sizeof err)==1,
+            "test_preflight_hello_roundtrip: compose");
+        CHECK(strstr(text,"payload 1 ") && strstr(text,"data=1"),"preflight must use existing hex payload");
+        int rc=d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err);
+        CHECK(!rc,"test_preflight_hello_roundtrip: text rejected");
+        if(rc)continue;
+        d2k_plan *p=NULL;
+        CHECK(!d2k_plan_load(tlv,n,&p,err,sizeof err),"test_preflight_hello_roundtrip: datapath rejected");
+        if(p)CHECK(p->pf_hello_len==hello_len && !memcmp(p->pf_hello,hello,hello_len),"preflight hello bytes changed");
+        /* Parsed bytes must survive the input TLV being overwritten. */
+        memset(tlv,0,n);
+        if(p)CHECK(!memcmp(p->pf_hello,hello,hello_len),"preflight hello borrows TLV input");
+        d2k_plan_free(p);
+    }
+}
+static void test_hello_too_long_no_plan(void) {
+    uint8_t hello[D2K_CAPTURE_BYTES+1];memset(hello,0xa5,sizeof hello);
+    char text[2*D2K_CAPTURE_BYTES+512],err[200];d2k_box_props p=gate_props();
+    strcpy(text,"stale");
+    CHECK(d2k_compose_preflight_from_props(&p,NULL,0,4,6,hello,sizeof hello,text,sizeof text,err,sizeof err)==0 &&
+        !text[0] && err[0],"test_hello_too_long_no_plan");
+    CHECK(d2k_compose_preflight_from_props(&p,NULL,0,4,6,hello,D2K_CAPTURE_BYTES,text,sizeof text,err,sizeof err)==1,
+        "maximum supported preflight hello rejected");
+    uint8_t tlv[D2K_CAPTURE_BYTES+512];size_t n=0;
+    CHECK(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err),"maximum hello text rejected");
+    d2k_plan *plan=NULL;
+    CHECK(!d2k_plan_load(tlv,n,&plan,err,sizeof err),"maximum hello TLV rejected");d2k_plan_free(plan);
+    /* Bypass text/compose: a wire payload beyond the FSM capacity is refused. */
+    const uint8_t wire_head[]={ 'D','2','K','P',0,1,0,18,0,0,0,3,
+        0,2,0,2,6,1, 1,0x14,0,11,0,7,0,9,1,0,0,9,96,0,1,
+        0,0x10,0x10,3,0,1 };
+    memcpy(tlv,wire_head,sizeof wire_head);
+    memset(tlv+sizeof wire_head,0xa5,D2K_CAPTURE_BYTES+1);plan=NULL;
+    CHECK(d2k_plan_load(tlv,sizeof wire_head+D2K_CAPTURE_BYTES+1,&plan,err,sizeof err)!=0 && !plan,
+        "oversized wire hello accepted");d2k_plan_free(plan);
+    /* Bypass compose: parser must also reject an oversized payload. */
+    size_t used=strlen(text);text[used-1]='a';text[used]='5';text[used+1]='\n';text[used+2]=0;
+    CHECK(d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err)!=0,"oversized hello text accepted");
+}
+static void test_compose_preflight_from_props(void) {
+    unsigned rtt[]={50,300,900,UINT32_MAX},timeout[]={11360,26760,0,0};
+    for(unsigned i=0;i<4;i++) {
+        d2k_box_props p=gate_props();p.gate_rtt_ms=rtt[i];
+        char text[1024],err[200],want[200];
+        int rc=d2k_compose_preflight_from_props(&p,NULL,0,4,6,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err);
+        if(!timeout[i]) {
+            CHECK(rc==0 && !text[0] && strstr(err,"budget"),"unrepresentable execution budget accepted");
+            continue;
+        }
+        CHECK(rc==1,"test_compose_preflight_from_props: no plan");
+        CHECK(rc==1 && strstr(text,"\nid 00000000000000000000000000000000\n"),
+            "preflight cannot receive scheduler plan identity");
+        snprintf(want,sizeof want,"preflight window=7 wscale=0 pieces=9 hello=own timeout=%u",timeout[i]);
+        CHECK(rc==1 && strstr(text,want),"preflight numbers not derived from properties");
+        uint8_t tlv[2048];size_t n=0;
+        CHECK(rc==1 && !d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err),"composed plan invalid");
+    }
+}
+static void test_compose_no_carry_no_plan(void) {
+    int carries[]={D2K_PROP_UNKNOWN,D2K_PROP_NO};
+    for(unsigned i=0;i<2;i++) {
+        int carry=carries[i];
+        d2k_box_props p=gate_props();p.gate_carry=(int8_t)carry;
+        char text[1024]="stale",err[200]="";
+        CHECK(d2k_compose_preflight_from_props(&p,NULL,0,4,6,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err)==0 &&
+            !text[0] && err[0],"test_compose_no_carry_no_plan: unsafe plan or missing reason");
+    }
+}
+static void test_compose_white_without_name_no_plan(void) {
+    d2k_box_props p=gate_props();p.gate_hello_own=D2K_PROP_NO;
+    char text[1024]="stale",err[200]="";
+    CHECK(d2k_compose_preflight_from_props(&p,NULL,0,4,6,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err)==0 &&
+        !text[0] && err[0],"test_compose_white_without_name_no_plan");
+    d2k_net_whitelist network={0};strcpy(network.name,"white.example");
+    CHECK(d2k_compose_preflight_from_props(&p,network.name,0,4,6,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err)==1 &&
+        strstr(text,"hello=white name=white.example"),"network white name not used");
+    p.gate_window=1;p.gate_pieces=1;
+    CHECK(d2k_compose_preflight_from_props(&p,"recent-direct.example",1,4,6,pf_sample,sizeof pf_sample,
+        text,sizeof text,err,sizeof err)==1 &&
+        strstr(text,"window=1 wscale=1 pieces=1 hello=white name=recent-direct.example timeout=4000"),
+        "observed name must retain measured scale and handover mode");
+    CHECK(d2k_compose_preflight_from_props(&p,"recent-direct.example",0,4,6,pf_sample,sizeof pf_sample,
+        text,sizeof text,err,sizeof err)==1 && strstr(text,"window=1 wscale=0 pieces=1"),
+        "name alone must not select the small-window mode");
+}
+static void test_preflight_ipv6_tcp(void) {
+    d2k_box_props p=gate_props();char text[1024]="stale",err[200]="";
+    CHECK(d2k_compose_preflight_from_props(&p,NULL,0,6,6,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err)==1 &&
+        strstr(text,"preflight ") && !err[0],"test_preflight_ipv6_tcp");
+    CHECK(d2k_compose_preflight_from_props(&p,NULL,0,6,17,pf_sample,sizeof pf_sample,text,sizeof text,err,sizeof err)==0,
+        "preflight composed for UDP");
+}
+
+static void test_preflight_invalid_directives(void) {
+    const char *bad[]={
+        "window=0 wscale=0 pieces=1 hello=own timeout=1000",
+        "window=1 wscale=15 pieces=1 hello=own timeout=1000",
+        "window=1 wscale=0 pieces=0 hello=own timeout=1000",
+        "window=1 wscale=0 pieces=256 hello=own timeout=1000",
+        "window=1 pieces=1 hello=own timeout=1000",
+        "window=1 wscale=0 pieces=1 hello=white timeout=1000",
+        "window=1 wscale=0 pieces=1 hello=own name=x.example timeout=1000",
+        "window=1 wscale=0 pieces=1 hello=own timeout=999",
+        "window=1 wscale=0 pieces=1 hello=own timeout=5001",
+        "window=1 wscale=0 pieces=1 hello=own timeout=1000 window=2",
+        "window=1 wscale=0 pieces=1 hello=white name=a/b timeout=1000",
+        "window=1 wscale=0 pieces=1 hello=white name=a..b timeout=1000",
+        "window=1 wscale=0 pieces=1 hello=own timeout=1000 data=1",
+        "window=1 wscale=0 pieces=1 hello=own timeout=1000 data=0",
+        "window=1 wscale=0 pieces=1 hello=own timeout=1000 data=65536"
+    };
+    for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+        char text[512],err[200];uint8_t tlv[1024];size_t n=0;
+        snprintf(text,sizeof text,"d2k-plan 1 18\nproto tcp tls\npreflight %s data=1\npayload 1 160301\n",bad[i]);
+        CHECK(d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err)!=0,
+            "invalid preflight directive accepted");
+    }
+}
+
+static void test_preflight_hello_references(void) {
+    const char *payloads[]={"", "payload 1\n", "payload 2 160301\n", "payload 1 160301\npayload 2 ff\n"};
+    for(size_t i=0;i<sizeof payloads/sizeof payloads[0];i++) {
+        char text[512],err[200];uint8_t tlv[512];size_t n=0;
+        snprintf(text,sizeof text,"d2k-plan 1 18\nproto tcp tls\npreflight window=7 wscale=0 pieces=9 hello=own timeout=2400 data=1\n%s",payloads[i]);
+        CHECK(d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err)!=0,"invalid preflight hello reference accepted");
+    }
+}
+static void test_preflight_tlv_validation(void) {
+    const uint8_t good[]={ 'D','2','K','P',0,1,0,18,0,0,0,3,
+        0,2,0,2,6,1, 1,0x14,0,11, 0,7,3,9,1,0,0,9,96,0,1, 0,0x10,0,3,0,1,0x16 };
+    d2k_plan *baseline=NULL;char baseline_err[200];
+    CHECK(!d2k_plan_load(good,sizeof good,&baseline,baseline_err,sizeof baseline_err),"wire validation baseline invalid");
+    d2k_plan_free(baseline);
+    unsigned off[]={7,16,21,23,24,25,26,27,29};
+    uint8_t val[]={17,17,8,0,15,0,2,255,0};
+    for(unsigned i=0;i<sizeof off/sizeof off[0];i++) {
+        uint8_t b[128];memcpy(b,good,sizeof good);b[off[i]]=val[i];
+        d2k_plan *p=NULL;char err[200];
+        CHECK(d2k_plan_load(b,sizeof good,&p,err,sizeof err)!=0 && !p,
+            "malformed preflight TLV accepted");d2k_plan_free(p);
+    }
+    uint8_t b[128];memcpy(b,good,sizeof good);
+    memcpy(b+sizeof good,good+18,sizeof good-18);b[11]=5;
+    d2k_plan *p=NULL;char err[200];
+    CHECK(d2k_plan_load(b,sizeof good+sizeof good-18,&p,err,sizeof err)!=0 && !p,
+        "duplicate preflight TLV accepted");d2k_plan_free(p);
+    const char *text="d2k-plan 1 17\nproto tcp tls\npreflight window=7 wscale=0 pieces=9 hello=own timeout=2400\n";
+    size_t n=0;
+    CHECK(d2k_plan_text_to_tlv(text,b,sizeof b,&n,err,sizeof err)!=0,"preflight accepted minexec17 text");
+}
+static void test_preflight_resyn_timing(void) {
+    const char *text="d2k-plan 1 19\nproto tcp tls\npreflight window=1 wscale=1 pieces=1 hello=own timeout=1000 data=1 resyn_delay=60 resyn_sends=6 resyn_timeout=500\npayload 1 160301\n";
+    uint8_t tlv[2048];size_t n=0;char err[200];d2k_plan *p=NULL;
+    int rc=d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err);
+    CHECK(!rc,"explicit resyn timing text rejected");
+    if(!rc) {
+        CHECK(!d2k_plan_load(tlv,n,&p,err,sizeof err),"explicit resyn timing TLV rejected");
+        CHECK(p && p->pf_resyn_delay_ms==60 && p->pf_resyn_sends==6,"resyn timing lost in translation");
+        d2k_plan_free(p);
+    }
+}
+static void test_preflight_resyn_rejects_incomplete_or_unsupported(void) {
+    const char *args[]={"resyn_delay=60", "resyn_sends=6", "resyn_delay=0 resyn_sends=6",
+        "resyn_delay=1000 resyn_sends=6", "resyn_delay=60 resyn_sends=0",
+        "resyn_delay=60 resyn_sends=6 resyn_timeout=500 resyn_sends=6"};
+    for(size_t i=0;i<sizeof args/sizeof args[0];i++) {
+        char text[512],err[160];uint8_t tlv[512];size_t n=0;
+        snprintf(text,sizeof text,"d2k-plan 1 19\nproto tcp tls\npreflight window=1 wscale=1 pieces=1 hello=own timeout=1000 data=1 %s\npayload 1 160301\n",args[i]);
+        CHECK(d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&n,err,sizeof err)!=0,"invalid resyn timing accepted");
+    }
+    const char *old="d2k-plan 1 18\nproto tcp tls\npreflight window=1 wscale=1 pieces=1 hello=own timeout=1000 data=1 resyn_delay=60 resyn_sends=6 resyn_timeout=500\npayload 1 160301\n";
+    char err[160];uint8_t tlv[512];size_t n=0;
+    CHECK(d2k_plan_text_to_tlv(old,tlv,sizeof tlv,&n,err,sizeof err)!=0,"executor18 accepted delayed resyn timing");
+}
+static void test_gv_reference(void) {
+    char plan[4096],err[200];uint8_t tlv[8192];size_t n=0;d2k_plan *p=NULL;
+    CHECK(!d2k_compose_gv_reference(1492,plan,sizeof plan),"Z2K GV plan composed");
+    CHECK(!d2k_plan_text_to_tlv(plan,tlv,sizeof tlv,&n,err,sizeof err),
+        "Z2K GV plan encoded");
+    if(n)CHECK(!d2k_plan_load(tlv,n,&p,err,sizeof err),"Z2K GV plan parsed");
+    if(p) {
+        CHECK(p->n_splits==7 && p->n_fakes==1 && p->n_poisons==1,
+            "Z2K GV fragment and fake count");
+        CHECK(p->poisons[0].seq_shift==-3000 && p->order==ORDER_REVERSE,
+            "Z2K GV fake sequence and reverse order");
+        d2k_plan_free(p);
+    }
+}
 int main(void) {
+    test_gv_reference();
+    test_preflight_resyn_timing();
+    test_preflight_resyn_rejects_incomplete_or_unsupported();
+    test_preflight_hello_roundtrip();
+    test_hello_too_long_no_plan();
+    test_preflight_hello_references();
+    test_preflight_tlv_validation();
+    test_preflight_invalid_directives();
+    test_preflight_directive_roundtrip();
+    test_preflight_outgoing_composition();
+    test_preflight_composer_preserves_outgoing_payloads();
+    test_partial_candidate_is_not_a_carry_property();
+    test_compose_preflight_from_props();
+    test_compose_no_carry_no_plan();
+    test_compose_white_without_name_no_plan();
+    test_preflight_ipv6_tcp();
+    ackshift_end_to_end();
     autottl_end_to_end();
     /* --- перекрытие слева ------------------------------------------------ */
     {

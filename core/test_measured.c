@@ -608,6 +608,37 @@ static void md5_plan_contract(void) {
                               tlv, sizeof tlv, &tn, err, sizeof err) != 0);
     CHECK(d2k_plan_text_to_tlv("d2k-plan 1 12\nproto tcp tls\nwire tcp-template-v1\npoison 1 md5\n",
                               tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+
+    /* MD5+метка (md5ts) — отдельная гипотеза: minexec 15 и detect-tcp-v1.
+       Заголовок на 8 байт шире MD5-одиночки (28 опций против 20). */
+    const char *tsbody = "proto tcp tls\nwire detect-tcp-v1\n"
+        "payload-pad 1 1400 15\npoison 1 md5ts\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+        "segment 1400\norder forward\n";
+    snprintf(text, sizeof text, "d2k-plan 1 15\n%s", tsbody);
+    rc = d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err);
+    CHECK(rc == 0);
+    if (rc == 0) {
+        CHECK(d2k_plan_load(tlv, tn, &p, err, sizeof err) == 0);
+        if (p) {
+            CHECK(d2k_plan_max_emit(p) == 1468);   /* 1460 (md5) + 8 */
+            /* Комбо требует метку потока даже на detect-tcp-v1 (не только
+               tcp-template-v1): датапат откажет клиенту без метки. */
+            CHECK(d2k_plan_flow_needs(p) & D2K_FLOW_NEED_TCPTS);
+        }
+        d2k_plan_free(p); p = NULL;
+        /* Старый датапат (minexec 14) обязан отвергнуть TLV с md5ts. */
+        tlv[7] = 14;
+        CHECK(d2k_plan_load(tlv, tn, &p, err, sizeof err) != 0);
+        d2k_plan_free(p); p = NULL;
+    }
+    /* Текстовая сторона: minexec 14, чужой профиль и UDP — все отказы. */
+    snprintf(text, sizeof text, "d2k-plan 1 14\n%s", tsbody);
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+    CHECK(d2k_plan_text_to_tlv("d2k-plan 1 15\nproto tcp tls\nwire tcp-template-v1\npoison 1 md5ts\n",
+                              tlv, sizeof tlv, &tn, err, sizeof err) != 0);
+    CHECK(d2k_plan_text_to_tlv("d2k-plan 1 15\nproto udp quic\npoison 1 md5ts\n",
+                              tlv, sizeof tlv, &tn, err, sizeof err) != 0);
 }
 
 /* The raw sender replaces all TCP options with this exact malformed MD5
@@ -635,6 +666,106 @@ static void md5_wire(void) {
             }
         }
     }
+}
+
+/* MD5-first + метка времени (D2K_POISON_MD5_TS): MD5 (kind 19, len 18) ПЕРВОЙ,
+ * за ней РЕАЛЬНАЯ метка потока (kind 8, len 10), скопированная дословно из
+ * опций соединения = 28 байт, добивки NOP не нужно. Проверяем точные
+ * байты/порядок/длину/сумму на IPv4 и IPv6, нетривиальные TSval/TSecr, что
+ * seq/нагрузка на месте, отказ при отсутствующей/кривой метке даже на
+ * измеренном профиле, что MD5-одиночка осталась 20 байт и не читает опции
+ * потока, и отказ вне detect-tcp-v1. Без живого потока. */
+static void md5_ts_wire(void) {
+    /* Согласованная метка в опциях соединения: NOP NOP + 08 0a + TSval + TSecr. */
+    const uint8_t conn_opts[12] = {1, 1, 8, 10, 0x11, 0x22, 0x33, 0x44,
+                                   0x55, 0x66, 0x77, 0x88};
+    /* Ожидается: MD5(18) + та же опция метки (08 0a + те же восемь байт). */
+    const uint8_t opt[28] = {19, 18, 0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             8, 10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    uint8_t wire[128], data[] = {1, 2, 3};
+    case_name = "raw MD5+timestamp wire header";
+    for (int family = 4; family <= 6; family += 2) {
+        d2k_conn c = {0}; c.family = family;
+        memcpy(c.tcp_options, conn_opts, sizeof conn_opts);
+        c.tcp_options_len = sizeof conn_opts;
+        d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE;
+        e.wire_profile = D2K_WIRE_DETECT_TCP;
+        e.poison = D2K_POISON_MD5_TS;
+        e.seq = 4242; e.bytes = data; e.len = sizeof data;
+        size_t ip = family == 6 ? 40 : 20;
+        size_t n = d2k_wire_build(&c, &e, wire, sizeof wire);
+        CHECK(n == ip + 20 + 28 + sizeof data);
+        if (n == ip + 20 + 28 + sizeof data) {
+            CHECK((wire[ip + 12] >> 4) == 12);        /* смещение данных 12 слов = 48 байт */
+            CHECK(memcmp(wire + ip + 20, opt, sizeof opt) == 0);   /* метка дословно */
+            CHECK(memcmp(wire + ip + 20 + 28, data, sizeof data) == 0);
+            /* seq сохранён (4242 = 0x1092), сдвига нет. */
+            CHECK(wire[ip + 4] == 0 && wire[ip + 5] == 0 &&
+                  wire[ip + 6] == 0x10 && wire[ip + 7] == 0x92);
+            CHECK(d2k_wire_tcp_checksum_ok(wire, n));
+        }
+    }
+    /* Метка отсутствует или кривая — отказ ДАЖЕ на измеренном профиле. */
+    {
+        d2k_conn c = {0}; c.family = 4; c.tcp_options_len = 0;
+        d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE;
+        e.wire_profile = D2K_WIRE_DETECT_TCP; e.poison = D2K_POISON_MD5_TS;
+        e.bytes = data; e.len = sizeof data;
+        CHECK(d2k_wire_build(&c, &e, wire, sizeof wire) == 0);
+        const uint8_t no_ts[4] = {1, 1, 4, 2};   /* NOP NOP SACK-perm, метки нет */
+        memcpy(c.tcp_options, no_ts, sizeof no_ts);
+        c.tcp_options_len = sizeof no_ts;
+        CHECK(d2k_wire_build(&c, &e, wire, sizeof wire) == 0);
+    }
+    /* MD5-одиночка не изменилась: 20 байт, добивка NOP (01 01), опции потока
+       не читает (здесь их нет вовсе). */
+    {
+        d2k_conn c = {0}; c.family = 4;
+        d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE;
+        e.wire_profile = D2K_WIRE_DETECT_TCP; e.poison = D2K_POISON_MD5;
+        e.bytes = data; e.len = sizeof data;
+        size_t n = d2k_wire_build(&c, &e, wire, sizeof wire);
+        CHECK(n == 20 + 40 + sizeof data);   /* ip + (tcphdr 20 + opts 20) + data */
+        CHECK(n && wire[20 + 20 + 18] == 1 && wire[20 + 20 + 19] == 1);
+    }
+    /* Вне detect-tcp-v1 комбо не собирается (у native опции клиента — своя
+       ветка): отказ и на потоковом профиле, и на legacy, даже с меткой. */
+    {
+        d2k_conn c = {0}; c.family = 4;
+        memcpy(c.tcp_options, conn_opts, sizeof conn_opts);
+        c.tcp_options_len = sizeof conn_opts;
+        d2k_emit e = {0}; e.kind = D2K_EMIT_FAKE; e.poison = D2K_POISON_MD5_TS;
+        e.bytes = data; e.len = sizeof data;
+        e.wire_profile = D2K_WIRE_TCP_TEMPLATE;
+        CHECK(d2k_wire_build(&c, &e, wire, sizeof wire) == 0);
+        e.wire_profile = 0;
+        CHECK(d2k_wire_build(&c, &e, wire, sizeof wire) == 0);
+    }
+}
+
+/* Плечо arm с md5_ts проходит весь конвейер: arm -> текст плана -> TLV. Текст
+ * обязан нести minexec 15 и токен md5ts (а не md5-одиночку), и TLV обязан
+ * принять его. Фальшивка «между» и совмещение с md5-одиночкой — отказ. */
+static void md5_ts_arm(void) {
+    d2k_arm a; d2k_arm_input in; char text[8192], err[200];
+    uint8_t tlv[D2K_PLAN_TLV_MAX]; size_t tn = 0;
+    case_name = "MD5+timestamp arm->plan->tlv";
+    memset(&in, 0, sizeof in);
+    in.trigger_len = 300; in.sni_off = 100; in.sni_len = 11; in.decoy_len = 300;
+    for (size_t i = 0; i < in.decoy_len; i++) { in.decoy[i] = (uint8_t)(i * 3 + 1); }
+
+    memset(&a, 0, sizeof a); a.md5_ts = 1; a.repeats = 1;
+    CHECK(d2k_arm_plan_measured(&a, &in, text, sizeof text) == 0);
+    CHECK(strstr(text, "d2k-plan 1 15") != NULL);
+    CHECK(strstr(text, " md5ts") != NULL);
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tn, err, sizeof err) == 0);
+
+    memset(&a, 0, sizeof a); a.md5_ts = 1; a.between = 1; a.repeats = 1;
+    CHECK(d2k_arm_plan_measured(&a, &in, text, sizeof text) != 0);
+
+    memset(&a, 0, sizeof a); a.md5 = 1; a.md5_ts = 1; a.repeats = 1;
+    CHECK(d2k_arm_plan_measured(&a, &in, text, sizeof text) != 0);
 }
 
 /* БЕЛЫЙ СПИСОК ИМЁН ВСТРОЕН В БИНАРНИК (поле 10.10.2026). Как и приветствия
@@ -774,6 +905,8 @@ int main(void) {
     rx_volume_named();
     md5_plan_contract();
     md5_wire();
+    md5_ts_wire();
+    md5_ts_arm();
     malformed();
     fallback_disorder_pos2();
     rx_volume_fake_sni_split();

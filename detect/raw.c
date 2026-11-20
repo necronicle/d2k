@@ -179,9 +179,14 @@ enum {
 typedef struct {
     uint8_t recv[65535];
     uint8_t resp[8192];
+    uint8_t pending[65536];
+    uint8_t present[8192];
 } raw_buffers;
 
 typedef struct {
+    d2k_raw_observation observed;
+    d2k_raw_transport transport;
+    uint32_t transport_base;
     int      send_fd;
     int      recv_fd;
     uint8_t  src[16];
@@ -189,9 +194,16 @@ typedef struct {
     uint8_t  family; /* 0/4 IPv4, 6 IPv6 */
     uint16_t sport;
     uint16_t dport;
+    uint16_t syn_window, data_window;
+    uint8_t syn_wscale, port_reserved;
+    uint16_t syn_retry_ms;
+    uint8_t syn_max_sends;
     uint32_t seq; /* наш следующий номер */
     uint32_t ack; /* что подтверждаем */
     int      rule_up;
+    int      rx_fin;
+    int      rx_initialized, rx_fin_pending;
+    uint32_t rx_fin_seq;
     uint8_t tcp_options[12];
     uint8_t tcp_options_len;
     /* Предлагать ли метку времени в SYN — по набору опций клиента, чьё
@@ -374,6 +386,28 @@ static void sweep_stale_rst_rules(void)
 #define RST_RELEASE_ATTEMPTS 5
 static struct { rst_key key; int attempts; } g_rst_pending[RST_PENDING_MAX];
 static size_t g_rst_pending_n;
+static uint8_t g_raw_ports[65536];
+/* g_raw_state held: an unresolved delete must never affect a new owner. */
+static int raw_port_busy(uint16_t port)
+{
+    if (g_raw_ports[port]) return 1;
+    for (size_t i=0;i<g_rst_pending_n;i++)
+        if (g_rst_pending[i].key.sport==port) return 1;
+    return 0;
+}
+static uint16_t reserve_source_port(uint16_t requested)
+{
+    unsigned count=requested ? 1 : 25000;
+    for (unsigned i=0;i<count;i++) {
+        uint16_t port=requested ? requested : next_source_port();
+        pthread_mutex_lock(&g_raw_state);
+        int busy=raw_port_busy(port);
+        if (!busy) g_raw_ports[port]=1;
+        pthread_mutex_unlock(&g_raw_state);
+        if (!busy) return port;
+    }
+    return 0;
+}
 static int g_rst_abandon_said;
 static pthread_once_t g_atexit_once = PTHREAD_ONCE_INIT;
 
@@ -653,13 +687,13 @@ static uint16_t tcp_checksum(const uint8_t src[4], const uint8_t dst[4],
 
 /* buildIPv4TCP собирает пакет целиком. Контрольные суммы считаем сами: ядро
  * их для IP_HDRINCL не трогает, а нам порча суммы нужна как инструмент. */
-static size_t build_ipv4_tcp(uint8_t *pkt, size_t cap,
+static size_t build_ipv4_tcp_window(uint8_t *pkt, size_t cap,
                              const uint8_t src[4], const uint8_t dst[4],
                              uint16_t sport, uint16_t dport,
                              uint32_t seq, uint32_t ack, uint8_t flags,
                              const uint8_t *payload, size_t plen,
                              const d2k_poison *p,
-                             const uint8_t *extra, size_t extralen)
+                             const uint8_t *extra, size_t extralen, uint16_t window)
 {
     uint8_t opts[64];
     size_t olen = 0;
@@ -720,7 +754,7 @@ static size_t build_ipv4_tcp(uint8_t *pkt, size_t cap,
     wr32(t + 8, ack);
     t[12] = (uint8_t)(data_off << 4);
     t[13] = flags;
-    wr16(t + 14, 65535);
+    wr16(t + 14, window);
     if (olen > 0) {
         memcpy(t + 20, opts, olen);
     }
@@ -739,6 +773,7 @@ static size_t build_ipv4_tcp(uint8_t *pkt, size_t cap,
     return ip_len;
 }
 
+
 static uint16_t tcp_checksum_family(uint8_t family, const uint8_t *src,
                                      const uint8_t *dst, const uint8_t *tcp, size_t n)
 {
@@ -751,18 +786,18 @@ static uint16_t tcp_checksum_family(uint8_t family, const uint8_t *src,
 }
 
 /* Share TCP/options/poison construction with the original IPv4 builder. */
-static size_t build_ip_tcp(uint8_t *pkt, size_t cap, uint8_t family,
+static size_t build_ip_tcp_window(uint8_t *pkt, size_t cap, uint8_t family,
                             const uint8_t *src, const uint8_t *dst,
                             uint16_t sport, uint16_t dport, uint32_t seq, uint32_t ack,
                             uint8_t flags, const uint8_t *payload, size_t plen,
-                            const d2k_poison *p, const uint8_t *extra, size_t extralen)
+                            const d2k_poison *p, const uint8_t *extra, size_t extralen, uint16_t window)
 {
     if (family != 6)
-        return build_ipv4_tcp(pkt, cap, src, dst, sport, dport, seq, ack, flags,
-                               payload, plen, p, extra, extralen);
+        return build_ipv4_tcp_window(pkt, cap, src, dst, sport, dport, seq, ack, flags,
+                               payload, plen, p, extra, extralen, window);
     if (cap < 60 || p->ip_id_zero) return 0;
-    size_t n = build_ipv4_tcp(pkt + 20, cap - 20, src, dst, sport, dport,
-                              seq, ack, flags, payload, plen, p, extra, extralen);
+    size_t n = build_ipv4_tcp_window(pkt + 20, cap - 20, src, dst, sport, dport,
+                              seq, ack, flags, payload, plen, p, extra, extralen, window);
     if (n < 40 || n - 20 > 65535) return 0;
     memset(pkt, 0, 40);
     pkt[0] = 0x60; wr16(pkt + 4, (uint16_t)(n - 20));
@@ -773,6 +808,7 @@ static size_t build_ip_tcp(uint8_t *pkt, size_t cap, uint8_t family,
     wr16(pkt + 56, sum);
     return n + 20;
 }
+
 
 static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
 {
@@ -816,6 +852,7 @@ static int raw_sendto(raw_conn *c, const uint8_t *pkt, size_t n)
  * измеренное расходилось с исполнимым. По умолчанию — прежние 1400. */
 static unsigned seg_max = D2K_ARM_SEGMENT_MAX;
 void d2k_raw_set_segment_max(unsigned seg) { seg_max = seg ? seg : D2K_ARM_SEGMENT_MAX; }
+unsigned d2k_raw_segment_max(void) { return seg_max; }
 
 /* send кладёт нагрузку на провод. Номер последовательности НЕ двигается при
  * отравленной посылке: фальшивка обязана занять ту же область, что займут
@@ -847,9 +884,10 @@ static int raw_send(raw_conn *c, const uint8_t *payload, size_t plen,
         if (take > seg_max) {
             take = seg_max;
         }
-        n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
+        n = build_ip_tcp_window(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
                            seq + (uint32_t)off, c->ack, flags,
-                           plen ? payload + off : NULL, take, p, NULL, 0);
+                           plen ? payload + off : NULL, take, p,
+                           c->tcp_options,c->tcp_options_len,c->data_window ? c->data_window : 65535);
         if (n == 0) {
             return -1;
         }
@@ -884,19 +922,46 @@ static int raw_send_syn(raw_conn *c)
         1, 1,                           /* NOP, NOP */
         4, 2                            /* SACK permitted */
     };
-    const uint8_t *opts = c->offer_ts ? opts_ts : opts_plain;
+    uint8_t opts[sizeof opts_ts];
+    memcpy(opts,c->offer_ts ? opts_ts : opts_plain,c->offer_ts ? sizeof opts_ts : sizeof opts_plain);
+    opts[c->offer_ts ? 19 : 7]=c->syn_wscale;
     size_t optlen = c->offer_ts ? sizeof(opts_ts) : sizeof(opts_plain);
     uint8_t pkt[256];
     d2k_poison none;
     size_t n;
 
     memset(&none, 0, sizeof(none));
-    n = build_ip_tcp(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
-                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, optlen);
+    n = build_ip_tcp_window(pkt, sizeof(pkt), c->family, c->src, c->dst, c->sport, c->dport,
+                       c->seq, 0, TCP_SYN, NULL, 0, &none, opts, optlen,c->syn_window ? c->syn_window : 65535);
     if (n == 0) {
         return -1;
     }
     return raw_sendto(c, pkt, n);
+}
+
+static uint64_t raw_count_add(uint64_t value,uint64_t add)
+{
+    return UINT64_MAX-value<add?UINT64_MAX:value+add;
+}
+static void raw_transport_receive(raw_conn *c,const uint8_t *tcp,size_t payload)
+{
+    d2k_raw_transport *t=&c->transport;
+    if(!t->available)return;
+    t->received_packets=raw_count_add(t->received_packets,1);
+    t->received_payload_bytes=raw_count_add(t->received_payload_bytes,payload);
+    if((tcp[13]&TCP_ACK) && !(tcp[13]&(TCP_SYN|TCP_RST))) {
+        uint32_t offset=rd32(tcp+8)-c->transport_base;
+        t->ack_packets=raw_count_add(t->ack_packets,1);
+        if(offset<UINT32_C(0x80000000) && offset<=t->sent_end) {
+            t->ack_seen=1;
+            if(offset>t->acked_end) {
+                t->acked_end=offset;
+                t->ack_advances=raw_count_add(t->ack_advances,1);
+            }
+            t->peer_window_raw=rd16(tcp+14);t->window_seen=1;
+        }
+    }
+    c->observed.transport=*t;
 }
 
 /* recv returns our peer's segment, a wait/deadline, or a local error. */
@@ -911,7 +976,7 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
          * busy router unrelated packets otherwise keep a silent probe alive
          * forever, also preventing cancellation and occupying its worker. */
         if (d2k_now_ms() >= deadline || d2k_detect_stopped(cancel)) return -1;
-        struct sockaddr_storage peer;
+        struct sockaddr_storage peer={0};
         socklen_t peerlen = sizeof peer;
         ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0,
                               (struct sockaddr *)&peer, &peerlen);
@@ -948,46 +1013,95 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
         *ack = rd32(t + 8);
         *payload = t + off;
         *plen = tlen - off;
+        raw_transport_receive(c,t,*plen);
         return 0;
     }
 }
 
-/* readPayload ждёт от сервера сегмент с данными. */
+/* Collect the contiguous reply prefix required by the trigger predicate. */
 static int raw_read_payload(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
-                            uint8_t *out, size_t cap, size_t *outlen)
+                            uint8_t *out, size_t cap, size_t *outlen, size_t minimum)
 {
     int64_t deadline = d2k_now_ms() + timeout_ms;
+    *outlen = 0;
+    if (!minimum || minimum > cap) { errno = EINVAL; return RAW_RECV_ERROR; }
+    if(c->rx_fin) {c->observed.kind=D2K_RAW_OBS_RESPONSE_FIN;return -1;}
+    if(!c->rx_initialized) {
+        memset(c->buffers->present,0,sizeof c->buffers->present);
+        c->rx_initialized=1;
+    }
     while (d2k_now_ms() < deadline) {
         uint8_t flags;
         if (d2k_detect_stopped(cancel)) {
+            c->observed.kind = D2K_RAW_OBS_CANCELLED;
             return -1;
+        }
+        size_t before=*outlen;
+        while(*outlen<cap && !(c->rx_fin_pending && c->ack==c->rx_fin_seq)) {
+            size_t at=c->ack&65535u;uint8_t bit=(uint8_t)(1u<<(at&7));
+            if(!(c->buffers->present[at>>3]&bit))break;
+            out[(*outlen)++]=c->buffers->pending[at];
+            c->buffers->present[at>>3]&=(uint8_t)~bit;c->ack++;
+        }
+        if(c->rx_fin_pending && c->ack==c->rx_fin_seq) {
+            c->rx_fin=1;c->ack++;
+        }
+        c->observed.response_bytes=*outlen;
+        if(c->rx_fin || *outlen>=minimum) {
+            if(c->rx_fin) {
+                d2k_poison none={0};
+                if(raw_send(c,NULL,0,TCP_ACK,&none)) {
+                    c->observed.kind=D2K_RAW_OBS_LOCAL;return RAW_RECV_ERROR;
+                }
+            }
+            c->observed.kind=c->rx_fin?D2K_RAW_OBS_RESPONSE_FIN:D2K_RAW_OBS_RESPONSE_BYTES;
+            return *outlen?0:-1;
+        }
+        if(*outlen>before) {
+            d2k_poison none={0};
+            if(raw_send(c,NULL,0,TCP_ACK,&none)) {
+                c->observed.kind=D2K_RAW_OBS_LOCAL;return RAW_RECV_ERROR;
+            }
         }
         uint32_t seq, ack;
         const uint8_t *pay;
         size_t plen;
         int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen, deadline, cancel);
-        if (received == RAW_RECV_ERROR) return RAW_RECV_ERROR;
+        if (received == RAW_RECV_ERROR) {
+            c->observed.kind = D2K_RAW_OBS_LOCAL;
+            return RAW_RECV_ERROR;
+        }
         if (received != 0) continue;
         if (flags & TCP_RST) {
+            if ((uint32_t)(seq - c->ack) >= UINT32_C(0x80000000)) continue;
+            c->observed.kind = D2K_RAW_OBS_RESPONSE_RESET;
             return -1; /* RST */
         }
+        uint32_t fin_at=seq+(uint32_t)plen;
+        if((flags&TCP_FIN) && fin_at-c->ack<65536u && !c->rx_fin_pending) {
+            c->rx_fin_pending=1;c->rx_fin_seq=fin_at;
+        }
         if (plen > 0) {
-            /* НАЧАЛО ОТВЕТА — СЕГМЕНТ С НОМЕРОМ c->ack, а не первый пришедший
-               (поле 14.10.2026, fost.club: 1441:2881 пришёл раньше 1:1441, и
-               полный ответ сервера засчитался «нет»). Более поздние данные
-               ждут своего начала; повтор уже полученного обрезается до
-               непрочитанного. */
-            if ((int32_t)(seq - c->ack) > 0) continue;
-            uint32_t skip = c->ack - seq;
-            if (skip >= plen) continue;
-            pay += skip;
-            plen -= skip;
-            size_t k = plen < cap ? plen : cap;
-            memcpy(out, pay, k);
-            *outlen = k;
-            return 0;
+            /* A bounded sequence-indexed window retains reordered segments and
+               the unread tail of a small application read. First arrival wins;
+               bytes outside the window are neither retained nor acknowledged. */
+            for(size_t i=0;i<plen;i++) {
+                uint32_t pos=seq+(uint32_t)i;
+                if(pos-c->ack>=65536u)continue;
+                size_t at=pos&65535u;uint8_t bit=(uint8_t)(1u<<(at&7));
+                if(!(c->buffers->present[at>>3]&bit)) {
+                    c->buffers->pending[at]=pay[i];c->buffers->present[at>>3]|=bit;
+                }
+            }
+            if ((int32_t)(seq - c->ack) > 0 || c->ack-seq>=plen) {
+                d2k_poison none={0};
+                if(raw_send(c,NULL,0,TCP_ACK,&none)) {
+                    c->observed.kind=D2K_RAW_OBS_LOCAL;return RAW_RECV_ERROR;
+                }
+            }
         }
     }
+    c->observed.kind = D2K_RAW_OBS_RESPONSE_TIMEOUT;
     return -1; /* тишина */
 }
 
@@ -1007,6 +1121,12 @@ static void raw_close(raw_conn *c)
     }
     free(c->buffers);
     c->buffers = NULL;
+    if (c->port_reserved) {
+        pthread_mutex_lock(&g_raw_state);
+        g_raw_ports[c->sport]=0;
+        pthread_mutex_unlock(&g_raw_state);
+        c->port_reserved=0;
+    }
 }
 
 static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *cancel,
@@ -1016,11 +1136,13 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
     d2k_poison none;
 
     memset(&none, 0, sizeof(none));
+    int64_t syn_at = d2k_now_ms();
     if (raw_send_syn(c) != 0) {
         snprintf(err, errcap, "%s", strerror(errno));
         return -1;
     }
-    deadline = d2k_now_ms() + timeout_ms;
+    int retransmitted = 0;
+    deadline = syn_at + timeout_ms;
     /* ПОТЕРЯННЫЙ SYN ПОВТОРЯЕТСЯ, КАК У TCP ЯДРА (RFC 6298: RTO с секунды,
      * затем вдвое), тем же номером. Поле 15.10.2026, flibusta.is: путь
      * эпизодами теряет SYN (17-19 %, в эпизоде до половины), а единственный
@@ -1028,7 +1150,8 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
      * бросался, не дойдя до вопросов, которыми цель берётся. Настоящий
      * клиент повторяет SYN; зонд, который этого не делает, мерит не коробку,
      * а потери пути. */
-    int rto_ms = 1000;
+    unsigned syn_sends=1;
+    int rto_ms = c->syn_retry_ms ? c->syn_retry_ms : 1000;
     int64_t next_syn = d2k_now_ms() + rto_ms;
     while (d2k_now_ms() < deadline) {
         uint8_t flags;
@@ -1036,15 +1159,22 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
         const uint8_t *pay;
         size_t plen;
         if (d2k_detect_stopped(cancel)) {
+            c->observed.kind = D2K_RAW_OBS_CANCELLED;
             snprintf(err, errcap, "context canceled");
             return -1;
         }
         if (d2k_now_ms() >= next_syn) {
+            if(c->syn_max_sends && syn_sends>=c->syn_max_sends) {
+                next_syn=deadline;
+                continue;
+            }
             if (raw_send_syn(c) != 0) {
                 snprintf(err, errcap, "%s", strerror(errno));
                 return -1;
             }
-            rto_ms *= 2;
+            retransmitted = 1;
+            syn_sends++;
+            if(!c->syn_retry_ms)rto_ms *= 2;
             next_syn = d2k_now_ms() + rto_ms;
         }
         int received = raw_recv(c, &flags, &seq, &ack, &pay, &plen,
@@ -1055,6 +1185,7 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
         }
         if (received != 0) continue;
         if (flags & TCP_RST) {
+            c->observed.kind = D2K_RAW_OBS_CONNECT_RESET;
             snprintf(err, errcap, "classify: сервер ответил RST на SYN");
             return -1;
         }
@@ -1062,6 +1193,8 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
             if (ack != c->seq + 1) {
                 continue;
             }
+            int64_t elapsed = d2k_now_ms() - syn_at;
+            if (!retransmitted) c->observed.rtt_ms = elapsed > 0 ? (uint32_t)elapsed : 1;
             /* Keep negotiated timestamps for tcp-template-v1. The SYN
                offered TSval=1; echo the peer's actual SYN-ACK timestamp. */
             const uint8_t *tcp = c->buffers->recv + (c->family == 6 ? 0 :
@@ -1085,17 +1218,19 @@ static int raw_handshake(raw_conn *c, int timeout_ms, const d2k_detect_stop *can
                 snprintf(err, errcap, "%s", strerror(errno));
                 return -1;
             }
+            c->observed.connected = 1;
             return 0;
         }
     }
     snprintf(err, errcap, "classify: SYN-ACK не пришёл");
+    c->observed.kind = D2K_RAW_OBS_CONNECT_TIMEOUT;
     return D2K_RAW_CONNECT_TIMEOUT;
 }
 
 /* dialRaw поднимает соединение своими руками и возвращает его установленным. */
-static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dport,
+static int raw_dial_shaped(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dport,
                     int timeout_ms, uint32_t mark_val, const d2k_detect_stop *cancel,
-                    int offer_ts, char *err, size_t errcap)
+                    int offer_ts, const d2k_raw_shape *shape, char *err, size_t errcap)
 {
     int one = 1;
     int mark = (int)mark_val;
@@ -1103,6 +1238,11 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
 
     memset(c, 0, sizeof(*c));
     c->offer_ts = offer_ts ? 1 : 0;
+    c->syn_window=shape ? shape->syn_window : 0;
+    c->data_window=shape ? shape->data_window : 0;
+    c->syn_wscale=shape && shape->syn_wscale>=0 ? (uint8_t)shape->syn_wscale : 7;
+    c->syn_retry_ms=shape ? shape->syn_retry_ms : 0;
+    c->syn_max_sends=shape ? shape->syn_max_sends : 0;
     c->send_fd = -1;
     c->recv_fd = -1;
     if (family != 4 && family != 6) return -1;
@@ -1154,17 +1294,28 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
             raw_close(c); return -1;
         }
     }
-    tv.tv_usec = 300000;
-    (void)setsockopt(c->recv_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    /* A receive must yield before the next shaped SYN retry. A fixed
+     * 300-ms read otherwise swallows the executor's 60-ms retry schedule. */
+    unsigned receive_ms=c->syn_retry_ms && c->syn_retry_ms<300 ? c->syn_retry_ms : 300;
+    tv.tv_usec = (int)receive_ms*1000;
+    if(setsockopt(c->recv_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) && c->syn_retry_ms) {
+        snprintf(err,errcap,"shaped receive timeout: %s",strerror(errno));
+        raw_close(c);return -1;
+    }
 
     /* Подметаем один раз за прогон, а не перед каждым зондом: зондов сотни, а
      * разбор таблицы стоит вызова iptables. */
     /* Other workers must wait for cleanup to finish before creating rules;
      * otherwise first-use cleanup can delete a new worker's live rule. */
     pthread_once(&g_sweep_once, sweep_stale_rst_rules);
-    c->sport = next_source_port();
+    c->sport = reserve_source_port(shape ? shape->sport : 0);
+    if (!c->sport) {
+        snprintf(err,errcap,"raw source port is already owned or unavailable");
+        raw_close(c);return -1;
+    }
+    c->port_reserved=1;
     seed_once();
-    c->seq = (uint32_t)random();
+    c->seq = shape && shape->initial_seq_known ? shape->initial_seq : (uint32_t)random();
     /* Как у донора (suppressKernelRST): без правила мерить ПРОДОЛЖАЕМ —
      * ядерный RST прилетает после SYN-ACK, а зонд к тому времени часто уже
      * пишет данные. Отказ iptables (нет бинарника, роутер только на nft) —
@@ -1181,6 +1332,12 @@ static int raw_dial(raw_conn *c, const uint8_t *dst, uint8_t family, uint16_t dp
         return rc;
     }
     return 0;
+}
+
+static int raw_dial(raw_conn *c,const uint8_t *dst,uint8_t family,uint16_t dport,
+    int timeout,uint32_t mark,const d2k_detect_stop *stop,int ts,char *err,size_t cap)
+{
+    return raw_dial_shaped(c,dst,family,dport,timeout,mark,stop,ts,NULL,err,cap);
 }
 
 /* probeRawHandshake — самопроверка сырого слоя: доходит ли наше собственное
@@ -1210,7 +1367,7 @@ int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port
 /* The measured Plan is the program, not a second description reconstructed
  * after the experiment. Same compiler, parser, TLS modifiers, segmentation,
  * ordering and IP/TCP builder as the datapath. Only the sink differs. */
-static int raw_send_plan(raw_conn *c, const d2k_trigger *tr, const d2k_poison *p,
+static int raw_send_program(raw_conn *c, const d2k_trigger *tr, const d2k_poison *p, const char *program,
                          const d2k_detect_stop *cancel, char *err, size_t errcap)
 {
     d2k_arm arm;
@@ -1224,45 +1381,104 @@ static int raw_send_plan(raw_conn *c, const d2k_trigger *tr, const d2k_poison *p
     size_t tn = 0;
     int rc = -1;
     if (errcap) err[0] = '\0';
-    if (d2k_arm_from_poison(p, &arm, err, errcap)) return -1;
-    if (p->decoy_len > sizeof input.decoy || (p->decoy_len && !p->decoy)) {
-        snprintf(err, errcap, "приманку измерительного плана нельзя сохранить целиком");
-        return -1;
-    }
-    input.trigger_len = tr->len;
-    input.sni_off = tr->sni_off; input.sni_len = tr->sni_len;
-    input.decoy_len = p->decoy_len;
-    if (p->decoy_len) memcpy(input.decoy, p->decoy, p->decoy_len);
     b = malloc(sizeof *b);
     if (!b) { snprintf(err, errcap, "нет памяти для измерительного плана"); return -1; }
-    if (d2k_arm_plan_measured(&arm, &input, b->text, sizeof b->text) ||
-        d2k_plan_text_to_tlv(b->text, b->tlv, sizeof b->tlv, &tn, err, errcap) ||
+    if (!program) {
+        if (!p || d2k_arm_from_poison(p, &arm, err, errcap)) goto done;
+        if (p->decoy_len > sizeof input.decoy || (p->decoy_len && !p->decoy)) {
+            snprintf(err, errcap, "приманку измерительного плана нельзя сохранить целиком");
+            goto done;
+        }
+        input.trigger_len = tr->len;
+        input.sni_off = tr->sni_off; input.sni_len = tr->sni_len;
+        input.decoy_len = p->decoy_len;
+        if (p->decoy_len) memcpy(input.decoy, p->decoy, p->decoy_len);
+        if (d2k_arm_plan_measured(&arm, &input, b->text, sizeof b->text)) goto done;
+        program = b->text;
+    }
+    if (d2k_plan_text_to_tlv(program, b->tlv, sizeof b->tlv, &tn, err, errcap) ||
         d2k_plan_load(b->tlv, tn, &plan, err, errcap)) goto done;
     pkt.seq = c->seq; pkt.payload = tr->payload; pkt.payload_len = tr->len;
+    pkt.segment_cap = seg_max;
+    pkt.emit_original = 1;
     pkt.have_sni = tr->sni_off > 0 && tr->sni_len > 0;
+    uint32_t stream_offset=c->seq-c->transport_base;
+    if(c->transport.available && stream_offset<UINT32_C(0x80000000)) {
+        pkt.have_stream_offset=1;pkt.stream_offset=stream_offset;
+    }
     pkt.sni_off = tr->sni_off; pkt.sni_len = tr->sni_len;
-    if (d2k_plan_apply(plan, NULL, &pkt, &out) || out.fate != D2K_ORIG_DROP) goto done;
-    conn.family = c->family; conn.ack = c->ack; conn.window = 65535; conn.ttl = 64;
+    if (d2k_plan_apply(plan, NULL, &pkt, &out) || out.fate != D2K_ORIG_DROP) {
+        snprintf(err,errcap,"measurement plan apply: %s",
+            out.refuse_why ? out.refuse_why : "original not owned");
+        goto done;
+    }
+    conn.family = c->family; conn.ack = c->ack; conn.window = c->data_window ? c->data_window : 65535; conn.ttl = 64;
     memcpy(&conn.src_ip, c->src, 4); memcpy(&conn.dst_ip, c->dst, 4);
     memcpy(conn.src_ip6, c->src, 16); memcpy(conn.dst_ip6, c->dst, 16);
     conn.src_port = htons(c->sport); conn.dst_port = htons(c->dport);
     memcpy(conn.tcp_options, c->tcp_options, c->tcp_options_len);
     conn.tcp_options_len = c->tcp_options_len;
+    c->observed.program_packets = out.n;
+    c->observed.submitted_packets = 0;
     for (size_t i = 0; i < out.n; i++) {
-        if (d2k_detect_stopped(cancel)) { snprintf(err, errcap, "context canceled"); goto done; }
-        if (out.v[i].delay_us) d2k_sleep_ms((int)(out.v[i].delay_us / 1000));
+        uint32_t remaining=out.v[i].delay_us;
+        while(remaining) {
+            if(d2k_detect_stopped(cancel)) {
+                c->observed.kind=D2K_RAW_OBS_CANCELLED;
+                snprintf(err,errcap,"context canceled");goto done;
+            }
+            uint32_t chunk=remaining>50000u?50000u:remaining;
+            if(d2k_sleep_us(chunk)) {snprintf(err,errcap,"packet delay failed");goto done;}
+            remaining-=chunk;
+        }
+        if (d2k_detect_stopped(cancel)) {
+            c->observed.kind=D2K_RAW_OBS_CANCELLED;
+            snprintf(err, errcap, "context canceled"); goto done;
+        }
         size_t n = d2k_wire_build(&conn, &out.v[i], b->packet, sizeof b->packet);
-        if (!n || raw_sendto(c, b->packet, n)) goto done;
+        if (!n) {
+            snprintf(err,errcap,"measurement plan build packet %zu/%zu",i+1,out.n);
+            goto done;
+        }
+        /* detect-tcp-v1 deliberately fixes the legacy window in wire.c.
+         * A shaped episode overrides only that connection-local field. */
+        if (c->data_window && c->data_window!=65535) {
+            size_t ihl=c->family==6 ? 40 : (b->packet[0]&15u)*4u;
+            uint8_t *tcp=b->packet+ihl;
+            wr16(tcp+14,c->data_window);wr16(tcp+16,0);
+            uint16_t sum=tcp_checksum_family(c->family,c->src,c->dst,tcp,n-ihl);
+            if (out.v[i].poison & D2K_POISON_BADSUM) {
+                if (out.v[i].wire_profile==D2K_WIRE_DETECT_TCP) {
+                    sum^=0xbeef;if (!sum) sum=0x1234;
+                } else {
+                    sum=(uint16_t)~sum;if (!sum) sum=0xffff;
+                }
+            }
+            wr16(tcp+16,sum);
+        }
+        if (raw_sendto(c, b->packet, n)) {
+            int saved_errno=errno;
+            snprintf(err,errcap,"measurement plan send packet %zu/%zu (%zu bytes): %s",
+                i+1,out.n,n,strerror(saved_errno));
+            goto done;
+        }
+        c->observed.submitted_packets++;
     }
     /* Historical receive-side grace period; not an emission instruction. */
-    if (p->disorder && !p->disorder_pos && !p->seqovl && !p->seqovl_exact && !p->fake_between)
+    if (p && p->disorder && !p->disorder_pos && !p->seqovl && !p->seqovl_exact && !p->fake_between)
         d2k_sleep_ms(12);
-    c->seq += (uint32_t)tr->len + (p->oob ? 1u : 0u);
+    c->seq += (uint32_t)tr->len + (p && p->oob ? 1u : 0u);
     rc = 0;
 done:
     if (rc && errcap && !err[0]) snprintf(err, errcap, "не удалось исполнить измерительный план");
     d2k_actions_free(&out); d2k_plan_free(plan); free(b);
     return rc;
+}
+
+static int raw_send_plan(raw_conn *c, const d2k_trigger *tr, const d2k_poison *p,
+                         const d2k_detect_stop *cancel, char *err, size_t errcap)
+{
+    return raw_send_program(c, tr, p, NULL, cancel, err, errcap);
 }
 
 /* probePoison — ОДИН зонд, собранный из независимых приёмов.
@@ -1273,10 +1489,10 @@ done:
  * (замер 2026-08-28: 48 гипотез поодиночке мимо, то же плечо в связке — 10 из
  * 10 на том же адресе). Поэтому здесь два независимых шага: отравить буфер
  * фальшивкой и отдать правду — как есть, задом наперёд или внахлёст слева. */
-int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+static int raw_probe_program(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                         char *err, size_t errcap)
+                         char *err, size_t errcap, d2k_raw_observation *observed, const char *program)
 {
     uint8_t *resp;
     raw_conn c;
@@ -1285,14 +1501,16 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
 
     int dial_rc = raw_dial(&c, ip4, family, port, timeout_ms, mark, cancel,
                           d2k_trigger_offers_ts(tr), err, errcap);
-    if (dial_rc != 0) return dial_rc;
+    if (dial_rc != 0) { if (observed) *observed = c.observed; return dial_rc; }
     resp = c.buffers->resp;
 
     /* Direct control and SYN-data have no bypass Plan. All expressible
        hypotheses execute the Plan; a compile/apply failure never falls back
        to the old sender and cannot become a positive measurement. */
-    if (strcmp(p->name, "none") && !p->syn_data) {
-        if (raw_send_plan(&c, tr, p, cancel, err, errcap)) {
+    if (program || (strcmp(p->name, "none") && !p->syn_data)) {
+        if (program ? raw_send_program(&c, tr, NULL, program, cancel, err, errcap) :
+                      raw_send_plan(&c, tr, p, cancel, err, errcap)) {
+            if (observed) *observed = c.observed;
             raw_close(&c); return -1;
         }
         goto receive;
@@ -1308,20 +1526,45 @@ int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t por
     c.seq += (uint32_t)tr->len;
 
 receive:
-    rc = raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp), &resp_len);
+    c.observed.sent = 1;
+    rc = raw_read_payload(&c, timeout_ms, cancel, resp, sizeof(c.buffers->resp), &resp_len, d2k_trigger_prefix_size(tr));
     if (rc == RAW_RECV_ERROR) {
         snprintf(err, errcap, "classify: recvfrom: %s", strerror(errno));
+        if (observed) *observed = c.observed;
         raw_close(&c); return -1;
     }
-    if (rc != 0) { raw_close(&c); return 0; }
+    if (rc != 0) { if (observed) *observed = c.observed; raw_close(&c); return 0; }
     rc = d2k_trigger_accepts(tr, resp, resp_len);
+    if (rc > 0) c.observed.kind = D2K_RAW_OBS_ACCEPTED;
+    if (observed) *observed = c.observed;
     raw_close(&c);
     return rc;
 
 senderr:
+    if (observed) *observed = c.observed;
     snprintf(err, errcap, "%s", strerror(errno));
     raw_close(&c);
     return -1;
+}
+
+int d2k_raw_probe_observed(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap, d2k_raw_observation *obs)
+{
+    return raw_probe_program(ip, family, port, tr, p, timeout_ms, mark,
+                             cancel, err, errcap, obs, NULL);
+}
+int d2k_raw_probe_program(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const char *program, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap, d2k_raw_observation *obs)
+{
+    if (!program || !program[0]) {
+        if (obs) memset(obs, 0, sizeof(*obs));
+        snprintf(err, errcap, "empty measurement program");
+        return -1;
+    }
+    return raw_probe_program(ip, family, port, tr, NULL, timeout_ms, mark,
+                             cancel, err, errcap, obs, program);
 }
 
 #else /* !__linux__ */
@@ -1331,19 +1574,30 @@ senderr:
  * это сказать (см. res.RawUsable в эталоне), а не промолчать. */
 int d2k_raw_supported(void) { return 0; }
 void d2k_raw_set_segment_max(unsigned seg) { (void)seg; }
+unsigned d2k_raw_segment_max(void) { return D2K_ARM_SEGMENT_MAX; }
 unsigned long d2k_raw_rst_fail_count(void) { return 0; }
 unsigned long d2k_raw_dial_count(void) { return 0; }
 void d2k_raw_flush_pending(void) {}
 size_t d2k_raw_pending_count(void) { return 0; }
 
-int d2k_raw_probe_poison_family(const uint8_t *ip4, uint8_t family, uint16_t port,
+int d2k_raw_probe_observed(const uint8_t *ip4, uint8_t family, uint16_t port,
                          const d2k_trigger *tr, const d2k_poison *p,
                          int timeout_ms, uint32_t mark, const d2k_detect_stop *cancel,
-                         char *err, size_t errcap)
+                         char *err, size_t errcap, d2k_raw_observation *observed)
 {
+    if (observed) memset(observed, 0, sizeof(*observed));
     (void)family; (void)ip4; (void)port; (void)tr; (void)p; (void)timeout_ms; (void)mark; (void)cancel;
     snprintf(err, errcap, "classify: сырой слой доступен только на Linux");
     return -1;
+}
+
+int d2k_raw_probe_program(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const char *program, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap, d2k_raw_observation *obs)
+{
+    (void)program;
+    return d2k_raw_probe_observed(ip, family, port, tr, NULL, timeout_ms, mark,
+                                  cancel, err, errcap, obs);
 }
 
 int d2k_raw_probe_handshake_as(const uint8_t *ip4, uint8_t family, uint16_t port,
@@ -1378,4 +1632,241 @@ int d2k_raw_probe_poison(const uint8_t ip4[4], uint16_t port,
     const d2k_detect_stop *cancel, char *err, size_t errcap)
 {
     return d2k_raw_probe_poison_family(ip4, 4, port, tr, p, timeout_ms, mark, cancel, err, errcap);
+}
+
+int d2k_raw_probe_poison_family(const uint8_t *ip, uint8_t family, uint16_t port,
+    const d2k_trigger *tr, const d2k_poison *p, int timeout_ms, uint32_t mark,
+    const d2k_detect_stop *cancel, char *err, size_t errcap)
+{
+    return d2k_raw_probe_observed(ip, family, port, tr, p, timeout_ms, mark,
+                                  cancel, err, errcap, NULL);
+}
+
+#if defined(__linux__) || defined(D2K_RAW_UNIT_TEST)
+struct d2k_raw_episode { raw_conn conn; uint32_t base, peer_base, sent_end; int active, defer_ack, pending_ack; };
+int d2k_raw_episode_tuple(const d2k_raw_episode *ep,d2k_raw_tuple *out) {
+    if(out)memset(out,0,sizeof *out);
+    if(!ep || !out)return 0;
+    const raw_conn *c=&ep->conn;
+    if((c->family!=4 && c->family!=6) || !c->sport || !c->dport)return 0;
+    size_t n=c->family==6?16:4;
+    memcpy(out->local,c->src,n);memcpy(out->remote,c->dst,n);
+    out->family=c->family;out->local_port=c->sport;out->remote_port=c->dport;
+    out->initial_seq=ep->base-1;return 1;
+}
+static void episode_abort(d2k_raw_episode *ep)
+{
+    if(ep && ep->active) { raw_close(&ep->conn); ep->active=0; }
+}
+d2k_raw_episode *d2k_raw_episode_open_shaped(const uint8_t *ip,uint8_t family,uint16_t port,
+    int timeout,uint32_t mark,int ts,const d2k_raw_shape *shape,const d2k_detect_stop *stop,char *err,size_t cap,
+    d2k_raw_observation *obs)
+{
+    if(obs) memset(obs,0,sizeof *obs);
+    if(!ip || (family!=4 && family!=6) || !port || timeout<=0 ||
+        (shape && (shape->syn_wscale < -1 || shape->syn_wscale > 14 ||
+                   (!shape->syn_retry_ms != !shape->syn_max_sends)))) {
+        snprintf(err,cap,"invalid episode endpoint or timeout"); return NULL;
+    }
+    d2k_raw_episode *ep=calloc(1,sizeof *ep);
+    if(!ep) {snprintf(err,cap,"episode allocation failed");return NULL;}
+    int rc=raw_dial_shaped(&ep->conn,ip,family,port,timeout,mark,stop,ts,shape,err,cap);
+    if(obs) *obs=ep->conn.observed;
+    if(rc) {free(ep);return NULL;}
+    ep->active=1;ep->base=ep->conn.seq;ep->peer_base=ep->conn.ack;
+    ep->defer_ack=shape && shape->defer_response_ack;
+    ep->conn.transport.available=1;ep->conn.transport_base=ep->base;
+    ep->conn.observed.transport=ep->conn.transport;
+    if(obs)*obs=ep->conn.observed;
+    return ep;
+}
+int d2k_raw_episode_set_window(d2k_raw_episode *ep,uint16_t window)
+{
+    if (!ep || !ep->active) return -1;
+    ep->conn.data_window=window;return 0;
+}
+int d2k_raw_episode_reset(d2k_raw_episode *ep)
+{
+    if (!ep || !ep->active) return -1;
+    raw_conn *c=&ep->conn;
+    if (!c->rule_up) {episode_abort(ep);return -1;}
+    rst_key key=rst_key_of(c);
+    pthread_mutex_lock(&g_raw_state);
+    int removed=rst_delete_once(&key);
+    pthread_mutex_unlock(&g_raw_state);
+    if (!removed) return -1; /* Never send a reset while suppression remains. */
+    c->rule_up=0;
+    d2k_poison none={0};
+    int rc=raw_send(c,NULL,0,TCP_RST,&none);
+    c->rule_up=suppress_kernel_rst(c);
+    if (!c->rule_up) rc=-1;
+    episode_abort(ep);
+    return rc;
+}
+int d2k_raw_episode_send(d2k_raw_episode *ep,uint32_t offset,uint32_t next_offset,const d2k_trigger *tr,
+    const char *plan,const d2k_detect_stop *stop,char *err,size_t cap,d2k_raw_observation *obs)
+{
+    if(obs) memset(obs,0,sizeof *obs);
+    if(!ep || !ep->active) {snprintf(err,cap,"episode is closed");return -1;}
+    raw_conn *c=&ep->conn;
+    memset(&c->observed,0,sizeof c->observed);c->observed.connected=1;
+    c->observed.transport=c->transport;
+    if(!tr || !tr->len || tr->len>sizeof tr->payload || !plan || !*plan) {
+        snprintf(err,cap,"invalid episode program or payload");
+        if(obs) *obs=c->observed;
+        episode_abort(ep);return -1;
+    }
+    c->seq=ep->base+offset;
+    int rc=raw_send_program(c,tr,NULL,plan,stop,err,cap);
+    if(rc) {
+        if(d2k_detect_stopped(stop)) c->observed.kind=D2K_RAW_OBS_CANCELLED;
+    } else { c->observed.sent=1;c->seq=ep->base+next_offset;
+        if(next_offset>ep->sent_end) ep->sent_end=next_offset;
+        if(next_offset<UINT32_C(0x80000000) && next_offset>c->transport.sent_end)
+            c->transport.sent_end=next_offset;
+        else if(next_offset>=UINT32_C(0x80000000))c->transport.available=0;
+        c->observed.transport=c->transport; }
+    if(obs) *obs=c->observed;
+    if(rc) episode_abort(ep);
+    return rc;
+}
+int d2k_raw_episode_read(d2k_raw_episode *ep,int timeout,const d2k_detect_stop *stop,
+    uint8_t *buf,size_t cap,size_t *have,size_t minimum,d2k_raw_observation *obs)
+{
+    if(obs) memset(obs,0,sizeof *obs);
+    if(have) *have=0;
+    if(!ep || !ep->active) return RAW_RECV_ERROR;
+    raw_conn *c=&ep->conn;
+    c->observed.kind=D2K_RAW_OBS_LOCAL;c->observed.response_bytes=0;
+    if(!buf || !have || !minimum || minimum>cap || timeout<=0) {
+        if(obs) *obs=c->observed;
+        episode_abort(ep);return RAW_RECV_ERROR;
+    }
+    int rc=raw_read_payload(c,timeout,stop,buf,cap,have,minimum);
+    if(!rc) {
+        d2k_poison none={0};
+        if(raw_send(c,NULL,0,TCP_ACK,&none)) {
+            c->observed.kind=D2K_RAW_OBS_LOCAL;rc=RAW_RECV_ERROR;
+        }
+    }
+
+    if(obs) *obs=c->observed;
+    if(rc && c->observed.kind!=D2K_RAW_OBS_RESPONSE_TIMEOUT) episode_abort(ep);
+    return rc;
+}
+void d2k_raw_episode_free(d2k_raw_episode *ep)
+{
+    episode_abort(ep);free(ep);
+}
+#else
+
+d2k_raw_episode *d2k_raw_episode_open_shaped(const uint8_t *ip,uint8_t family,uint16_t port,
+    int timeout,uint32_t mark,int ts,const d2k_raw_shape *shape,const d2k_detect_stop *stop,char *err,size_t cap,
+    d2k_raw_observation *obs)
+{
+    (void)shape;(void)ip;(void)family;(void)port;(void)timeout;(void)mark;(void)ts;
+    (void)stop;if(obs) memset(obs,0,sizeof *obs);snprintf(err,cap,"raw episodes require Linux");return NULL;
+}
+int d2k_raw_episode_set_window(d2k_raw_episode *ep,uint16_t window)
+{ (void)ep;(void)window;return -1; }
+int d2k_raw_episode_reset(d2k_raw_episode *ep)
+{ (void)ep;return -1; }
+int d2k_raw_episode_send(d2k_raw_episode *ep,uint32_t offset,uint32_t next_offset,const d2k_trigger *tr,
+    const char *plan,const d2k_detect_stop *stop,char *err,size_t cap,d2k_raw_observation *obs)
+{
+    (void)ep;(void)offset;(void)next_offset;(void)tr;(void)plan;(void)stop;if(obs) memset(obs,0,sizeof *obs);snprintf(err,cap,"raw episodes require Linux");return -1;
+}
+int d2k_raw_episode_read(d2k_raw_episode *ep,int timeout,const d2k_detect_stop *stop,
+    uint8_t *buf,size_t cap,size_t *have,size_t minimum,d2k_raw_observation *obs)
+{
+    (void)ep;(void)timeout;(void)stop;(void)buf;(void)cap;(void)minimum;if(have) *have=0;if(obs) memset(obs,0,sizeof *obs);return -2;
+}
+void d2k_raw_episode_free(d2k_raw_episode *ep) { (void)ep; }
+int d2k_raw_episode_tuple(const d2k_raw_episode *ep,d2k_raw_tuple *out) {
+    (void)ep;if(out)memset(out,0,sizeof *out);return 0;
+}
+
+#endif
+d2k_raw_episode *d2k_raw_episode_open(const uint8_t *ip,uint8_t family,uint16_t port,
+    int timeout,uint32_t mark,int ts,const d2k_detect_stop *stop,char *err,size_t cap,
+    d2k_raw_observation *obs)
+{
+    return d2k_raw_episode_open_shaped(ip,family,port,timeout,mark,ts,NULL,stop,err,cap,obs);
+}
+int d2k_raw_episode_event(d2k_raw_episode *ep,int timeout,const d2k_detect_stop *stop,
+    uint8_t *buf,size_t cap,d2k_raw_packet_event *event,d2k_raw_observation *obs)
+{
+    if(event) memset(event,0,sizeof *event);
+    if(obs) memset(obs,0,sizeof *obs);
+#if defined(__linux__) || defined(D2K_RAW_UNIT_TEST)
+    if(!ep || !ep->active) return RAW_RECV_ERROR;
+    raw_conn *c=&ep->conn;
+    c->observed.kind=D2K_RAW_OBS_LOCAL;c->observed.response_bytes=0;
+    if(!event || (!buf && cap) || timeout<=0) {
+        if(obs) *obs=c->observed;
+        episode_abort(ep);return RAW_RECV_ERROR;
+    }
+    if(ep->pending_ack) {
+        d2k_poison none={0};
+        if(d2k_detect_stopped(stop) || raw_send(c,NULL,0,TCP_ACK,&none)) {
+            if(obs)*obs=c->observed;
+            episode_abort(ep);return RAW_RECV_ERROR;
+        }
+        ep->pending_ack=0;
+    }
+    int64_t deadline=d2k_now_ms()+timeout;
+    while(d2k_now_ms()<deadline) {
+        if(d2k_detect_stopped(stop)) {
+            c->observed.kind=D2K_RAW_OBS_CANCELLED;
+            if(obs) *obs=c->observed;
+            episode_abort(ep);return -1;
+        }
+        uint8_t flags;uint32_t seq,ack;const uint8_t *payload;size_t n;
+        int rc=raw_recv(c,&flags,&seq,&ack,&payload,&n,deadline,stop);
+        if(rc==RAW_RECV_ERROR) {
+            if(obs) *obs=c->observed;
+            episode_abort(ep);return rc;
+        }
+        if(rc) continue;
+        if(n>cap) {
+            if(obs) *obs=c->observed;
+            episode_abort(ep);return RAW_RECV_ERROR;
+        }
+        event->flags=flags;event->sequence_offset=seq-ep->peer_base;
+        event->ack_offset=ack-ep->base;event->payload_len=n;
+        event->ack_in_sent_range=(flags&TCP_ACK) && event->ack_offset<=ep->sent_end;
+        if(n) memcpy(buf,payload,n);
+        c->observed.response_bytes=n;
+        c->observed.kind=(flags&TCP_RST)?D2K_RAW_OBS_RESPONSE_RESET:
+            (flags&TCP_FIN)?D2K_RAW_OBS_RESPONSE_FIN:
+            n?D2K_RAW_OBS_RESPONSE_BYTES:
+            (flags&TCP_ACK)?D2K_RAW_OBS_RESPONSE_ACK:D2K_RAW_OBS_RESPONSE_PACKET;
+        int finished=0;
+        if(flags&TCP_RST) finished=seq==c->ack;
+        else if(event->ack_in_sent_range && !(flags&TCP_SYN)) {
+            if((int32_t)(seq-c->ack)<=0) {
+                uint32_t skip=c->ack-seq;
+                if(skip<n) c->ack+=(uint32_t)(n-skip);
+            }
+            if((flags&TCP_FIN) && seq+(uint32_t)n==c->ack) {c->ack++;finished=1;}
+            if(n || (flags&TCP_FIN)) {
+                d2k_poison none={0};
+                if(ep->defer_ack && !finished) ep->pending_ack=1;
+                else if(raw_send(c,NULL,0,TCP_ACK,&none)) {
+                    c->observed.kind=D2K_RAW_OBS_LOCAL;
+                    if(obs) *obs=c->observed;
+                    episode_abort(ep);return RAW_RECV_ERROR;
+                }
+            }
+        }
+        if(obs) *obs=c->observed;
+        if(finished) episode_abort(ep);
+        return 0;
+    }
+    c->observed.kind=D2K_RAW_OBS_RESPONSE_TIMEOUT;
+    if(obs) *obs=c->observed;
+    return -1;
+#else
+    (void)ep;(void)timeout;(void)stop;(void)buf;(void)cap;return -2;
+#endif
 }

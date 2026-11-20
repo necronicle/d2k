@@ -54,6 +54,41 @@ async function main(){
   await until('document.querySelectorAll(".search").length===2','C API must populate the live searches');
   await evaluate('document.fonts.ready');
   assert.equal(await evaluate('document.fonts.check("700 24px Onest")'),true,'C CSP must load the bundled text face');
+  await until('document.querySelector("#policy-select").options.length===3','C API must populate policies');
+  assert.equal(await evaluate('document.querySelector("#policy-select").options[1].textContent'),'Work <devices> (Policy7)');
+  assert.equal(await evaluate('document.querySelector("#policies img")'),null,'policy label must remain plain text');
+  await evaluate('document.querySelector("#policy-select").focus()');
+  await call('Input.dispatchKeyEvent',{type:'keyDown',key:'w',code:'KeyW',windowsVirtualKeyCode:87});
+  await call('Input.dispatchKeyEvent',{type:'char',text:'w',key:'w',code:'KeyW',windowsVirtualKeyCode:87});
+  await call('Input.dispatchKeyEvent',{type:'keyUp',key:'w',code:'KeyW',windowsVirtualKeyCode:87});
+  assert.equal(await evaluate('document.querySelector("#policy-select").value'),'Policy7','native select supports keyboard');
+  await evaluate('document.querySelector("#policy-form").requestSubmit()');
+  assert.equal(await evaluate('document.querySelector("#policy-apply").disabled'),true,'prevent duplicate policy save while applying');
+  await panel.waitFor('engine-restart');
+  await until('!document.querySelector("#policy-apply").disabled','policy action must finish');
+  assert.equal(panel.policy(),'Policy7','real C API must atomically persist selected policy');
+  assert.match(await evaluate('document.querySelector("#policy-status").textContent'),/не подтверждено/,'without Linux proc evidence do not claim application');
+  panel.policyFail(true);
+  await evaluate('document.querySelector("#policy-select").value="D2Ktest";document.querySelector("#policy-form").requestSubmit()');
+  await until('document.querySelector("#policy-status").textContent.includes("ошибкой")','failed restart must show saved but not applied');
+  assert.equal(panel.policy(),'D2Ktest');
+  assert.equal(await evaluate('document.querySelector("#policy-select").value'),'D2Ktest','error must preserve choice');
+  panel.policyFail(false);
+  await evaluate('document.querySelector("#policy-refresh").click()');
+  await until('document.querySelector("#policy-status").textContent.includes("прочитан")','refresh must resolve saved internal policy ID');
+  assert.equal(await evaluate('document.querySelector("#policy-select").value'),'D2Ktest');
+  assert.equal(await evaluate('document.querySelector("#policy-select").selectedOptions[0].textContent'),'D2Ktest','internal name without description must not be duplicated');
+  if(out) {
+    for(const [name,width,height] of [['desktop',1440,900],['mobile',390,844]]) {
+      await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:width<600});
+      await evaluate('document.querySelector("#policies").scrollIntoView()');await wait(150);
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true,'policy controls must fit '+name);
+      assert.equal(await evaluate('getComputedStyle(document.querySelector("#policy-select")).minHeight'),'48px');
+      const capture=await call('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(out,'policy-'+name+'.png'),Buffer.from(capture.data,'base64'));
+    }
+    await call('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});await evaluate('scrollTo(0,0)');
+  }
+  if(process.env.D2K_POLICY_ONLY){console.log('Policy browser + C API: native keyboard, safe labels, save, loading, failed apply, desktop/mobile PASS');return;}
   async function checkLayout(){
   // Раскладка на ширинах содержимого.
   for(const [name,width,height] of [['narrow',320,740],['phone',390,844],['compact-boundary',640,1020],['overlap-regression',649,1020],['small-tablet',650,1020],['chrome-report',678,1020],['mid-tablet',700,1020],['tablet',768,1024],['tablet-boundary',820,1020],['full-label-boundary',821,1020],['status-regression',854,1020],['large-tablet',971,1020],['nav-boundary',1080,1020],['laptop',1280,800],['wide',1920,1080]]){

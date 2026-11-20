@@ -157,7 +157,11 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
     size_t hello_len;
     uint32_t hello_seq;
     int rc;
-    if(s->kind==D2K_HOLD_HTTP)
+    if(s->kind>D2K_HOLD_EXACT_BASE) {
+        if(!have_anchor)rc=-1;
+        else rc=d2k_capture_feed_exact(&h->capture,&v.key,s->deadline,now,v.seq,
+            anchor,p+v.header,v.payload,&hello,&hello_len,&hello_seq,(size_t)(s->kind-D2K_HOLD_EXACT_BASE));
+    } else if(s->kind==D2K_HOLD_HTTP)
         rc=d2k_capture_feed_ready(&h->capture,&v.key,s->deadline,now,v.seq,
             anchor,have_anchor,p+v.header,v.payload,&hello,&hello_len,&hello_seq,http_ready);
     else rc=d2k_capture_feed(&h->capture,&v.key,s->deadline,now,v.seq,

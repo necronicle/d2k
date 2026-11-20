@@ -23,11 +23,21 @@ int d2k_udp_release_enqueue(d2k_udp_release *q, uint64_t due_ns,
                             const uint32_t *ids, const uint32_t *verdicts,
                             size_t count, const d2k_key *key, uint64_t token);
 
-/* Releases every due batch in due/arrival order.  A failed send marks that
- * batch incomplete but never leaves its IDs owned forever. */
+/* Attempts each due batch once, in due/arrival order. Successful IDs are
+ * retired; only failed IDs/verdicts remain, retried no earlier than 10ms later.
+ * No raw bytes are sent here. A failed slot does not block other due slots,
+ * including a final flush at UINT64_MAX. Returns completed batch count; done
+ * is called only after every ID succeeds, with cumulative successful count. */
 size_t d2k_udp_release_flush(d2k_udp_release *q, uint64_t now_ns,
                              d2k_udp_release_send send, d2k_udp_release_done done,
                              void *ctx);
+
+/* Terminal shutdown only, after the final flush: notify done(complete=0)
+ * once per remaining batch, with its cumulative successful verdict count.
+ * No verdict or packet is sent. The caller must close NFQUEUE to retire the
+ * unresolved kernel IDs. Returns cancelled batch count; call before free. */
+size_t d2k_udp_release_cancel(d2k_udp_release *q, d2k_udp_release_done done,
+                              void *ctx);
 
 /* Who releases each held original of a held UDP batch (tasks 42, 46).
  *

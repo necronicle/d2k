@@ -66,6 +66,7 @@ typedef enum {
 } d2k_vol_verdict;
 
 typedef struct {
+    int probes;
     d2k_vol_verdict verdict;
     int      at_kb;       /* накопленный объём, на котором всё кончилось */
     int      rx_cut;      /* paired identity/gzip response cut, domain given by rx_wire_basis */
@@ -78,6 +79,10 @@ typedef struct {
     int      rx_compressed_complete; /* контроль gzip дошёл до конца */
     int      rtt_ms;      /* измеренный RTT до мишени */
     char     reason[160]; /* человеческая причина, заполняется всегда */
+    /* Исход ТОЛЬКО TX-лестницы. reason после RX-обрыва несёт текст RX-приметы
+       (её читает планировщик), а этот — то, чем кончилась лестница: два
+       направления не сливаются в одну строку. */
+    char     tx_reason[160];
     char     rx_reason[256]; /* отдельный исход GET, даже если TX не дошёл до TLS */
     int      rx_tls_unavailable; /* прямой GET не дошёл до TLS; RX-тела ещё не измерить */
     /* ОТВЕТ ЗОНДА ЗАВЕРШИЛСЯ, НЕ ДОЙДЯ ДО ИЗМЕРЯЕМОЙ ПОЛОСЫ: бюджет объёма

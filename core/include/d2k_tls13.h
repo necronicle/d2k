@@ -26,6 +26,51 @@
 #include "d2k_tls13core.h"
 
 typedef struct d2k_tls d2k_tls;
+typedef struct d2k_tls_probe_seed d2k_tls_probe_seed;
+/* Own random/key material for one controlled measurement episode. Reuse only
+ * to keep ClientHello bytes fixed across its experiments, never for ordinary
+ * user sessions. Does not reset the peer/network. Free wipes this storage. */
+d2k_tls_probe_seed *d2k_tls_probe_seed_new(void);
+void d2k_tls_probe_seed_free(d2k_tls_probe_seed *);
+/* Copy public ClientHello random; private key material is never exposed. */
+int d2k_tls_probe_seed_random(const d2k_tls_probe_seed *,uint8_t out[32]);
+/* Exact first TLS record used by connect_probe for these inputs. No IO;
+ * contains public handshake bytes only. Zero means invalid input/capacity. */
+size_t d2k_tls_probe_hello(const d2k_tls_probe_seed *,const char *,size_t,
+    const uint8_t *,size_t,uint8_t *,size_t);
+
+/* Ordered byte stream supplied by a measurement transport. Descriptor is
+ * copied; context stays borrowed until tls_free. read returns 1..cap bytes,
+ * zero for EOF or -1 with reason; wait_ms is the remaining deadline.
+ * write submits all bytes or returns -1. Neither callback owns TLS state.
+ * No socket operations or implicit transport close occur on this path. */
+typedef struct {
+    void *context;
+    long (*read)(void *,uint8_t *,size_t,int,char *,size_t);
+    int (*write)(void *,const uint8_t *,size_t,char *,size_t);
+} d2k_tls_io;
+/* TLS1.3 only, explicit ALPN list (zero length means no ALPN). This is the
+ * existing measurement client, with the same authentication limitations. */
+int d2k_tls_connect_io(const d2k_tls_io *,const char *,int,size_t,
+    const uint8_t *,size_t,d2k_tls **,char *,size_t);
+/* РУКОПОЖАТИЕ НА ФОРМЕ КЛИЕНТА (ТЗ §4.3, §11.1). form — запись TLS с
+ * ClientHello клиента; уходят его байты, где заменены только Random,
+ * session_id и открытые ключи key_share (X25519, X25519MLKEM768, P-256 —
+ * свои ключи; прочие группы — свои случайные байты). Шифр — 0x1301..0x1303 по выбору сервера. sni —
+ * имя цели для сверки сертификата (имя в форме не меняется). fd или
+ * io (io — транспорт опыта, тогда fd < 0). Отказ: форма не разбирается,
+ * возобновление сессии, HelloRetryRequest, группа без нашего ключа. */
+int d2k_tls_connect_form(int fd, const d2k_tls_io *io, const char *sni,
+    const uint8_t *form, size_t form_len, int deadline_ms, d2k_tls **out,
+    char *err, size_t errcap);
+/* Группа key_share, выбранная сервером в режиме формы; 0 — неизвестно. */
+int d2k_tls_group(const d2k_tls *);
+/* Исход последнего чтения сокета в этом потоке: 0, ETIMEDOUT, -1 (FIN), errno. */
+int d2k_tls_last_read_errno(void);
+/* Протокол, выбранный сервером по ALPN (например "h2", "http/1.1"); "" — не согласован. */
+const char *d2k_tls_alpn(const d2k_tls *);
+int d2k_tls_connect_probe(const d2k_tls_io *,const d2k_tls_probe_seed *,const char *,int,size_t,
+    const uint8_t *,size_t,d2k_tls **,char *,size_t);
 
 /* Поднимает сессию поверх УЖЕ ПОДКЛЮЧЁННОГО сокета fd. sni — имя, которое
  * предъявляем (пустое — без расширения имени). deadline_ms — потолок на всё

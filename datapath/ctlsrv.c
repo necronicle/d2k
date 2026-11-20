@@ -9,7 +9,10 @@
 #include <string.h>
 
 #include "d2k_ctlsrv.h"
+#include "plan_internal.h"
 #include "d2k_quicsnap.h"
+#include "d2k_lateobs.h"
+#include "d2k_crypto.h"
 #include "../runtime/d2k_runtime.h"
 
 /* Кладёт ключ потока в тело события ПОЛЯМИ, а не наложением структуры на
@@ -34,6 +37,20 @@ static size_t put_key(uint8_t *out, const d2k_key *k) {
     memcpy(out + 35, &k->high_port, 2);
     out[37] = k->proto;
     return D2K_KEY_WIRE_LEN;
+}
+
+int d2k_ctlsrv_raw_measure(d2k_ctlsrv *cx,const struct d2k_rawmeasure_report *r) {
+    if (!cx || !cx->ctl || !d2k_rawmeasure_report_valid(r)) return -1;
+    uint8_t body[D2K_KEY_WIRE_LEN+D2K_RM_REPORT_LEN];
+    const d2k_ct_tuple *t=&r->request.tuple;
+    d2k_addr src={0},dst={0};d2k_key key;
+    src.family=dst.family=t->family;
+    memcpy(src.bytes,t->src,16);memcpy(dst.bytes,t->dst,16);
+    if (d2k_key_make_addr(&key,t->proto,&src,&dst,t->sport_be,t->dport_be)<0) return -1;
+    put_key(body,&key);
+    if (d2k_rawmeasure_report_write(body+D2K_KEY_WIRE_LEN,D2K_RM_REPORT_LEN,r)) return -1;
+    d2k_ctl_event(cx->ctl,D2K_EV_RAW_MEASURE,body,sizeof body);
+    return 0;
 }
 
 int d2k_plan_fits(const d2k_plan *p, uint32_t limits, uint32_t maxlen,
@@ -99,14 +116,31 @@ static void ack(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason) {
     if (cx->ctl) {
         size_t len = D2K_KEY_WIRE_LEN+4;
         if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
-            type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND) {
+            type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND ||
+            type == D2K_CMD_SET_ENDPOINT_BOUND || type == D2K_CMD_SET_PREFLIGHT_TRIAL ||
+            type == D2K_CMD_SET_PREFLIGHT_LEASE || type == D2K_CMD_DEL_PREFLIGHT_LEASE ||
+            type == D2K_CMD_SET_DNS_ENDPOINT) {
             memcpy(body+len, cx->area_id, D2K_TRIAL_ID_LEN); len += D2K_TRIAL_ID_LEN;
         }
-        if(type==D2K_CMD_SET_NAME_BOUND) {
+        if(type==D2K_CMD_SET_NAME_BOUND || type==D2K_CMD_SET_ENDPOINT_BOUND ||
+           type==D2K_CMD_SET_PREFLIGHT_TRIAL || type==D2K_CMD_SET_PREFLIGHT_LEASE ||
+           type==D2K_CMD_SET_DNS_ENDPOINT) {
             d2k_ctl_binding_write(body+len,&cx->installed_binding); len+=D2K_CTL_BINDING_LEN;
         }
         d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, len);
     }
+}
+
+static void ack_trial(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason,
+                      const uint8_t trial_id[D2K_TRIAL_ID_LEN]);
+
+void d2k_ctlsrv_ack_late(d2k_ctlsrv *cx, int ok, uint8_t reason, const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    if (cx && cx->ctl) ack_trial(cx, D2K_CMD_LATE_OBSERVE, ok, reason, token);
+}
+
+void d2k_ctlsrv_ack_raw_measure(d2k_ctlsrv *cx, int ok, uint8_t reason,
+                                const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    if (cx && cx->ctl) ack_trial(cx, D2K_CMD_RAW_MEASURE, ok, reason, token);
 }
 
 static void ack_trial(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason,
@@ -120,6 +154,29 @@ static void ack_trial(d2k_ctlsrv *cx, uint16_t type, int ok, uint8_t reason,
     body[D2K_KEY_WIRE_LEN + 3] = ok ? D2K_ACK_OK : reason;
     memcpy(body + D2K_KEY_WIRE_LEN + 4, trial_id, D2K_TRIAL_ID_LEN);
     d2k_ctl_event(cx->ctl, D2K_EV_ACK, body, sizeof body);
+}
+
+void d2k_ctlsrv_stats(d2k_ctl *ctl) {
+    if (!ctl) { return; }
+    /* Сколько СОБЫТИЙ мы потеряли. Датапат держит ровно один исходящий кадр и
+       теряет всё, что не поместилось (см. шапку d2k_ctl.h) — осознанный
+       предел. Контроллер обязан знать, что был слеп: без этого числа пропавший
+       обмен выглядит у него как «план не сработал». */
+    uint8_t body[D2K_KEY_WIRE_LEN + 8];
+    memset(body, 0, sizeof body);
+    body[0] = 4; /* ключа потока нет; семейство обязано быть известным (link.c) */
+    uint64_t dr = d2k_ctl_dropped(ctl), sn = d2k_ctl_sent(ctl);
+    uint32_t dr32 = dr > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)dr;
+    uint32_t sn32 = sn > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)sn;
+    body[D2K_KEY_WIRE_LEN + 0] = (uint8_t)(dr32 >> 24);
+    body[D2K_KEY_WIRE_LEN + 1] = (uint8_t)(dr32 >> 16);
+    body[D2K_KEY_WIRE_LEN + 2] = (uint8_t)(dr32 >> 8);
+    body[D2K_KEY_WIRE_LEN + 3] = (uint8_t)dr32;
+    body[D2K_KEY_WIRE_LEN + 4] = (uint8_t)(sn32 >> 24);
+    body[D2K_KEY_WIRE_LEN + 5] = (uint8_t)(sn32 >> 16);
+    body[D2K_KEY_WIRE_LEN + 6] = (uint8_t)(sn32 >> 8);
+    body[D2K_KEY_WIRE_LEN + 7] = (uint8_t)sn32;
+    d2k_ctl_event(ctl, D2K_EV_STATS, body, sizeof body);
 }
 
 void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
@@ -146,7 +203,12 @@ void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen) {
 
 void d2k_ctlsrv_peer_closed(void *ctx) {
     d2k_ctlsrv *cx = ctx;
-    if (cx && cx->sess) d2k_plantab_clear_probes(d2k_session_plans(cx->sess));
+    if (cx && cx->sess) {
+        d2k_plantab *tab=d2k_session_plans(cx->sess);
+        d2k_plantab_clear_probes(tab);
+        d2k_plantab_clear_dns_endpoints(tab);
+    }
+    if (cx && cx->peer_closed_hook) cx->peer_closed_hook(cx->probe_hook_ctx);
 }
 
 static int canonical_address(uint8_t family, const uint8_t *ip) {
@@ -163,7 +225,7 @@ static int canonical_address(uint8_t family, const uint8_t *ip) {
 static int addr_shape_valid(uint8_t shape) {
     return shape == D2K_PLAN_SHAPE_MODERN || shape == D2K_PLAN_SHAPE_LEGACY ||
            shape == D2K_PLAN_SHAPE_QUIC || shape == D2K_PLAN_SHAPE_VOICE ||
-           shape == D2K_PLAN_SHAPE_ECH_TCP;
+           shape == D2K_PLAN_SHAPE_ECH_TCP || shape == D2K_PLAN_SHAPE_RAW;
 }
 
 static int read_probe_flow(const uint8_t *b, d2k_addr_probe_flow *flow) {
@@ -196,7 +258,8 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
        его — и на отказ тоже: контроллер обязан отличить СВОЙ отказ
        исполнителя от чужого подтверждения (задача 19). */
     if ((type >= D2K_CMD_SET_SUFFIX && type <= D2K_CMD_DEL_BYPASS) ||
-        type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND) {
+        type == D2K_CMD_SET_NAME_PROBE || type == D2K_CMD_SET_NAME_BOUND ||
+        type == D2K_CMD_SET_ENDPOINT_BOUND || type == D2K_CMD_SET_PREFLIGHT_TRIAL || type == D2K_CMD_SET_DNS_ENDPOINT) {
         memset(cx->area_id, 0, sizeof cx->area_id);
         if (len < D2K_TRIAL_ID_LEN) { ack(cx, type, 0, D2K_ACK_BAD_ARGS); return; }
         len -= D2K_TRIAL_ID_LEN;
@@ -208,11 +271,25 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     case D2K_CMD_SET_NAME:
     case D2K_CMD_SET_SUFFIX:
     case D2K_CMD_SET_NAME_PROBE:
+    case D2K_CMD_SET_ENDPOINT_BOUND:
+    case D2K_CMD_SET_PREFLIGHT_TRIAL:
+    case D2K_CMD_SET_ENDPOINT:
+    case D2K_CMD_SET_DNS_ENDPOINT:
     case D2K_CMD_SET_ADDR: {
         /* v4: [длина имени][имя][форма][family][пробный порт?][план].
            План занимает остаток тела; адресное семейство обязательно. */
         size_t hdr;
-        if (type == D2K_CMD_SET_ADDR) {
+        int dns=type==D2K_CMD_SET_DNS_ENDPOINT;
+        int gate=type==D2K_CMD_SET_PREFLIGHT_TRIAL;
+        int endpoint = type == D2K_CMD_SET_ENDPOINT || type == D2K_CMD_SET_ENDPOINT_BOUND || dns || gate;
+        if (dns) {
+            uint8_t any=0;
+            for(size_t i=0;i<D2K_TRIAL_ID_LEN;i++)any|=cx->area_id[i];
+            if (!any) {ack(cx,type,0,D2K_ACK_BAD_ARGS);return;}
+        }
+        if (endpoint) {
+            hdr = (dns || gate) ? 22u : 20u;
+        } else if (type == D2K_CMD_SET_ADDR) {
             hdr = 18u; /* v7: family, address(16), форма протокола */
         } else if (type == D2K_CMD_SET_NAME_PROBE) {
             hdr = len ? 5u + b[0] : 5u;
@@ -223,12 +300,14 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        if (type == D2K_CMD_SET_ADDR &&
-            (!canonical_address(b[0], b + 1) || !addr_shape_valid(b[17]))) {
+        if ((type == D2K_CMD_SET_ADDR || endpoint) &&
+            (!canonical_address(b[0], b + 1) || (dns ? b[17]!=D2K_PLAN_SHAPE_DNS : !addr_shape_valid(b[17])) ||
+             (endpoint && !b[18] && !b[19]))) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        if (type != D2K_CMD_SET_ADDR && b[2u + b[0]] != 4 && b[2u + b[0]] != 6) {
+        if (type != D2K_CMD_SET_ADDR && !endpoint &&
+            b[2u + b[0]] != 4 && b[2u + b[0]] != 6) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
@@ -237,6 +316,12 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             fprintf(stderr, "d2kd: план от контроллера не принят: %s\n", why);
             ack(cx, type, 0, D2K_ACK_BAD_PLAN);
             return;
+        }
+        /* A SYN has no name: preflight requires a request-scoped
+           endpoint install. The existing command/ACK format already carries it. */
+        if((p->preflight && !gate && type!=D2K_CMD_SET_ENDPOINT_BOUND) ||
+           (gate && (!p->preflight || (!b[20] && !b[21])))) {
+            d2k_plan_free(p);ack(cx,type,0,D2K_ACK_BAD_ARGS);return;
         }
         if (!d2k_plan_fits(p, cx->send_limits, cx->send_maxlen, why, sizeof why)) {
             fprintf(stderr, "d2kd: план от контроллера не активирован: %s\n", why);
@@ -256,9 +341,21 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             if (type == D2K_CMD_SET_NAME_PROBE)
                 rc = d2k_plantab_set_name_trial(tab,b+1,b[0],cx->now_ns,p,
                     b[1u+b[0]],sport_be,b[2u+b[0]],cx->area_id);
+            else if(type==D2K_CMD_SET_NAME_BOUND)
+                rc=d2k_plantab_set_name_bound(tab,b+1,b[0],cx->now_ns,p,b[1u+b[0]],b[2u+b[0]]);
             else
                 rc = d2k_plantab_set_name_family(tab, b + 1, b[0], cx->now_ns, p,
                                                 b[1u + b[0]], sport_be, b[2u + b[0]]);
+        } else if (endpoint) {
+            uint16_t port_be;
+            memcpy(&port_be, b + 18, 2);
+            uint16_t sport_be = 0;
+            if (gate) memcpy(&sport_be, b + 20, 2);
+            rc = gate ? d2k_plantab_set_endpoint_trial_port(tab,b+1,b[0],port_be,sport_be,cx->now_ns,p,b[17],cx->area_id) :
+                dns ? d2k_plantab_set_dns_endpoint(tab,b+1,b[0],port_be,cx->now_ns,
+                     (uint16_t)((uint16_t)b[20]*256+b[21]),p) : type==D2K_CMD_SET_ENDPOINT_BOUND?
+                d2k_plantab_set_endpoint_trial(tab,b+1,b[0],port_be,cx->now_ns,p,b[17],cx->area_id):
+                d2k_plantab_set_endpoint(tab,b+1,b[0],port_be,cx->now_ns,p,b[17]);
         } else {
             rc = d2k_plantab_set_addr_shaped(tab, b + 1, b[0], cx->now_ns, p, b[17]);
         }
@@ -276,13 +373,61 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         } else if (rc != 0) {
             reason = D2K_ACK_BAD_ARGS;
         }
-        if(rc==0 && type==D2K_CMD_SET_NAME_BOUND)
+        if(rc==0 && (type==D2K_CMD_SET_NAME_BOUND || type==D2K_CMD_SET_ENDPOINT_BOUND || gate || dns))
             (void)d2k_plantab_binding(tab,p,&cx->installed_binding);
+        if (rc == 0 && type == D2K_CMD_SET_NAME_PROBE && cx->name_probe_hook) {
+            uint16_t sp; memcpy(&sp, b + 3u + b[0], 2);
+            if (sp) {
+                /* Транспорта в SET_NAME_PROBE на проводе нет (d2k_link.h): именные
+                   пробы порта — TCP. */
+                cx->name_probe_hook(cx->probe_hook_ctx, b + 1, b[0], 6, b[2u + b[0]], sp, 0, 1);
+            }
+        }
         ack(cx, type, rc == 0, reason);
         return;
     }
+    case D2K_CMD_SET_RAW_PROBE: {
+        const size_t fixed=D2K_RM_REPORT_LEN+20;
+        if(len<fixed){ack(cx,type,0,D2K_ACK_BAD_ARGS);return;}
+        const uint8_t *trial=b+D2K_RM_REPORT_LEN;
+        struct d2k_rawmeasure_report r;
+        uint32_t lease=d2k_rm_get32(trial+16);
+        if(d2k_rawmeasure_report_read(&r,b,D2K_RM_REPORT_LEN)||r.code!=D2K_RM_REPEAT_SILENT||
+           !d2k_rm_nonzero(trial,16)||!lease||lease>D2K_ADDR_PROBE_LEASE_MAX_MS||
+           cx->now_ns>UINT64_MAX-(uint64_t)lease*1000000u) {
+            ack_trial(cx,type,0,D2K_ACK_BAD_ARGS,trial);return;
+        }
+        uint8_t epoch[16];uint64_t generation;int previous=0;
+        if(d2k_session_raw_identity(cx->sess,&r.request.tuple,epoch,&generation,&previous)||
+           generation!=r.request.generation||memcmp(epoch,r.request.epoch,16)||
+           (r.request.tuple.proto==17&&!previous)) {
+            ack_trial(cx,type,0,D2K_ACK_UNAVAILABLE,trial);return;
+        }
+        d2k_plan *p=NULL;
+        if(d2k_plan_load(b+fixed,len-fixed,&p,why,sizeof why)) {
+            ack_trial(cx,type,0,D2K_ACK_BAD_PLAN,trial);return;
+        }
+        if(!d2k_plan_fits(p,cx->send_limits,cx->send_maxlen,why,sizeof why)) {
+            d2k_plan_free(p);ack_trial(cx,type,0,D2K_ACK_BAD_PLAN,trial);return;
+        }
+        uint64_t expires=cx->now_ns+(uint64_t)lease*1000000u;
+        uint8_t plan_digest[32];d2k_sha256(b+fixed,len-fixed,plan_digest);
+        int rc=d2k_plantab_set_measured_probe(tab,&r,trial,plan_digest,cx->now_ns,expires,p);
+        if(!rc&&cx->addr_probe_hook) {
+            d2k_addr_probe_flow flow={0};flow.family=r.request.tuple.family;flow.transport=r.request.tuple.proto;
+            memcpy(flow.family==6?flow.src_ip6:flow.src_ip4,r.request.tuple.src,flow.family==6?16:4);
+            memcpy(flow.family==6?flow.dst_ip6:flow.dst_ip4,r.request.tuple.dst,flow.family==6?16:4);
+            memcpy(&flow.src_port_be,r.request.tuple.sport_be,2);memcpy(&flow.dst_port_be,r.request.tuple.dport_be,2);
+            cx->addr_probe_hook(cx->probe_hook_ctx,&flow,expires,1);
+        }
+        ack_trial(cx,type,rc==0,rc==-1?D2K_ACK_NO_ROOM:rc?D2K_ACK_BAD_ARGS:D2K_ACK_OK,trial);
+        return;
+    }
+    case D2K_CMD_SET_DNS_PROBE:
     case D2K_CMD_SET_ADDR_PROBE: {
-        const size_t fixed = D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN + 4u;
+        int dns=type==D2K_CMD_SET_DNS_PROBE;
+        const size_t fixed = dns ? D2K_DNS_PROBE_FIXED :
+            D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN + 4u;
         if (len < fixed) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
@@ -301,7 +446,7 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
         /* src_port 0 — голосовой опыт «любой клиентский порт» (задача 15);
            подстановка видна только поиску голоса (d2k_plantab_find_voice_probe). */
-        if (flow.transport != 17 || !flow.dst_port_be ||
+        if ((!dns && flow.transport!=17) || (dns && !flow.src_port_be) || !flow.dst_port_be ||
             !lease_ms || lease_ms > D2K_ADDR_PROBE_LEASE_MAX_MS || !any_id ||
             cx->now_ns > UINT64_MAX - (uint64_t)lease_ms * 1000000u) {
             ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, trial_id);
@@ -319,10 +464,15 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             return;
         }
         uint64_t expires = cx->now_ns + (uint64_t)lease_ms * 1000000u;
-        int rc = d2k_plantab_set_addr_probe(tab, &flow, trial_id,
-                                            cx->now_ns, expires, p);
+        const uint8_t *guard=b+lease_off+4;
+        int rc = dns ? d2k_plantab_set_dns_probe(tab,&flow,trial_id,cx->now_ns,expires,
+                (uint16_t)((uint16_t)guard[0]*256+guard[1]),guard+2,p) :
+            d2k_plantab_set_addr_probe(tab,&flow,trial_id,cx->now_ns,expires,p);
         uint8_t reason = rc == -1 ? D2K_ACK_NO_ROOM :
                          rc == 0 ? D2K_ACK_OK : D2K_ACK_BAD_ARGS;
+        if (rc == 0 && !dns && cx->addr_probe_hook && flow.src_port_be) {
+            cx->addr_probe_hook(cx->probe_hook_ctx, &flow, expires, 1);
+        }
         ack_trial(cx, type, rc == 0, reason, trial_id);
         return;
     }
@@ -332,14 +482,17 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
            него датапат отдал бы QUIC-задаче байты TLS. Старое тело (без
            последнего байта) отвергается — смешанная пара ловится сверкой
            версии провода, а не молча. */
-        if (len < 3 || len != 3u + b[0]) {
+        if (len < 3 || (len != 3u + b[0] && len != 3u + b[0] + D2K_TRIAL_ID_LEN)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
+        const uint8_t *request_id = len == 3u + b[0] + D2K_TRIAL_ID_LEN
+                                  ? b + 3u + b[0] : NULL;
         uint8_t want_tr = b[1u + b[0]];
         uint8_t want_family = b[2u + b[0]];
         if ((want_tr != 6 && want_tr != 17) || (want_family != 4 && want_family != 6)) {
-            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            if (request_id) ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, request_id);
+            else ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
         if (d2k_session_want_shape_family(cx->sess, b + 1, b[0], want_tr, want_family)) {
@@ -372,7 +525,8 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
                 }
             }
         }
-        ack(cx, type, 1, D2K_ACK_OK);
+        if (request_id) ack_trial(cx, type, 1, D2K_ACK_OK, request_id);
+        else ack(cx, type, 1, D2K_ACK_OK);
         return;
     }
     case D2K_CMD_DEL_SUFFIX:
@@ -392,6 +546,59 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         else
             rc = d2k_plantab_del_bypass_family(tab, b+1, b[0], b[1u+b[0]], b[2u+b[0]], b[3u+b[0]]);
         ack(cx, type, rc >= 0, rc == -1 ? D2K_ACK_NO_ROOM : rc < 0 ? D2K_ACK_BAD_ARGS : D2K_ACK_OK);
+        return;
+    }
+    case D2K_CMD_SET_PREFLIGHT_LEASE:
+    case D2K_CMD_DEL_PREFLIGHT_LEASE: {
+        d2k_pf_scope scope={0};uint16_t name_len=0;uint32_t lease_ms=0;const uint8_t *id=NULL;
+        if(len>=D2K_PREFLIGHT_LEASE_SCOPE_WIRE_LEN) {
+            scope.family=b[0];memcpy(scope.client,b+1,16);memcpy(scope.server,b+17,16);
+            scope.shape=b[33];scope.path=((uint32_t)b[34]<<24)|((uint32_t)b[35]<<16)|((uint32_t)b[36]<<8)|b[37];
+            memcpy(&scope.server_port,b+38,2);
+            lease_ms=((uint32_t)b[40]<<24)|((uint32_t)b[41]<<16)|((uint32_t)b[42]<<8)|b[43];
+            name_len=((uint16_t)b[44]<<8)|b[45];
+            if(name_len&&name_len<=253&&len>=D2K_PREFLIGHT_LEASE_SCOPE_WIRE_LEN+name_len+16) {
+                memcpy(scope.name,b+46,name_len);scope.name[name_len]=0;id=b+46+name_len;
+            }
+        }
+        int set=type==D2K_CMD_SET_PREFLIGHT_LEASE;
+        if(!id||(set&&(!lease_ms||lease_ms>D2K_PREFLIGHT_LEASE_MAX_MS||
+            len<=D2K_PREFLIGHT_LEASE_SCOPE_WIRE_LEN+name_len+16))||
+            (!set&&(len!=D2K_PREFLIGHT_LEASE_SCOPE_WIRE_LEN+name_len+16))||
+            !canonical_address(scope.family,scope.client)||!canonical_address(scope.family,scope.server) ||
+            (scope.shape!=D2K_PLAN_SHAPE_MODERN&&scope.shape!=D2K_PLAN_SHAPE_LEGACY)) {
+            ack(cx,type,0,D2K_ACK_BAD_ARGS);return;
+        }
+        memcpy(cx->area_id,id,16);
+        if(!set) {(void)d2k_session_del_preflight_lease(cx->sess,&scope,id);ack(cx,type,1,D2K_ACK_OK);return;}
+        if(cx->now_ns>UINT64_MAX-(uint64_t)lease_ms*1000000) {ack(cx,type,0,D2K_ACK_BAD_ARGS);return;}
+        d2k_plan *plan=NULL;char err[200];size_t off=D2K_PREFLIGHT_LEASE_SCOPE_WIRE_LEN+name_len+16;
+        if(d2k_plan_load(b+off,len-off,&plan,err,sizeof err)) {ack(cx,type,0,D2K_ACK_BAD_PLAN);return;}
+        int rc=d2k_session_set_preflight_lease(cx->sess,&scope,cx->now_ns,
+            cx->now_ns+(uint64_t)lease_ms*1000000,id,plan);
+        if(!rc) {
+            const d2k_binding_context *binding=d2k_session_preflight_lease_binding(cx->sess,plan);
+            if(binding)cx->installed_binding=*binding;
+        }
+        ack(cx,type,rc==0,rc==-1?D2K_ACK_NO_ROOM:rc==-2?D2K_ACK_UNAVAILABLE:D2K_ACK_BAD_ARGS);
+        return;
+    }
+    case D2K_CMD_COMMIT_ENDPOINT_TRIAL:
+    case D2K_CMD_DEL_ENDPOINT_TRIAL: {
+        uint16_t port=0;uint8_t any=0;
+        if(len==36) { memcpy(&port,b+18,2);for(unsigned i=20;i<36;i++)any|=b[i]; }
+        if(len!=36 || !canonical_address(b[0],b+1) || !port || !any ||
+           (b[17]!=D2K_PLAN_SHAPE_MODERN && b[17]!=D2K_PLAN_SHAPE_LEGACY)) {
+            ack(cx,type,0,D2K_ACK_BAD_ARGS);return;
+        }
+        if(type==D2K_CMD_COMMIT_ENDPOINT_TRIAL) {
+            int ok=d2k_plantab_commit_endpoint_trial(tab,b+1,b[0],port,b[17],b+20);
+            if(cx->ctl)ack_trial(cx,type,ok,ok?D2K_ACK_OK:D2K_ACK_BAD_ARGS,b+20);
+            else if(ok)cx->ok_cmds++;else cx->bad_cmds++;
+        } else {
+            (void)d2k_plantab_del_endpoint_trial(tab,b+1,b[0],port,b[17],b+20);
+            ack(cx,type,1,D2K_ACK_OK);
+        }
         return;
     }
     case D2K_CMD_DEL_NAME_BOUND: {
@@ -420,8 +627,9 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_DEL_NAME_PROBE:
-        /* тело: длина имени, имя, форма, family, местный порт */
-        if (len < 5 || len != 5u + b[0] ||
+        /* Old exact key, optionally followed by its owning trial token.
+           Old peers reject the longer form, never widen it to a delete. */
+        if (len < 5 || (len != 5u + b[0] && len != 5u + b[0] + D2K_TRIAL_ID_LEN) ||
             (b[2u + b[0]] != 4 && b[2u + b[0]] != 6)) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
@@ -432,8 +640,18 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
-        d2k_plantab_del_name_probe_family(tab, b + 1, b[0], b[1u + b[0]],
-                                          probe_port, b[2u + b[0]]);
+        int conditional=len==5u+b[0]+D2K_TRIAL_ID_LEN,probe_removed;
+        if(conditional) {
+            const uint8_t *trial=b+5u+b[0];uint8_t any=0;
+            for(size_t i=0;i<D2K_TRIAL_ID_LEN;i++)any|=trial[i];
+            if(!any || !b[1u+b[0]]) {ack(cx,type,0,D2K_ACK_BAD_ARGS);return;}
+            probe_removed=d2k_plantab_del_name_probe_trial(tab,b+1,b[0],b[1u+b[0]],
+                probe_port,b[2u+b[0]],trial);
+        } else probe_removed=d2k_plantab_del_name_probe_family(tab,b+1,b[0],b[1u+b[0]],
+                probe_port,b[2u+b[0]]);
+        if (cx->name_probe_hook && (!conditional || probe_removed)) {
+            cx->name_probe_hook(cx->probe_hook_ctx, b + 1, b[0], 6, b[2u + b[0]], probe_port, 0, 0);
+        }
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     case D2K_CMD_SET_HTTPS: {
@@ -468,6 +686,24 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
         ack(cx, type, 1, D2K_ACK_OK);
         return;
     }
+    case D2K_CMD_DEL_ENDPOINT: {
+        int dns=len>=20 && b[17]==D2K_PLAN_SHAPE_DNS;
+        if ((len != 20 && len != 21) || !canonical_address(b[0], b + 1) ||
+            (!dns && !addr_shape_valid(b[17])) || (!b[18] && !b[19]) ||
+            ((dns || b[17]==D2K_PLAN_SHAPE_RAW) ? (len != 21 || (b[20] != 6 && b[20] != 17)) : len != 20)) {
+            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            return;
+        }
+        uint16_t port_be;
+        memcpy(&port_be, b + 18, 2);
+        if (dns)
+            d2k_plantab_del_dns_endpoint(tab,b+1,b[0],port_be,b[20]);
+        else if (b[17] == D2K_PLAN_SHAPE_RAW)
+            d2k_plantab_del_raw_endpoint(tab, b + 1, b[0], port_be, b[20]);
+        else d2k_plantab_del_endpoint(tab, b + 1, b[0], port_be, b[17]);
+        ack(cx, type, 1, D2K_ACK_OK);
+        return;
+    }
     case D2K_CMD_DEL_ADDR: {
         if (len != 18 || !canonical_address(b[0], b + 1) || !addr_shape_valid(b[17])) {
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
@@ -482,22 +718,59 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
             ack(cx, type, 0, D2K_ACK_BAD_ARGS);
             return;
         }
+        const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
         d2k_addr_probe_flow flow = {0};
         if (read_probe_flow(b, &flow) != 0) {
-            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+            ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, trial_id);
             return;
         }
-        const uint8_t *trial_id = b + D2K_ADDR_PROBE_FLOW_WIRE_LEN;
         uint8_t any_id = 0;
         for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) { any_id |= trial_id[i]; }
-        if (flow.transport != 17 || !flow.dst_port_be || !any_id) {
-            ack(cx, type, 0, D2K_ACK_BAD_ARGS);
+        if ((flow.transport != 17 && flow.transport != 6) || (flow.transport==6 && !flow.src_port_be) || !flow.dst_port_be || !any_id) {
+            ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, trial_id);
             return;
         }
         /* Idempotent and generation-safe: not finding this exact owner is
            success, but can never remove a different trial or persistent addr. */
-        (void)d2k_plantab_del_addr_probe(tab, &flow, trial_id);
-        ack(cx, type, 1, D2K_ACK_OK);
+        int removed = d2k_plantab_del_addr_probe(tab, &flow, trial_id);
+        if (removed == 1 && cx->addr_probe_hook && flow.src_port_be) {
+            cx->addr_probe_hook(cx->probe_hook_ctx, &flow, 0, 0);
+        }
+        ack_trial(cx, type, 1, D2K_ACK_OK, trial_id);
+        return;
+    }
+    case D2K_CMD_RAW_MEASURE: {
+        struct d2k_rawmeasure_request request;
+        uint8_t token[D2K_TRIAL_ID_LEN] = {0};
+        if (len == D2K_RM_REQUEST_LEN) memcpy(token, b + 62, sizeof token);
+        if (d2k_rawmeasure_request_read(&request, b, len) != 0) {
+            ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, token);
+            return;
+        }
+        if (cx->raw_measure_hook) cx->raw_measure_hook(cx->probe_hook_ctx, &request);
+        else ack_trial(cx, type, 0, D2K_ACK_UNAVAILABLE, request.token);
+        return;
+    }
+    case D2K_CMD_LATE_OBSERVE: {
+        d2k_ct_tuple t;
+        uint8_t token[D2K_TRIAL_ID_LEN] = {0}, any = 0;
+        if (len == D2K_LATE_OBSERVE_LEN) {
+            memcpy(token, b + 39, D2K_TRIAL_ID_LEN);
+            for (size_t i = 0; i < D2K_TRIAL_ID_LEN; i++) any |= token[i];
+        }
+        if (len != D2K_LATE_OBSERVE_LEN || !any || !canonical_address(b[0], b + 2) ||
+            !canonical_address(b[0], b + 18) || b[1] != 6 || !b[38] || b[38] > 120) {
+            ack_trial(cx, type, 0, D2K_ACK_BAD_ARGS, token);
+            return;
+        }
+        memset(&t, 0, sizeof t);
+        t.family = b[0]; t.proto = b[1];
+        memcpy(t.src, b + 2, 16); memcpy(t.dst, b + 18, 16);
+        memcpy(t.sport_be, b + 34, 2); memcpy(t.dport_be, b + 36, 2);
+        /* Подтверждение — по готовности доставки (этап 53): его шлёт модуль
+           через d2k_ctlsrv_ack_late. Нечем наблюдать — отказ сразу. */
+        if (cx->late_observe_hook) cx->late_observe_hook(cx->probe_hook_ctx, &t, b[38], token);
+        else ack_trial(cx, type, 0, D2K_ACK_UNAVAILABLE, token);
         return;
     }
     default:
@@ -508,6 +781,48 @@ void d2k_ctlsrv_command(void *vctx, uint16_t type, const uint8_t *b, size_t len)
     }
 }
 
+/* КВИТАНЦИИ ОПЫТОВ (ТЗ §8.3). События исполнения по пробным планам,
+   поставленным через вход опытов, уходят его клиенту, а не основному
+   контроллеру: тот этих планов не ставил и о них не знает. Последние
+   идентификаторы опытов держатся кольцом — плечо живёт секунды. */
+#define EXP_TRIALS 32
+static struct {
+    uint8_t id[D2K_TRIAL_ID_LEN];
+    d2k_ctl *owner;
+    int used,active;
+} exp_trials[EXP_TRIALS];
+static unsigned exp_next;
+
+void d2k_ctlsrv_forget_exp_ctl(d2k_ctl *x) {
+    for(unsigned i=0;i<EXP_TRIALS;i++)if(exp_trials[i].owner==x) {
+        exp_trials[i].owner=NULL;exp_trials[i].active=0;
+    }
+}
+static int exp_find(const uint8_t id[D2K_TRIAL_ID_LEN]) {
+    for(unsigned i=0;i<EXP_TRIALS;i++)
+        if(exp_trials[i].used && !memcmp(exp_trials[i].id,id,D2K_TRIAL_ID_LEN))return (int)i;
+    return -1;
+}
+static int exp_remember(d2k_ctl *owner,const uint8_t id[D2K_TRIAL_ID_LEN]) {
+    int old=exp_find(id);
+    if(old>=0) {
+        if(exp_trials[old].owner!=owner)return -1;
+        exp_trials[old].active=1;return 0;
+    }
+    for(unsigned n=0;n<EXP_TRIALS;n++) {
+        unsigned i=(exp_next+n)%EXP_TRIALS;
+        if(exp_trials[i].active)continue;
+        memcpy(exp_trials[i].id,id,D2K_TRIAL_ID_LEN);
+        exp_trials[i].owner=owner;exp_trials[i].used=exp_trials[i].active=1;
+        exp_next=(i+1)%EXP_TRIALS;return 0;
+    }
+    return -1;
+}
+static void exp_release(d2k_ctl *owner,const uint8_t id[D2K_TRIAL_ID_LEN]) {
+    int i=exp_find(id);
+    if(i>=0 && exp_trials[i].owner==owner)exp_trials[i].active=0;
+}
+
 void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
     const d2k_journal *j = d2k_session_journal(s);
     uint64_t added = d2k_journal_added(j);
@@ -516,6 +831,9 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
     }
     size_t have = d2k_journal_count(j);
     uint64_t fresh = added - *seen;
+    if (fresh > have) {
+        d2k_ctl_note_dropped(ctl, fresh - have);
+    }
     size_t from = (fresh >= have) ? 0 : (size_t)(have - fresh);
     *seen = added;
 
@@ -529,6 +847,18 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
         size_t n = put_key(body, &e->key);
         uint16_t type = 0;
         switch (e->kind) {
+        case D2K_JRN_PREFLIGHT_START:
+        case D2K_JRN_PREFLIGHT_HANDOVER:
+        case D2K_JRN_PREFLIGHT_GAVE_UP:
+            type=e->kind==D2K_JRN_PREFLIGHT_START ? D2K_EV_PREFLIGHT_START :
+                 e->kind==D2K_JRN_PREFLIGHT_HANDOVER ? D2K_EV_PREFLIGHT_HANDOVER : D2K_EV_PREFLIGHT_GAVE_UP;
+            body[n++]=e->d_client_side;
+            for(unsigned b=0;b<4;b++) body[n++]=(uint8_t)(e->num>>(24-8*b));
+            for(unsigned b=0;b<8;b++) body[n++]=(uint8_t)(e->preflight_elapsed_ns>>(56-8*b));
+            memcpy(body+n,e->plan_id,D2K_PLAN_ID_LEN);n+=D2K_PLAN_ID_LEN;
+            memcpy(body+n,e->trial_id,D2K_TRIAL_ID_LEN);n+=D2K_TRIAL_ID_LEN;
+            d2k_ctl_binding_write(body+n,&e->binding);n+=D2K_CTL_BINDING_LEN;
+            break;
         case D2K_JRN_HELLO_SNI:
         case D2K_JRN_HELLO_NONAME:
             type = D2K_EV_HELLO;
@@ -537,6 +867,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                 memcpy(body + n, e->name, e->name_len);
                 n += e->name_len;
             }
+            /* HELLO also exists without RAW FLOW. Preserve observed direction. */
+            body[n++]=e->d_client_side;
             break;
         case D2K_JRN_SUSPECT:
             type = D2K_EV_SUSPECT;
@@ -562,6 +894,24 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                коробки цели. У остальных подозрений ноль. */
             body[n++] = (uint8_t)((e->num > 0xffffu ? 0xffffu : e->num) >> 8);
             body[n++] = (uint8_t)(e->num > 0xffffu ? 0xffffu : e->num);
+            /* Optional compatible extension: observed endpoint, not a port guess. */
+            body[n++] = e->d_client_side;
+            if (e->execution_id) {
+                memcpy(body+n,e->plan_id,D2K_PLAN_ID_LEN); n+=D2K_PLAN_ID_LEN;
+                memcpy(body+n,e->trial_id,D2K_TRIAL_ID_LEN); n+=D2K_TRIAL_ID_LEN;
+            }
+            break;
+        case D2K_JRN_FLOW:
+            type = D2K_EV_FLOW;
+            body[n++] = e->d_client_side;
+            break;
+        case D2K_JRN_LATE_OBS:
+            type = D2K_EV_LATE_OBS;
+            body[n++] = e->code;
+            body[n++] = e->d_client_side;
+            body[n++] = (uint8_t)((e->num > 0xffffu ? 0xffffu : e->num) >> 8);
+            body[n++] = (uint8_t)(e->num > 0xffffu ? 0xffffu : e->num);
+            memcpy(body + n, e->trial_id, D2K_TRIAL_ID_LEN); n += D2K_TRIAL_ID_LEN;
             break;
         case D2K_JRN_PLAN_APPLIED:
             /* Prepared, not yet sent. Never expose this as positive proof. */
@@ -634,8 +984,7 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
             size_t slen = 0;
             /* Транспорт берётся из ключа записи журнала: ловушка взводится на
                транспорт, и снимок лежит в его слоте. */
-            const uint8_t *sh = d2k_session_shape_family(s, e->key.proto,
-                                                         e->key.family == 6 ? 6 : 4, &slen);
+            const uint8_t *sh = d2k_session_shape_event(s,&e->key,e->at_ns,&slen);
             if (!sh || slen == 0 || n + slen > sizeof body) {
                 continue;
             }
@@ -677,19 +1026,36 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen) {
                замечает; новый по нему гасит замер на рукопожатии для имени,
                которое завершило обмен без плана (медиа VK, 15.10.2026). */
             body[n++] = e->d_planned;
+            if (e->execution_id) {
+                memcpy(body+n,e->plan_id,D2K_PLAN_ID_LEN); n+=D2K_PLAN_ID_LEN;
+                memcpy(body+n,e->trial_id,D2K_TRIAL_ID_LEN); n+=D2K_TRIAL_ID_LEN;
+            }
             break;
         default:
             continue;
         }
         if (type == D2K_EV_REFUSED) body[n++] = d2k_session_client_shape(s, &e->key);
-        if (type == D2K_EV_APPLIED || type == D2K_EV_REFUSED) {
+        if (type == D2K_EV_APPLIED || type == D2K_EV_REFUSED ||
+            ((type == D2K_EV_EXCHANGE || type == D2K_EV_SUSPECT) && e->execution_id)) {
             /* Snapshot from journal, never the current plan-table entry. */
             for (unsigned b = 0; b < 8; b++)
                 body[n++] = (uint8_t)(e->execution_id >> (56 - 8*b));
             d2k_ctl_binding_write(body+n,&e->binding);
             n += D2K_CTL_BINDING_LEN;
         }
-        d2k_ctl_event(ctl, type, body, n);
+        if(type==D2K_EV_EXCHANGE && e->flow_incarnation && d2k_rm_nonzero(e->flow_epoch,16)) {
+            type=D2K_EV_OWNED_EXCHANGE;
+            memcpy(body+n,e->flow_epoch,16);n+=16;
+            for(unsigned b=0;b<8;b++)body[n++]=(uint8_t)(e->flow_incarnation>>(56-8*b));
+        }
+        if (((type==D2K_EV_SUSPECT && e->d_client_shape==D2K_PLAN_SHAPE_RAW) || type==D2K_EV_FLOW) &&
+            e->d_client_side && e->flow_incarnation && d2k_rm_nonzero(e->flow_epoch,16)) {
+            type=type==D2K_EV_FLOW?D2K_EV_RAW_FLOW:D2K_EV_RAW_SUSPECT;
+            memcpy(body+n,e->flow_epoch,16);n+=16;
+            for(unsigned b=0;b<8;b++)body[n++]=(uint8_t)(e->flow_incarnation>>(56-8*b));
+        }
+        int trial=(type==D2K_EV_APPLIED || type==D2K_EV_REFUSED)?exp_find(e->trial_id):-1;
+        d2k_ctl_event(trial>=0?exp_trials[trial].owner:ctl,type,body,n);
     }
 }
 
@@ -728,4 +1094,48 @@ void d2k_ctlsrv_http80_event(d2k_ctl *ctl, const d2k_http80_res *r) {
         for(unsigned i=0;i<8;i++)body[end++]=(uint8_t)(r->request_no>>(56-8*i));
     }
     d2k_ctl_event(ctl,r->response?D2K_EV_HTTP_RESPONSE:D2K_EV_HTTP_PORTAL,body,end);
+}
+
+/* ВТОРОЙ УПРАВЛЯЮЩИЙ — ДЛЯ ОПЫТОВ НОВОЙ ЦЕПОЧКИ (ТЗ §6.7, §8.1).
+ * Принимает только пробный план на местный порт собственного потока опыта
+ * (SET_NAME_PROBE с ненулевым портом) и его снятие (DEL_NAME_PROBE). Планы
+ * для потоков клиентов через этот вход не ставятся, поэтому с основным
+ * контроллером ему конфликтовать нечему. Остальное — отказ BAD_ARGS. */
+void d2k_ctlsrv_command_exp(void *vctx, uint16_t type, const uint8_t *b, size_t len) {
+    d2k_ctlsrv *cx = vctx;
+    if (type == D2K_CMD_SET_NAME_PROBE && len >= 5 + D2K_TRIAL_ID_LEN &&
+        len - D2K_TRIAL_ID_LEN >= 5u + b[0]) {
+        uint16_t sport;
+        memcpy(&sport, b + 3u + b[0], 2);
+        if (sport) {
+            const uint8_t *id=b+len-D2K_TRIAL_ID_LEN;
+            uint8_t any=0;
+            for(unsigned i=0;i<D2K_TRIAL_ID_LEN;i++)any|=id[i];
+            if(!any) {ack_trial(cx,type,0,D2K_ACK_BAD_ARGS,id);return;}
+            if(exp_remember(cx->ctl,id)) {
+                ack_trial(cx,type,0,D2K_ACK_NO_ROOM,id);return;
+            }
+            uint64_t bad=cx->bad_cmds;
+            d2k_ctlsrv_command(vctx, type, b, len);
+            if(cx->bad_cmds!=bad)exp_release(cx->ctl,id);
+            return;
+        }
+    }
+    if (type == D2K_CMD_DEL_NAME_PROBE) {
+        if(cx->ctl) {
+            int i=len>=D2K_TRIAL_ID_LEN?exp_find(b+len-D2K_TRIAL_ID_LEN):-1;
+            if(i<0 || exp_trials[i].owner!=cx->ctl) {
+                ack(cx,type,0,D2K_ACK_BAD_ARGS);return;
+            }
+        }
+        uint64_t ok=cx->ok_cmds;
+        d2k_ctlsrv_command(vctx,type,b,len);
+        if(cx->ok_cmds!=ok && len>=D2K_TRIAL_ID_LEN)
+            exp_release(cx->ctl,b+len-D2K_TRIAL_ID_LEN);
+        return;
+    }
+    memset(cx->area_id, 0, sizeof cx->area_id);
+    if (type == D2K_CMD_SET_NAME_PROBE && len >= D2K_TRIAL_ID_LEN)
+        memcpy(cx->area_id, b + len - D2K_TRIAL_ID_LEN, sizeof cx->area_id);
+    ack(cx, type, 0, D2K_ACK_BAD_ARGS);
 }

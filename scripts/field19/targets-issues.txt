@@ -1,0 +1,14 @@
+# Цели из issue, которых не было в наборе 19. Проверены эталоном с VPS.
+#
+# x-minus.pro ИСКЛЮЧЁН 24.10.2026: его 451 приходит по валидному TLS к
+# собственному фронтенду, то есть от владельца имени (поле 23.10), а эталонный
+# VPS стоит в Нидерландах и страну сравнение не выравнивает. Сайт сам отказывает
+# этой стране — мерилом обхода он быть не может.
+#
+# www.tampermonkey.net и www.userscript.zone поиска не заводят вовсе: они
+# контроль (видно ли, что мы ничего не сломали), а не мерило.
+soundcloud.com|chrome,safari|/
+clubtone.net|chrome,safari|/
+clubtone.do.am|chrome,safari|/
+www.tampermonkey.net|chrome,safari|/
+www.userscript.zone|chrome,safari|/

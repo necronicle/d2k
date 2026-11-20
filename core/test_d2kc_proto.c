@@ -27,9 +27,13 @@ static int fails;
 
 /* Возвращает: код выхода d2kc (>=0), или -1 если через wait_ms он ещё жив
    (тогда процесс убит). out — stderr d2kc. */
-static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t outcap) {
-    char dir[64];
-    snprintf(dir, sizeof dir, "/tmp/d2kc-proto-%ld-%u", (long)getpid(), version);
+static int run_with_greeting(unsigned version, long wait_ms, const uint8_t *extra, size_t extra_len,
+                             char *out, size_t outcap) {
+    /* Имя каталога уникально на запуск: живой d2kc оставляет рядом с каталогом
+       свои файлы, и повтор той же версии упирался бы в EEXIST. */
+    static int seq;
+    char dir[80];
+    snprintf(dir, sizeof dir, "/tmp/d2kc-proto-%ld-%u-%d", (long)getpid(), version, ++seq);
     if (mkdir(dir, 0700) != 0) { return -2; }
     char sock_path[108], cat_path[128];
     snprintf(sock_path, sizeof sock_path, "%s/s", dir);
@@ -79,6 +83,9 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
             f[6 + D2K_KEY_WIRE_LEN + 6] = (uint8_t)idlen;
             memcpy(f + 6 + D2K_KEY_WIRE_LEN + 7, D2K_RELEASE_ID, idlen);
             (void)!write(c, f, 4 + plen);
+            /* Следом — произвольный кадр «датапата» (например, ACK старого
+               формата): d2kc обязан его не принять и сказать об этом вслух. */
+            if (extra_len) { (void)!write(c, extra, extra_len); }
             int status = 0;
             long waited = 0;
             pid_t w = 0;
@@ -116,6 +123,9 @@ static int run_with_greeting(unsigned version, long wait_ms, char *out, size_t o
     close(lfd);
     unlink(sock_path);
     unlink(cat_path);
+    {   /* живой d2kc пишет сердцебиение рядом с каталогом */
+        char live[160]; snprintf(live, sizeof live, "%s/live.json", dir); unlink(live);
+    }
     rmdir(dir);
     return rc;
 }
@@ -133,14 +143,33 @@ int main(void) {
           "offline self-check disagrees with control protocol");
     signal(SIGPIPE, SIG_IGN);
     char err[4096];
-    int rc = run_with_greeting(7, 10000, err, sizeof err);
+    int rc = run_with_greeting(7, 10000, NULL, 0, err, sizeof err);
     CHECK(rc == 1, "d2kc принял приветствие v7 (SET_NAME_PROBE без trial ID)");
     CHECK(strstr(err, "несовместимое приветствие") != NULL,
           "отказ d2kc на v7 не назван несовместимым приветствием");
-    rc = run_with_greeting(D2K_CTL_PROTO_VERSION + 1, 10000, err, sizeof err);
+    rc = run_with_greeting(D2K_CTL_PROTO_VERSION + 1, 10000, NULL, 0, err, sizeof err);
     CHECK(rc == 1, "d2kc принял приветствие будущей версии — сверка не точная");
-    rc = run_with_greeting(D2K_CTL_PROTO_VERSION, 500, err, sizeof err);
+    rc = run_with_greeting(D2K_CTL_PROTO_VERSION, 500, NULL, 0, err, sizeof err);
     CHECK(rc == -1, "d2kc не работает со своей версией провода");
+    {   /* Своя версия, но следом ACK снятия адресного опыта СТАРОГО формата
+           (успех без trial ID, v22). По контракту (d2k_stuntrial.h) такой ACK
+           ничего не освобождает; d2kc его отвергает — и обязан не молчать:
+           иначе «зависший» cleanup невозможно отличить от потерянного ACK. */
+        uint8_t ack[6 + D2K_KEY_WIRE_LEN + 4];
+        memset(ack, 0, sizeof ack);
+        uint32_t plen = (uint32_t)(2 + D2K_KEY_WIRE_LEN + 4);
+        ack[0] = (uint8_t)(plen >> 24); ack[1] = (uint8_t)(plen >> 16);
+        ack[2] = (uint8_t)(plen >> 8);  ack[3] = (uint8_t)plen;
+        ack[4] = (uint8_t)(D2K_EV_ACK >> 8); ack[5] = (uint8_t)D2K_EV_ACK;
+        ack[6] = 4;
+        ack[6 + D2K_KEY_WIRE_LEN] = (uint8_t)(D2K_CMD_DEL_ADDR_PROBE >> 8);
+        ack[6 + D2K_KEY_WIRE_LEN + 1] = (uint8_t)D2K_CMD_DEL_ADDR_PROBE;
+        ack[6 + D2K_KEY_WIRE_LEN + 2] = 1; /* ok */
+        rc = run_with_greeting(D2K_CTL_PROTO_VERSION, 500, ack, sizeof ack, err, sizeof err);
+        CHECK(rc == -1, "короткий ACK старого формата уронил d2kc вместо того, чтобы быть отвергнутым");
+        CHECK(strstr(err, "без его идентификатора") != NULL,
+              "d2kc молча проглотил неразобранный ACK — причина отказа не названа");
+    }
     if (fails) { printf("ПРОВАЛОВ: %d\n", fails); return 1; }
     printf("d2kc: сверка версии провода — все проверки прошли\n");
     return 0;

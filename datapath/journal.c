@@ -47,6 +47,7 @@ const char *d2k_suspect_text(uint8_t code) {
     case D2K_SUSPECT_RST_AFTER_APP: return "сброс клиента или сервера после TLS app-data; проверить объём ответа";
     case D2K_SUSPECT_QUIC_STALL: return "QUIC: сервер замолчал после рукопожатия, клиент повторяет; проверить ответ своим запросом";
     case D2K_SUSPECT_TCP_STALL: return "TCP: сервер замолчал на бюджете коробки, соединение открыто; проверить объём ответа";
+    case D2K_SUSPECT_LATE_SILENCE: return "TCP: сервер отвечал, затем замолчал за окном очереди, клиент шлёт; проверить объём ответа";
     case D2K_SUSPECT_FIN_RETRY: return "FIN клиента повторён без ответа после ответа сервера; проверить объём ответа";
     default:                  return "подозрение без кода";
     }
@@ -61,6 +62,8 @@ const char *d2k_refuse_text(uint8_t code) {
     case D2K_REFUSE_DAMAGED:  return "поток испорчен недоисполнением плана";
     case D2K_REFUSE_NOT_APPLIED:
         return "исполнитель отверг план на этом пакете (причина — в записи)";
+    case D2K_REFUSE_CONTEXT:
+        return "нет подтверждённого местного контекста исполнения";
     case D2K_REFUSE_FLOW_UNFIT:
         return "поток клиента не несёт того, что план требует (причина — в записи)";
     default:                  return "отказ без кода";
@@ -104,6 +107,9 @@ static d2k_jrn_entry *add_entry(d2k_journal *j, uint64_t at_ns, const d2k_key *k
         e->d_server_hello = det->server_hello;
         e->d_planned = det->planned;
         e->d_client_shape = det->client_shape;
+        e->d_client_side = det->client_side;
+        e->flow_incarnation=det->flow_incarnation;
+        memcpy(e->flow_epoch,det->flow_epoch,16);
         e->d_ipid = det->ipid;
     }
     e->note = note ? note : (kind == D2K_JRN_SUSPECT ? d2k_suspect_text(code) : NULL);
@@ -157,6 +163,59 @@ void d2k_journal_add_refused(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
     if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
 }
 
+void d2k_journal_add_suspect_request(d2k_journal *j, uint64_t at_ns,
+    const d2k_key *key, uint8_t code, const d2k_jrn_detail *detail,
+    const d2k_udp_request_context *request) {
+    d2k_jrn_entry *e=add_entry(j,at_ns,key,D2K_JRN_SUSPECT,code,0,
+                             detail,NULL,0,NULL);
+    if(!e || !request)return;
+    e->execution_id=request->execution_id;e->binding=request->binding;
+    memcpy(e->plan_id,request->plan_id,D2K_PLAN_ID_LEN);
+    memcpy(e->trial_id,request->trial_id,D2K_TRIAL_ID_LEN);
+}
+
+void d2k_journal_add_suspect_bound(d2k_journal *j, uint64_t at_ns,
+    const d2k_key *key, uint8_t code, uint32_t num, const d2k_jrn_detail *detail,
+    const d2k_flow *flow) {
+    d2k_jrn_entry *e=add_entry(j,at_ns,key,D2K_JRN_SUSPECT,code,num,
+                             detail,NULL,0,NULL);
+    if (!e || !flow) return;
+    e->flow_incarnation=flow->incarnation;
+    memcpy(e->flow_epoch,flow->flow_epoch,16);
+    e->execution_id=flow->execution_id;
+    e->binding=flow->execution_binding;
+    memcpy(e->plan_id,flow->execution_plan_id,D2K_PLAN_ID_LEN);
+    memcpy(e->trial_id,flow->execution_trial_id,D2K_TRIAL_ID_LEN);
+}
+
+void d2k_journal_add_exchange_bound(d2k_journal *j, uint64_t at_ns,
+    const d2k_key *key, uint8_t code, uint32_t num, const d2k_jrn_detail *detail,
+    const d2k_flow *flow) {
+    d2k_jrn_entry *e=add_entry(j,at_ns,key,D2K_JRN_EXCHANGE,code,num,
+                             detail,NULL,0,NULL);
+    if (!e || !flow) return;
+    e->flow_incarnation=flow->incarnation;
+    memcpy(e->flow_epoch,flow->flow_epoch,16);
+    if (!flow->execution_id) return;
+    e->execution_id=flow->execution_id;
+    e->binding=flow->execution_binding;
+    memcpy(e->plan_id,flow->execution_plan_id,D2K_PLAN_ID_LEN);
+    memcpy(e->trial_id,flow->execution_trial_id,D2K_TRIAL_ID_LEN);
+}
+
+void d2k_journal_add_udp_proof(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+                              uint8_t code, uint32_t bytes,
+                              const d2k_udp_request_context *request) {
+    d2k_jrn_entry *e=add_entry(j,at_ns,key,D2K_JRN_EXCHANGE,code,bytes,
+                             NULL,NULL,0,NULL);
+    if (!e || !request) return;
+    e->execution_id=request->execution_id;
+    e->binding=request->binding;
+    memcpy(e->plan_id,request->plan_id,D2K_PLAN_ID_LEN);
+    memcpy(e->trial_id,request->trial_id,D2K_TRIAL_ID_LEN);
+    if (request->execution_id) e->d_planned=D2K_PLANNED_YES;
+}
+
 void d2k_journal_add_fate_bound(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
                           uint8_t kind, uint8_t code, const uint8_t *plan_id,
                           const uint8_t *trial_id, uint64_t execution,
@@ -173,6 +232,13 @@ void d2k_journal_add_fate_bound(d2k_journal *j, uint64_t at_ns, const d2k_key *k
     }
     if (e && trial_id) { memcpy(e->trial_id, trial_id, D2K_TRIAL_ID_LEN); }
     if (e) { e->execution_id = execution; if (binding) e->binding = *binding; }
+}
+
+void d2k_journal_add_lateobs(d2k_journal *j, uint64_t at_ns, const d2k_key *key, uint8_t code,
+                             uint32_t repeats, const d2k_jrn_detail *det,
+                             const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    d2k_jrn_entry *e = add_entry(j, at_ns, key, D2K_JRN_LATE_OBS, code, repeats, det, NULL, 0, NULL);
+    if (e && token) { memcpy(e->trial_id, token, D2K_TRIAL_ID_LEN); }
 }
 
 void d2k_journal_add_fate(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
@@ -201,4 +267,19 @@ uint64_t d2k_journal_dropped(const d2k_journal *j) {
 
 uint64_t d2k_journal_added(const d2k_journal *j) {
     return j ? j->added : 0;
+}
+
+void d2k_journal_add_preflight(d2k_journal *j, uint64_t at_ns, const d2k_key *key,
+    uint8_t kind, uint32_t pieces, uint64_t elapsed_ns, uint8_t client_side,
+    const uint8_t *plan_id, const uint8_t *trial_id,
+    const d2k_binding_context *binding) {
+    if (kind != D2K_JRN_PREFLIGHT_START && kind != D2K_JRN_PREFLIGHT_HANDOVER &&
+        kind != D2K_JRN_PREFLIGHT_GAVE_UP) return;
+    d2k_jrn_entry *e=add_entry(j,at_ns,key,kind,0,pieces,NULL,NULL,0,NULL);
+    if (!e) return;
+    e->preflight_elapsed_ns=elapsed_ns;
+    e->d_client_side=client_side;
+    if(plan_id) memcpy(e->plan_id,plan_id,D2K_PLAN_ID_LEN);
+    if(trial_id) memcpy(e->trial_id,trial_id,D2K_TRIAL_ID_LEN);
+    if(binding) e->binding=*binding;
 }

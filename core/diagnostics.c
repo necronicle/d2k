@@ -15,10 +15,18 @@
 #define PROCESS_COUNT 4
 static const char *const names[PROCESS_COUNT]={"d2kc","d2kd","d2ktg","d2kpanel"};
 static const char *const pidfiles[PROCESS_COUNT]={"d2k.pid","d2kd.pid","d2ktg.pid","d2k-panel.pid"};
-typedef struct {long pid;int64_t rss,hwm,anon,threads;} proc_mem;
+typedef struct {long pid;int64_t rss,hwm,anon,threads,start_ticks;} proc_mem;
 typedef struct {
     uint64_t id; int64_t at,elapsed,queued,units;unsigned family,trigger,shape;
     char target[256],protocol[16],outcome[32],reason[256],ip[48],path[16],kind[8];
+    /* ПРИЧИНА САМОГО ИТОГА И ИДЕНТИЧНОСТЬ РЕШЕНИЯ (23.10.2026).
+       reason выше — последняя фраза классификатора, и она про ЦЕЛЬ, а не про
+       итог: в диагностике владельца 23.10 они противоречили друг другу в 18
+       событиях из 61 («probe-confirmed» с текстом «замер брошен»,
+       «failed» с текстом «дальнейшие вопросы не нужны»). Копируются В КОЛЬЦО,
+       как и остальные строки: указатели события смотрят в задачу, а задача
+       переживёт запись не дольше тика. */
+    char why[160],plan[40],box[40];
 } event;
 typedef struct {
     int64_t at,mono,total,available,conntrack;d2k_diag_counts counts;proc_mem procs[PROCESS_COUNT];
@@ -27,7 +35,8 @@ typedef struct {
  * Groups follow kernel labels, not allocator ownership: unlabelled thread
  * stacks and malloc mappings can both appear in anonymous. */
 typedef struct {
-    long pid; int64_t at,mono,rss,start_ticks,vm[4],fds;
+    long pid; int64_t at,mono,rss,anon,start_ticks,vm[4],fds;
+    d2k_diag_memory owners;
     int smaps_ok; int64_t groups[4][5];
 } memory_detail;
 struct d2k_diag {
@@ -66,6 +75,8 @@ void d2k_diag_record(d2k_diag *d,const d2k_diag_event *v) {
     copy(e->ip,sizeof e->ip,v->ip);copy(e->path,sizeof e->path,v->path);copy(e->kind,sizeof e->kind,v->kind);
     copy(e->target,sizeof e->target,v->target);copy(e->protocol,sizeof e->protocol,v->protocol);
     copy(e->outcome,sizeof e->outcome,v->outcome);copy(e->reason,sizeof e->reason,v->reason);
+    copy(e->why,sizeof e->why,v->outcome_reason);
+    copy(e->plan,sizeof e->plan,v->plan_id);copy(e->box,sizeof e->box,v->box_id);
     if(d->ne<EVENTS)d->ne++;
 }
 static int64_t value(const char *line,const char *key) {
@@ -75,15 +86,21 @@ static int64_t value(const char *line,const char *key) {
 }
 static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
     char path[512],line[256];FILE *f;long pid=0;
-    *m=(proc_mem){.pid=0,.rss=-1,.hwm=-1,.anon=-1,.threads=-1};
-    if(snprintf(path,sizeof path,"%s/%s",run,pidfiles[i])>=(int)sizeof path)return;
-    f=fopen(path,"r");if(!f)return;int ok=fscanf(f,"%ld",&pid)==1&&pid>0&&pid<=INT_MAX;fclose(f);if(!ok)return;
-    if(snprintf(path,sizeof path,"%s/%ld/comm",proc,pid)>=(int)sizeof path)return;
-    f=fopen(path,"r");if(!f)return;ok=fgets(line,sizeof line,f)!=NULL;fclose(f);
-    if(!ok)return;
-    line[strcspn(line,"\r\n")]=0;if(strcmp(line,names[i]))return;
-    m->pid=pid;
-    if(snprintf(path,sizeof path,"%s/%ld/status",proc,pid)>=(int)sizeof path)return;
+    *m=(proc_mem){.pid=0,.rss=-1,.hwm=-1,.anon=-1,.threads=-1,.start_ticks=-1};
+    if(i==0) {
+        /* The controller reads itself, independent of stale/missing pidfiles. */
+        m->pid=(long)getpid();
+        if(snprintf(path,sizeof path,"%s/self/status",proc)>=(int)sizeof path)return;
+    } else {
+        if(snprintf(path,sizeof path,"%s/%s",run,pidfiles[i])>=(int)sizeof path)return;
+        f=fopen(path,"r");if(!f)return;int ok=fscanf(f,"%ld",&pid)==1&&pid>0&&pid<=INT_MAX;fclose(f);if(!ok)return;
+        if(snprintf(path,sizeof path,"%s/%ld/comm",proc,pid)>=(int)sizeof path)return;
+        f=fopen(path,"r");if(!f)return;ok=fgets(line,sizeof line,f)!=NULL;fclose(f);
+        if(!ok)return;
+        line[strcspn(line,"\r\n")]=0;if(strcmp(line,names[i]))return;
+        m->pid=pid;
+        if(snprintf(path,sizeof path,"%s/%ld/status",proc,pid)>=(int)sizeof path)return;
+    }
     f=fopen(path,"r");if(!f)return;
     while(fgets(line,sizeof line,f)) {
         int64_t v;
@@ -93,12 +110,14 @@ static void read_proc(proc_mem *m,const char *proc,const char *run,size_t i) {
         if((v=value(line,"Threads:"))>=0)m->threads=v;
     }fclose(f);
 }
-static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms,const char *proc) {
-    memset(m,0,sizeof *m);m->pid=p->pid;m->rss=p->rss;m->at=at;m->mono=ms;
+static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms,const char *proc,int self) {
+    memset(m,0,sizeof *m);m->pid=p->pid;m->rss=p->rss;m->anon=p->anon;m->at=at;m->mono=ms;
     m->start_ticks=m->fds=-1;for(size_t k=0;k<4;k++)m->vm[k]=-1;
     if(!p->pid)return;
-    char path[512],line[512];FILE *f;
-    if(snprintf(path,sizeof path,"%s/%ld/stat",proc,p->pid)>=(int)sizeof path)return;
+    char path[512],base[448],line[512];FILE *f;
+    int n=self?snprintf(base,sizeof base,"%s/self",proc):snprintf(base,sizeof base,"%s/%ld",proc,p->pid);
+    if(n<0 || (size_t)n>=sizeof base)return;
+    snprintf(path,sizeof path,"%s/stat",base);
     f=fopen(path,"r");if(f){
         if(fgets(line,sizeof line,f)) {
             char *end=strrchr(line,')'),*save=NULL;
@@ -110,18 +129,18 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
         }fclose(f);
     }
     const char *keys[]={"VmSize:","VmData:","VmStk:","VmSwap:"};
-    snprintf(path,sizeof path,"%s/%ld/status",proc,p->pid);
+    snprintf(path,sizeof path,"%s/status",base);
     f=fopen(path,"r");if(f){while(fgets(line,sizeof line,f)){for(size_t k=0;k<4;k++){
         int64_t n=value(line,keys[k]);if(n>=0)m->vm[k]=n;
     }}fclose(f);}
-    snprintf(path,sizeof path,"%s/%ld/fd",proc,p->pid);
+    snprintf(path,sizeof path,"%s/fd",base);
     DIR *dir=opendir(path);if(dir){
         struct dirent *entry;m->fds=0;errno=0;
         while((entry=readdir(dir)))if(entry->d_name[0]!='.')m->fds++;
         if(errno)m->fds=-1;
         closedir(dir);
     }
-    snprintf(path,sizeof path,"%s/%ld/smaps",proc,p->pid);
+    snprintf(path,sizeof path,"%s/smaps",base);
     f=fopen(path,"r");if(!f)return;
     int group=-1,valid=1;int64_t maps=0,fields=0;
     const char *metrics[]={"Size:","Rss:","Anonymous:","Private_Dirty:"};
@@ -143,10 +162,37 @@ static void read_detail(memory_detail *m,const proc_mem *p,int64_t at,int64_t ms
     m->smaps_ok=valid && maps>0 && fields==maps*4 && !ferror(f);
     fclose(f);
 }
-static void write_detail(FILE *f,const memory_detail *m) {
+static void write_owners(FILE *f,const d2k_diag_memory *m) {
+    fputc('{',f);
+    fprintf(f,"\"workers_started\":%llu",(unsigned long long)m->workers_started);
+    fprintf(f,",\"workers_joined\":%llu",(unsigned long long)m->workers_joined);
+    fprintf(f,",\"worker_join_errors\":%llu",(unsigned long long)m->worker_join_errors);
+    fprintf(f,",\"worker_start_while_live\":%llu",(unsigned long long)m->worker_start_while_live);
+    fprintf(f,",\"worker_args_allocated\":%llu",(unsigned long long)m->worker_args_allocated);
+    fprintf(f,",\"worker_args_freed\":%llu",(unsigned long long)m->worker_args_freed);
+    fprintf(f,",\"worker_args_live\":%llu",(unsigned long long)m->worker_args_live);
+    fprintf(f,",\"worker_args_live_bytes\":%llu",(unsigned long long)m->worker_args_live_bytes);
+    fprintf(f,",\"http_records_capacity\":%llu",(unsigned long long)m->http_records_capacity);
+    fprintf(f,",\"http_records_bytes\":%llu",(unsigned long long)m->http_records_bytes);
+    fprintf(f,",\"http_queue_capacity\":%llu",(unsigned long long)m->http_queue_capacity);
+    fprintf(f,",\"http_queue_bytes\":%llu",(unsigned long long)m->http_queue_bytes);
+    fprintf(f,",\"http_failures\":%llu",(unsigned long long)m->http_failures);
+    fprintf(f,",\"http_failures_bytes\":%llu",(unsigned long long)m->http_failures_bytes);
+    fprintf(f,",\"task_madvise_calls\":%llu",(unsigned long long)m->task_madvise_calls);
+    fprintf(f,",\"task_madvise_successes\":%llu",(unsigned long long)m->task_madvise_successes);
+    fprintf(f,",\"task_madvise_requested_bytes\":%llu",(unsigned long long)m->task_madvise_requested_bytes);
+    fprintf(f,",\"task_madvise_last_errno\":%llu",(unsigned long long)m->task_madvise_last_errno);
+    fprintf(f,",\"catalog_boxes_bytes\":%llu",(unsigned long long)m->catalog_boxes_bytes);
+    fprintf(f,",\"catalog_plans_bytes\":%llu",(unsigned long long)m->catalog_plans_bytes);
+    fprintf(f,",\"catalog_bindings_bytes\":%llu",(unsigned long long)m->catalog_bindings_bytes);
+    fputc('}',f);
+}
+static void write_detail(FILE *f,const memory_detail *m,int self) {
     if(!m->pid){fputs("null",f);return;}
     fprintf(f,"{\"pid\":%ld,\"at\":%lld,\"mono_ms\":%lld,\"rss_kib\":",m->pid,(long long)m->at,(long long)m->mono);
     number(f,m->rss);fputs(",\"start_ticks\":",f);number(f,m->start_ticks);
+    fputs(",\"anon_kib\":",f);number(f,m->anon);
+    if(self){fputs(",\"owners\":",f);write_owners(f,&m->owners);}
     const char *keys[]={"vm_size_kib","vm_data_kib","vm_stack_kib","vm_swap_kib"};
     for(size_t k=0;k<4;k++){fprintf(f,",\"%s\":",keys[k]);number(f,m->vm[k]);}
     fputs(",\"fd_count\":",f);number(f,m->fds);fputs(",\"smaps\":",f);
@@ -180,7 +226,9 @@ void d2k_diag_sample(d2k_diag *d,int64_t ms,const d2k_diag_counts *c,const char 
     }
     for(size_t i=0;i<PROCESS_COUNT;i++){
         read_proc(&s->procs[i],proc,run,i);
-        read_detail(&d->latest[i],&s->procs[i],s->at,ms,proc);
+        read_detail(&d->latest[i],&s->procs[i],s->at,ms,proc,i==0);
+        if(i==0)d->latest[i].owners=c->memory;
+        s->procs[i].start_ticks=d->latest[i].start_ticks;
         const memory_detail *m=&d->latest[i];
         if(m->pid && (d->first[i].pid!=m->pid ||
            (m->start_ticks>=0 && d->first[i].start_ticks!=m->start_ticks)))d->first[i]=*m;
@@ -201,7 +249,12 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         js(f,e->target);
         fputs(",\"ip\":",f);js(f,e->ip);fputs(",\"path\":",f);js(f,e->path);fputs(",\"kind\":",f);js(f,e->kind);
         fprintf(f,",\"shape\":%u",e->shape);
-        fputs(",\"protocol\":",f);js(f,e->protocol);fputs(",\"outcome\":",f);js(f,e->outcome);fputs(",\"reason\":",f);js(f,e->reason);fputs(",\"reason_source\":",f);js(f,!strcmp(e->protocol,"http")?"terminal-code":"last-classifier-context");fputc('}',f);
+        fputs(",\"protocol\":",f);js(f,e->protocol);fputs(",\"outcome\":",f);js(f,e->outcome);fputs(",\"reason\":",f);js(f,e->reason);fputs(",\"reason_source\":",f);js(f,!strcmp(e->protocol,"http")?"terminal-code":"last-classifier-context");
+        /* Причина итога и идентичность решения — рядом с фразой
+           классификатора, а не вместо неё: фраза остаётся контекстом. */
+        fputs(",\"outcome_reason\":",f);js(f,e->why);
+        fputs(",\"plan_id\":",f);js(f,e->plan);fputs(",\"box_id\":",f);js(f,e->box);
+        fputc('}',f);
     }
     fputs("],\"samples\":[",f);
     for(size_t i=0;i<d->ns;i++) {
@@ -216,12 +269,12 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         for(size_t j=0;j<PROCESS_COUNT;j++) {
             const proc_mem *p=&s->procs[j];if(j)fputc(',',f);fputs("{\"name\":",f);js(f,names[j]);
             fprintf(f,",\"pid\":%ld,\"rss_kib\":",p->pid);number(f,p->rss);fputs(",\"hwm_kib\":",f);number(f,p->hwm);
-            fputs(",\"anon_kib\":",f);number(f,p->anon);fputs(",\"threads\":",f);number(f,p->threads);fputc('}',f);
+            fputs(",\"anon_kib\":",f);number(f,p->anon);fputs(",\"threads\":",f);number(f,p->threads);fputs(",\"start_ticks\":",f);number(f,p->start_ticks);fputc('}',f);
         }fputs("]}",f);
     }fputs("],\"memory_details\":[",f);
     for(size_t i=0;i<PROCESS_COUNT;i++){
         if(i)fputc(',',f);
-        fputs("{\"name\":",f);js(f,names[i]);fputs(",\"first\":",f);write_detail(f,&d->first[i]);
-        fputs(",\"latest\":",f);write_detail(f,&d->latest[i]);fputc('}',f);
+        fputs("{\"name\":",f);js(f,names[i]);fputs(",\"first\":",f);write_detail(f,&d->first[i],i==0);
+        fputs(",\"latest\":",f);write_detail(f,&d->latest[i],i==0);fputc('}',f);
     }fputs("]}\n",f);return ferror(f)?-1:0;
 }

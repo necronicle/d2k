@@ -651,11 +651,13 @@ static inline d2k_quic_arm_data_verdict d2k_quic_arm_data_judge3(int handshake, 
     return D2K_QAD_NOT_RUN;
 }
 
-/* Longest original askArms ladder (quicarms.c, donor arms.go): 5 intrinsic
- * fakes + 2 candidates x 2 copy counts + 4 TTLs + fragment survival + 4
- * fragment shapes = 18 questions. The Run budget is derived from it. */
-#define D2K_QUIC_ARM_QUESTIONS_MAX 18u
-/* 18 резервных вопросов плюс до 9 опросов стратегии, включая произведение. */
+/* Longest ladder (quicarms.c): 6 intrinsic fakes (5 donor plus
+ * quic_initial_nofix, the form the box reads as an Initial while the server
+ * must discard it) + 2 candidates x 2 copy counts + 4 TTLs + fragment
+ * survival + 4 fragment shapes = 19 questions. The Run budget is derived
+ * from it. */
+#define D2K_QUIC_ARM_QUESTIONS_MAX 19u
+/* 19 резервных вопросов плюс до 9 опросов стратегии, включая произведение. */
 #define D2K_QUIC_ARM_STEPS 28
 typedef struct {
     char label[192];

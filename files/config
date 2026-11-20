@@ -11,8 +11,9 @@ DECOY_SNI=disk.rzd.ru
 # Keenetic: первые 30 пакетов каждого потока идут мимо аппаратного ускорителя
 # (-j PPE с connskip), иначе d2k не видит ответов. 0 — не ставить.
 D2K_PPE_DEOFFLOAD=1
-# TCP-порты разгрузки; по умолчанию — PORTS очереди (0:65535). UDP — 443 и
-# голосовые VOICE_PORTS (D2K_PPE_UDP_PORTS). Сузить, если окно в 30 пакетов
+# TCP-порты разгрузки; по умолчанию — PORTS очереди (0:65535).
+# UDP — все порты (D2K_PPE_UDP_PORTS), включая неизвестные приложения.
+# Сузить, если окно в 30 пакетов
 # на каждый поток слишком дорого процессору:
 # D2K_PPE_TCP_PORTS=80,443
 MARK=0x2d
@@ -22,3 +23,15 @@ TG_RELAY_URL=wss://85.192.60.175.nip.io/ws
 TG_ENROLL_PORT=9443
 # Custom relays may use TG_RELAY_SECRET instead of the enrollment endpoint.
 # TG_PORT=1443
+
+# Новая цепочка в тени (§16), по умолчанию выключена. Требует EXP_CONTROL=1.
+# Рабочих планов не ставит; опыты идут только на собственных потоках.
+# SHADOW=1
+
+# Working client bindings from measured shadow knowledge. Requires SHADOW=1
+# (and its EXP_CONTROL=1 dependency). Explicit owner opt-in, default disabled.
+NEWCHAIN=0
+
+# Изолированный полевой круг новой цепочки (§16); старый поиск и каталог
+# не применяются. Требует SHADOW=1, NEWCHAIN=1 и EXP_CONTROL=1.
+SYNTHESIS_ONLY=0

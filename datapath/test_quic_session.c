@@ -27,6 +27,7 @@
 #include "d2k_nat.h"
 #include "../core/test_quic_pq.h"
 #include "d2k_quicsnap.h"
+#include "d2k_crypto.h"
 
 static int fails;
 #define CHECK(cond, msg)                                   \
@@ -1057,6 +1058,13 @@ static size_t build_stun_binding(uint8_t *p, uint16_t type, const uint8_t txid[1
     p[0] = (uint8_t)(type >> 8); p[1] = (uint8_t)type;
     p[4] = 0x21; p[5] = 0x12; p[6] = 0xa4; p[7] = 0x42;
     memcpy(p + 8, txid, 12);
+    if (type == 0x0101) {
+        /* A success fixture includes the mandatory mapped address. */
+        memset(p + 20, 0, 12); wr16(p + 2, 12);
+        wr16(p + 20, 0x0020); wr16(p + 22, 8);
+        p[25] = 1; wr16(p + 26, (uint16_t)(50000 ^ 0x2112));
+        return 32;
+    }
     return 20;
 }
 
@@ -1387,6 +1395,28 @@ static void test_discord_voice(void) {
         } else {
             CHECK(!r.applied, "план формы QUIC достался голосу");
         }
+        d2k_result request=r;
+        d2k_plan *replacement=NULL;
+        CHECK(!d2k_plan_load(plan_bytes,sizeof plan_bytes,&replacement,err,sizeof err),
+              "Discovery replacement plan loads");
+        CHECK(!d2k_plantab_set_name_shaped(d2k_session_plans(s),
+              (const uint8_t *)D2K_VOICE_CLASS,strlen(D2K_VOICE_CLASS),1001,
+              replacement,D2K_PLAN_SHAPE_VOICE),"Discovery replacement installs");
+        n=build_udp_rev_pkt(pkt,64037,disc,build_ip_discovery_response(disc,0x77));
+        wr16(pkt+20,50004);
+        d2k_session_set_hook(s,D2K_HOOK_FORWARD);
+        d2k_session_packet(s,pkt,n,2000,buf,sizeof buf,&r);
+        const d2k_journal *j=d2k_session_journal(s);int found=0;
+        for(size_t i=0;i<d2k_journal_count(j);i++) {
+            const d2k_jrn_entry *e=d2k_journal_at(j,i);
+            if(e->kind!=D2K_JRN_EXCHANGE || e->code!=D2K_UDP_PROOF_VOICE_DISCOVERY)continue;
+            found=1;
+            CHECK(e->execution_id==request.execution_id &&
+                  (!own || d2k_binding_equal(&e->binding,&request.binding)),
+                  "Discovery response rebound to later plan");
+            CHECK(e->num==74,"Discovery context loses response size");
+        }
+        CHECK(found,"Discovery response context emitted");
         d2k_session_free(s);
     }
     /* ОТВЕТ СЕРВЕРА — СОБЫТИЕ ОБМЕНА, и приходит он на FORWARD.
@@ -1837,6 +1867,467 @@ static d2k_session *stall_flow(uint16_t cport, int rev) {
         d2k_session_packet(s, pkt, n, 1 * S + 50000000ull + (uint64_t)i, buf, sizeof buf, &r);
     }
     return s;
+}
+
+/* ДОЛГИЙ ПОТОК (очередь 28.10, задание 05). Очередь видит первые 8 датаграмм,
+   дальше запись потока живёт только 120 с после последнего пакета В ОЧЕРЕДИ —
+   пятиминутный здоровый поток забывался на третьей минуте, и его обрыв на
+   шестой не замечал никто. Активность сервера по conntrack — такая же улика
+   жизни потока, как пакет в очереди: пока обратный счётчик растёт, запись
+   жива; кончился поток (записи conntrack нет) — забывается штатно. Критерии
+   самого подозрения не меняются: здоровый или просто молчащий поток
+   подозрения не даёт. */
+/* UDP БЕЗ РАСПОЗНАННОГО ПРОТОКОЛА (этап 12, 28.10.2026): не QUIC Initial,
+   не STUN, не Discovery. Молчание — только при трёх уликах: клиент упорствует
+   (≥3 датаграмм), обратная сторона видна сессии, оттуда ничего дольше срока.
+   Любой ответ оттуда снимает подозрение; две датаграммы — не упорство.
+   Подозрение несёт форму RAW и planned=NO. */
+static void test_udp_raw_silence(void) {
+    const uint64_t S = 1000000000ull;
+    static const uint8_t game[] = "\x01\x00GAME-PING\x00\x00";
+    for (int variant = 0; variant < 3; variant++) {
+        d2k_session *s = d2k_session_new(64, 64);
+        d2k_session_set_udp_reverse_hook(s, 1);
+        uint8_t pkt[1300], buf[4096];
+        d2k_result r;
+        uint16_t cport = (uint16_t)(46000 + variant);
+        int sends = variant == 2 ? 2 : 3;
+        for (int i = 0; i < sends; i++) {
+            size_t n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);
+            d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+        }
+        if (variant == 1) {
+            size_t n = build_udp_rev_pkt(pkt, cport, game, sizeof game - 1);
+            d2k_session_packet(s, pkt, n, 3 * S + S / 2, buf, sizeof buf, &r);
+        }
+        CHECK(d2k_session_hellos(s) == 0, "udp raw: нагрузка принята за приветствие");
+        CHECK(d2k_session_sweep(s, 2 * S) == 0, "udp raw: подозрение раньше срока/упорства");
+        size_t told = d2k_session_sweep(s, 8 * S);
+        if (variant == 0) {
+            CHECK(told == 1, "udp raw: молчание при упорстве клиента и видимой обратной стороне не заподозрено");
+            CHECK(last_suspect_code(s) == D2K_SUSPECT_SILENT, "udp raw: код подозрения не SILENT");
+            const d2k_journal *j = d2k_session_journal(s);
+            for (size_t i = 0; i < d2k_journal_count(j); i++) {
+                const d2k_jrn_entry *e = d2k_journal_at(j, i);
+                if (e->kind != D2K_JRN_SUSPECT) continue;
+                CHECK(e->d_client_shape == D2K_PLAN_SHAPE_RAW && e->d_planned == D2K_PLANNED_NO,
+                      "udp raw: подозрение без формы RAW/планности");
+            }
+            CHECK(d2k_session_sweep(s, 20 * S) == 0, "udp raw: подозрение продублировано");
+        } else {
+            CHECK(told == 0, variant == 1 ? "udp raw: ответ сервера назван молчанием"
+                                          : "udp raw: две датаграммы названы упорством");
+        }
+        d2k_session_free(s);
+    }
+    /* Обратная сторона сессии не видна — не молчание. */
+    d2k_session *s = d2k_session_new(64, 64);
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    for (int i = 0; i < 3; i++) {
+        size_t n = build_udp_pkt(pkt, 46010, 443, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+    }
+    CHECK(d2k_session_sweep(s, 8 * S) == 0, "udp raw: без видимой обратной стороны названо молчанием");
+    d2k_session_free(s);
+}
+
+/* ПОЯВЛЕНИЕ ПОТОКА БЕЗ ПРОТОКОЛА (этап 42): здоровый безымянный поток без
+   нашего плана событий не давал вовсе, и контроллер его не видел. Теперь —
+   один факт D2K_JRN_FLOW на поток (не на пакет), с наблюдённой стороной
+   клиента; не для QUIC/STUN/зонда; объём ограничен, подавленное считается. */
+static size_t count_flow_facts(const d2k_session *s) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t c = 0;
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == D2K_JRN_FLOW) c++;
+    }
+    return c;
+}
+static void test_flow_fact_udp(void) {
+    const uint64_t S = 1000000000ull;
+    static const uint8_t game[] = "\x01\x00GAME-PING\x00\x00";
+    uint8_t pkt[1300], buf[4096];
+    d2k_result r;
+    d2k_session *s = d2k_session_new(512, 1024);
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    for (int i = 0; i < 4; i++) {
+        size_t n = build_udp_pkt(pkt, 47000, 27015, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+    }
+    CHECK(count_flow_facts(s) == 1, "поток UDP без протокола: не один факт появления на поток");
+    const d2k_journal *j = d2k_session_journal(s);
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e->kind != D2K_JRN_FLOW) continue;
+        /* 192.168.1.67 — высокий конец пары относительно 1.2.3.4. */
+        CHECK(e->key.proto == 17 && e->d_client_side == D2K_CLIENT_SIDE_HIGH && e->name_len == 0,
+              "поток UDP: факт без транспорта/стороны клиента или с выдуманным именем");
+        CHECK(e->execution_id == 0, "поток UDP: факт появления несёт исполнение");
+    }
+    /* QUIC Initial, STUN и поток зонда — свои пути, факта появления нет. */
+    size_t n = build_udp_pkt(pkt, 47001, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 6 * S, buf, sizeof buf, &r);
+    uint8_t stun[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 1,2,3,4,5,6,7,8,9,10,11,12};
+    n = build_udp_pkt(pkt, 47002, 3478, stun, sizeof stun);
+    d2k_session_packet(s, pkt, n, 6 * S, buf, sizeof buf, &r);
+    n = build_udp_pkt(pkt, 47003, 27015, game, sizeof game - 1);
+    d2k_session_packet_probe(s, pkt, n, 6 * S, buf, sizeof buf, &r);
+    CHECK(count_flow_facts(s) == 1, "поток UDP: факт появления у QUIC/STUN/зонда");
+    d2k_session_free(s);
+
+    /* Без крючка на не-443 направление не известно: датаграмма уходит как
+       есть до разбора, клиент не угадывается и факта нет. */
+    s = d2k_session_new(64, 64);
+    n = build_udp_pkt(pkt, 47010, 27015, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, S, buf, sizeof buf, &r);
+    CHECK(count_flow_facts(s) == 0, "поток UDP без крючка: клиент угадан по порту");
+    d2k_session_free(s);
+
+    /* ОБЪЁМ: пачка новых потоков разом — сообщается не больше запаса,
+       остальное считается подавленным; со временем запас восполняется. */
+    s = d2k_session_new(512, 1024);
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    for (int i = 0; i < 300; i++) {
+        n = build_udp_pkt(pkt, (uint16_t)(48000 + i), 27015, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, S, buf, sizeof buf, &r);
+    }
+    d2k_payload_stats ps;
+    d2k_session_payload_stats(s, &ps);
+    CHECK(ps.flow_told == count_flow_facts(s) && ps.flow_told == D2K_FLOW_FACT_BURST &&
+          ps.flow_suppressed == 300 - D2K_FLOW_FACT_BURST,
+          "поток UDP: пачка потоков не ограничена запасом или подавленное не сосчитано");
+    n = build_udp_pkt(pkt, 48000, 27015, game, sizeof game - 1);   /* повтор подавленного — не новый */
+    d2k_session_packet(s, pkt, n, 30 * S, buf, sizeof buf, &r);
+    n = build_udp_pkt(pkt, 48299, 27015, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 30 * S, buf, sizeof buf, &r);
+    d2k_session_payload_stats(s, &ps);
+    CHECK(ps.flow_told == D2K_FLOW_FACT_BURST && ps.flow_suppressed == 300 - D2K_FLOW_FACT_BURST,
+          "поток UDP: повтор потока сочтён новым появлением");
+    n = build_udp_pkt(pkt, 49000, 27015, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 30 * S, buf, sizeof buf, &r);
+    d2k_session_payload_stats(s, &ps);
+    CHECK(ps.flow_told == D2K_FLOW_FACT_BURST + 1, "поток UDP: запас не восполнился со временем");
+    d2k_session_free(s);
+}
+
+/* УЖЕ СУЩЕСТВУЮЩИЕ ПОТОКИ НА СТАРТЕ (этап 13): принятый из conntrack поток
+   без приветствия наблюдается только счётчиками. Ответы идут — жив и запись
+   продлевается; сервер встал, клиент упорствует (≥3) дольше срока —
+   подозрение SILENT формы RAW, planned=NO, один раз; сервер никогда не
+   отвечал — подозрения нет; запись conntrack исчезла — забвение штатное. */
+static struct { uint16_t cport; uint64_t orig, reply; int acct; uint8_t proto; int tcp_known; uint8_t tcp_state; } fake_any;
+static int fake_ct_any(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out) {
+    (void)ctx;
+    uint16_t sp = (uint16_t)(t->sport_be[0] << 8 | t->sport_be[1]);
+    if (!fake_any.acct || t->proto != fake_any.proto || sp != fake_any.cport) return -1;
+    out->orig_pkts = fake_any.orig; out->reply_pkts = fake_any.reply;
+    out->tcp_state_known = fake_any.tcp_known; out->tcp_state = fake_any.tcp_state;
+    return 0;
+}
+static void test_adopted_flows(void) {
+    const uint64_t S = 1000000000ull, IDLE = 120 * S;
+    for (int proto = 17; proto >= 6; proto -= 11) {
+        for (int variant = 0; variant < 3; variant++) {
+            d2k_session *s = d2k_session_new(64, 64);
+            d2k_session_set_ct_query(s, fake_ct_any, NULL);
+            d2k_ct_tuple t; memset(&t, 0, sizeof t);
+            t.family = 4; t.proto = (uint8_t)proto;
+            uint8_t cli[4] = {192, 168, 1, 67}, srv[4] = {1, 2, 3, 4};
+            memcpy(t.src, cli, 4); memcpy(t.dst, srv, 4);
+            uint16_t cport = (uint16_t)(47000 + variant + (proto == 6 ? 10 : 0));
+            t.sport_be[0] = (uint8_t)(cport >> 8); t.sport_be[1] = (uint8_t)cport;
+            t.dport_be[0] = 0x01; t.dport_be[1] = 0xbb;
+            d2k_ct_info i; memset(&i, 0, sizeof i);
+            i.orig_pkts = 10; i.reply_pkts = variant == 2 ? 0 : 8;
+            CHECK(d2k_session_adopt(s, &t, &i, 1 * S) == 0, "adopt: поток не принят");
+            CHECK(d2k_session_adopt(s, &t, &i, 1 * S) == 0 && d2k_session_flows(s) == 1, "adopt: повторный приём размножил запись");
+            memset(&fake_any, 0, sizeof fake_any);
+            fake_any.cport = cport; fake_any.proto = (uint8_t)proto; fake_any.acct = 1;
+            fake_any.tcp_known = proto == 6; fake_any.tcp_state = D2K_CT_TCP_ESTABLISHED;
+            uint64_t orig = 10, reply = i.reply_pkts, now;
+            for (now = 2; now <= 200; now++) {            /* три минуты живого обмена */
+                orig += 2; if (variant != 2) reply += 2;
+                fake_any.orig = orig; fake_any.reply = reply;
+                d2k_session_sweep(s, now * S);
+                d2k_session_expire(s, now * S, IDLE);
+            }
+            if (variant == 2) {
+                CHECK(d2k_session_suspects(s) == 0, "adopt: поток, которому сервер никогда не отвечал, заподозрен");
+                d2k_session_free(s);
+                continue;
+            }
+            CHECK(d2k_session_flows(s) == 1 && d2k_session_suspects(s) == 0,
+                  "adopt: живой принятый поток забыт или заподозрен");
+            if (variant == 0) {                            /* сервер встал, клиент упорствует */
+                for (; now <= 212; now++) { orig += 1; fake_any.orig = orig; d2k_session_sweep(s, now * S); }
+                CHECK(d2k_session_suspects(s) == 1 && last_suspect_code(s) == D2K_SUSPECT_SILENT,
+                      "adopt: обрыв принятого потока не заподозрен");
+                const d2k_journal *j = d2k_session_journal(s);
+                for (size_t k = 0; k < d2k_journal_count(j); k++) {
+                    const d2k_jrn_entry *e = d2k_journal_at(j, k);
+                    if (e->kind != D2K_JRN_SUSPECT) continue;
+                    CHECK(e->d_client_shape == D2K_PLAN_SHAPE_RAW && e->d_planned == D2K_PLANNED_NO,
+                          "adopt: подозрение без формы RAW / planned=NO");
+                }
+                for (; now <= 240; now++) { orig += 1; fake_any.orig = orig; d2k_session_sweep(s, now * S); }
+                CHECK(d2k_session_suspects(s) == 1, "adopt: подозрение продублировано");
+            } else {                                       /* клиент замолчал сам: простой, не обрыв */
+                for (; now <= 230; now++) { d2k_session_sweep(s, now * S); }
+                CHECK(d2k_session_suspects(s) == 0, "adopt: простой клиента назван обрывом");
+                fake_any.acct = 0;                         /* запись conntrack исчезла */
+                for (; now <= 400; now++) { d2k_session_sweep(s, now * S); d2k_session_expire(s, now * S, IDLE); }
+                CHECK(d2k_session_flows(s) == 0, "adopt: исчезнувший поток не забыт");
+            }
+            d2k_session_free(s);
+        }
+    }
+}
+
+/* ОПЫТ НА ПРОДОЛЖЕНИИ КЛИЕНТА ПО UDP (этап 16, 28.10.2026). Поток без
+   протокола молчит; контроллер ставит точную запись опыта по 5-tuple
+   (SET_ADDR_PROBE, trial, lease). Следующая датаграмма ТОГО ЖЕ клиента
+   исполняет план (один раз на поток), APPLIED несёт trial ID; ответ сервера
+   после этого — EXCHANGE planned=YES формы RAW (уровень пути). Чужой порт
+   клиента опыта не получает; после истечения lease — тоже; постоянный
+   адресный план формы RAW применяется к первой датаграмме нового потока. */
+static const uint8_t raw_plan_voice[] = {
+    'D', '2', 'K', 'P', 0, 1, 0, 1, 0, 0, 0, 5,
+    0x00, 0x02, 0x00, 0x02, 0x11, 0x03,
+    0x00, 0x10, 0x00, 0x05, 0x00, 0x01, 0xDE, 0xAD, 0xBE,
+    0x00, 0x11, 0x00, 0x08, 0x00, 0x01, 0x03, 0x00, 0, 0, 0, 0,
+    0x01, 0x01, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x01, 0x02, 0x00,
+                            0x00, 0x01, 0x30, 0xB0,
+    0x01, 0x03, 0x00, 0x01, 0x00
+};
+static size_t jcount(const d2k_session *s, uint8_t kind, uint8_t code, int *planned_yes, int *shape_raw) {
+    const d2k_journal *j = d2k_session_journal(s);
+    size_t n = 0;
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e->kind != kind || e->code != code) continue;
+        n++;
+        if (planned_yes) *planned_yes = e->d_planned == D2K_PLANNED_YES;
+        if (shape_raw) *shape_raw = e->d_client_shape == D2K_PLAN_SHAPE_RAW;
+    }
+    return n;
+}
+static void test_udp_raw_experiment(void) {
+    const uint64_t S = 1000000000ull;
+    static const uint8_t game[] = "\x01\x00GAME-PING\x00\x00";
+    char err[160];
+    d2k_session *s = d2k_session_new(64, 64);
+    d2k_session_set_udp_reverse_hook(s, 1);
+    D2K_TEST_NAT_NO_TABLE();
+    uint8_t pkt[1300], buf[8192];
+    d2k_result r;
+    uint16_t cport = 48000;
+    for (int i = 0; i < 3; i++) {
+        size_t n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+        CHECK(r.n_out == 0 && !r.applied, "udp-опыт: без записи опыта план взялся ниоткуда");
+    }
+    CHECK(d2k_session_sweep(s, 8 * S) == 1, "udp-опыт: молчание не заподозрено");
+    /* Без крючка направление — догадка по порту 443: сторона клиента в
+       подозрении НЕ называется (контроллер точную пробу не выдумает). */
+    {
+        const d2k_journal *j = d2k_session_journal(s); int side = -1;
+        for (size_t i = 0; i < d2k_journal_count(j); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(j, i);
+            if (e->kind == D2K_JRN_SUSPECT) side = e->d_client_side;
+        }
+        CHECK(side == 0, "udp-опыт: без крючка сторона клиента выдумана по порту");
+    }
+    /* Контроллер ставит точный опыт по 5-tuple этого потока. */
+    d2k_addr_probe_flow f = {0};
+    f.family = 4; f.transport = 17;
+    memcpy(f.src_ip4, "\xc0\xa8\x01\x43", 4); memcpy(f.dst_ip4, "\x01\x02\x03\x04", 4);
+    f.src_port_be = (uint16_t)((cport >> 8) | ((cport & 0xff) << 8)); f.dst_port_be = (uint16_t)(0x01bb >> 8 | (0xbb << 8));
+    uint8_t trial[16] = {0x16, 0x01};
+    d2k_plan *p = NULL;
+    CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &p, err, sizeof err) &&
+          !d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, trial, 9 * S, 60 * S, p),
+          "udp-опыт: запись опыта не поставилась");
+    size_t n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);     /* продолжение клиента */
+    d2k_session_packet(s, pkt, n, 10 * S, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out >= 2 && !memcmp(r.trial_id, trial, 16),
+          "udp-опыт: план не исполнен на продолжении клиента или без trial ID");
+    d2k_session_packet(s, pkt, n, 11 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied && r.n_out == 0, "udp-опыт: план исполнен дважды на одном потоке");
+    n = build_udp_rev_pkt(pkt, cport, game, sizeof game - 1);             /* сервер ответил */
+    d2k_session_packet(s, pkt, n, 11 * S + S / 2, buf, sizeof buf, &r);
+    int yes = 0, raw = 0;
+    CHECK(jcount(s, D2K_JRN_PLAN_APPLIED, 0, NULL, NULL) >= 1, "udp-опыт: нет APPLIED");
+    CHECK(jcount(s, D2K_JRN_EXCHANGE, D2K_RAW_PROOF_ECHO, &yes, &raw) == 1 && yes && raw,
+          "udp-опыт: ответ сервера без planned=YES/формы RAW");
+    CHECK(d2k_session_sweep(s, 30 * S) == 0, "udp-опыт: ответивший поток назван молчащим");
+    /* Чужой порт клиента — опыта нет. */
+    n = build_udp_pkt(pkt, 48001, 443, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 12 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied, "udp-опыт: запись опыта досталась чужому порту");
+    d2k_session_free(s);
+    /* Even an exact echo of a one-byte original is not meaningful evidence. */
+    s=d2k_session_new(16,32);D2K_TEST_NAT_NO_TABLE();
+    p=NULL;
+    CHECK(!d2k_plan_load(raw_plan_voice,sizeof raw_plan_voice,&p,err,sizeof err)&&
+          !d2k_plantab_set_addr_probe(d2k_session_plans(s),&f,trial,S,5*S,p),
+          "one-byte UDP proof fixture");
+    n=build_udp_pkt(pkt,cport,443,game,1);
+    d2k_session_packet(s,pkt,n,2*S,buf,sizeof buf,&r);
+    CHECK(r.applied,"one-byte UDP fixture not executed");
+    n=build_udp_rev_pkt(pkt,cport,game,1);
+    d2k_session_packet(s,pkt,n,3*S,buf,sizeof buf,&r);
+    CHECK(count_journal_kind(s,D2K_JRN_EXCHANGE)==0,"one-byte original echo confirmed RAW proof");
+    d2k_session_free(s);
+    /* Lease истёк — продолжение без опыта. */
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    d2k_plan *q = NULL;
+    CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &q, err, sizeof err) &&
+          !d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, trial, 1 * S, 5 * S, q), "udp-опыт: запись с коротким lease");
+    n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    CHECK(r.applied, "udp-опыт: в пределах lease не исполнен");
+    d2k_session_free(s);
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    q = NULL;
+    CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &q, err, sizeof err) &&
+          !d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, trial, 1 * S, 5 * S, q), "udp-опыт: запись для истечения");
+    d2k_session_packet(s, pkt, n, 9 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied, "udp-опыт: истёкший lease всё ещё исполняет план");
+    d2k_session_free(s);
+    /* КРЮЧОК OUTPUT ДОКАЗЫВАЕТ СТОРОНУ (Linux, этап 16): подозрение по потоку
+       без протокола на произвольном порту несёт client_side — иначе контроллеру
+       не на что ставить точную пробу 5-tuple. */
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    d2k_session_set_udp_reverse_hook(s, 1);
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    for (int i = 0; i < 3; i++) {
+        n = build_udp_pkt(pkt, 44749, 4455, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+    }
+    CHECK(d2k_session_sweep(s, 8 * S) == 1, "udp-опыт/крючок: молчание на порту 4455 не заподозрено");
+    {
+        const d2k_journal *j = d2k_session_journal(s); int side = -1, shape = -1;
+        for (size_t i = 0; i < d2k_journal_count(j); i++) {
+            const d2k_jrn_entry *e = d2k_journal_at(j, i);
+            if (e->kind == D2K_JRN_SUSPECT) { side = e->d_client_side; shape = e->d_client_shape; }
+        }
+        /* клиент 192.168.1.67:44749 → 1.2.3.4:4455: клиент — старшая сторона ключа */
+        CHECK(side == D2K_CLIENT_SIDE_HIGH, "udp-опыт/крючок: сторона клиента, доказанная крючком OUTPUT, не названа");
+        CHECK(shape == D2K_PLAN_SHAPE_RAW, "udp-опыт/крючок: форма подозрения не RAW");
+    }
+    d2k_session_free(s);
+    /* ПОЗДНЯЯ ДОСТАВКА (этап 17): поток уже прошёл окно поиска (8 датаграмм
+       клиента без ответа), только потом контроллер поставил точную пробу
+       5-tuple — следующая датаграмма ТОГО ЖЕ потока обязана получить план,
+       а не «за окном поиска». Чужой поток за окном по-прежнему мимо. */
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    d2k_session_set_udp_reverse_hook(s, 1);
+    d2k_session_set_hook(s, D2K_HOOK_OUTPUT);
+    for (int i = 0; i < 10; i++) {
+        n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, (uint64_t)(i + 1) * S, buf, sizeof buf, &r);
+        CHECK(!r.applied, "поздняя доставка: план взялся без записи");
+    }
+    CHECK(r.skipped && strstr(r.skipped, "за окном поиска"), "поздняя доставка: десятая датаграмма без записи не «за окном поиска»");
+    {
+        d2k_plan *lp = NULL; uint8_t ltrial[16] = {0x17, 0x01};
+        CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &lp, err, sizeof err) &&
+              !d2k_plantab_set_addr_probe(d2k_session_plans(s), &f, ltrial, 11 * S, 70 * S, lp),
+              "поздняя доставка: запись опыта не поставилась");
+        n = build_udp_pkt(pkt, cport, 443, game, sizeof game - 1);
+        d2k_session_packet(s, pkt, n, 12 * S, buf, sizeof buf, &r);
+        CHECK(r.applied && r.n_out >= 2 && !memcmp(r.trial_id, ltrial, 16),
+              "поздняя доставка: датаграмма за окном под точной пробой не получила план");
+        n = build_udp_pkt(pkt, 48002, 443, game, sizeof game - 1);
+        for (int i = 0; i < 10; i++) { d2k_session_packet(s, pkt, n, (uint64_t)(13 + i) * S, buf, sizeof buf, &r); }
+        CHECK(!r.applied && r.skipped && strstr(r.skipped, "за окном поиска"),
+              "поздняя доставка: чужой поток за окном прошёл в опыт");
+    }
+    d2k_session_free(s);
+    /* ПРИНЯТИЕ ПОТОКА С МЛАДШИМ АДРЕСОМ КЛИЕНТА (этап 17, дефект 13):
+       d2k_key_make_addr отвечает 1, когда источник — младшая сторона ключа, и
+       adopt принимал это за ошибку: клиент 10.0.0.2 → сервер 172.16.0.1 не
+       принимался. Флаг позднего наблюдения ставится по тому же кортежу. */
+    {
+        d2k_session *a = d2k_session_new(64, 64);
+        d2k_ct_tuple lt; memset(&lt, 0, sizeof lt);
+        lt.family = 4; lt.proto = 17;
+        inet_pton(AF_INET, "10.0.0.2", lt.src); inet_pton(AF_INET, "172.16.0.1", lt.dst);
+        lt.sport_be[0] = 0xc3; lt.sport_be[1] = 0x50; lt.dport_be[0] = 0x01; lt.dport_be[1] = 0xbb;
+        d2k_ct_info ci; memset(&ci, 0, sizeof ci); ci.orig_pkts = 5; ci.reply_pkts = 3;
+        CHECK(d2k_session_adopt(a, &lt, &ci, 1 * S) == 0,
+              "adopt: клиент с младшим адресом не принят (возврат low=1 принят за ошибку)");
+        CHECK(d2k_session_late_watch(a, &lt, 1) == 0, "late_watch: принятый поток не найден по кортежу");
+        d2k_ct_tuple other = lt; other.dport_be[1] = 0xbc;
+        CHECK(d2k_session_late_watch(a, &other, 1) == -1, "late_watch: чужой кортеж «найден»");
+        d2k_session_free(a);
+    }
+    /* Постоянный адресный план формы RAW — первой датаграмме нового потока. */
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    q = NULL;
+    uint8_t dst[4] = {1, 2, 3, 4};
+    CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &q, err, sizeof err) &&
+          !d2k_plantab_set_addr_shaped(d2k_session_plans(s), dst, 4, 1, q, D2K_PLAN_SHAPE_RAW), "udp-опыт: постоянная RAW-запись");
+    n = build_udp_pkt(pkt, 48002, 443, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out >= 2, "udp-опыт: постоянный RAW-план не применён к первой датаграмме");
+    n = build_udp_pkt(pkt, 48003, 443, v1_initial, sizeof v1_initial);   /* QUIC того же адреса — не его форма */
+    d2k_session_packet(s, pkt, n, 3 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied, "udp-опыт: RAW-план достался QUIC Initial");
+    d2k_session_free(s);
+
+    /* A measured RAW service owns only its UDP destination port. */
+    s = d2k_session_new(64, 64); D2K_TEST_NAT_NO_TABLE();
+    q = NULL;
+    const uint8_t port443_bytes[2] = {1, 0xbb};
+    uint16_t port443_be;
+    memcpy(&port443_be, port443_bytes, sizeof port443_be);
+    CHECK(!d2k_plan_load(raw_plan_voice, sizeof raw_plan_voice, &q, err, sizeof err) &&
+          !d2k_plantab_set_endpoint(d2k_session_plans(s), dst, 4, port443_be, 1,
+                                   q, D2K_PLAN_SHAPE_RAW), "udp RAW service: install");
+    n = build_udp_pkt(pkt, 48012, 443, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 2 * S, buf, sizeof buf, &r);
+    CHECK(r.applied && r.n_out >= 2, "udp RAW service: measured port not transformed");
+    n = build_udp_pkt(pkt, 48013, 8443, game, sizeof game - 1);
+    d2k_session_packet(s, pkt, n, 3 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied && !r.n_out, "udp RAW service: unrelated port transformed");
+    n = build_udp_pkt(pkt, 48014, 443, v1_initial, sizeof v1_initial);
+    d2k_session_packet(s, pkt, n, 4 * S, buf, sizeof buf, &r);
+    CHECK(!r.applied, "udp RAW service: QUIC Initial inherited RAW plan");
+    d2k_session_free(s);
+}
+
+static void test_quic_long_stream(void) {
+    const uint64_t S = 1000000000ull, IDLE = 120 * S;
+    d2k_session *s = stall_flow(50420, 8);
+    CHECK(s != NULL, "долгий поток: сессия");
+    if (!s) return;
+    uint64_t orig = 12, reply = 14, t;
+    for (t = 2; t <= 300; t++) {            /* пять минут здорового вещания */
+        orig += 2; reply += 3;
+        ct_write(50420, orig, reply, 1);
+        d2k_session_sweep(s, t * S);
+        d2k_session_expire(s, t * S, IDLE);
+    }
+    CHECK(d2k_session_flows(s) == 1, "здоровый долгий поток забыт, пока conntrack показывает ответы сервера");
+    CHECK(d2k_session_suspects(s) == 0, "здоровый долгий поток заподозрен");
+    for (; t <= 310; t++) {                 /* сервер встал, клиент повторяет */
+        orig += 1;
+        ct_write(50420, orig, reply, 1);
+        d2k_session_sweep(s, t * S);
+        d2k_session_expire(s, t * S, IDLE);
+    }
+    CHECK(d2k_session_suspects(s) == 1 && last_suspect_code(s) == D2K_SUSPECT_QUIC_STALL,
+          "обрыв после пяти минут вещания не замечен");
+    /* Пауза клиента — не обрыв: при молчащем клиенте второго подозрения нет. */
+    for (; t <= 330; t++) { d2k_session_sweep(s, t * S); d2k_session_expire(s, t * S, IDLE); }
+    CHECK(d2k_session_suspects(s) == 1, "пауза породила второе подозрение");
+    ct_write(50420, orig, reply, 0);        /* записи conntrack больше нет */
+    for (; t <= 460; t++) { d2k_session_sweep(s, t * S); d2k_session_expire(s, t * S, IDLE); }
+    CHECK(d2k_session_flows(s) == 0, "завершённый поток не забыт");
+    d2k_session_free(s);
 }
 
 static void test_quic_post_handshake_stall(void) {
@@ -2387,10 +2878,458 @@ static void test_quic_no_proof_ask(void) {
     }
 }
 
+static size_t measured_udp_packet(uint8_t *out,int family,int reverse,uint16_t port,
+                                  const uint8_t *data,size_t len) {
+    uint8_t v4[1500];
+    size_t n=reverse?build_udp_rev_pkt(v4,49001,data,len):build_udp_pkt(v4,49001,port,data,len);
+    if(family==4){memcpy(out,v4,n);return n;}
+    memset(out,0,40);out[0]=0x60;wr16(out+4,(uint16_t)(n-20));out[6]=17;out[7]=64;
+    out[8]=out[24]=0x20;out[9]=out[25]=1;out[10]=out[26]=0x0d;out[11]=out[27]=0xb8;
+    out[23]=v4[15];out[39]=v4[19];memcpy(out+40,v4+20,n-20);return n+20;
+}
+static int measured_nat6(const char *path,uint8_t proto,const uint8_t *src,uint16_t sp,
+                         const uint8_t *dst,uint16_t dp,uint8_t family,uint8_t *ext,uint16_t *ep) {
+    if(frag_nat_missing)return frag_nat_missing==2?1:-1;
+    return frag_nat6(path,proto,src,sp,dst,dp,family,ext,ep);
+}
+static void test_measured_udp_packet_scope(int family, int progress) {
+    d2k_session *s=d2k_session_new(32,64);CHECK(s!=NULL,"measured UDP session");if(!s)return;
+    d2k_nat_family_fn saved_nat6=d2k_nat_family_hook;d2k_nat_family_hook=measured_nat6;
+    d2k_nat_fn saved_nat=d2k_nat_hook;frag_nat_missing=0;d2k_nat_hook=frag_nat;
+    d2k_session_set_udp_reverse_hook(s,1);
+    uint8_t packet[1500],scratch[8192],data[20];memset(data,'q',sizeof data);d2k_result out;
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    size_t n=measured_udp_packet(packet,family,0,443,data,sizeof data);
+    d2k_session_packet(s,packet,n,1,scratch,sizeof scratch,&out);
+    struct d2k_rawmeasure_report report={0};report.request.tuple.family=(uint8_t)family;report.request.tuple.proto=17;
+    memcpy(report.request.tuple.src,packet+(family==6?8:12),family==6?16:4);
+    memcpy(report.request.tuple.dst,packet+(family==6?24:16),family==6?16:4);
+    unsigned l4=family==6?40:20;
+    memcpy(report.request.tuple.sport_be,packet+l4,2);memcpy(report.request.tuple.dport_be,packet+l4+2,2);
+    int prior=0;
+    CHECK(!d2k_session_raw_identity(s,&report.request.tuple,report.request.epoch,&report.request.generation,&prior)&&!prior,
+          "new UDP flow inherited prior reply");
+    d2k_session_set_hook(s,D2K_HOOK_FORWARD);n=measured_udp_packet(packet,family,1,443,data,sizeof data);
+    d2k_session_packet(s,packet,n,2,scratch,sizeof scratch,&out);
+    CHECK(!d2k_session_raw_identity(s,&report.request.tuple,report.request.epoch,&report.request.generation,&prior)&&prior,
+          "same-flow UDP reply not available to measurement");
+    /* Measured trials must survive the ordinary initial parse window. */
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    n=measured_udp_packet(packet,family,0,443,data,sizeof data);
+    for(unsigned i=0;i<12;i++)d2k_session_packet(s,packet,n,2,scratch,sizeof scratch,&out);
+    CHECK(!d2k_session_late_watch(s,&report.request.tuple,1),"UDP late delivery fixture");
+    report.request.token[0]=1;report.request.seconds=10;report.code=D2K_RM_REPEAT_SILENT;
+    report.flags=D2K_RM_PRIOR_REPLY;report.sample_len=report.smallest_data=report.largest_data=sizeof data;
+    report.client_data=2;report.exact_repeats=1;d2k_sha256(data,sizeof data,report.sample_digest);
+    const uint8_t tlv[]={'D','2','K','P',0,1,0,7,0,0,0,2,0,2,0,2,17,2,1,12,0,1,1};
+    uint8_t trial[16]={9};d2k_plan *plan=NULL;char err[160];
+    CHECK(!d2k_plan_load(tlv,sizeof tlv,&plan,err,sizeof err),"measured UDP fragment plan load");
+    CHECK(!d2k_plantab_set_measured_probe(d2k_session_plans(s),&report,trial,(const uint8_t[32]){1},3,1000,plan),"measured UDP plan install");
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    n=measured_udp_packet(packet,family,0,443,data,sizeof data);packet[family==6?23:15]=68;
+    d2k_session_packet(s,packet,n,4,scratch,sizeof scratch,&out);CHECK(!out.applied,"UDP candidate leaked to other client");
+    n=measured_udp_packet(packet,family,0,8443,data,sizeof data);
+    d2k_session_packet(s,packet,n,5,scratch,sizeof scratch,&out);CHECK(!out.applied,"UDP candidate leaked to other service");
+    n=measured_udp_packet(packet,family,0,443,data,sizeof data);packet[l4+8]='r';
+    d2k_session_packet(s,packet,n,6,scratch,sizeof scratch,&out);CHECK(!out.applied,"UDP candidate accepted changed payload");
+    packet[l4+8]='q';frag_nat_missing=1;
+    d2k_session_packet(s,packet,n,7,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"UDP fragmented without confirmed NAT context");
+    frag_nat_missing=2;d2k_session_packet(s,packet,n,8,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"absent conntrack table treated as no-NAT proof");
+    int local_refusal=0;const d2k_journal *before=d2k_session_journal(s);
+    for(size_t i=0;i<d2k_journal_count(before);i++) {
+        const d2k_jrn_entry *e=d2k_journal_at(before,i);
+        if(e->kind==D2K_JRN_PLAN_REFUSED&&e->code==D2K_REFUSE_CONTEXT&&!memcmp(e->trial_id,trial,16))local_refusal++;
+    }
+    if(local_refusal!=2)for(size_t i=0;i<d2k_journal_count(before);i++) {
+        const d2k_jrn_entry *e=d2k_journal_at(before,i);
+        if(e->kind==D2K_JRN_PLAN_REFUSED)fprintf(stderr,"UDP local refusal code=%u trial=%u\n",e->code,e->trial_id[0]);
+    }
+    CHECK(local_refusal==2,"missing NAT context not reported with exact trial identity");
+    frag_nat_missing=0;d2k_session_packet(s,packet,n,9,scratch,sizeof scratch,&out);
+    CHECK(out.applied&&out.n_out==2&&out.verdict==D2K_VERDICT_DROP&&!memcmp(out.trial_id,trial,16),
+          "measured UDP repetition not fragmented with exact trial identity");
+    if(!out.applied)fprintf(stderr,"measured UDP skip: %s\n",out.skipped?out.skipped:"none");
+    uint64_t execution=out.execution_id;
+    CHECK(execution&&!d2k_session_done(s),"prepared measured UDP trial treated as completed sends");
+    d2k_session_set_hook(s,D2K_HOOK_FORWARD);
+    n=measured_udp_packet(packet,family,1,443,data,0);
+    d2k_session_packet(s,packet,n,10,scratch,sizeof scratch,&out);
+    n=measured_udp_packet(packet,family,1,443,data,1);
+    d2k_session_packet(s,packet,n,11,scratch,sizeof scratch,&out);
+    n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"arbitrary",9);
+    d2k_session_packet(s,packet,n,12,scratch,sizeof scratch,&out);
+    CHECK(jcount(s,D2K_JRN_EXCHANGE,0,NULL,NULL)==0,
+          "RAW UDP arbitrary/empty/one-byte reply attributed as trial proof");
+    if (progress) {
+        n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"server-timer",12);
+        d2k_session_packet(s,packet,n,13,scratch,sizeof scratch,&out);
+        CHECK(count_journal_kind(s,D2K_JRN_EXCHANGE)==0,"RAW server burst promoted without client progress");
+        d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+        n=measured_udp_packet(packet,family,0,443,data,sizeof data);
+        d2k_session_packet(s,packet,n,14,scratch,sizeof scratch,&out);
+        d2k_session_set_hook(s,D2K_HOOK_FORWARD);
+        n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"server-timer",12);
+        d2k_session_packet(s,packet,n,15,scratch,sizeof scratch,&out);
+        CHECK(count_journal_kind(s,D2K_JRN_EXCHANGE)==0,"RAW retransmitted request promoted server burst");
+        d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+        n=measured_udp_packet(packet,family,0,443,(const uint8_t *)"next-request",12);
+        d2k_session_packet(s,packet,n,16,scratch,sizeof scratch,&out);
+        d2k_session_set_hook(s,D2K_HOOK_FORWARD);
+        n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"arbitrary",9);
+        d2k_session_packet(s,packet,n,17,scratch,sizeof scratch,&out);
+        CHECK(count_journal_kind(s,D2K_JRN_EXCHANGE)==0,"RAW repeated server bytes promoted progress");
+        n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"server-timer",12);
+        d2k_session_packet(s,packet,n,17,scratch,sizeof scratch,&out);
+        CHECK(count_journal_kind(s,D2K_JRN_EXCHANGE)==0,"RAW known periodic server data promoted progress");
+        n=measured_udp_packet(packet,family,1,443,(const uint8_t *)"next-response",13);
+        d2k_session_packet(s,packet,n,18,scratch,sizeof scratch,&out);
+    } else {
+        n=measured_udp_packet(packet,family,1,443,data,sizeof data);
+        d2k_session_packet(s,packet,n,13,scratch,sizeof scratch,&out);
+    }
+    const d2k_journal *j=d2k_session_journal(s);int own=0;
+    for(size_t i=0;i<d2k_journal_count(j);i++) {
+        const d2k_jrn_entry *e=d2k_journal_at(j,i);
+        if(e->kind==D2K_JRN_EXCHANGE&&e->execution_id==execution&&!memcmp(e->trial_id,trial,16)) {
+            own++;CHECK(e->code==(progress ? D2K_RAW_PROOF_PROGRESS : D2K_RAW_PROOF_ECHO),"unknown UDP evidence missing path-only proof");
+        }
+    }
+    CHECK(own==1,"measured UDP reply missing exact execution/trial context");
+    CHECK(d2k_session_expire(s,100,10)>0,"UDP replacement fixture did not expire flow");
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);n=measured_udp_packet(packet,family,0,443,data,sizeof data);
+    d2k_session_packet(s,packet,n,101,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"new UDP incarnation inherited measured plan");
+    d2k_session_free(s);d2k_nat_hook=saved_nat;d2k_nat_family_hook=saved_nat6;
+}
+/* Install a measured UDP fragment probe for `payload` under `trial`, keyed to
+   the live flow identity of `packet`. */
+static int install_udp_measured(d2k_session *s,const uint8_t *packet,int family,
+        const uint8_t *payload,size_t plen,const uint8_t trial[16],uint64_t now) {
+    struct d2k_rawmeasure_report r={0};
+    r.request.tuple.family=(uint8_t)family;r.request.tuple.proto=17;
+    unsigned l4=family==6?40:20;
+    memcpy(r.request.tuple.src,packet+(family==6?8:12),family==6?16:4);
+    memcpy(r.request.tuple.dst,packet+(family==6?24:16),family==6?16:4);
+    memcpy(r.request.tuple.sport_be,packet+l4,2);memcpy(r.request.tuple.dport_be,packet+l4+2,2);
+    int prior=0;
+    if(d2k_session_raw_identity(s,&r.request.tuple,r.request.epoch,&r.request.generation,&prior))return -1;
+    r.request.token[0]=1;r.request.seconds=10;r.code=D2K_RM_REPEAT_SILENT;r.flags=D2K_RM_PRIOR_REPLY;
+    r.sample_len=r.smallest_data=r.largest_data=(uint16_t)plen;r.client_data=2;r.exact_repeats=1;
+    d2k_sha256(payload,plen,r.sample_digest);
+    static const uint8_t tlv[]={'D','2','K','P',0,1,0,7,0,0,0,2,0,2,0,2,17,2,1,12,0,1,1};
+    d2k_plan *plan=NULL;char err[160];
+    if(d2k_plan_load(tlv,sizeof tlv,&plan,err,sizeof err))return -1;
+    return d2k_plantab_set_measured_probe(d2k_session_plans(s),&r,trial,(const uint8_t[32]){1},now,now+1000000000ull,plan);
+}
+static void complete_sends(d2k_session *s,const d2k_result *r,uint64_t *now) {
+    for(size_t i=0;i<=r->n_out;i++)d2k_session_sent(s,(*now)++,&r->key,r->execution_id);
+}
+/* UDP63: the controller's FRESH measured candidate (after its own plan failed)
+   must execute on the same client continuation even though a plan already ran
+   on the flow — both inside the hello window and, as the real LAN does, after
+   it. The same trial, pending/failed sends, and permanent/address plans stay
+   rejected. Mirrors the TCP raw_measured_new refinement. */
+static void test_measured_udp_refinement(int family,int past_window) {
+    d2k_session *s=d2k_session_new(32,64);CHECK(s!=NULL,"udp refine session");if(!s)return;
+    d2k_nat_family_fn sn6=d2k_nat_family_hook;d2k_nat_family_hook=measured_nat6;
+    d2k_nat_fn sn=d2k_nat_hook;frag_nat_missing=0;d2k_nat_hook=frag_nat;
+    d2k_session_set_udp_reverse_hook(s,1);
+    uint8_t packet[1500],scratch[8192],qa[20],rb[20];memset(qa,'q',20);memset(rb,'r',20);
+    uint8_t trialA[16]={9},trialB[16]={0x20};d2k_result out,first;uint64_t now=1;size_t n;
+    /* Establish the flow and a same-flow reply so a measured probe is valid. */
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    n=measured_udp_packet(packet,family,0,443,qa,20);d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);
+    d2k_session_set_hook(s,D2K_HOOK_FORWARD);
+    n=measured_udp_packet(packet,family,1,443,qa,20);d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    n=measured_udp_packet(packet,family,0,443,qa,20);
+    CHECK(!install_udp_measured(s,packet,family,qa,20,trialA,now),"first measured probe install");
+    d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&first);
+    CHECK(first.applied&&first.n_out==2&&first.verdict==D2K_VERDICT_DROP&&!memcmp(first.trial_id,trialA,16),
+          "in-window first measured execution missing");
+    if(!first.applied){fprintf(stderr,"udp refine first skip: %s\n",first.skipped?first.skipped:"none");}
+    if(past_window) {
+        /* Push the flow beyond the hello window (session.c D2K_HELLO_WINDOW==8,
+           not exported); the already-applied plan makes each filler a plain
+           "already applied" miss. */
+        for(int i=0;i<12;i++){n=measured_udp_packet(packet,family,0,443,qa,20);
+            d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);CHECK(!out.applied,"filler executed");}
+    }
+    /* The controller's fresh candidate arrives after the first probe's lease
+       (the real repeat was ~123 s later); advance past it so the measured slot
+       is free for the new trial. fwd_pkts (the window) is unchanged by time. */
+    now=2000000000ull;
+    /* Fresh candidate installed; while the first sends are still pending it must
+       NOT execute (pending-sends protection), window or not. */
+    CHECK(!install_udp_measured(s,packet,family,rb,20,trialB,now),"fresh measured probe install");
+    n=measured_udp_packet(packet,family,0,443,rb,20);
+    d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"fresh measured trial executed over pending sends");
+    /* Complete the first execution's sends, then the fresh trial executes with
+       a distinct execution and its own trial, despite plan_done. */
+    complete_sends(s,&first,&now);
+    n=measured_udp_packet(packet,family,0,443,rb,20);
+    d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);
+    CHECK(out.applied&&out.n_out==2&&out.execution_id!=first.execution_id&&!memcmp(out.trial_id,trialB,16),
+          past_window?"fresh measured trial rejected after window":"fresh measured trial rejected in window");
+    if(!out.applied)fprintf(stderr,"udp refine fresh skip (past=%d): %s\n",past_window,out.skipped?out.skipped:"none");
+    d2k_result second=out;
+    /* The SAME trial, after its sends complete, does not execute again. */
+    complete_sends(s,&second,&now);
+    n=measured_udp_packet(packet,family,0,443,rb,20);
+    d2k_session_packet(s,packet,n,now++,scratch,sizeof scratch,&out);
+    CHECK(!out.applied,"same measured trial executed twice");
+    d2k_session_free(s);d2k_nat_hook=sn;d2k_nat_family_hook=sn6;
+}
+/* UDP63 сессионная непрерывность: демон, взяв во владение первую датаграмму
+ * свежего QUIC-потока с планом фрагментации (NAT ещё не подтверждён → defer),
+ * продолжает её через d2k_session_udp_continue, когда внешний кортеж
+ * подтверждён. Проверяем: один выстрел применяется; устаревшая инкарнация,
+ * переиспользованный кортеж, удалённая и переустановленная (то же байты, новое
+ * поколение) привязки — отказ; счётчик применений на отказах не растёт. */
+static const uint8_t cont_frag_tlv[] =
+    {'D','2','K','P',0,1,0,7,0,0,0,2,0,2,0,2,17,2,1,12,0,1,1};
+
+static d2k_session *udp_cont_defer(uint8_t *pkt, size_t *np, d2k_result *r) {
+    char err[160];
+    d2k_session *s = d2k_session_new(32, 64);
+    if (!s) { return NULL; }
+    d2k_plan *p = NULL;
+    if (d2k_plan_load(cont_frag_tlv, sizeof cont_frag_tlv, &p, err, sizeof err) != 0 ||
+        d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                    1, p, D2K_PLAN_SHAPE_QUIC) != 0) {
+        d2k_session_free(s); return NULL;
+    }
+    uint8_t buf[8192];
+    size_t n = build_udp_pkt(pkt, 50801, 443, v1_initial, sizeof v1_initial);
+    *np = n;
+    /* Первый QUIC Initial демон держит и повторяет после сборки ClientHello;
+       на повторе NAT всё ещё не подтверждён → план фрагментации откладывается,
+       а датаграмма помечается кандидатом на владение. */
+    d2k_key key;
+    d2k_session_udp_hold_begin(s, pkt, n, 1000, &key);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, r);
+    d2k_session_udp_hold_replay(s, &key);
+    d2k_session_packet(s, pkt, n, 1001, buf, sizeof buf, r);
+    return s;
+}
+
+static void fill_reply(d2k_ct_info *m, int good_server) {
+    memset(m, 0, sizeof *m);
+    m->reply_tuple_known = 1;
+    m->reply_tuple.family = 4; m->reply_tuple.proto = 17;
+    uint8_t good[4] = {1, 2, 3, 4}, bad[4] = {9, 9, 9, 9};
+    memcpy(m->reply_tuple.src, good_server ? good : bad, 4);          /* сервер */
+    uint8_t ext[4] = {203, 0, 113, 9}; memcpy(m->reply_tuple.dst, ext, 4); /* внешний */
+    m->reply_tuple.sport_be[0] = (uint8_t)(443 >> 8); m->reply_tuple.sport_be[1] = (uint8_t)443;
+    m->reply_tuple.dport_be[0] = (uint8_t)(40001 >> 8); m->reply_tuple.dport_be[1] = (uint8_t)40001;
+}
+
+static void test_udp_continue(void) {
+    d2k_nat_fn saved = d2k_nat_hook;
+    d2k_nat_hook = quic_nat_not_ready;
+    uint8_t pkt[1300], scratch[8192];
+    d2k_result r;
+    d2k_ct_info map; fill_reply(&map, 1);
+
+    /* --- один выстрел: defer, затем применение на подтверждённом кортеже --- */
+    size_t n = 0;
+    d2k_session *s = udp_cont_defer(pkt, &n, &r);
+    CHECK(s != NULL, "udp-continue fixture");
+    if (!s) { d2k_nat_hook = saved; return; }
+    CHECK(r.udp_defer_pending && !r.applied,
+          "udp-continue: первый Initial не помечен кандидатом на владение");
+    d2k_key key = r.udp_defer_key;
+    uint8_t pid[16], tid[16];
+    memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+    d2k_binding_context bind = r.udp_defer_binding;
+    uint8_t ep[16]; memcpy(ep, r.udp_defer_epoch, 16);
+    uint64_t inc = r.udp_defer_incarnation;
+
+    d2k_key foreign = key; foreign.proto = 6;
+    CHECK(!d2k_session_udp_continue(s, 1900, &foreign, pid, tid, &bind, ep, inc,
+          &map, pkt, n, scratch, sizeof scratch, &r), "foreign supplied key refused");
+    uint8_t wrong_epoch[16]; memcpy(wrong_epoch, ep, 16); wrong_epoch[0] ^= 1;
+    CHECK(!d2k_session_udp_continue(s, 1900, &key, pid, tid, &bind, wrong_epoch, inc,
+          &map, pkt, n, scratch, sizeof scratch, &r), "foreign flow epoch refused");
+    CHECK(!d2k_session_udp_continue(s, 1900, &key, pid, tid, &bind, ep, inc,
+          &map, pkt, n-1, scratch, sizeof scratch, &r), "incomplete IP packet refused");
+    pkt[25] ^= 1;
+    CHECK(!d2k_session_udp_continue(s, 1900, &key, pid, tid, &bind, ep, inc,
+          &map, pkt, n, scratch, sizeof scratch, &r), "invalid UDP length refused");
+    pkt[25] ^= 1;
+    /* A reversed datagram has the same canonical key, but is not this send. */
+    uint8_t reverse[1300]; memcpy(reverse, pkt, n);
+    memcpy(reverse + 12, pkt + 16, 4); memcpy(reverse + 16, pkt + 12, 4);
+    memcpy(reverse + 20, pkt + 22, 2); memcpy(reverse + 22, pkt + 20, 2);
+    d2k_ct_info reverse_map = map;
+    memcpy(reverse_map.reply_tuple.src, reverse + 16, 4);
+    memcpy(reverse_map.reply_tuple.sport_be, reverse + 22, 2);
+    CHECK(!d2k_session_udp_continue(s, 1999, &key, pid, tid, &bind, ep, inc,
+          &reverse_map, reverse, n, scratch, sizeof scratch, &r),
+          "udp-continue must reject reverse direction with same canonical key");
+    pkt[6] |= 0x40; /* DF is not fragmentation. */
+    uint64_t app0 = d2k_session_applied(s);
+    int rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc, &map,
+                                      pkt, n, scratch, sizeof scratch, &r);
+    CHECK(rc == 1 && r.applied && r.n_out > 0,
+          "udp-continue: один выстрел не применён на подтверждённом кортеже");
+    CHECK(d2k_session_applied(s) == app0 + 1, "udp-continue: счётчик применений не +1");
+    /* Повторное продолжение после применения — отказ (plan_done). */
+    rc = d2k_session_udp_continue(s, 2001, &key, pid, tid, &bind, ep, inc, &map,
+                                  pkt, n, scratch, sizeof scratch, &r);
+    CHECK(rc == 0, "udp-continue: второе продолжение после применения не отвергнуто");
+    d2k_session_free(s);
+
+    /* --- устаревшая инкарнация потока: отказ, счётчик не растёт ------------ */
+    s = udp_cont_defer(pkt, &n, &r); CHECK(s != NULL, "fixture stale");
+    if (s) {
+        key = r.udp_defer_key; memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+        bind = r.udp_defer_binding; memcpy(ep, r.udp_defer_epoch, 16); inc = r.udp_defer_incarnation;
+        app0 = d2k_session_applied(s);
+        rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc + 1, &map,
+                                      pkt, n, scratch, sizeof scratch, &r);
+        CHECK(rc == 0 && d2k_session_applied(s) == app0,
+              "udp-continue: устаревшая инкарнация не отвергнута или счётчик сдвинулся");
+        d2k_session_free(s);
+    }
+
+    /* --- переиспользованный/чужой кортеж ответа: отказ --------------------- */
+    s = udp_cont_defer(pkt, &n, &r); CHECK(s != NULL, "fixture tuple");
+    if (s) {
+        key = r.udp_defer_key; memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+        bind = r.udp_defer_binding; memcpy(ep, r.udp_defer_epoch, 16); inc = r.udp_defer_incarnation;
+        d2k_ct_info badmap; fill_reply(&badmap, 0);
+        app0 = d2k_session_applied(s);
+        rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc, &badmap,
+                                      pkt, n, scratch, sizeof scratch, &r);
+        CHECK(rc == 0 && d2k_session_applied(s) == app0,
+              "udp-continue: чужой кортеж ответа не отвергнут");
+        d2k_session_free(s);
+    }
+
+    /* --- удалённая привязка (поток тот же): отказ -------------------------- */
+    s = udp_cont_defer(pkt, &n, &r); CHECK(s != NULL, "fixture del");
+    if (s) {
+        key = r.udp_defer_key; memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+        bind = r.udp_defer_binding; memcpy(ep, r.udp_defer_epoch, 16); inc = r.udp_defer_incarnation;
+        d2k_plantab_del_name_shaped(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                    17, D2K_PLAN_SHAPE_QUIC, 4);
+        app0 = d2k_session_applied(s);
+        rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc, &map,
+                                      pkt, n, scratch, sizeof scratch, &r);
+        CHECK(rc == 0 && d2k_session_applied(s) == app0,
+              "udp-continue: удалённая привязка не отвергнута");
+        d2k_session_free(s);
+    }
+
+    /* --- переустановка ТЕХ ЖЕ байт (новое поколение привязки): отказ ------- */
+    s = udp_cont_defer(pkt, &n, &r); CHECK(s != NULL, "fixture reinstall");
+    if (s) {
+        char err[160];
+        key = r.udp_defer_key; memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+        bind = r.udp_defer_binding; memcpy(ep, r.udp_defer_epoch, 16); inc = r.udp_defer_incarnation;
+        d2k_plan *again = NULL;
+        CHECK(d2k_plan_load(cont_frag_tlv, sizeof cont_frag_tlv, &again, err, sizeof err) == 0 &&
+              d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)"example.com", 11,
+                                          1, again, D2K_PLAN_SHAPE_QUIC) == 0,
+              "udp-continue: переустановка плана");
+        app0 = d2k_session_applied(s);
+        rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc, &map,
+                                      pkt, n, scratch, sizeof scratch, &r);
+        CHECK(rc == 0 && d2k_session_applied(s) == app0,
+              "udp-continue: переустановленная привязка (новое поколение) не отвергнута");
+        d2k_session_free(s);
+    }
+    d2k_nat_hook = saved;
+}
+
+/* Непрерывность на ПОТОКЕ STUN/голоса: defer плана фрагментации, продолжение
+ * на подтверждённом кортеже, затем STUN-ответ по тому же transaction ID обязан
+ * дать transaction-bound proof — связка запрос→исполнение сохранена (не теряется
+ * из-за stun_request=NULL, как было бы без её восстановления в продолжении). */
+static void test_udp_continue_stun(void) {
+    d2k_nat_fn saved = d2k_nat_hook;
+    d2k_nat_hook = quic_nat_not_ready;
+    char err[160];
+    d2k_session *s = d2k_session_new(64, 32);
+    CHECK(s != NULL, "stun-continue session");
+    if (!s) { d2k_nat_hook = saved; return; }
+    d2k_plan *p = NULL;
+    CHECK(d2k_plan_load(cont_frag_tlv, sizeof cont_frag_tlv, &p, err, sizeof err) == 0 &&
+          d2k_plantab_set_name_shaped(d2k_session_plans(s), (const uint8_t *)D2K_VOICE_CLASS,
+                                      strlen(D2K_VOICE_CLASS), 1, p, D2K_PLAN_SHAPE_VOICE) == 0,
+          "stun-continue: ipfrag voice plan fixture");
+    uint8_t stun[32], txid[12] = {7,7,1,2,3,4,5,6,7,8,9,10};
+    uint8_t pkt[256], buf[4096], scratch[4096];
+    d2k_result r;
+    size_t sn = build_stun_binding(stun, 0x0001, txid);
+    size_t n = build_udp_pkt(pkt, 64051, 50004, stun, sn);   /* Discord media port */
+    d2k_session_set_hook(s, D2K_HOOK_POSTROUTING);
+    d2k_session_packet(s, pkt, n, 1000, buf, sizeof buf, &r);
+    CHECK(r.udp_defer_pending && !r.applied,
+          "stun-continue: STUN-запрос с планом фрагментации не отложен");
+    d2k_key key = r.udp_defer_key;
+    uint8_t pid[16], tid[16];
+    memcpy(pid, r.udp_defer_plan_id, 16); memcpy(tid, r.udp_defer_trial_id, 16);
+    d2k_binding_context bind = r.udp_defer_binding;
+    uint8_t ep[16]; memcpy(ep, r.udp_defer_epoch, 16);
+    uint64_t inc = r.udp_defer_incarnation;
+
+    d2k_ct_info map; memset(&map, 0, sizeof map);
+    map.reply_tuple_known = 1;
+    map.reply_tuple.family = 4; map.reply_tuple.proto = 17;
+    uint8_t srv[4] = {1,2,3,4}; memcpy(map.reply_tuple.src, srv, 4);
+    uint8_t ext[4] = {203,0,113,9}; memcpy(map.reply_tuple.dst, ext, 4);
+    map.reply_tuple.sport_be[0] = (uint8_t)(50004 >> 8); map.reply_tuple.sport_be[1] = (uint8_t)50004;
+    map.reply_tuple.dport_be[0] = (uint8_t)(40001 >> 8); map.reply_tuple.dport_be[1] = (uint8_t)40001;
+
+    int rc = d2k_session_udp_continue(s, 2000, &key, pid, tid, &bind, ep, inc, &map,
+                                      pkt, n, scratch, sizeof scratch, &r);
+    CHECK(rc == 1 && r.applied, "stun-continue: не применено на подтверждённом кортеже");
+    uint64_t exec = r.execution_id;   /* исполнение, с которым обязан связаться ответ */
+    CHECK(exec != 0, "stun-continue: продолжение не дало execution_id");
+
+    /* STUN-ответ тем же transaction ID. Proof обязан быть ПРИВЯЗАН к исполнению
+       продолжения (execution_id), а не просто существовать: без восстановления
+       связки запрос→исполнение (stun_request + new=1) запись обмена несла бы
+       execution_id==0, и этот CHECK падает — что и подтверждает ред-проверка. */
+    uint8_t resp[32]; size_t rn = build_stun_binding(resp, 0x0101, txid);
+    n = build_udp_rev_pkt(pkt, 64051, resp, rn);
+    wr16(pkt + 20, 50004);
+    d2k_session_set_hook(s, D2K_HOOK_FORWARD);
+    d2k_session_packet(s, pkt, n, 1200, buf, sizeof buf, &r);
+    const d2k_journal *j = d2k_session_journal(s);
+    int stun_bound = 0;
+    for (size_t i = 0; i < d2k_journal_count(j); i++) {
+        const d2k_jrn_entry *e = d2k_journal_at(j, i);
+        if (e && e->kind == D2K_JRN_EXCHANGE && e->code == D2K_UDP_PROOF_STUN &&
+            e->execution_id == exec) { stun_bound = 1; }
+    }
+    CHECK(stun_bound,
+          "stun-continue: STUN proof не привязан к исполнению продолжения (связка потеряна)");
+    d2k_session_free(s);
+    d2k_nat_hook = saved;
+}
+
 int main(void) {
     D2K_TEST_NAT_NO_TABLE();
+    test_udp_continue();
+    test_udp_continue_stun();
+    test_measured_udp_refinement(4,0);
+    test_measured_udp_refinement(4,1);
+    test_measured_udp_refinement(6,0);
+    test_measured_udp_refinement(6,1);
     test_quic_deny();
     test_quic_post_handshake_stall();
+    test_quic_long_stream();
+    test_udp_raw_silence();
+    test_flow_fact_udp();
+    test_adopted_flows();
+    test_udp_raw_experiment();
+    for (int f=4; f<=6; f+=2) for (int p=0; p<2; p++) test_measured_udp_packet_scope(f,p);
     test_quic_oneway_block();
     test_quic_no_proof_ask();
     {

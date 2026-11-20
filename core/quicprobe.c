@@ -2628,7 +2628,17 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                 r.verdict = D2K_V_FLAKY;
                 reason_set(&r, "прямой зонд: %d/%d не состоялись — транспорт, не коробка", base.err,
                            D2K_QUIC_REPEATS);
-            } else if (base.pass == D2K_QUIC_REPEATS) {
+            } else if (base.pass == D2K_QUIC_REPEATS ||
+                       (base.pass > 0 && all_marked && data_cut && arm)) {
+                /* ВОПРОС О ДАННЫХ НЕ СНИМАЕТСЯ ПОТЕРЯННЫМ INITIAL (поле
+                   24.10.2026, h3-1024: katzauction.com, rua.gr, enimerosi.com).
+                   Подозрение — о молчании ПОСЛЕ рукопожатия; прямой Initial
+                   2/3 говорит лишь, что одна датаграмма из трёх потерялась, и
+                   прежде на этом поиск кончался FLAKY — «подбор не открыт», а
+                   у клиента запрос HTTP/3 оставался без ответа. Этап данных
+                   сам ведёт свои соединения до рукопожатия; ему хватает, что
+                   рукопожатие проходит хоть раз. Вопрос ТОЛЬКО о рукопожатии
+                   остаётся строгим: 2/3 без признака обрыва данных — FLAKY. */
                 /* Run завершает прямой успех после исходных repeats.
                    Дополнительные два зонда были перенесены из TCP-дерева,
                    а не из QUIC-оригинала. Изоляция через mark остаётся
@@ -2814,7 +2824,7 @@ static d2k_vres classify_run(const char *ip, uint16_t port, const char *sni,
                             snprintf(arm->reason, sizeof arm->reason, "budget exhausted before askArms");
                         }
                     }
-                } else if (all_marked) {
+                } else if (all_marked && base.pass == D2K_QUIC_REPEATS) {
                     /* Проверено ТОЛЬКО рукопожатие: ответ на свой запрос
                        HTTP/3 не спрашивался (подозрение не о данных или нет
                        arm). Строка называет, что именно прошло, — прежде

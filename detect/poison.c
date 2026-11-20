@@ -35,7 +35,7 @@ int d2k_poison_has_fake(const d2k_poison *p)
      * её не увидит, потому что пакет умрёт по дороге. Без этого плечо с одним
      * autottl не получало даже одной копии фальшивки, и план не собирался
      * (поймано test_probe_plan на 12 входах). */
-    return p->badsum || p->md5 || p->ttl > 0 || p->autottl ||
+    return p->badsum || p->md5 || p->md5_ts || p->ttl > 0 || p->autottl ||
            p->seq_shift != 0 || p->tcp_ts;
 }
 
@@ -88,8 +88,6 @@ static void init_poisons(void)
     static const int ovn[7] = {2, 4, 8, 16, 64, 336, 681};
     static const int gaps[4] = {0, 20, 80, 300};
     static const int reps[4] = {2, 3, 4, 7};
-    static const int ttls[8] = {62, 60, 58, 55, 50, 40, 20, 8};
-    static const int dttls[3] = {62, 58, 50};
     d2k_poison *p;
     int i, j;
 
@@ -159,23 +157,30 @@ static void init_poisons(void)
         }
     }
 
-    /* TTL сверху вниз: фальшивка должна пройти почти весь путь и умереть
-     * перед сервером, а не сдохнуть у первого маршрутизатора. */
-    for (i = 0; i < 8; i++) {
-        p = add("ttl-%d", ttls[i]);         p->ttl = ttls[i];
-        p = add("badsum+ttl-%d", ttls[i]);  p->badsum = 1; p->ttl = ttls[i];
-    }
+    /* ГИПОТЕЗ TTL ЗДЕСЬ БОЛЬШЕ НЕТ (23.10.2026). Их было девятнадцать:
+     * ttl-62…ttl-8, badsum+ttl-62…badsum+ttl-8 и три disorder+badsum+ttl-N,
+     * со значениями из чужого поля. Расстояние до коробки — её собственное
+     * свойство, и теперь оно ИЗМЕРЯЕТСЯ делением отрезка прохода фальшивки
+     * (d2k_hop_search, detect/props.c): опрос задаёт этот вопрос последним по
+     * цене, находит само число и отдаёт готовую гипотезу с ним. Число ложится
+     * в запись коробки, и следующей её цели зондов не стоит вовсе.
+     *
+     * ЧТО УШЛО ВМЕСТЕ С НИМИ: связки badsum+ttl и disorder+badsum+ttl. Их
+     * смысл был в запасе на случай, когда TTL угадан неточно, — при
+     * измеренном расстоянии запас не нужен, а нужную добавку (битую сумму,
+     * сбитый порядок) теперь даёт вектор свойств через d2k_compose_from_props,
+     * который видит и расстояние, и сверяет ли коробка сумму. */
 
     p = add("disorder+badsum");        p->disorder = 1; p->badsum = 1;
     p = add("disorder+badsum+hello");  p->disorder = 1; p->badsum = 1; p->decoy_hello = 1;
-    for (i = 0; i < 3; i++) {
-        p = add("disorder+badsum+ttl-%d", dttls[i]);
-        p->disorder = 1; p->badsum = 1; p->ttl = dttls[i];
-    }
 
     p = add("badsum+ts");    p->badsum = 1; p->tcp_ts = 1;
     p = add("badsum+ipid");  p->badsum = 1; p->ip_id_zero = 1;
     p = add("badsum+hello"); p->badsum = 1; p->decoy_hello = 1;
+
+    /* A distinct measured hypothesis after the existing questions fail.
+       Its timestamp comes from the negotiated connection, not a fixed TS. */
+    p = add("md5ts"); p->md5_ts = 1;
 
 }
 
@@ -388,6 +393,8 @@ void d2k_strategy_for_poison(const d2k_poison *p, char *out, size_t cap)
     }
     if (p->badsum) {
         snprintf(out, cap, "%s:badsum", head);
+    } else if (p->md5_ts) {
+        snprintf(out, cap, "%s:tcp_md5:tcp_ts:tcp_md5_first", head);
     } else if (p->md5) {
         snprintf(out, cap, "%s:tcp_md5", head);
     } else if (p->seq_shift != 0) {
@@ -430,6 +437,7 @@ int d2k_arm_from_poison(const d2k_poison *p, d2k_arm *a, char *why, size_t whyca
     }
     a->badsum       = p->badsum;
     a->md5          = p->md5;
+    a->md5_ts       = p->md5_ts;
     a->repeats      = p->repeats > 0 ? (unsigned)p->repeats : 0u;
     /* In the original, TTL/seq-shift alone also send a fake (one by
      * default). The Plan builder needs this explicitly to emit its body. */

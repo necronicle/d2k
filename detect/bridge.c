@@ -25,6 +25,10 @@
 #include "d2k_hello.h"
 #include "d2k_verdict.h"
 #include "d2k_sched.h"
+#include "../synthesis/provider.h"
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <limits.h>
 
 #include <signal.h>
 #include <stdint.h>
@@ -52,6 +56,45 @@ static int stop_asked(void *ctx)
     const volatile sig_atomic_t *task_stop = ctx;
     if (g_stop_all) { return 1; }
     return task_stop && *task_stop;
+}
+
+static d2k_synthesis_provider synthesis_provider;
+static pthread_mutex_t synthesis_generation_mutex=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t synthesis_sequence;
+void d2k_detect_synthesis_set(d2k_synthesis_provider fn) {synthesis_provider=fn;}
+static d2k_syn_status synthesize_tcp(const char *ip,uint16_t port,
+    const d2k_trigger *trigger,const d2k_opts *opt,d2k_vres *out)
+{
+    size_t chunks[sizeof(size_t)*CHAR_BIT+3],n=0;
+    uint8_t reply[4096];
+    uint64_t generation;
+    pthread_mutex_lock(&synthesis_generation_mutex);
+    generation=synthesis_sequence==UINT64_MAX?0:++synthesis_sequence;
+    pthread_mutex_unlock(&synthesis_generation_mutex);
+    memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
+    d2k_experiment e={.port=port,.mark=opt->mark,.connect_ms=opt->timeout_ms,
+        .cancel=&opt->cancel,.reply=reply,.reply_capacity=sizeof reply,
+        .offer_ts=d2k_trigger_offers_ts(trigger)};
+    e.family=strchr(ip,':')?6:4;
+    if(!generation || inet_pton(e.family==6?AF_INET6:AF_INET,ip,e.ip)!=1) {
+        snprintf(out->reason,sizeof out->reason,"синтез: недопустимый адрес или исчерпано поколение опыта");
+        return D2K_SYN_ERROR;
+    }
+    /* Initial arithmetic operation vocabulary, not executable recipes. The
+       learner composes sequences from observations; this grammar is finite. */
+    for(size_t size=trigger->len;size;size/=2)chunks[n++]=size;
+    const size_t boundaries[]={trigger->sni_off>0?(size_t)trigger->sni_off:0,
+        trigger->sni_off>0 && trigger->sni_len>0?(size_t)trigger->sni_off+(size_t)trigger->sni_len:0};
+    for(size_t b=0;b<2;b++) {
+        if(!boundaries[b] || boundaries[b]>trigger->len)continue;
+        size_t j;for(j=0;j<n;j++)if(chunks[j]==boundaries[b])break;
+        if(j==n)chunks[n++]=boundaries[b];
+    }
+    d2k_tls_stream stream={trigger,chunks,n,opt->timeout_ms,1};
+    d2k_syn_status status=synthesis_provider(&stream,&e,generation,out);
+    out->owns_search=1;
+    out->verdict=status==D2K_SYN_ERROR && out->dial_deadline?D2K_V_FLAKY:D2K_V_INCONCLUSIVE;
+    return status;
 }
 
 /* НАХОДКА, КОТОРУЮ НЕЛЬЗЯ ПОСТАВИТЬ, ДЛЯ ПЛАНА — НЕ НАХОДКА.
@@ -105,6 +148,7 @@ static d2k_verdict map_verdict(d2k_verdict_t v)
     case D2K_DV_POISONABLE:   return D2K_V_OPAQUE;
     case D2K_DV_ADDRESS:      return D2K_V_ADDRESS;
     case D2K_DV_RESPONSE:     return D2K_V_RESPONSE;
+    case D2K_DV_RESPONSE_GATE: return D2K_V_RESPONSE_GATE;
     case D2K_DV_UNREACHABLE:  return D2K_V_UNREACHABLE;
     case D2K_DV_FLAKY:        return D2K_V_FLAKY;
     default:                  return D2K_V_INCONCLUSIVE;
@@ -260,6 +304,12 @@ static int bridge_input(const char *ip, uint16_t port,
  * Наблюдение то же, что печатает --progress, ни на что в дереве не влияет. */
 static void progress_seen(void *ctx, const d2k_obs *o)
 {
+    char line[640];
+    snprintf(line, sizeof line,
+             "%s pass=%d fail=%d reused=%d cuts=%d,%d,%d,%d ncuts=%d gap=%d err=%s",
+             o->probe, o->pass, o->fail, o->seeded || o->from_known, o->cuts[0], o->cuts[1],
+             o->cuts[2], o->cuts[3], o->ncuts, o->delay_ms, o->err);
+    d2k_sched_measure_trace(line);
     /* С ответом базы (seeded) наблюдение "whole" несёт счёт ПРОШЛОГО
        прогона, зондов в этом не было: вопрос виден, зонды — нет (задача 49:
        иначе ход обгонял итог, и карточка потом падала). */
@@ -269,6 +319,8 @@ static void progress_seen(void *ctx, const d2k_obs *o)
         d2k_sched_progress_note(o->probe, 0, 0);
         return;
     }
+    /* Ответ из прежнего прогона (этап 25): вопрос виден, зондов в этом прогоне нет. */
+    if (o->seeded || o->from_known) { d2k_sched_progress_note(o->probe, 0, 0); return; }
     d2k_sched_progress_note(o->probe, o->pass, o->fail);
 }
 
@@ -278,9 +330,78 @@ static void progress_seen(void *ctx, const d2k_obs *o)
  * на rutracker.org пришлось выводить из порядка дерева. Копируются только
  * наблюдения «свойство:*»: база, разрез и гипотезы перебора — не вопросы о
  * свойствах. Исход: большинство повторов прошло — YES (props.c,
- * d2k_prop_majority), иначе — NO, локальная ошибка
- * зонда — UNKNOWN (сети зонд не достиг). Ярлык режется только по границе
+ * d2k_prop_majority), большинство уже недостижимо — NO; незаконченный вопрос
+ * и локальная ошибка зонда — UNKNOWN. Ярлык режется только по границе
  * символа UTF-8 (r-73.1). */
+/* РАСХОЖДЕНИЕ КОДИРОВОК — ОШИБКА СБОРКИ, А НЕ ПОЛЯ. Тройственная логика
+ * измерителя (d2k_tri: UNSET/FALSE/TRUE) и ядра (D2K_PROP_UNKNOWN/NO/YES) —
+ * одна и та же тройка чисел 0/1/2, поэтому перенос вектора ниже прямой, без
+ * таблицы перевода. Таблица только спрятала бы расхождение, если одна из
+ * кодировок однажды сдвинется; этот массив тогда не соберётся. */
+typedef char d2k_bridge_tri_check[
+    (D2K_TRI_UNSET == D2K_PROP_UNKNOWN && D2K_TRI_FALSE == D2K_PROP_NO &&
+     D2K_TRI_TRUE == D2K_PROP_YES) ? 1 : -1];
+
+/* ВЕКТОР СВОЙСТВ КОРОБКИ — ПЛАНИРОВЩИКУ И КАТАЛОГУ (23.10.2026).
+ *
+ * Дерево заполняет d2k_dprops своими вопросами и попутно считает порог
+ * пересборки (res->boundary — первая позиция разреза, которая УЖЕ не
+ * проходит), но до правки мост переносил только найденный приём. Знание о
+ * коробке кончалось здесь, и вторая её цель спрашивала заново уже
+ * измеренное: на выпуске 374a6df одиннадцать имён Facebook получили готовый
+ * план переносом, а каждое всё равно отсидело базу 0 из 3.
+ *
+ * ПЕРЕСБОРКУ ДЕРЕВО ОТВЕЧАЕТ САМО. У res->reassembles ответ СВОЕГО вопроса
+ * дерева, и вопросник свойств её обычно не спрашивает вовсе. Берём ответ
+ * дерева, когда вектор по этому полю молчит, — иначе измеренное свойство
+ * терялось бы на ровном месте.
+ *
+ * НУЛИ НЕ ВЫДУМЫВАЮТСЯ. Отрицательный hop_ttl и отрицательный boundary
+ * сводятся к нулю — «не измерено» (§2.4), а не к числу. */
+static void box_props_of(const d2k_result *res, d2k_box_props *p)
+{
+    const d2k_dprops *s = &res->props;
+    memset(p, 0, sizeof(*p));
+    p->reassembles = (int8_t)(s->reassembles != D2K_TRI_UNSET
+                              ? s->reassembles : res->reassembles);
+    p->parses_l7 = (int8_t)s->parses_l7;
+    p->validates_checksum = (int8_t)s->validates_checksum;
+    p->tolerates_reorder = (int8_t)s->tolerates_reorder;
+    p->tolerates_left_overlap = (int8_t)s->tolerates_left_overlap;
+    p->counts_duplicates = (int8_t)s->counts_duplicates;
+    p->inspects_syn = (int8_t)s->inspects_syn;
+    p->validates_md5 = (int8_t)s->validates_md5;
+    p->validates_seq_window = (int8_t)s->validates_seq_window;
+    p->validates_timestamps = (int8_t)s->validates_timestamps;
+    p->overlap_covers_sni = (int8_t)s->overlap_covers_sni;
+    p->handles_urgent = (int8_t)s->handles_urgent;
+    p->hops = s->hop_ttl > 0 ? s->hop_ttl : 0;
+    p->reasm_boundary = res->boundary > 0 ? res->boundary : 0;
+    const d2k_preflight_meas *g = &res->preflight;
+    if (g->response_gate) p->response_gate = D2K_PROP_YES;
+    p->gate_window = g->window;
+    p->gate_pieces = g->pieces_needed;
+    p->gate_rtt_ms = g->rtt_ms;
+    /* Zero booleans in an unasked/incomplete measurement are UNKNOWN.
+     * pieces_pass establishes which hello actually elicited a response.
+     * A completed carry question is witnessed by its trace, not by silence
+     * or by the mere presence of a partial measurement. */
+    if (g->pieces_pass) p->gate_hello_own = g->hello_own ? D2K_PROP_YES : D2K_PROP_NO;
+    if (g->carry_over_rst) p->gate_carry = D2K_PROP_YES;
+    else if (g->response_gate) {
+        for (int i = 0; i < res->ntrace; i++) {
+            const d2k_obs *o = &res->trace[i];
+            if (!strcmp(o->probe, "response-gate") && o->fail && !o->err[0] &&
+                (g->pieces_pass || o->from_known)) {
+                p->gate_carry = D2K_PROP_NO;
+                break;
+            }
+        }
+    }
+    /* white_name, probes and reason describe the network/probe, not the box.
+     * client_shape заполняет планировщик: форма клиента — его знание. */
+}
+
 static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
 {
     static const char pfx[] = "свойство:";
@@ -303,7 +424,10 @@ static void trace_questions(const d2k_result *res, int repeats, d2k_vres *out)
         st->label[n] = '\0';
         st->sent = (uint8_t)(o->pass + o->fail > 255 ? 255 : o->pass + o->fail);
         st->answered = (uint8_t)(o->pass > 255 ? 255 : o->pass);
-        st->outcome = o->err[0] ? D2K_PROP_UNKNOWN
+        int done = o->pass + o->fail;
+        int decided = d2k_prop_majority(o->pass, repeats) ||
+                      !d2k_prop_majority(o->pass + repeats - done, repeats);
+        st->outcome = o->err[0] || !decided ? D2K_PROP_UNKNOWN
                     : d2k_prop_majority(o->pass, repeats) ? D2K_PROP_YES : D2K_PROP_NO;
     }
 }
@@ -319,9 +443,12 @@ static int retry_base_timeout(const char *err) {
  * (d2k_opts.seed_whole), NULL — прогон спрашивает базу сам. */
 static d2k_vres sched_tcp(const char *ip, uint16_t port,
                           d2k_hello trigger, d2k_hello control, d2k_hello white,
+                          const char *response_probe_name,
                           uint32_t mark, int repeats,
                           uint32_t gap_us, uint32_t wait_ms,
-                          const volatile sig_atomic_t *stop, const d2k_base_seed *seed)
+                          const volatile sig_atomic_t *stop, const d2k_base_seed *seed,
+                          const d2k_box_props *known,
+                          const char (*refuted)[64], int n_refuted)
 {
     d2k_vres out;
     d2k_opts opt;
@@ -333,12 +460,59 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
                      &tr, &opt, addr, &out) != 0) {
         return out;
     }
+    const char *preflight = getenv("D2K_PREFLIGHT");
+    opt.preflight_auto = !preflight || !strcmp(preflight, "1");
+    opt.preflight_combined = opt.preflight_auto;
+    opt.response_probe_name = response_probe_name;
+    const char *preflight_ipv6 = getenv("D2K_PREFLIGHT_V6");
+    opt.preflight_ipv6 = preflight_ipv6 && !strcmp(preflight_ipv6, "1");
+    d2k_opts_defaults(&opt);
+    int synthesis_probes=0;
+    if(synthesis_provider) {
+        d2k_syn_status status=synthesize_tcp(ip,port,&tr,&opt,&out);
+        if(status!=D2K_SYN_CLOSED)return out;
+        synthesis_probes=out.probes>0?out.probes:0;
+        d2k_sched_progress_note("синтез не нашёл решения в текущей модели; последняя резервная ветка",0,0);
+        memset(&out,0,sizeof out);out.owns_search=1;
+    }
+    opt.run_cache = d2k_sched_measure_cache();
+    /* Ответы вопросов о свойствах прерванного прогона тем же входом (этап 25):
+       контекст (цель/порт/байты) сверил планировщик (seed_input), число
+       повторов сверяется здесь. Берутся только измеренные исходы. */
+    if (seed && seed->props_valid && seed->props_repeats == opt.repeats) {
+        int k;
+        for (k = 0; k < seed->nprops && k < D2K_QTRACE_MAX && opt.nknown < D2K_KNOWN_MAX; k++) {
+            const d2k_quic_step *st = &seed->props[k];
+            if (!st->label[0] || st->outcome == D2K_PROP_UNKNOWN || st->sent < st->answered) { continue; }
+            snprintf(opt.known_answers[opt.nknown].label, sizeof(opt.known_answers[opt.nknown].label), "%s", st->label);
+            opt.known_answers[opt.nknown].pass = st->answered;
+            opt.known_answers[opt.nknown].fail = st->sent - st->answered;
+            opt.nknown++;
+        }
+        opt.known_repeats = opt.repeats;
+    }
     if (seed && seed->valid && !retry_base_timeout(seed->err)) {
         opt.seed_whole = 1;
         opt.seed_repeats = seed->repeats;
         opt.seed_pass = seed->pass;
         opt.seed_fail = seed->fail;
         snprintf(opt.seed_err, sizeof(opt.seed_err), "%s", seed->err);
+    }
+    if (known) {
+        /* Знание о коробке из каталога: вопрос, чей записанный ответ означает
+           промах приёма, опрос не задаёт (detect/props.c). Вопрос с известным
+           проходом задаётся всё равно — он и есть доказательство (§0.1). */
+        opt.known = *known;
+    }
+    /* ОПРОВЕРГНУТЫЙ ПРИЁМ — В СПИСОК «НЕ ПРОБОВАТЬ». Тот же список, которым
+       пользуется CLI (detect/main.c) и дерево (detect/classify.c): опрос
+       сверяется с ним по имени приёма до первого зонда. Переполнение
+       невозможно в практике (вопросов 13, D2K_SKIP_MAX 32), но обрезка
+       молчаливой быть не должна — лишние имена просто не попадут, и опрос
+       предложит то, что уже отвергнуто; это видно по повтору в журнале. */
+    for (int k = 0; k < n_refuted && refuted; k++) {
+        if (opt.nskip >= D2K_SKIP_MAX) { break; }
+        snprintf(opt.skip[opt.nskip++], sizeof(opt.skip[0]), "%s", refuted[k]);
     }
     int seeded_whole = opt.seed_whole;
     opt.on_obs = progress_seen;
@@ -352,21 +526,33 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     if (res.stopped) {
         /* БРОШЕННЫЙ ЗАМЕР НЕ ВЫДАЁТСЯ ЗА ИЗМЕРЕННЫЙ. Дерево пройдено не до
          * конца, и любой его вердикт утверждал бы больше, чем известно:
-         * «чисто» сняло бы рабочий план, «режут адрес» закрыло бы цель. */
+         * «чисто» сняло бы рабочий план, «режут адрес» закрыло бы цель.
+         * НО ТО, ЧТО УСПЕЛИ ИЗМЕРИТЬ, ВЕРНО (этап 25, поле 28.10.2026): ответы
+         * заданных вопросов о свойствах едут планировщику трассой — иначе
+         * перезапуск спрашивал их второй раз, а прерванный поиск терял дерево. */
         out.verdict = D2K_V_INCONCLUSIVE;
         snprintf(out.reason, sizeof(out.reason),
                  "замер брошен по требованию остановки на %d-м зонде — о цели не сказано ничего",
                  res.probes);
-        out.probes = res.probes;
+        out.probes = res.probes>INT_MAX-synthesis_probes?INT_MAX:res.probes+synthesis_probes;
+        out.repeats = opt.repeats;
+        trace_questions(&res, opt.repeats, &out);
         return out;
     }
     out.verdict = map_verdict(res.verdict);
+    out.repeats = opt.repeats;
     out.dial_deadline = res.dial_deadline;
     trace_questions(&res, opt.repeats, &out);
+    box_props_of(&res, &out.box_props);
+    out.gate_candidate=res.preflight.candidate;
+    if (res.verdict == D2K_DV_RESPONSE_GATE) {
+        snprintf(out.gate_probe_name, sizeof out.gate_probe_name, "%s", res.preflight.white_name);
+        out.gate_probe_wscale = res.preflight.window_scale;
+    }
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
     snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
     out.split_pos = res.split_pos;
-    out.probes = res.probes;
+    out.probes = res.probes>INT_MAX-synthesis_probes?INT_MAX:res.probes+synthesis_probes;
     /* Socket-only split diagnostics remain useful on unsupported hosts, but
        cannot arm a packet program that the measurement never executed. */
     if ((res.verdict == D2K_DV_PREFIX || res.verdict == D2K_DV_WHOLE_PACKET) &&
@@ -462,52 +648,26 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     return out;
 }
 
-/* Крючок планировщика. Сигнатура — d2k_sched_tcp_fn, менять её нельзя. */
+/* КРЮЧОК ПЛАНИРОВЩИКА — ОДИН, ДОПОЛНЕНИЯ ОДНОЙ СТРУКТУРОЙ (23.10.2026).
+ *
+ * Прежде входов было четыре: прогон, прогон с белым именем, прогон с ответом
+ * базы, прогон с тем и другим. Дополнения ортогональны, и каждое новое
+ * удваивало их число — знание о коробке стало бы восьмым входом. Теперь
+ * планировщик зовёт один крючок и кладёт в d2k_sched_tcp_extra то, что у него
+ * есть; пустое поле значит «дополнения нет». extra == NULL тоже законен. */
 d2k_vres d2k_detect_sched_tcp(const char *ip, uint16_t port,
                               d2k_hello trigger, d2k_hello control,
                               uint32_t mark, int repeats,
                               uint32_t gap_us, uint32_t wait_ms,
-                              const volatile sig_atomic_t *stop)
+                              const volatile sig_atomic_t *stop,
+                              const d2k_sched_tcp_extra *extra)
 {
     d2k_hello none = {0};
-    return sched_tcp(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop, NULL);
-}
-
-/* Тот же прогон, но с белым именем сети приманкой (d2k_sched_tcp_white_fn,
-   поле 10.10.2026): планировщик зовёт его, когда имя подобрано. */
-d2k_vres d2k_detect_sched_tcp_white(const char *ip, uint16_t port,
-                                    d2k_hello trigger, d2k_hello control, d2k_hello white,
-                                    uint32_t mark, int repeats,
-                                    uint32_t gap_us, uint32_t wait_ms,
-                                    const volatile sig_atomic_t *stop)
-{
-    return sched_tcp(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop, NULL);
-}
-
-/* Тот же прогон с ответом базового вопроса (d2k_sched_tcp_seeded_fn). */
-d2k_vres d2k_detect_sched_tcp_seeded(const char *ip, uint16_t port,
-                                     d2k_hello trigger, d2k_hello control,
-                                     uint32_t mark, int repeats,
-                                     uint32_t gap_us, uint32_t wait_ms,
-                                     const volatile sig_atomic_t *stop,
-                                     const d2k_base_seed *seed)
-{
-    d2k_hello none = {0};
-    return sched_tcp(ip, port, trigger, control, none, mark, repeats, gap_us, wait_ms, stop, seed);
-}
-
-/* Тот же прогон С ОТВЕТОМ БАЗЫ И ECH-ПРИМАНКОЙ (d2k_sched_tcp_seeded_white_fn,
-   поле 10.10.2026). У целей семейства C профильный замер идёт SEEDED (снятыми
-   байтами клиента), и без этого крючка приманка туда не доходила — составной
-   ECH-вопрос не задавался. sched_tcp уже умеет и seed, и white сразу. */
-d2k_vres d2k_detect_sched_tcp_seeded_white(const char *ip, uint16_t port,
-                                           d2k_hello trigger, d2k_hello control,
-                                           d2k_hello white, uint32_t mark, int repeats,
-                                           uint32_t gap_us, uint32_t wait_ms,
-                                           const volatile sig_atomic_t *stop,
-                                           const d2k_base_seed *seed)
-{
-    return sched_tcp(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop, seed);
+    return sched_tcp(ip, port, trigger, control, extra ? extra->white : none,
+                     extra ? extra->response_probe_name : NULL,
+                     mark, repeats, gap_us, wait_ms, stop,
+                     extra ? extra->seed : NULL, extra ? extra->known : NULL,
+                     extra ? extra->refuted : NULL, extra ? extra->n_refuted : 0);
 }
 
 /* БАЗОВЫЙ ВОПРОС ДОНОРА ОТДЕЛЬНО (задача 32 d2k, d2k_sched_tcp_base_hook).
@@ -576,8 +736,13 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
                                    d2k_hello trigger, d2k_hello control,
                                    uint32_t mark, int repeats,
                                    uint32_t gap_us, uint32_t wait_ms,
-                                   const volatile sig_atomic_t *stop)
+                                   const volatile sig_atomic_t *stop,
+                                   const d2k_sched_tcp_extra *extra)
 {
+    /* Базовый вопрос задаёт один триггер целиком и из каталога не берёт
+       ничего: ни приманки, ни ответа базы (он его и добывает), ни знания о
+       коробке — вопрос у него один, и пропускать нечего. */
+    (void)extra;
     d2k_vres out;
     d2k_opts opt;
     d2k_trigger tr;

@@ -68,6 +68,28 @@ static int anchor_offset(const d2k_pkt *in, uint16_t anchor, size_t *out,
             *out = in->payload_len - 1;
         }
         return 0;
+    case ANCHOR_SLD_MIDDLE: {
+        if (!in->have_sni || in->sni_off > in->payload_len ||
+            in->sni_len > in->payload_len-in->sni_off) {
+            *why = "якорь «середина домена»: полного имени нет";
+            return -1;
+        }
+        const uint8_t *name=in->payload+in->sni_off;
+        size_t last=in->sni_len, first=0;
+        while(last && name[last-1]!='.')last--;
+        if(!last || last==1 || last==in->sni_len) {
+            *why = "якорь «середина домена»: второго уровня нет";
+            return -1;
+        }
+        size_t end=last-1;
+        for(size_t i=end;i>0;i--)if(name[i-1]=='.'){first=i;break;}
+        if(first>=end) {
+            *why = "якорь «середина домена»: пустая метка";
+            return -1;
+        }
+        *out=in->sni_off+first+(end-first)/2;
+        return 0;
+    }
     case ANCHOR_RECORD_END:
         /* Границу записи TLS обязан передать протокольный модуль. Пока он не
            написан, честный ответ — отказ, а не догадка о длине. */
@@ -256,6 +278,7 @@ static int emit_fake(d2k_emit *e, const d2k_plan *p, const struct d2k_fake *f,
         e->ttl = po->ttl;
         e->poison = po->flags;
         e->seq_shift = po->seq_shift;
+        e->ack_shift = po->ack_shift;
         e->ts_up = po->ts_up;
         e->autottl = po->autottl;
         e->autottl_delta = po->autottl_delta;
@@ -287,8 +310,10 @@ static size_t emit_overhead(const d2k_plan *p, const struct d2k_poison *po) {
        эту сторону отвергает лишнее, а не пропускает непроходимое. */
     size_t hdr = EMIT_IP_HDR + ((p->transport == 17) ? EMIT_UDP_HDR : EMIT_TCP_HDR);
     if (po && p->transport != 17) {
-        /* MD5 replaces the timestamp option in detect/raw.c and wire.c. */
-        if (po->flags & D2K_POISON_MD5) { hdr += 20; }
+        /* MD5 replaces the timestamp option in detect/raw.c and wire.c.
+           MD5+метка (D2K_POISON_MD5_TS) — MD5 первой плюс метка = 28 байт. */
+        if (po->flags & D2K_POISON_MD5_TS) { hdr += 28; }
+        else if (po->flags & D2K_POISON_MD5) { hdr += 20; }
         else if (po->flags & D2K_POISON_TCPTS_BACK) { hdr += EMIT_TS_OPT; }
     }
     return hdr;
@@ -347,6 +372,32 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         return -1;
     }
     memset(out, 0, sizeof *out);
+    if (p->preflight && !p->pf_handover_apply) {
+        out->refuse_why = "preflight requires the SYN FSM";
+        return -1;
+    }
+    if(p->after_length) {
+        uint32_t relative=in->stream_offset-p->after_offset;
+        int replay=in->after_split_retry && relative<p->after_length &&
+            in->payload_len && in->payload_len<=p->after_length-relative;
+        if(!in->have_stream_offset ||
+           (in->after_split_retry && !replay) ||
+           (in->stream_offset!=0 && in->stream_offset!=p->after_offset && !replay)) {
+            out->refuse_why="composed plan requires exact first or follow-up TCP input";return -1;
+        }
+        if(in->stream_offset==p->after_offset || replay) {
+            uint32_t delta=replay?relative:0;
+            size_t length=replay?in->payload_len:p->after_length;
+            int interior=p->after_cut>delta && p->after_cut-delta<length;
+            struct d2k_split cut={ANCHOR_PAYLOAD_START,interior?(int16_t)(p->after_cut-delta):0};
+            d2k_plan late={0};
+            late.schema=p->schema;late.minexec=p->minexec;memcpy(late.id,p->id,sizeof late.id);
+            late.transport=p->transport;late.proto=p->proto;late.wire_profile=p->wire_profile;
+            late.has_stream_offset=1;late.stream_offset=in->stream_offset;
+            late.input_len=(uint32_t)length;late.splits=&cut;late.n_splits=interior?1:0;
+            return d2k_plan_apply(&late,f,in,out);
+        }
+    }
     /* ПРИЧИНА ОТКАЗА НАЗЫВАЕТСЯ ВСЕГДА. Отказ исполнителя и вердикт коробки
        на проводе выглядят одинаково: зонд уходит голым и его срезают. Пока 36
        из 37 путей отказа молчали, обобщённое «план неприменим к этому пакету»
@@ -363,6 +414,10 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         out->refuse_why = p->proto == D2K_PLAN_PROTO_HTTP
             ? "план открытого HTTP, а пакет — не запрос HTTP"
             : "пакет — запрос HTTP, а план объявлен не для него";
+        return -1;
+    }
+    if(p->has_stream_offset && (!in->have_stream_offset || in->stream_offset!=p->stream_offset)) {
+        out->refuse_why="TCP stream offset missing or different from measured input";
         return -1;
     }
     if (p->qdeny) {
@@ -519,12 +574,36 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             free(pts);
             return -1; /* невычислимый якорь — причина уже названа */
         }
+        /* НИ ОДИН РАЗРЕЗ НЕ ПОПАЛ В ПРИШЕДШИЕ БАЙТЫ — ЭТО ДРУГАЯ ПРОГРАММА.
+         *
+         * split_points пропускает разрез за нагрузкой молча («разрез вне
+         * нагрузки не режет ничего»), и до 24.10.2026 план при этом
+         * исполнялся без своего разреза и возвращался как ПРИМЕНЁННЫЙ. Для
+         * плана с объявленным входом это уже было отказом (см. «ПРОГРАММА
+         * ОБЯЗАНА БЫТЬ ТОЙ ЖЕ» выше); у плана без объявленного входа та же
+         * подмена оставалась незамеченной.
+         *
+         * Так выглядит поток браузера: приветствие Chrome 1919–2015 байт при
+         * MSS 1388 уезжает в два сегмента (issue 28), и числовой разрез,
+         * измеренный на одном сегменте собственного зонда (1534 байта),
+         * в голову клиента не попадает. Коробка режет по-прежнему, а
+         * контроллер видит applied=1 и считает план рабочим.
+         *
+         * Отказ — только когда НЕ ПОПАЛ НИ ОДИН: часть разрезов плана может
+         * законно не попасть (короткий запрос HTTP, несколько разрезов на
+         * разных якорях), и такой план по-прежнему исполняется. */
+        if (n_pts == 0) {
+            free(pts);
+            out->refuse_why = "ни один измеренный разрез не попал в пришедшие байты: "
+                              "исполнилась бы другая программа, чем мерили";
+            return -1;
+        }
     }
 
     /* Разнос во времени тоже означает владение нагрузкой: выдержать паузу
        перед правдой можно только тогда, когда правду выпускаем мы сами.
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
-    owns_payload = (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
+    owns_payload = in->emit_original || (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
                        (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
                        p->udplen || p->qsplit;
     /* Оригинал, отданный ядру после наших сырых фальшивок, может не уйти
@@ -688,6 +767,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                     e->ttl = ovl_po->ttl;
                     e->poison = ovl_po->flags;
                     e->seq_shift = ovl_po->seq_shift;
+                    e->ack_shift = ovl_po->ack_shift;
                     e->ts_up = ovl_po->ts_up;
                     e->autottl = ovl_po->autottl;
                     e->autottl_delta = ovl_po->autottl_delta;

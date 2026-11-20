@@ -22,6 +22,7 @@
 #include "d2k_http_request_stream.h"
 #include "d2k_plans.h"
 #include "d2k_quic.h"
+#include "d2k_crypto.h"
 
 /* Ключ потока. Адреса и порты в сетевом порядке — ровно как в заголовке, без
  * перекладываний: перекладывание уже стоило одной ошибки в контрольных суммах.
@@ -99,6 +100,26 @@ int d2k_key_make_addr(d2k_key *k, uint8_t proto,
 int d2k_key_make(d2k_key *k, uint8_t proto, const uint8_t *src_ip4, const uint8_t *dst_ip4,
                  const uint8_t *src_port_be, const uint8_t *dst_port_be);
 
+/* Immutable context of the observed request, not the latest flow plan.
+ * Zero execution means no bound execution was observed for that request. */
+typedef struct {
+    uint64_t execution_id;
+    d2k_binding_context binding;
+    uint8_t plan_id[D2K_PLAN_ID_LEN];
+    uint8_t trial_id[D2K_TRIAL_ID_LEN];
+} d2k_udp_request_context;
+
+/* Bounded observation cache, not a probe budget. Evicted requests provide
+ * no response evidence. Completed slots are reused before pending slots. */
+#define D2K_STUN_REQUEST_SLOTS 8
+typedef struct {
+    uint8_t txid[12];
+    /* told — запрос уже вошёл в сообщённый эпизод молчания (см. sweep_udp_one). */
+    uint8_t valid, answered, repeated, told;
+    uint64_t started_ns;
+    d2k_udp_request_context context;
+} d2k_stun_request_slot;
+
 struct d2k_flow {
     d2k_key  key;
     int      in_use;
@@ -106,6 +127,10 @@ struct d2k_flow {
        not evidence for new user-traffic discovery. */
     int      controller_probe;
 
+    /* Connection identity, independent of table-residency timestamps.
+       Zero epoch/incarnation means measurement identity is unavailable. */
+    uint8_t flow_epoch[16];
+    uint64_t incarnation;
     uint64_t first_ns;
     uint64_t last_ns;
 
@@ -159,6 +184,11 @@ struct d2k_flow {
        slot and retransmissions cannot publish another snapshot. */
     int      hello_capture_done;
     uint32_t syn_seq;
+    d2k_binding_context stream_plan_binding;
+    uint8_t stream_plan_pending;
+    /* 0 none, 1 first pending, 2 first sent, 3 late pending, 4 complete, 5 replay pending. */
+    uint8_t stream_plan_stage;
+    uint32_t stream_plan_offset,stream_plan_length;
     int      stream_attempted;
     /* Составное приветствие этого потока уже отпущено без сборки, и событие
        об этом записано. Отпускается несколько пакетов, событие — одно. */
@@ -167,6 +197,40 @@ struct d2k_flow {
     /* Признаки для обнаружения подозрений. Это НАБЛЮДЕНИЯ, а не диагноз:
      * §2.4 говорит, что таймаут не доказывает блокировку, а промах не
      * доказывает свойство механизма. Поля называют то, что видно. */
+    /* Identity of a bounded session-owned retransmission snapshot. */
+    uint64_t retry_plan_revision;
+    uint32_t retry_tls_len;
+    uint64_t retry_token;
+    uint8_t retry_slot;
+    uint8_t tcp_payload_seen;
+    /* Нагрузка без распознанного протокола (этап 12): первый сегмент клиента,
+       который не TLS/HTTP-приветствие, и его повторы по таймеру. Молчание
+       такого потока — подозрение той же силы, что у приветствия: клиент
+       повторяет, обратная сторона видна, ответа с данными нет. */
+    uint8_t  raw_seen;
+    uint8_t  raw_repeats;
+    /* О появлении потока решено (сообщено или подавлено), этап 42. */
+    uint8_t  flow_told;
+    /* Поток принят из таблицы conntrack на старте (этап 13): приветствия не
+       видели, протокол не разобран; наблюдается только счётчиками ядра. */
+    uint8_t  adopted;
+    /* Поздняя доставка (этап 17): d2kd пометил запись conntrack этого потока,
+       чтобы его пакеты за окном шли в очередь; пока стоит — пакет потока не
+       освобождается NF_REPEAT (иначе D2K_WCLR снял бы метку). */
+    uint8_t  late_watch;
+    uint32_t raw_seq;
+    uint32_t raw_execution_seq;
+    uint16_t raw_execution_len;
+    uint8_t raw_proof_stage; /* 0: request, 1: reply, 2: changed client continuation */
+    uint8_t raw_execution_digest[32], raw_reply_digest[32];
+    uint16_t raw_reply_len;
+    uint32_t raw_reply_seq;
+    uint64_t raw_reply_seen; /* conservative filter of pre-continuation replies */
+    d2k_sha256_ctx raw_echo_hash;
+    uint32_t raw_echo_seq, raw_echo_last_seq;
+    uint16_t raw_echo_len, raw_echo_last_len;
+    uint8_t raw_echo_disabled, raw_echo_last_digest[32];
+    uint64_t raw_ns;
     uint32_t hello_seq;        /* seq приветствия — чтобы считать повторы */
     uint32_t hello_repeats;    /* приветствие послано снова */
     /* Подтверждение, с которым ушло приветствие TCP. Клиент, получивший
@@ -242,6 +306,8 @@ struct d2k_flow {
     uint8_t  stun_txid[12];
     uint8_t  stun_txid_valid;
     uint8_t  stun_proof_told;
+    d2k_stun_request_slot stun_requests[D2K_STUN_REQUEST_SLOTS];
+    d2k_udp_request_context voice_request_context;
     /* ПРИЗНАКА «ПРИКЛАДНОЕ ДОКАЗАТЕЛЬСТВО QUIC» ЗДЕСЬ НЕТ, И ЭТО ЗАМЕР.
        Короткий заголовок 1-RTT от сервера (RFC 9000 §17.3) доказательством
        выхода за рукопожатие является, но в окно очереди 0:8 он не умещается у
@@ -368,6 +434,8 @@ struct d2k_flow {
     uint64_t execution_id; /* distinguishes reuse of the same 5-tuple */
     uint8_t execution_plan_id[16];
     uint8_t execution_trial_id[16]; /* nonzero only for ephemeral address probe */
+    uint8_t preflight_outgoing_owned;
+    uint32_t preflight_outgoing_path;
 };
 /* Псевдоним объявлен в d2k_plan.h опережающе — повторять его здесь нельзя:
  * C99 запрещает повторный typedef, и это ловится только сборкой обоих

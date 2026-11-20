@@ -46,6 +46,10 @@ main() {
     make -C datapath clean
     make -C datapath -j"$J" check planlab ctlprobe
 
+    echo "== модель: общие понятия ТЗ =="
+    make -C model clean
+    make -C model check
+
     echo "== ядро: сборка и тесты (-j$J) =="
     make -C core clean
     # d2kc нужен интеграционному тесту рукопожатия контроллера в фазе 2.
@@ -66,6 +70,8 @@ main() {
         # места, где ветка с меткой вообще компилируется. На маке её нет.
         make -C core gcc-warn
         make -C core cross
+        make -C model gcc-warn
+        make -C model cross
         # Проводник установки на VPS (relay-gate/): свой C-сервис, без сети в тестах.
         make -C relay-gate test
     }

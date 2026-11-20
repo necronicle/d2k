@@ -1,3 +1,4 @@
+#include "d2k_crypto.h"
 /* plans.c — таблица планов по целям. */
 #include <stdlib.h>
 #include <stdio.h>
@@ -6,7 +7,7 @@
 #include "d2k_plans.h"
 #include "plan_internal.h"
 
-enum { KEY_FREE = 0, KEY_NAME = 1, KEY_ADDR = 2 };
+enum { KEY_FREE = 0, KEY_NAME = 1, KEY_ADDR = 2, KEY_ENDPOINT = 3, KEY_ENDPOINT_TRIAL = 4 };
 
 typedef struct {
     uint8_t  kind;
@@ -30,6 +31,8 @@ typedef struct {
        Ненулевой ставит только испытание кандидата (см.
        d2k_plantab_set_name_probe в d2k_plans.h). */
     uint16_t only_sport;
+    uint16_t endpoint_port; /* KEY_ENDPOINT: exact server port, network order. */
+    uint16_t dns_length;    /* DNS endpoint: measured request length including TCP prefix. */
     d2k_plan *plan;
 } entry;
 
@@ -39,6 +42,10 @@ typedef struct {
     uint8_t trial_id[D2K_TRIAL_ID_LEN];
     uint64_t expires_ns;
     d2k_plan *plan;
+    struct d2k_rawmeasure_report *raw_guard;
+    uint8_t raw_plan_digest[32];
+    uint16_t dns_length;
+    uint8_t dns_digest[32];
 } probe_entry;
 
 typedef struct {
@@ -99,6 +106,7 @@ static void bind_context(d2k_plantab *t, d2k_plan *p, uint8_t kind,
     p->binding_kind = kind; p->binding_family = family;
     p->binding_shape = shape; p->binding_temporary = temporary != 0;
     memset(p->binding_trial_id,0,sizeof p->binding_trial_id);
+    p->binding_exact_shape=0;
 }
 
 d2k_plantab *d2k_plantab_new(size_t cap) {
@@ -141,6 +149,7 @@ void d2k_plantab_free(d2k_plantab *t) {
     for (size_t i = 0; i < t->cap; i++) {
         d2k_plan_free(t->v[i].plan);
         d2k_plan_free(t->probes[i].plan);
+        free(t->probes[i].raw_guard);
     }
     for (size_t i = 0; i < t->suffix_used; i++) d2k_plan_free(t->suffixes[i].plan);
     free(t->probes);
@@ -208,7 +217,7 @@ static area_entry *area_exact(area_entry *v, size_t used, const uint8_t *name,
 static int area_set(d2k_plantab *t, area_entry *v, size_t *used, size_t cap,
     const uint8_t *name, size_t len, uint8_t transport, uint8_t shape,
     uint8_t family, d2k_plan *p) {
-    if (!area_name_valid(name, len) || transport != shape_transport(shape) ||
+    if ((p && p->preflight) || !area_name_valid(name, len) || transport != shape_transport(shape) ||
         !transport || (family != 4 && family != 6)) {
         d2k_plan_free(p); return -2;
     }
@@ -283,6 +292,18 @@ static const area_entry *area_match(const d2k_plantab *t, const uint8_t *name,
 }
 
 uint64_t d2k_plantab_revision(const d2k_plantab *t) { return t ? t->revision : 0; }
+
+int d2k_plantab_needs_complete_tls_shape(const d2k_plantab *t,const uint8_t *name,
+    size_t len,uint8_t family) {
+    if(!t || !name || !len)return 0;
+    for(size_t i=0;i<t->used;i++) {
+        const entry *e=&t->v[i];
+        if(e->kind==KEY_NAME && !e->only_sport && e->family==family &&
+           e->shape==D2K_PLAN_SHAPE_MODERN && e->plan->binding_exact_shape &&
+           name_eq(e->name,e->name_len,name,len))return 1;
+    }
+    return 0;
+}
 
 int d2k_plantab_has_ech_target(const d2k_plantab *t, const uint8_t *name,
     size_t len, const uint8_t *addr, uint8_t family, uint16_t sport_be) {
@@ -426,17 +447,52 @@ const d2k_plan *d2k_plantab_find_http(d2k_plantab *t, const uint8_t *name, size_
    голосовому плану затирать QUIC-привязку того же IP и применяться ко всем
    его Initial. find_addr — любая форма (снятие адреса целиком, учёт промаха),
    find_addr_shape — ровно одна. */
-static entry *find_addr_shape(d2k_plantab *t, const uint8_t *addr, uint8_t family,
-                              int any_shape, uint8_t shape) {
+/* Транспорт записи формы RAW (этап 39): у потока без протокола решение своё
+   для TCP и для UDP одного адреса. План без объявленного транспорта (0)
+   подходит любому — прежнее поведение. Для прочих форм транспорт задан самой
+   формой и в ключ не входит. */
+static int raw_transport_fits(const entry *e, uint8_t transport) {
+    if (e->shape != D2K_PLAN_SHAPE_RAW || !transport) return 1;
+    uint8_t pt = d2k_plan_transport(e->plan);
+    return !pt || pt == transport;
+}
+
+static entry *find_addr_shape_tr(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                                 int any_shape, uint8_t shape, uint8_t transport) {
     if (!addr || (family != 4 && family != 6)) { return NULL; }
     for (size_t i = 0; i < t->used; i++) {
         if (t->v[i].kind == KEY_ADDR && t->v[i].family == family &&
             (any_shape || t->v[i].shape == shape) &&
-            memcmp(t->v[i].addr, addr, family == 6 ? 16 : 4) == 0) {
+            memcmp(t->v[i].addr, addr, family == 6 ? 16 : 4) == 0 &&
+            (any_shape || raw_transport_fits(&t->v[i], transport))) {
             return &t->v[i];
         }
     }
     return NULL;
+}
+
+static entry *find_addr_shape(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                              int any_shape, uint8_t shape) {
+    return find_addr_shape_tr(t, addr, family, any_shape, shape, 0);
+}
+
+static entry *find_endpoint_kind(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+                            uint16_t port_be, uint8_t shape, uint8_t transport, unsigned kind) {
+    if (!t || !addr || !port_be || (family != 4 && family != 6)) return NULL;
+    for (size_t i = 0; i < t->used; i++) {
+        entry *e = &t->v[i];
+        if (e->kind == kind && e->family == family &&
+            e->endpoint_port == port_be && e->shape == shape &&
+            ((shape != D2K_PLAN_SHAPE_RAW && shape != D2K_PLAN_SHAPE_DNS) ||
+             (transport && d2k_plan_transport(e->plan) == transport)) &&
+            !memcmp(e->addr, addr, family == 6 ? 16 : 4)) return e;
+    }
+    return NULL;
+}
+
+static entry *find_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint8_t shape,uint8_t transport) {
+    return find_endpoint_kind(t,addr,family,port,shape,transport,KEY_ENDPOINT);
 }
 
 static entry *find_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family) {
@@ -470,7 +526,7 @@ static void scan_name(d2k_plantab *t, const uint8_t *name, size_t len,
 }
 
 static void scan_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family,
-                      uint8_t seen_shape, addr_hits *h) {
+                      uint8_t seen_shape, uint8_t transport, addr_hits *h) {
     memset(h, 0, sizeof *h);
     if (!addr || (family != 4 && family != 6)) return;
     for (size_t i = 0; i < t->used; i++) {
@@ -478,7 +534,8 @@ static void scan_addr(d2k_plantab *t, const uint8_t *addr, uint8_t family,
         if (e->kind != KEY_ADDR || e->family != family ||
             memcmp(e->addr, addr, family == 6 ? 16 : 4) != 0) continue;
         if (!h->any) h->any = e;
-        if (!h->shaped && seen_shape != D2K_PLAN_SHAPE_ANY && e->shape == seen_shape)
+        if (!h->shaped && seen_shape != D2K_PLAN_SHAPE_ANY && e->shape == seen_shape &&
+            raw_transport_fits(e, transport))
             h->shaped = e;
         if (!h->modern && e->shape == D2K_PLAN_SHAPE_MODERN) h->modern = e;
         if (!h->grandfather && e->shape == D2K_PLAN_SHAPE_GRANDFATHER) h->grandfather = e;
@@ -573,7 +630,7 @@ static uint8_t probe_transport(const d2k_plan *p, uint8_t shape) {
 
 int d2k_plantab_set_name_family(d2k_plantab *t, const uint8_t *name, size_t len,
     uint64_t now_ns, d2k_plan *p, uint8_t shape, uint16_t sport_be, uint8_t family) {
-    if (!t || !name || len == 0 || len > D2K_TARGET_NAME_MAX ||
+    if ((p && p->preflight) || !t || !name || len == 0 || len > D2K_TARGET_NAME_MAX ||
         (family != 4 && family != 6)) {
         d2k_plan_free(p);
         return -2;
@@ -675,7 +732,7 @@ int d2k_plantab_set_addr_family(d2k_plantab *t, const uint8_t *addr, uint8_t fam
 
 int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t family,
                                 uint64_t now_ns, d2k_plan *p, uint8_t shape) {
-    if (!t || !addr || (family != 4 && family != 6) || shape == D2K_PLAN_SHAPE_ANY ||
+    if ((p && p->preflight) || !t || !addr || (family != 4 && family != 6) || shape == D2K_PLAN_SHAPE_ANY ||
         shape == D2K_PLAN_SHAPE_HTTP || d2k_plan_proto(p) == D2K_PLAN_PROTO_HTTP) {
         d2k_plan_free(p);   /* HTTP — только точное имя, не адрес */
         return -2;
@@ -683,7 +740,9 @@ int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t fam
     t->revision++;
     /* Своя запись на каждую форму: замена плана одной формы не трогает
        подтверждённое на другой (§7 — чужое знание не задевать). */
-    entry *e = find_addr_shape(t, addr, family, 0, shape);
+    /* У формы RAW — своя запись на транспорт плана (этап 39). */
+    entry *e = find_addr_shape_tr(t, addr, family, 0, shape,
+                                  shape == D2K_PLAN_SHAPE_RAW ? d2k_plan_transport(p) : 0);
     if (!e) {
         e = take_free_or_evict(t);
         if (!e) {
@@ -704,6 +763,107 @@ int d2k_plantab_set_addr_shaped(d2k_plantab *t, const uint8_t *addr, uint8_t fam
     return 0;
 }
 
+static int set_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t dport_be,uint64_t now_ns,d2k_plan *p,uint8_t shape,uint16_t dns_length) {
+    int dns=shape==D2K_PLAN_SHAPE_DNS;
+    uint8_t transport = (shape == D2K_PLAN_SHAPE_RAW || dns) ? d2k_plan_transport(p) :
+                        shape == D2K_PLAN_SHAPE_VOICE ? 17 : shape_transport(shape);
+    unsigned prefix=transport==6 ? 2 : 0;
+    if ((p && p->preflight && transport!=6) ||
+        !t || !addr || !p || (family != 4 && family != 6) || !dport_be || (transport != 6 && transport != 17) ||
+        (dns && (p->preflight || dns_length<17+prefix || dns_length>272+prefix)) ||
+        d2k_plan_proto(p) == D2K_PLAN_PROTO_HTTP ||
+        (d2k_plan_transport(p) && d2k_plan_transport(p) != transport) ||
+        (transport == 17 && !dns && shape != D2K_PLAN_SHAPE_RAW && (d2k_plan_transport(p) != 17 ||
+            d2k_plan_proto(p) != (shape == D2K_PLAN_SHAPE_VOICE ? 3 : 2)))) {
+        d2k_plan_free(p);
+        return -2;
+    }
+    entry *e = find_endpoint(t, addr, family, dport_be, shape, transport);
+    if (!e) {
+        e = take_free_or_evict(t);
+        if (!e) { d2k_plan_free(p); return -1; }
+        t->used++;
+        e->kind = KEY_ENDPOINT;
+        e->family = family;
+        memcpy(e->addr, addr, family == 6 ? 16 : 4);
+        e->endpoint_port = dport_be;
+        e->shape = shape;
+    }
+    t->revision++;
+    e->last_used_ns = now_ns;
+    e->dns_length=dns_length;
+    d2k_plan_free(e->plan);
+    e->plan = p;
+    bind_context(t, p, D2K_BIND_ADDR, family, shape, 0);
+    return 0;
+}
+
+int d2k_plantab_set_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint64_t now,d2k_plan *p,uint8_t shape) {
+    return set_endpoint(t,addr,family,port,now,p,shape,0);
+}
+
+int d2k_plantab_set_dns_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint64_t now,uint16_t wire_length,d2k_plan *p) {
+    return set_endpoint(t,addr,family,port,now,p,D2K_PLAN_SHAPE_DNS,wire_length);
+}
+
+static int dns_wire_query(const uint8_t *q,size_t len,uint8_t transport) {
+    if (transport==6) {
+        if (len<19 || (size_t)q[0]*256+q[1]!=len-2)return 0;
+        q+=2;len-=2;
+    }
+    if (len<17 || len>272 || (q[2]&0xf8) || q[4] || q[5]!=1 ||
+        q[6] || q[7] || q[8] || q[9] || q[10] || q[11])return 0;
+    size_t i=12;
+    while (i<len-4 && q[i]) {
+        size_t lc=q[i++];
+        if (lc>63 || lc>len-4-i)return 0;
+        i+=lc;
+    }
+    return i<=266 && i+5==len && !q[i] && (q[i+1] || q[i+2]) && !q[i+3] && q[i+4]==1;
+}
+
+const d2k_plan *d2k_plantab_find_dns_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint8_t transport,const uint8_t *wire,size_t len,uint64_t now) {
+    entry *e=find_endpoint(t,addr,family,port,D2K_PLAN_SHAPE_DNS,transport);
+    if (!e || !wire || len!=e->dns_length || !dns_wire_query(wire,len,transport))return NULL;
+    e->last_used_ns=now;
+    return e->plan;
+}
+
+int d2k_plantab_set_endpoint_trial_port(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint16_t sport,uint64_t now,d2k_plan *p,uint8_t shape,const uint8_t trial[16]) {
+    uint8_t any=0;
+    if(trial)for(unsigned i=0;i<16;i++)any|=trial[i];
+    if(!any){d2k_plan_free(p);return -2;}
+    if(!p || !p->preflight) {
+        int rc=d2k_plantab_set_endpoint(t,addr,family,port,now,p,shape);
+        if(!rc)memcpy(p->binding_trial_id,trial,16);
+        return rc;
+    }
+    if(!t || !addr || (family!=4 && family!=6) || !port ||
+       (shape!=D2K_PLAN_SHAPE_MODERN && shape!=D2K_PLAN_SHAPE_LEGACY)) {
+        d2k_plan_free(p);return -2;
+    }
+    /* A candidate never replaces or evicts confirmed knowledge or another trial. */
+    if(t->used==t->cap || find_endpoint_kind(t,addr,family,port,shape,6,KEY_ENDPOINT_TRIAL)) {
+        d2k_plan_free(p);return -1;
+    }
+    entry *e=&t->v[t->used++];memset(e,0,sizeof *e);
+    p->preflight_trial_sport = sport;
+    e->kind=KEY_ENDPOINT_TRIAL;e->family=family;e->shape=shape;e->endpoint_port=port;e->only_sport=sport;
+    memcpy(e->addr,addr,family==6?16:4);e->plan=p;e->last_used_ns=now;t->revision++;
+    bind_context(t,p,D2K_BIND_ADDR,family,shape,1);memcpy(p->binding_trial_id,trial,16);
+    return 0;
+}
+
+int d2k_plantab_set_endpoint_trial(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint64_t now,d2k_plan *p,uint8_t shape,const uint8_t trial[16]) {
+    return d2k_plantab_set_endpoint_trial_port(t,addr,family,port,0,now,p,shape,trial);
+}
+
 /* Убирает произвольную запись, сохраняя уплотнение — той же техникой, что и
    вытеснение в take_free_or_evict: перенос последней занятой на освободившееся
    место, затем used--. Без этого удаление прогрызало бы дыру в v[0..used), и
@@ -722,6 +882,53 @@ static int drop(d2k_plantab *t, entry *e) {
     memset(last, 0, sizeof *last);
     t->used--;
     return 1;
+}
+
+int d2k_plantab_del_endpoint_trial(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+    uint16_t port, uint8_t shape, const uint8_t trial[16]) {
+    uint8_t any=0;
+    if(!trial)return 0;
+    for(unsigned i=0;i<16;i++)any|=trial[i];
+    entry *e=find_endpoint_kind(t,addr,family,port,shape,0,KEY_ENDPOINT_TRIAL);
+    if(!any || !e || memcmp(e->plan->binding_trial_id,trial,16))return 0;
+    return drop(t,e);
+}
+
+int d2k_plantab_commit_endpoint_trial(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint8_t shape,const uint8_t trial[16]) {
+    entry *e=find_endpoint_kind(t,addr,family,port,shape,0,KEY_ENDPOINT_TRIAL);
+    if(!trial || !e || memcmp(e->plan->binding_trial_id,trial,16))return 0;
+    /* drop may compact the trial, so resolve it again after removing the old owner. */
+    (void)drop(t,find_endpoint(t,addr,family,port,shape,0));
+    e=find_endpoint_kind(t,addr,family,port,shape,0,KEY_ENDPOINT_TRIAL);
+    e->plan->preflight_trial_sport = 0;
+    e->kind=KEY_ENDPOINT;e->only_sport=0;e->plan->binding_temporary=0;t->revision++;
+    return 1;
+}
+
+int d2k_plantab_del_endpoint(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+    uint16_t dport_be, uint8_t shape) {
+    /* RAW deletion without a transport is ambiguous: preserve both owners. */
+    return drop(t, find_endpoint(t, addr, family, dport_be, shape, 0));
+}
+
+int d2k_plantab_del_raw_endpoint(d2k_plantab *t, const uint8_t *addr, uint8_t family,
+    uint16_t dport_be, uint8_t transport) {
+    if (transport != 6 && transport != 17) return 0;
+    return drop(t, find_endpoint(t, addr, family, dport_be, D2K_PLAN_SHAPE_RAW, transport));
+}
+
+int d2k_plantab_del_dns_endpoint(d2k_plantab *t,const uint8_t *addr,uint8_t family,
+    uint16_t port,uint8_t transport) {
+    return drop(t,find_endpoint(t,addr,family,port,D2K_PLAN_SHAPE_DNS,transport));
+}
+
+void d2k_plantab_clear_dns_endpoints(d2k_plantab *t) {
+    for(size_t i=0;t && i<t->used;) {
+        entry *e=&t->v[i];
+        if (e->kind==KEY_ENDPOINT && e->shape==D2K_PLAN_SHAPE_DNS)drop(t,e);
+        else i++;
+    }
 }
 
 int d2k_plantab_del_name(d2k_plantab *t, const uint8_t *name, size_t len) {
@@ -794,14 +1001,15 @@ int d2k_plantab_del_name_probe(d2k_plantab *t, const uint8_t *name, size_t len,
     return d2k_plantab_del_name_probe_family(t, name, len, shape, sport_be, 4);
 }
 
-int d2k_plantab_del_name_probe_family(d2k_plantab *t, const uint8_t *name, size_t len,
-    uint8_t shape, uint16_t sport_be, uint8_t family) {
+static int del_name_probe_if(d2k_plantab *t,const uint8_t *name,size_t len,
+    uint8_t shape,uint16_t sport_be,uint8_t family,const uint8_t *trial) {
     if (!t || !name || len == 0 || sport_be == 0) { return 0; }
     int n = 0;
     for (size_t i = 0; i < t->used;) {
         entry *e = &t->v[i];
         if (e->kind == KEY_NAME && e->family == family && e->only_sport == sport_be &&
-            e->shape == shape && name_eq(e->name, e->name_len, name, len)) {
+            e->shape == shape && name_eq(e->name, e->name_len, name, len) &&
+            (!trial || !memcmp(e->plan->binding_trial_id,trial,D2K_TRIAL_ID_LEN))) {
             (void)drop(t, e);
             n++;
             continue; /* drop() compacted the last entry into slot i */
@@ -809,6 +1017,19 @@ int d2k_plantab_del_name_probe_family(d2k_plantab *t, const uint8_t *name, size_
         i++;
     }
     return n > 0;
+}
+
+int d2k_plantab_del_name_probe_family(d2k_plantab *t,const uint8_t *name,size_t len,
+    uint8_t shape,uint16_t sport_be,uint8_t family) {
+    return del_name_probe_if(t,name,len,shape,sport_be,family,NULL);
+}
+
+int d2k_plantab_del_name_probe_trial(d2k_plantab *t,const uint8_t *name,size_t len,
+    uint8_t shape,uint16_t sport_be,uint8_t family,const uint8_t trial[D2K_TRIAL_ID_LEN]) {
+    uint8_t any=0;
+    if(trial)for(size_t i=0;i<D2K_TRIAL_ID_LEN;i++)any|=trial[i];
+    if(!any || !shape || (family!=4 && family!=6))return 0;
+    return del_name_probe_if(t,name,len,shape,sport_be,family,trial);
 }
 
 int d2k_plantab_del_addr(d2k_plantab *t, uint32_t addr_be) {
@@ -842,7 +1063,7 @@ static int trial_id_valid(const uint8_t id[D2K_TRIAL_ID_LEN]) {
    endpoint, ANY client port (the next call/rejoin socket). Only
    d2k_plantab_find_voice_probe consults such entries. */
 static int probe_flow_valid(const d2k_addr_probe_flow *f) {
-    if (!f || f->transport != 17 || f->dst_port_be == 0) {
+    if (!f || (f->transport != 6 && f->transport != 17) || (f->transport==6 && !f->src_port_be) || f->dst_port_be == 0) {
         return 0;
     }
     if (f->family != 0 && f->family != 4 && f->family != 6) return 0;
@@ -873,6 +1094,7 @@ static int probe_flow_equal(const d2k_addr_probe_flow *a,
 static void probe_drop(d2k_plantab *t, probe_entry *e) {
     if (!t || !e || !e->used) { return; }
     d2k_plan_free(e->plan);
+    free(e->raw_guard);
     memset(e, 0, sizeof *e);
     t->probe_used--;
     t->revision++;
@@ -883,8 +1105,8 @@ void d2k_plantab_clear_probes(d2k_plantab *t) {
     for (size_t i = 0; i < t->used;) {
         /* Опыты контроллера и запрет QUIC (задача 50, раунд 4): ни то, ни
            другое не знание каталога; без контроллера снимать их некому. */
-        if (t->v[i].kind == KEY_NAME &&
-            (t->v[i].only_sport || d2k_plan_quic_deny(t->v[i].plan))) {
+        if (t->v[i].kind == KEY_ENDPOINT_TRIAL || (t->v[i].kind == KEY_NAME &&
+            (t->v[i].only_sport || d2k_plan_quic_deny(t->v[i].plan)))) {
             (void)drop(t, &t->v[i]);
         } else {
             i++;
@@ -893,12 +1115,12 @@ void d2k_plantab_clear_probes(d2k_plantab *t) {
     for (size_t i = 0; i < t->cap; i++) probe_drop(t, &t->probes[i]);
 }
 
-int d2k_plantab_set_addr_probe(d2k_plantab *t,
+static int set_addr_probe_impl(d2k_plantab *t,
                                const d2k_addr_probe_flow *flow,
                                const uint8_t trial_id[D2K_TRIAL_ID_LEN],
                                uint64_t now_ns, uint64_t expires_ns,
-                               d2k_plan *p) {
-    if (!t || !probe_flow_valid(flow) || !trial_id_valid(trial_id) || !p ||
+                               d2k_plan *p,int measured) {
+    if ((p && p->preflight) || (!measured && flow && flow->transport!=17) || !t || !probe_flow_valid(flow) || !trial_id_valid(trial_id) || !p ||
         expires_ns <= now_ns) {
         d2k_plan_free(p);
         return -2;
@@ -918,11 +1140,12 @@ int d2k_plantab_set_addr_probe(d2k_plantab *t,
             continue;
         }
         if (!probe_flow_equal(&e->flow, flow)) { continue; }
-        if (memcmp(e->trial_id, trial_id, D2K_TRIAL_ID_LEN) != 0) {
+        if (e->dns_length || memcmp(e->trial_id, trial_id, D2K_TRIAL_ID_LEN) != 0) {
             d2k_plan_free(p);
             return -3;
         }
         d2k_plan_free(e->plan);
+        free(e->raw_guard);e->raw_guard=NULL;
         e->plan = p;
         bind_context(t, p, D2K_BIND_FLOW, flow->family ? flow->family : 4, shape, 1);
         e->expires_ns = expires_ns;
@@ -944,6 +1167,120 @@ int d2k_plantab_set_addr_probe(d2k_plantab *t,
     return 0;
 }
 
+int d2k_plantab_set_addr_probe(d2k_plantab *t,const d2k_addr_probe_flow *flow,
+    const uint8_t trial_id[16],uint64_t now_ns,uint64_t expires_ns,d2k_plan *p) {
+    return set_addr_probe_impl(t,flow,trial_id,now_ns,expires_ns,p,0);
+}
+int d2k_plantab_set_dns_probe(d2k_plantab *t,const d2k_addr_probe_flow *flow,
+    const uint8_t trial[16],uint64_t now,uint64_t expires,uint16_t length,
+    const uint8_t digest[32],d2k_plan *p) {
+    if (!t || !probe_flow_valid(flow) || (flow->family!=4 && flow->family!=6) ||
+        !flow->src_port_be || !trial_id_valid(trial) || !digest || !p ||
+        length<(flow->transport==6 ? 19 : 17) || length>274 ||
+        d2k_plan_transport(p)!=flow->transport) {
+        d2k_plan_free(p);
+        return -2;
+    }
+    for (size_t i=0;i<t->cap;i++) {
+        const probe_entry *e=t->probes+i;
+        if (e->used && e->expires_ns>now && probe_flow_equal(&e->flow,flow)) {
+            d2k_plan_free(p);
+            return -3;
+        }
+    }
+    int rc=set_addr_probe_impl(t,flow,trial,now,expires,p,1);
+    if (rc)return rc;
+    for (size_t i=0;i<t->cap;i++) {
+        probe_entry *e=t->probes+i;
+        if (e->used && e->plan==p) {
+            e->dns_length=length;
+            memcpy(e->dns_digest,digest,32);
+            bind_context(t,p,D2K_BIND_FLOW,flow->family,D2K_PLAN_SHAPE_RAW,1);
+            memcpy(p->binding_trial_id,trial,16);
+            return 0;
+        }
+    }
+    return -2;
+}
+const d2k_plan *d2k_plantab_find_dns_probe(d2k_plantab *t,const d2k_addr_probe_flow *flow,
+    int controller_owned,const uint8_t *payload,size_t length,uint64_t now,uint8_t trial[16],int *reserved) {
+    if (reserved)*reserved=0;
+    if (!t || !controller_owned || !probe_flow_valid(flow) || !flow->src_port_be)return NULL;
+    for (size_t i=0;i<t->cap;i++) {
+        probe_entry *e=t->probes+i;
+        if (!e->used || !e->dns_length)continue;
+        if (e->expires_ns<=now) {probe_drop(t,e);continue;}
+        if (!probe_flow_equal(&e->flow,flow))continue;
+        if (reserved)*reserved=1;
+        if (!payload || length!=e->dns_length)return NULL;
+        uint8_t digest[32];d2k_sha256(payload,length,digest);
+        if (memcmp(digest,e->dns_digest,sizeof digest))return NULL;
+        if (trial)memcpy(trial,e->trial_id,16);
+        return e->plan;
+    }
+    return NULL;
+}
+static void measured_flow(const d2k_ct_tuple *q,d2k_addr_probe_flow *f) {
+    memset(f,0,sizeof *f);f->family=q->family;f->transport=q->proto;
+    memcpy(q->family==6?f->src_ip6:f->src_ip4,q->src,q->family==6?16:4);
+    memcpy(q->family==6?f->dst_ip6:f->dst_ip4,q->dst,q->family==6?16:4);
+    memcpy(&f->src_port_be,q->sport_be,2);memcpy(&f->dst_port_be,q->dport_be,2);
+}
+int d2k_plantab_set_measured_probe(d2k_plantab *t,const struct d2k_rawmeasure_report *r,
+    const uint8_t trial[16],const uint8_t plan_digest[32],uint64_t now,uint64_t expires,d2k_plan *p) {
+    if(p && p->preflight) {d2k_plan_free(p);return -2;}
+    if(!t||!d2k_rawmeasure_report_valid(r)||r->code!=D2K_RM_REPEAT_SILENT||!p||!plan_digest||
+       d2k_plan_transport(p)!=r->request.tuple.proto||expires<=now) {d2k_plan_free(p);return -2;}
+    d2k_addr_probe_flow f;measured_flow(&r->request.tuple,&f);
+    /* Lease renewal: only this trial, only identical evidence and plan. A
+       different trial on the flow is refused below and keeps its entry. */
+    for(size_t i=0;i<t->cap;i++) {
+        probe_entry *e=&t->probes[i];
+        if(!e->used||!e->raw_guard||e->expires_ns<=now||!probe_flow_equal(&e->flow,&f)||
+           memcmp(e->trial_id,trial,16))continue;
+        uint8_t was[D2K_RM_REPORT_LEN],now_r[D2K_RM_REPORT_LEN];
+        int same=!d2k_rawmeasure_report_write(was,sizeof was,e->raw_guard)&&
+                 !d2k_rawmeasure_report_write(now_r,sizeof now_r,r)&&!memcmp(was,now_r,sizeof was)&&
+                 !memcmp(e->raw_plan_digest,plan_digest,32);
+        d2k_plan_free(p);
+        if(!same)return -3;
+        e->expires_ns=expires;t->revision++;return 0;
+    }
+    struct d2k_rawmeasure_report *guard=malloc(sizeof *guard);
+    if(!guard){d2k_plan_free(p);return -1;}*guard=*r;
+    int rc=set_addr_probe_impl(t,&f,trial,now,expires,p,1);
+    if(rc){free(guard);return rc;}
+    for(size_t i=0;i<t->cap;i++) {
+        probe_entry *e=&t->probes[i];
+        if(e->used&&probe_flow_equal(&e->flow,&f)&&!memcmp(e->trial_id,trial,16)) {
+            e->raw_guard=guard;memcpy(e->raw_plan_digest,plan_digest,32);
+            bind_context(t,p,D2K_BIND_FLOW,f.family,D2K_PLAN_SHAPE_RAW,1);
+            memcpy(p->binding_trial_id,trial,16);
+            return 0;
+        }
+    }
+    free(guard);return -2;
+}
+const d2k_plan *d2k_plantab_find_measured_probe(d2k_plantab *t,const d2k_ct_tuple *tuple,
+    const uint8_t epoch[16],uint64_t generation,uint32_t seq,const uint8_t *payload,size_t len,
+    uint64_t now,uint8_t trial_out[16]) {
+    if(!t||!tuple||!epoch||!generation||!payload||!len||len>D2K_RAWMEASURE_SAMPLE)return NULL;
+    d2k_addr_probe_flow f;measured_flow(tuple,&f);if(!probe_flow_valid(&f))return NULL;
+    for(size_t i=0;i<t->cap;i++) {
+        probe_entry *e=&t->probes[i];if(!e->used)continue;
+        if(e->expires_ns<=now){probe_drop(t,e);continue;}
+        const struct d2k_rawmeasure_report *r=e->raw_guard;
+        if(!r||!probe_flow_equal(&e->flow,&f)||r->request.generation!=generation||
+           memcmp(r->request.epoch,epoch,16)||r->sample_len!=len||
+           (tuple->proto==6&&r->sample_seq!=seq))continue;
+        uint8_t digest[32];d2k_sha256(payload,len,digest);
+        if(memcmp(digest,r->sample_digest,32))continue;
+        if(trial_out)memcpy(trial_out,e->trial_id,16);
+        return e->plan;
+    }
+    return NULL;
+}
+
 int d2k_plantab_del_addr_probe(d2k_plantab *t,
                                const d2k_addr_probe_flow *flow,
                                const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
@@ -952,8 +1289,9 @@ int d2k_plantab_del_addr_probe(d2k_plantab *t,
         probe_entry *e = &t->probes[i];
         if (e->used && probe_flow_equal(&e->flow, flow) &&
             memcmp(e->trial_id, trial_id, D2K_TRIAL_ID_LEN) == 0) {
+            int removed = e->dns_length ? 2 : 1;
             probe_drop(t, e);
-            return 1;
+            return removed;
         }
     }
     return 0;
@@ -970,6 +1308,7 @@ static const d2k_plan *find_probe(d2k_plantab *t, const d2k_addr_probe_flow *flo
             probe_drop(t, e);
             continue;
         }
+        if(e->raw_guard || e->dns_length)continue; /* Only guarded lookup may execute it. */
         int match;
         if (e->flow.src_port_be == 0) {
             /* Wildcard client port: voice only, every other field exact. */
@@ -1033,6 +1372,12 @@ static int shape_fits(uint8_t entry_shape, uint8_t seen_shape) {
     return entry_shape != 0 && entry_shape == seen_shape;
 }
 
+/* Correlated production bindings attest exactly their declared form.
+ * The old unbound catalog keeps its legacy MODERN/GREASE fallback. */
+static int entry_shape_fits(const entry *e,uint8_t seen_shape) {
+    return (!e->plan->binding_exact_shape || e->shape==seen_shape) && shape_fits(e->shape,seen_shape);
+}
+
 static inline int shape_is_udp(uint8_t shape) {
     return shape == D2K_PLAN_SHAPE_QUIC || shape == D2K_PLAN_SHAPE_VOICE;
 }
@@ -1062,6 +1407,23 @@ const d2k_plan *d2k_plantab_find_family(d2k_plantab *t, const uint8_t *name,
 
 const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, size_t len,
     const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape, uint16_t sport_be) {
+    return d2k_plantab_find_target_endpoint(t, name, len, addr, family, now_ns,
+                                           seen_shape, sport_be, 0);
+}
+
+static const d2k_plan *find_target_endpoint_impl(d2k_plantab *t, const uint8_t *name, size_t len,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint16_t dport_be, uint8_t transport);
+
+const d2k_plan *d2k_plantab_find_target_endpoint(d2k_plantab *t, const uint8_t *name, size_t len,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint16_t dport_be) {
+    return find_target_endpoint_impl(t, name, len, addr, family, now_ns, seen_shape, sport_be, dport_be, 0);
+}
+
+static const d2k_plan *find_target_endpoint_impl(d2k_plantab *t, const uint8_t *name, size_t len,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint16_t dport_be, uint8_t transport) {
     if (!t || (family != 4 && family != 6)) {
         return NULL;
     }
@@ -1077,7 +1439,7 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         for (size_t i = 0; i < t->used; i++) {
             entry *e = &t->v[i];
             if (e->kind != KEY_NAME || e->family != family || e->only_sport != sport_be ||
-                !shape_fits(e->shape, seen_shape)) {
+                !entry_shape_fits(e, seen_shape)) {
                 continue;
             }
             if (probe) {
@@ -1116,7 +1478,7 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
                 if (seen_shape == D2K_PLAN_SHAPE_ANY && e->only_sport == sport_be) {
                     return e->plan;
                 }
-                if (shape_fits(e->shape, seen_shape)) {
+                if (entry_shape_fits(e, seen_shape)) {
                     return e->plan;
                 }
                 t->shape_misses++;
@@ -1134,8 +1496,17 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         name_hits h;
         scan_name(t, name, len, seen_shape, family, &h);
         e = h.shaped;
-        if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) e = h.modern;
+        if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP && h.modern && !h.modern->plan->binding_exact_shape) e = h.modern;
         if (!e && shape_transport(seen_shape) == 6) e = h.grandfather;
+        /* A measured exact IP/port/shape is stronger than inherited area
+           knowledge. Own name/probe and grandfather authority stay first;
+           legacy whole-address fallback retains its old lower priority. */
+        if (!e && !h.grandfather) {
+            entry *service=find_endpoint_kind(t,addr,family,dport_be,seen_shape,transport,KEY_ENDPOINT_TRIAL);
+            if(service && service->only_sport && service->only_sport!=sport_be)service=NULL;
+            if(!service)service=find_endpoint(t,addr,family,dport_be,seen_shape,transport);
+            if(service) {service->last_used_ns=now_ns;return service->plan;}
+        }
         if (!e && area_bypassed(t, name, len, seen_shape, family)) return NULL;
         if (!e) {
             /* Дедушкино право — отдельная запись, и она подходит любой
@@ -1163,7 +1534,7 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
                Отметку ставим и тогда, когда форма не подошла: обращение к
                цели было, и забывать запись раньше времени незачем. */
             e->last_used_ns = now_ns;
-            if (shape_fits(e->shape, seen_shape)) {
+            if (entry_shape_fits(e, seen_shape)) {
                 return e->plan;
             }
             if (e->shape != D2K_PLAN_SHAPE_ANY &&
@@ -1190,6 +1561,15 @@ const d2k_plan *d2k_plantab_find_target(d2k_plantab *t, const uint8_t *name, siz
         }
     }
 check_addr:;
+    /* Exact service authority precedes legacy whole-address knowledge. It
+       never transfers across ports or shapes, including TLS -> ECH. */
+    entry *endpoint = find_endpoint_kind(t,addr,family,dport_be,seen_shape,transport,KEY_ENDPOINT_TRIAL);
+    if(endpoint && endpoint->only_sport && endpoint->only_sport!=sport_be)endpoint=NULL;
+    if(!endpoint)endpoint = find_endpoint(t, addr, family, dport_be, seen_shape, transport);
+    if (endpoint) {
+        endpoint->last_used_ns = now_ns;
+        return endpoint->plan;
+    }
     /* Только теперь по адресу: обратный порядок дал бы плану соседа по CDN
        перебить план, подтверждённый для этого имени. */
     /* Запись СВОЕЙ формы; ECH без своей — запись TLS 1.3 (как у имени);
@@ -1198,7 +1578,7 @@ check_addr:;
        наоборот (§5). */
     /* Один проход по таблице (финальное ревью, п.7), порядок прежний. */
     addr_hits a;
-    scan_addr(t, addr, family, seen_shape, &a);
+    scan_addr(t, addr, family, seen_shape, transport, &a);
     entry *e = a.shaped;
     if (!e && seen_shape == D2K_PLAN_SHAPE_ECH_TCP) e = a.modern;
     if (!e) e = a.grandfather;
@@ -1212,6 +1592,12 @@ check_addr:;
         t->shape_misses++;
     }
     return NULL;
+}
+
+const d2k_plan *d2k_plantab_find_target_endpoint_tr(d2k_plantab *t, const uint8_t *name, size_t len,
+    const uint8_t *addr, uint8_t family, uint64_t now_ns, uint8_t seen_shape,
+    uint16_t sport_be, uint16_t dport_be, uint8_t transport) {
+    return find_target_endpoint_impl(t, name, len, addr, family, now_ns, seen_shape, sport_be, dport_be, transport);
 }
 
 size_t d2k_plantab_count(const d2k_plantab *t) {
@@ -1235,6 +1621,50 @@ int d2k_plantab_binding(const d2k_plantab *t, const d2k_plan *p, d2k_binding_con
     return 1;
 }
 
+/* Разрешить ТОЧНУЮ ещё живую установку по её привязке. Поколение привязки —
+ * монотонный счётчик таблицы, уникальный на установку, поэтому совпадение
+ * привязки (d2k_binding_equal: поколение + эпоха таблицы + вид/семейство/форма/
+ * временность) указывает ровно на тот план, который был выбран, независимо от
+ * того, каким селектором его нашли (цель/имя/адрес/суффикс/проба). Возврат
+ * того же плана, что и обычный путь, без ДУБЛИРОВАНИЯ выбора: переустановленные
+ * те же байты несут новое поколение и сюда не попадут (NULL → отказ выше).
+ * Пробы с истёкшим сроком (now_ns за expires_ns) пропускаем — область пробы
+ * уже не живёт. Постоянные записи срока не имеют. */
+const d2k_plan *d2k_plantab_find_by_binding(const d2k_plantab *t,
+                                            const d2k_binding_context *b,
+                                            uint64_t now_ns) {
+    if (!t || !d2k_binding_known(b)) { return NULL; }
+    d2k_binding_context c;
+    for (size_t i = 0; i < t->used; i++) {
+        if (t->v[i].plan && d2k_plantab_binding(t, t->v[i].plan, &c) &&
+            d2k_binding_equal(&c, b)) { return t->v[i].plan; }
+    }
+    for (size_t i = 0; i < t->probe_used; i++) {
+        const probe_entry *pe = &t->probes[i];
+        if (!pe->used || !pe->plan) { continue; }
+        if (pe->expires_ns && now_ns >= pe->expires_ns) { continue; }
+        if (d2k_plantab_binding(t, pe->plan, &c) && d2k_binding_equal(&c, b)) {
+            return pe->plan;
+        }
+    }
+    for (size_t i = 0; i < t->suffix_used; i++) {
+        if (t->suffixes[i].plan && d2k_plantab_binding(t, t->suffixes[i].plan, &c) &&
+            d2k_binding_equal(&c, b)) { return t->suffixes[i].plan; }
+    }
+    for (size_t i = 0; i < t->bypass_used; i++) {
+        if (t->bypasses[i].plan && d2k_plantab_binding(t, t->bypasses[i].plan, &c) &&
+            d2k_binding_equal(&c, b)) { return t->bypasses[i].plan; }
+    }
+    return NULL;
+}
+
+int d2k_plantab_set_name_bound(d2k_plantab *t,const uint8_t *name,size_t len,
+    uint64_t now_ns,d2k_plan *p,uint8_t shape,uint8_t family) {
+    int rc=d2k_plantab_set_name_family(t,name,len,now_ns,p,shape,0,family);
+    if(!rc)p->binding_exact_shape=1;
+    return rc;
+}
+
 int d2k_plantab_set_name_trial(d2k_plantab *t, const uint8_t *name, size_t len,
     uint64_t now_ns, d2k_plan *p, uint8_t shape, uint16_t sport_be, uint8_t family,
     const uint8_t trial_id[D2K_TRIAL_ID_LEN]) {
@@ -1247,6 +1677,6 @@ int d2k_plantab_set_name_trial(d2k_plantab *t, const uint8_t *name, size_t len,
 void d2k_plantab_trial(const d2k_plantab *t, const d2k_plan *p,
                      uint8_t out[D2K_TRIAL_ID_LEN]) {
     memset(out,0,D2K_TRIAL_ID_LEN);
-    if (t && p && p->binding_owner==t && p->binding_temporary)
+    if (t && p && p->binding_owner==t)
         memcpy(out,p->binding_trial_id,D2K_TRIAL_ID_LEN);
 }

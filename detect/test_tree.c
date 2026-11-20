@@ -12,11 +12,52 @@
  * заканчивается одним и тем же opaque, только с честной оговоркой, что про
  * отравление вывода нет.
  */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
+#define _DARWIN_C_SOURCE 1
+/* Same in-translation-unit approach as test_repeats; only raw I/O is
+ * scripted for the socket-free scenarios. Old socket scenarios are unchanged. */
+#define d2k_raw_probe_handshake_as tree_handshake
+#define d2k_raw_probe_poison_family tree_poison
+#define d2k_raw_supported tree_raw_supported
+#define d2k_probe_preflight tree_preflight
+#include "classify.c"
+#undef d2k_raw_probe_handshake_as
+#undef d2k_raw_probe_poison_family
+#undef d2k_raw_supported
+#undef d2k_probe_preflight
+#include "d2k_preflight_probe.h"
+int d2k_raw_supported(void);
+int d2k_raw_probe_handshake_as(const uint8_t *,uint8_t,uint16_t,int,uint32_t,
+    const d2k_detect_stop *,int,char *,size_t);
+int d2k_raw_probe_poison_family(const uint8_t *,uint8_t,uint16_t,const d2k_trigger *,
+    const d2k_poison *,int,uint32_t,const d2k_detect_stop *,char *,size_t);
+int d2k_probe_preflight(const char *,const d2k_trigger *,const d2k_opts *,d2k_preflight_meas *);
+static int tree_script, tree_gate_calls;
+int tree_raw_supported(void) {return tree_script ? 1 : d2k_raw_supported();}
+int tree_handshake(const uint8_t *ip,uint8_t f,uint16_t p,int t,uint32_t m,
+    const d2k_detect_stop *c,int ts,char *e,size_t n)
+{ return tree_script ? 1 : d2k_raw_probe_handshake_as(ip,f,p,t,m,c,ts,e,n); }
+int tree_poison(const uint8_t *ip,uint8_t f,uint16_t p,const d2k_trigger *tr,
+    const d2k_poison *po,int t,uint32_t m,const d2k_detect_stop *c,char *e,size_t n)
+{
+    if(tree_script) return !strcmp(po->name,"tcp-split") ?
+        (tree_script==1 && po->split_pos<4) : tree_script==2;
+    return d2k_raw_probe_poison_family(ip,f,p,tr,po,t,m,c,e,n);
+}
+int tree_preflight(const char *a,const d2k_trigger *tr,const d2k_opts *o,d2k_preflight_meas *m)
+{
+    if(!tree_script)return d2k_probe_preflight(a,tr,o,m);
+    tree_gate_calls++;m->response_gate=m->carry_over_rst=1;m->pieces_needed=3;return 1;
+}
 #include "d2k_detect.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <stdarg.h>
@@ -53,10 +94,12 @@ typedef struct {
     int      fd;
     dpi_mode mode;
     int      sig_len;
+    pthread_t thread;
+    int stopping;
 } fake_dpi;
 
 typedef struct {
-    fake_dpi *d;
+    fake_dpi d;
     int       fd;
 } conn_job;
 
@@ -72,7 +115,8 @@ typedef struct {
 static void *conn_thread(void *arg)
 {
     conn_job *j = arg;
-    fake_dpi *d = j->d;
+    fake_dpi snapshot = j->d;
+    fake_dpi *d = &snapshot;
     int c = j->fd;
     uint8_t buf[4096];
     uint8_t all[8192];
@@ -159,19 +203,26 @@ static void *conn_thread(void *arg)
 static void *dpi_thread(void *arg)
 {
     fake_dpi *d = arg;
-    for (;;) {
+    while (!__atomic_load_n(&d->stopping, __ATOMIC_ACQUIRE)) {
         pthread_t th;
         conn_job *j;
+        struct pollfd pf = {d->fd, POLLIN, 0};
+        int ready = poll(&pf, 1, 50);
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0 || !(pf.revents & POLLIN)) return NULL;
         int c = accept(d->fd, NULL, NULL);
         if (c < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
             return NULL;
         }
+        (void)fcntl(c, F_SETFL, fcntl(c, F_GETFL, 0) & ~O_NONBLOCK);
         j = malloc(sizeof(*j));
         if (!j) {
             close(c);
             continue;
         }
-        j->d = d;
+        memset(&j->d, 0, sizeof j->d);
+        j->d.mode = d->mode; j->d.sig_len = d->sig_len;
         j->fd = c;
         if (pthread_create(&th, NULL, conn_thread, j) != 0) {
             close(c);
@@ -180,6 +231,7 @@ static void *dpi_thread(void *arg)
         }
         pthread_detach(th);
     }
+    return NULL;
 }
 
 static int fake_dpi_start_family(fake_dpi *d, dpi_mode mode, int sig_len,
@@ -187,7 +239,6 @@ static int fake_dpi_start_family(fake_dpi *d, dpi_mode mode, int sig_len,
 {
     struct sockaddr_storage sa;
     socklen_t sl = sizeof(sa);
-    pthread_t th;
     int one = 1;
 
     memset(d, 0, sizeof(*d));
@@ -222,10 +273,10 @@ static int fake_dpi_start_family(fake_dpi *d, dpi_mode mode, int sig_len,
         snprintf(addr, cap, "[::1]:%u", (unsigned)ntohs(((struct sockaddr_in6 *)&sa)->sin6_port));
     else
         snprintf(addr, cap, "127.0.0.1:%u", (unsigned)ntohs(((struct sockaddr_in *)&sa)->sin_port));
-    if (pthread_create(&th, NULL, dpi_thread, d) != 0) {
+    if (fcntl(d->fd, F_SETFL, fcntl(d->fd, F_GETFL, 0) | O_NONBLOCK) < 0) return -1;
+    if (pthread_create(&d->thread, NULL, dpi_thread, d) != 0) {
         return -1;
     }
-    pthread_detach(th);
     return 0;
 }
 
@@ -236,7 +287,8 @@ static int fake_dpi_start(fake_dpi *d, dpi_mode mode, int sig_len, char *addr, s
 
 static void fake_dpi_stop(fake_dpi *d)
 {
-    shutdown(d->fd, SHUT_RDWR);
+    __atomic_store_n(&d->stopping, 1, __ATOMIC_RELEASE);
+    pthread_join(d->thread, NULL);
     close(d->fd);
 }
 
@@ -765,8 +817,74 @@ static void test_seeded_base_matches_unseeded(void)
     }
 }
 
-int main(void)
+
+/* Seeded baseline and cancellation keep these guards socket-free. The raw
+ * model in test_preflight additionally exercises the same tree with raw enabled. */
+static int gate_cancelled;
+static int gate_stop(void *ctx) {(void)ctx;return gate_cancelled;}
+static void gate_stop_after_base(void *ctx,const d2k_obs *o)
+{(void)ctx;if(!strcmp(o->probe,"whole"))gate_cancelled=1;}
+static void test_response_gate_needs_vouched_control(void)
 {
+    d2k_opts o={0};d2k_result r;d2k_trigger t;char err[100];
+    if(d2k_trigger_tls("guard.example",1,&t,err,sizeof err)) {fail("TLS fixture");return;}
+    o.repeats=o.seed_repeats=1;o.seed_whole=1;o.seed_fail=1;
+    o.control_vouched=0;o.on_obs=gate_stop_after_base;
+    o.cancel.fn=gate_stop;gate_cancelled=0;
+    d2k_classify_run("198.51.100.7:443",&t,&o,&r);
+    if(r.verdict==D2K_DV_RESPONSE_GATE || r.preflight.response_gate)
+        fail("response gate requires vouched control");
+    for(int i=0;i<r.ntrace;i++) if(!strcmp(r.trace[i].probe,"response-gate"))
+        fail("unvouched target must not enter gate questions");
+}
+static void test_healthy_target_not_probed(void)
+{
+    d2k_opts o={0};d2k_result r;d2k_trigger t;char err[100];
+    if(d2k_trigger_tls("guard.example",1,&t,err,sizeof err)) {fail("TLS fixture");return;}
+    /* Captured hello has no diagnostic tls:name label, as with an IP context. */
+    snprintf(t.name,sizeof t.name,"captured");
+    o.repeats=o.seed_repeats=1;o.seed_whole=1;o.seed_pass=1;o.control_vouched=1;
+    d2k_classify_run("198.51.100.7:443",&t,&o,&r);
+    if(r.verdict!=D2K_DV_CLEAR || r.preflight.response_gate || r.probes!=0 || r.ntrace!=1)
+        fail("healthy target must stop before gate questions");
+}
+
+/* A premature gate masks both successful cheap branches. Script the raw
+ * transport, keeping the actual measure/sweep/verdict tree under test. */
+static void gate_tree_scenario(int scenario,d2k_verdict_t expected,const char *name)
+{
+    d2k_opts o={0};d2k_result r;d2k_trigger t;char err[100];
+    if(d2k_trigger_tls("guard.example",1,&t,err,sizeof err)) {fail("TLS fixture");return;}
+    o.repeats=o.seed_repeats=1;o.seed_whole=1;o.seed_fail=1;
+    o.control_vouched=1;o.timeout_ms=20;
+    snprintf(o.only,sizeof o.only,"badsum");
+    tree_script=scenario;tree_gate_calls=0;
+    d2k_classify_run("198.51.100.7:443",&t,&o,&r);
+    int traces=0;for(int i=0;i<r.ntrace;i++)traces+=!strcmp(r.trace[i].probe,"response-gate");
+    int asked=scenario==3;
+    if(r.verdict!=expected || tree_gate_calls!=asked || traces!=asked)
+        fail("%s: verdict=%s calls=%d traces=%d",name,d2k_verdict_name(r.verdict),tree_gate_calls,traces);
+    else printf("%s: PASS\n",name);
+    tree_script=0;
+}
+static void test_gate_after_split_success_not_asked(void)
+{gate_tree_scenario(1,D2K_DV_PREFIX,__func__);}
+static void test_gate_after_poison_success_not_asked(void)
+{gate_tree_scenario(2,D2K_DV_POISONABLE,__func__);}
+static void test_gate_asked_when_tree_opaque(void)
+{gate_tree_scenario(3,D2K_DV_RESPONSE_GATE,__func__);}
+
+int main(int argc,char **argv)
+{
+    test_gate_after_split_success_not_asked();
+    test_gate_after_poison_success_not_asked();
+    test_gate_asked_when_tree_opaque();
+    test_response_gate_needs_vouched_control();
+    test_healthy_target_not_probed();
+    if(argc==2 && !strcmp(argv[1],"--response-gate-only")) {
+        printf("response gate tree guards: %s\n",fails ? "FAIL" : "PASS");
+        return fails ? 1 : 0;
+    }
     test_epipe_and_fresh_neutral();
     test_epipe_survives_at_real_send_sites();
     {

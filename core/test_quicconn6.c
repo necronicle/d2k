@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -8,6 +9,11 @@
 #include <unistd.h>
 #include "d2k_quicconn.h"
 #include "d2k_compose_internal.h"
+
+static int hook_called;
+static int first_hook(int fd, const uint8_t *p, size_t n, void *u) {
+    (void)fd; (void)p; (void)n; (void)u; hook_called++; return 0;
+}
 
 int main(void) {
     int server = socket(AF_INET6, SOCK_DGRAM, 0);
@@ -36,6 +42,20 @@ int main(void) {
     assert(n >= 1200 && (packet[0] & 0xc0) == 0xc0);
     assert(peer.sin6_family == AF_INET6 && peer.sin6_port == sport);
     assert(memcmp(&peer.sin6_addr, &in6addr_loopback, 16) == 0);
+    while (recv(server, packet, sizeof packet, 0) > 0) {}
+    /* An Initial that cannot be serialized never reaches the peer. It is a
+       local refusal, including the first-send hook path, not network evidence. */
+    for (int scenario = 0; scenario < 4; scenario++) {
+        assert(d2k_props_bind_udp_family(6, &probe, &sport) == 0);
+        o.use_fd = probe;
+        o.pad_to = scenario < 2 ? 1556 : 4096;
+        o.first_send = (scenario & 1) ? first_hook : NULL;
+        assert(d2k_qc_connect(&o, &c, err, sizeof err) == -2 && c == NULL);
+        assert(hook_called == 0);
+        assert(recv(server, packet, sizeof packet, 0) < 0 &&
+               (errno == EAGAIN || errno == EWOULDBLOCK));
+        assert(fcntl(probe, F_GETFD) == -1 && errno == EBADF);
+    }
     close(server);
     puts("QUIC IPv6: Initial sent on reserved native tuple; silence is not success");
     return 0;

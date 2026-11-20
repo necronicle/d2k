@@ -22,6 +22,8 @@
 #include "d2k_track.h"
 #include "d2k_wire.h"
 #include "d2k_ctq.h"
+#include "d2k_preflight.h"
+#include "d2k_preflight_lease.h"
 
 /* Что делать с пакетом, который нам дали. */
 typedef enum {
@@ -50,6 +52,7 @@ typedef enum {
 typedef struct {
     d2k_verdict verdict;
     uint64_t execution_id;
+    uint32_t replay_tls_bytes; /* complete cached input used for a TCP retry */
     d2k_binding_context binding;
 
     /* Готовые пакеты на отправку, по одному на посылку. Буфер принадлежит
@@ -101,19 +104,68 @@ typedef struct {
        пропускается. Удержанная пачка снимается целиком, хвосты не
        переотправляются. */
     uint8_t  quic_deny;
-    /* Для журнала решений по клиентскому QUIC (поле 15.10.2026): имя потока
-       и признак «имя в таблице есть, но плана этой формы у него нет». */
-    char     quic_name[64];
-    uint8_t  quic_shape_miss;
+    /* ДЛЯ ЖУРНАЛА РЕШЕНИЙ ПО КЛИЕНТСКОМУ ПОТОКУ: имя потока и признак «имя в
+       таблице есть, но плана этой формы у него нет». Заведено для QUIC (поле
+       15.10.2026), с 24.10.2026 заполняется и на TCP: по журналу нельзя было
+       ответить, видел ли датапат поток браузера и почему не применил план
+       (issue 25 и 28). */
+    char     flow_name[64];
+    uint8_t  shape_miss;
     /* Task 47: the first packet of a flow whose client carries a routing mark
        (d2k_session_set_route_mark) — the caller logs it once per flow. */
     uint8_t  routed_first;
     uint32_t routed_mark;
+    /* Отложенная UDP-непрерывность (задача 63, сессионная часть). Свежий
+       UDP-поток с планом фрагментации на ПЕРВОМ оригинале исполнить нельзя:
+       внешний кортеж ещё не подтверждён. План НЕ ПРИМЕНЁН; датаграмма —
+       КАНДИДАТ, который демон вправе взять во владение (postnat_own) и позже
+       продолжить через d2k_session_udp_continue. Поэтому udp_defer_pending == 1
+       значит «кандидат пригоден к владению», НЕ «уже во владении/применён».
+       Привязка держится не по хешу плана: установочное поколение + эпоха
+       таблицы + вид (d2k_binding_context) ПЛЮС эпоха/инкарнация потока ПЛЮС
+       полный кортеж — те же байты, переустановленные заново, это ДРУГАЯ
+       привязка. */
+    uint8_t  udp_defer_pending;
+    d2k_key  udp_defer_key;
+    uint8_t  udp_defer_plan_id[D2K_PLAN_ID_LEN];
+    uint8_t  udp_defer_trial_id[D2K_TRIAL_ID_LEN];
+    d2k_binding_context udp_defer_binding;
+    uint8_t  udp_defer_epoch[16];
+    uint64_t udp_defer_incarnation;
 } d2k_result;
 
 
 
 typedef struct d2k_session d2k_session;
+
+/* Startup configuration only. Disabled by default; no FSM calls while off.
+ * DROP means the caller must NF_DROP the current ID BEFORE sending out,
+ * using its own marked raw socket, never hold it in NFQUEUE. */
+void d2k_session_preflight_output_sent(d2k_session *, const uint8_t *, size_t, unsigned clear);
+void d2k_session_preflight_send_cap(d2k_session *, size_t);
+void d2k_session_preflight_complete(d2k_session *, const uint8_t *, size_t, uint64_t, d2k_pf_out *);
+void d2k_session_preflight_complete_on(d2k_session *, const uint8_t *, size_t, uint64_t, d2k_pf_out *, uint32_t path);
+int d2k_session_set_preflight(d2k_session *, int enabled);
+int d2k_session_provider_ips_load(d2k_session *, const char *, uint64_t now_seconds);
+void d2k_session_preflight_ipv6(d2k_session *, int enabled);
+/* Interface context supplied by the daemon for each current packet. */
+void d2k_session_set_packet_path(d2k_session *, uint32_t path);
+int d2k_session_preflight_packet(d2k_session *, const uint8_t *, size_t,
+                                  uint64_t, d2k_pf_out *);
+int d2k_session_preflight_packet_path(d2k_session *,const uint8_t *,size_t,
+                                  uint64_t,d2k_pf_out *,uint32_t path);
+uint64_t d2k_session_preflight_next_ns(const d2k_session *);
+void d2k_session_preflight_tick(d2k_session *, uint64_t, d2k_pf_out *);
+void d2k_session_preflight_original_sent(d2k_session *, const uint8_t *, size_t, uint64_t);
+void d2k_session_preflight_flush(d2k_session *, uint64_t, d2k_pf_out *);
+void d2k_session_preflight_abort(d2k_session *, const uint8_t *, size_t, uint64_t, d2k_pf_out *);
+uint64_t d2k_session_preflight_calls(const d2k_session *);
+int d2k_session_set_preflight_lease(d2k_session *,const d2k_pf_scope *,uint64_t,
+    uint64_t,const uint8_t [16],d2k_plan *);
+int d2k_session_del_preflight_lease(d2k_session *,const d2k_pf_scope *,const uint8_t [16]);
+void d2k_session_invalidate_preflight_lease(d2k_session *,const d2k_pf_scope *);
+const d2k_plan *d2k_session_find_preflight_lease(d2k_session *,const d2k_pf_scope *,uint64_t);
+const d2k_binding_context *d2k_session_preflight_lease_binding(d2k_session *,const d2k_plan *);
 
 uint64_t d2k_session_plan_revision(const d2k_session *s);
 /* НОМЕР КРЮЧКА NETFILTER ДЛЯ СЛЕДУЮЩЕГО ПАКЕТА.
@@ -184,6 +236,15 @@ void d2k_session_set_udp_reverse_hook(d2k_session *s, int installed);
    бюджете» выключены. */
 typedef int (*d2k_ct_query_fn)(void *ctx, const d2k_ct_tuple *t, d2k_ct_info *out);
 void d2k_session_set_ct_query(d2k_session *s, d2k_ct_query_fn fn, void *ctx);
+/* УЖЕ СУЩЕСТВУЮЩИЙ ПОТОК (этап 13): запись из таблицы conntrack на старте
+ * службы — прямой кортеж (клиент → сервер) и счётчики на момент приёма.
+ * Приветствия у такого потока не было: ни имени, ни формы, ни плана; поток
+ * только наблюдается счётчиками (d2k_session_sweep): ответы сервера идут —
+ * жив; сервер перестал отвечать, а клиент упорствует — подозрение SILENT
+ * формы RAW, planned=NO. Поток, который сервер никогда не слышал, подозрения
+ * не даёт (нет пути, который мог бы сломаться). 0 — принят, -1 — нет места/
+ * негодный кортеж. */
+int d2k_session_adopt(d2k_session *s, const d2k_ct_tuple *t, const d2k_ct_info *i, uint64_t now_ns);
 /* Бюджеты потока коробок для детектора «TCP встал на бюджете» (задача 56):
    n значений, не больше D2K_STALL_BUDGETS_MAX; n == 0 возвращает полевой
    D2K_TCP_STALL_FIELD_BUDGET. Нули и лишнее отбрасываются: 0 — успех,
@@ -288,6 +349,28 @@ int d2k_session_packet_probe(d2k_session *s, const uint8_t *pkt, size_t len,
 int d2k_session_packet_probe_mtu(d2k_session *s, const uint8_t *pkt, size_t len,
                                  uint64_t now_ns, size_t tcp_segment_cap,
                                  uint8_t *buf, size_t bufcap, d2k_result *out);
+
+/* Отложенная UDP-непрерывность (задача 63, сессионная часть). Демон, взяв во
+ * владение первую датаграмму свежего UDP-потока (postnat_own) и подтвердив её
+ * внешний кортеж, продолжает РОВНО ЭТУ датаграмму через существующий UDP-
+ * исполнитель. Внутренний повтор НЕ считается клиентским пакетом: без счётчиков
+ * fwd_pkts, без HELLO/SUSPECT, без расширения области измеряемой пробы.
+ *
+ * datagram/len — ОРИГИНАЛ ДО NAT (не пост-NAT копия захвата): на отказе
+ * вызывающий повторно вводит именно эти байты — пост-NAT реинъекция меняет порт
+ * (лаба Linux). mapping — подтверждённый ответный кортеж ядра (не голые поля):
+ * проверяется против оригинала. Привязка валидируется ЦЕЛИКОМ — установочное
+ * поколение + эпоха таблицы + вид (binding), эпоха/инкарнация потока, план и
+ * trial; истёкшая/заменённая/удалённая привязка или переиспользованный кортеж —
+ * отказ. Контекст запроса STUN/QUIC потока сохраняется.
+ *
+ * Возврат: 1 — план применён, out[] заполнен (как у обычного исполнения);
+ * 0 — отказ, вызывающий повторно вводит ОРИГИНАЛ. */
+int d2k_session_udp_continue(d2k_session *s, uint64_t now_ns, const d2k_key *key,
+        const uint8_t plan_id[D2K_PLAN_ID_LEN], const uint8_t trial_id[D2K_TRIAL_ID_LEN],
+        const d2k_binding_context *binding, const uint8_t epoch[16], uint64_t incarnation,
+        const d2k_ct_info *mapping, const uint8_t *datagram, size_t len,
+        uint8_t *buf, size_t bufcap, d2k_result *out);
 
 /* Освобождает потоки, молчавшие дольше idle_ns. Возвращает сколько освободил.
  * Зовётся вызывающим, а не сама: датапат не заводит таймеров и не решает, как
@@ -408,7 +491,17 @@ typedef struct {
      * не определить (chunked, заголовок не кончился в сегменте, Upgrade) —
      * дальше как есть. */
     uint64_t http_later, http_unaligned, http_open_end;
+    /* ПОЯВЛЕНИЕ ПОТОКОВ БЕЗ ПРОТОКОЛА (этап 42): сообщено фактом D2K_JRN_FLOW
+     * и подавлено ограничением объёма. Подавленный поток не наблюдается
+     * контроллером — это предел, и он виден здесь, а не молча. */
+    uint64_t flow_told, flow_suppressed;
 } d2k_payload_stats;
+
+/* Ограничение объёма фактов появления: запас и пополнение в секунду. Пачка
+ * новых потоков (скан, торрент) не топит журнал и канал к контроллеру;
+ * контроллер всё равно наблюдает не больше SCHED_FLOWWATCH_SLOTS потоков. */
+#define D2K_FLOW_FACT_BURST 32u
+#define D2K_FLOW_FACT_PER_S 8u
 
 void d2k_session_payload_stats(const d2k_session *s, d2k_payload_stats *out);
 
@@ -438,6 +531,8 @@ int d2k_session_want_shape_family(d2k_session *s, const uint8_t *name, size_t le
                                   uint8_t transport, uint8_t family);
 const uint8_t *d2k_session_shape_family(const d2k_session *s, uint8_t transport,
                                         uint8_t family, size_t *len);
+/* Event delivery refuses an overwritten shared slot, including tuple reuse. */
+const uint8_t *d2k_session_shape_event(const d2k_session *,const d2k_key *,uint64_t,size_t *);
 
 /* Приветствие, готовое к выдаче. NULL — не готово. */
 const uint8_t *d2k_session_shape(const d2k_session *s, uint8_t transport, size_t *len);
@@ -461,4 +556,32 @@ void d2k_session_nat_stats(uint64_t *ok, uint64_t *miss, uint64_t *none,
                            uint64_t *retried);
 
 uint8_t d2k_session_client_shape(const d2k_session *s, const d2k_key *k);
+int d2k_session_retry_watch(d2k_session *, const uint8_t *, size_t);
+
+/* ПОЗДНЯЯ ДОСТАВКА (этап 17). Кортеж conntrack (клиент → сервер) TCP-потока
+ * по адресу сервера текстом (как имя в SET_NAME_PROBE: "1.2.3.4" / IPv6) и
+ * порту клиента сетевого порядка; направление — только доказанное (SYN).
+ * 0 — найден и записан в out; -1 — нет такого потока/адрес не разбирается. */
+int d2k_session_tcp_tuple_by_port(d2k_session *s, const uint8_t *ip_text, size_t len,
+                                  uint8_t family, uint16_t client_port_be, d2k_ct_tuple *out);
+/* Флаг позднего наблюдения на потоке (TCP или UDP) по кортежу conntrack:
+ * пока стоит, d2k_session_retry_watch отвечает «держать» (1). 0 — поток
+ * найден; -1 — нет (флаг ставить не на что; это не ошибка опыта). */
+#define D2K_SESSION_RAW_IDENTITY 1
+#define D2K_SESSION_MEASURED_PROBE 1
+/* Read-only identity of the current unrecognized direct client flow.
+ * Returns -1 for absent, foreign-direction, recognized or unsuitable flows.
+ * Output arguments are unchanged on failure. A reply is a transport fact. */
+int d2k_session_raw_identity(d2k_session *, const d2k_ct_tuple *,
+                             uint8_t epoch[16], uint64_t *generation, int *previous_reply);
+int d2k_session_late_watch(d2k_session *s, const d2k_ct_tuple *t, int on);
+
+/* Итог позднего наблюдения точного потока (этап 49) — в журнал записью
+ * D2K_JRN_LATE_OBS: code D2K_LATEOBS_*, repeats — повторы данных клиента.
+ * Кортеж orig (клиент → сервер); сторона клиента берётся из него. */
+void d2k_session_note_lateobs(d2k_session *s, const d2k_ct_tuple *t, uint8_t code,
+                              uint32_t repeats, const uint8_t token[D2K_TRIAL_ID_LEN], uint64_t now_ns);
+/* Датаграмм клиента за окном поиска, принятых в опыт по точной пробе. */
+uint64_t d2k_session_late_delivered(const d2k_session *s);
+
 #endif /* D2K_SESSION_H */

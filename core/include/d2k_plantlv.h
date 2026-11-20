@@ -29,6 +29,18 @@
  * кто будет чинить). */
 int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
                          size_t *out_len, char *err, size_t errcap);
+/* 1: IPv4 TCP endpoint-bound program, 0: ordinary plan, -1: invalid. */
+int d2k_plan_text_requires_endpoint(const char *,char *,size_t);
+/* Validated metadata from the same parser: 1 scoped, 0 unscoped, -1 invalid. */
+int d2k_plan_text_stream_offset(const char *,uint32_t *,char *,size_t);
+int d2k_plan_text_after_split(const char *,uint32_t *,uint32_t *,uint32_t *,char *,size_t);
+/* Preserve first-input operations and append a measured later partition.
+ * Allocates *out; never replaces an existing scoped/composed operation. */
+int d2k_plan_text_compose_after_split(const char *,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,
+    char **,char *,size_t);
+/* Compose two explicitly selected programs. Allocates *out, remaps only
+ * the preflight hello payload reference; conveys no application proof. */
+int d2k_plan_text_compose_preflight(const char *,const char *,char **,char *,size_t);
 
 /* То же, но сразу в hex — в том виде, в каком план принимает
  * d2k_link_set_name (d2k_link.h). out обязан быть не короче 2*N+1, где N —

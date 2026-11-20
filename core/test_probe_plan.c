@@ -11,6 +11,8 @@
 
 int d2k_arm_from_poison(const d2k_poison *, d2k_arm *, char *, size_t);
 /* Scheduler reporting is unrelated to the pure bridge conversion. */
+d2k_run_cache *d2k_sched_measure_cache(void) { return NULL; }
+void d2k_sched_measure_trace(const char *line) { (void)line; }
 void d2k_sched_progress_note(const char *q, int pass, int fail) {
     (void)q; (void)pass; (void)fail;
 }
@@ -43,7 +45,7 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
     if (p.seqovl_exact) { p.seqovl = (int)dn; }
     int bridge_rc = d2k_arm_from_poison(&p, &a, err, sizeof err);
     /* MD5 is now required to traverse the complete measured-plan path. */
-    REQUIRE(!p.md5 || bridge_rc == 0);
+    REQUIRE(!(p.md5 || p.md5_ts) || bridge_rc == 0);
     /* oob (срочный байт) выражается планом «oob sni_middle 0f» и исполняется
        датапатом (поле 10.10.2026): мост обязан его принять, а не отвергнуть. */
     REQUIRE(!p.oob || bridge_rc == 0);
@@ -86,7 +88,8 @@ static void run_case(d2k_poison p, const d2k_trigger *tr, const uint8_t *decoy, 
                 (s->poison.tcp_ts ? D2K_POISON_TCPTS_BACK : 0) |
                 (s->poison.tcp_ts_up ? D2K_POISON_TS_UP : 0) |
                 (s->poison.ip_id_zero ? D2K_POISON_IPID_ZERO : 0) |
-                (s->poison.md5 ? D2K_POISON_MD5 : 0);
+                (s->poison.md5 ? D2K_POISON_MD5 : 0) |
+                (s->poison.md5_ts ? D2K_POISON_MD5_TS : 0);
             REQUIRE(e->seq == (uint32_t)(BASE + s->seq_off + (int64_t)off));
             REQUIRE(e->seq_shift == s->poison.seq_shift);
             REQUIRE(e->kind == (s->kind == D2K_SEND_FAKE ? D2K_EMIT_FAKE : D2K_EMIT_PAYLOAD));

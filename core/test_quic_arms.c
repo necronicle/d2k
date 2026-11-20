@@ -55,6 +55,7 @@
 #include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_quic_arms.h"
+#include "d2k_udpruntime.h"
 /* d2k_quic_hello_rename — тот же вывод приманки, что у планировщика. */
 #include "d2k_quichello.h"
 /* d2k_quic_is_initial — им проверяется, что снятые приманки доехали в бинарник
@@ -252,6 +253,84 @@ static void test_arm_to_plan(void) {
         CHECK(d2k_plan_text_to_hex(plan,hex,sizeof hex,err,sizeof err)==0,
               "fragment-only grammar");
     }
+    /* ФАЛЬШИВКА, НА КОТОРУЮ ОТВЕТИТ СЕРВЕР, ОБЯЗАНА НЕСТИ ИЗМЕРЕННЫЙ TTL
+       (поле 24.10.2026, h3-1024). quic5, quic_google и quic_rutracker —
+       настоящие перехваченные Initial: длинный заголовок, фиксированный бит,
+       версия 1, 1200 байт. Без TTL такая копия доживает до сервера, сервер
+       отвечает ЕЙ (pcap: DCID ответа — SCID фальшивки), а настоящий Initial
+       клиента проигрывает гонку: rutracker.org, nnmclub.to, kinozal.me,
+       lostfilm.tv открывались у клиента примерно в одном случае из трёх, тогда
+       как зонд тот же план подтверждал. Документация zapret о том же:
+       фальшивка либо не доходит до сервера, либо доходит и там отбрасывается.
+       fake_default_quic (0x40, короткий заголовок) и 0x00…0 (погашенный
+       фиксированный бит) сервер отбрасывает сам — им TTL не нужен. */
+    {
+        size_t rlen = 0;
+        const char *rname = NULL;
+        const uint8_t *real = d2k_quic_original_blob(0, &rlen, &rname);
+        CHECK(real && rlen == 1200 && !strcmp(rname, "quic5"), "блоб quic5 не на месте");
+        CHECK(d2k_quic_blob_answerable(real, rlen) == 1,
+              "настоящий Initial не распознан как отвечаемый сервером");
+        size_t dlen = 0;
+        const uint8_t *dflt = d2k_quic_original_blob(3, &dlen, NULL);
+        CHECK(d2k_quic_blob_answerable(dflt, dlen) == 0,
+              "fake_default_quic (короткий заголовок) принят за настоящий Initial");
+        size_t zlen = 0;
+        const uint8_t *zero = d2k_quic_original_blob(4, &zlen, NULL);
+        CHECK(d2k_quic_blob_answerable(zero, zlen) == 0,
+              "датаграмма из нулей принята за настоящий Initial");
+        /* ФОРМА, КОТОРУЮ КОРОБКА ЧИТАЕТ, А СЕРВЕР ОБЯЗАН ОТБРОСИТЬ. Правило
+           коробки измерено и опубликовано (NTC.Party, ValdikSS 26.05.2022 и
+           bolvan 27.07.2022): длина ≥1200, старший бит первого байта, версия в
+           байтах 1…4; фиксированный бит в правиле не участвует. Сервер же по
+           RFC 9000 §17.3.1 обязан отбросить пакет с нулевым фиксированным
+           битом — значит ни гонки, ни нужды в TTL. */
+        size_t nlen = 0;
+        const char *nname = NULL;
+        const uint8_t *nofix = d2k_quic_original_blob(5, &nlen, &nname);
+        CHECK(nofix && nlen == 1200 && nname && !strcmp(nname, "quic_initial_nofix"),
+              "приманки quic_initial_nofix нет в наборе");
+        CHECK(nofix && (nofix[0] & 0x80) && !(nofix[0] & 0x40),
+              "форма: длинный заголовок обязателен, фиксированный бит обязан быть снят");
+        CHECK(nofix && !nofix[1] && !nofix[2] && !nofix[3] && nofix[4] == 1,
+              "версия QUIC 1 обязана стоять в байтах 1…4 — по ним коробка и сечёт");
+        CHECK(d2k_quic_blob_answerable(nofix, nlen) == 0,
+              "фальшивка с погашенным фиксированным битом принята за отвечаемую сервером");
+        CHECK(d2k_quic_original_blob(D2K_QUIC_BLOBS, &nlen, NULL) == NULL,
+              "набор приманок отдаёт блоб за своей границей");
+        d2k_quic_props np;
+        memset(&np, 0, sizeof np);
+        d2k_quic_arm live = {0};
+        live.original = 1; live.kind = D2K_QA_COPIES; live.copies = 11;
+        live.len = rlen; memcpy(live.bytes, real, rlen);
+        /* ЗАПРЕТА ПО ФОРМЕ ЗДЕСЬ НЕТ (поле 25.10.2026, h3e-1). Я запрещал план
+           с настоящим Initial без TTL — и потерял QUIC у шести целей, которые
+           отвечали и у выпуска, и у прошлого кандидата (adguard.com,
+           enimerosi.com, kinozal.me, romfea.gr, spzh.eu, katzauction.com):
+           гонка с сервером реальна, но случается не всегда, и запрет по форме
+           выбрасывает рабочее вместе с гоночным. Надёжность измеряется
+           подтверждением плана 3/3 новыми соединениями, а не формой. */
+        CHECK(d2k_quic_compose_plan(&live, &np, plan, sizeof plan) == 0,
+              "настоящий Initial без TTL плана не дал: запрет по форме вернулся");
+        live.kind = D2K_QA_TTL; live.ttl = 3;
+        CHECK(d2k_quic_compose_plan(&live, &np, plan, sizeof plan) == 0,
+              "настоящий Initial с измеренным TTL плана не дал");
+        CHECK(strstr(plan, "ttl=3") != NULL && strstr(plan, "repeats=11") != NULL,
+              "TTL или число копий не доехали в план");
+        d2k_quic_arm harmless = {0};
+        harmless.original = 1; harmless.kind = D2K_QA_COPIES; harmless.copies = 11;
+        harmless.len = dlen; memcpy(harmless.bytes, dflt, dlen);
+        CHECK(d2k_quic_compose_plan(&harmless, &np, plan, sizeof plan) == 0,
+              "отбрасываемая сервером фальшивка без TTL плана не дала");
+        d2k_quic_arm nf = {0};
+        nf.original = 1; nf.kind = D2K_QA_COPIES; nf.copies = 1;
+        nf.len = nlen; if (nofix) memcpy(nf.bytes, nofix, nlen);
+        CHECK(d2k_quic_compose_plan(&nf, &np, plan, sizeof plan) == 0,
+              "Initial с погашенным фиксированным битом без TTL плана не дал");
+        CHECK(strstr(plan, "ttl=") == NULL,
+              "безвредной фальшивке TTL не нужен — он сузил бы её без причины");
+    }
+
     /* Тело приманки — выведенное, как и в бою: то же, что подбор и увидит. */
     static uint8_t decoy[2048];
     size_t blen = 0;

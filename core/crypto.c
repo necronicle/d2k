@@ -191,12 +191,7 @@ static const uint32_t sha256_k[64] = {
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-typedef struct {
-    uint32_t h[8];
-    uint8_t buf[64];
-    size_t buf_len;
-    uint64_t total_len; /* байты, для длины в битах в конце */
-} sha256_ctx;
+typedef d2k_sha256_ctx sha256_ctx;
 
 static void sha256_compress(uint32_t h[8], const uint8_t block[64]) {
     uint32_t w[64];
@@ -288,6 +283,12 @@ static void sha256_final(sha256_ctx *ctx, uint8_t out[32]) {
         out[4 * i + 3] = (uint8_t)(ctx->h[i]);
     }
 }
+
+void d2k_sha256_init(d2k_sha256_ctx *ctx) { sha256_init(ctx); }
+void d2k_sha256_update(d2k_sha256_ctx *ctx, const uint8_t *data, size_t n) {
+    if (n) sha256_update(ctx, data, n);
+}
+void d2k_sha256_final(d2k_sha256_ctx *ctx, uint8_t out[32]) { sha256_final(ctx, out); }
 
 void d2k_sha256(const uint8_t *in, size_t n, uint8_t out[32]) {
     sha256_ctx ctx;

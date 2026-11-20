@@ -357,7 +357,7 @@
     });
     doc.addEventListener("keydown", function (e) {
       if (e.key === "Escape" && self.armed) { self.armed = null; self.renderActions(); }
-      if (e.key === "/" && doc.activeElement && doc.activeElement.tagName !== "INPUT") {
+      if (e.key === "/" && doc.activeElement && doc.activeElement.tagName !== "INPUT" && doc.activeElement.tagName !== "SELECT" && doc.activeElement.tagName !== "TEXTAREA") {
         e.preventDefault(); input.focus();
       }
     });
@@ -365,6 +365,7 @@
     this.navMotion();
     this.drawMark();
     this.poll();
+    this.initPolicies();
     this.initUpdates();
     this.checkUpdates(false);
     win.setInterval(function () { if (!doc.hidden) self.poll(true); }, POLL_MS);
@@ -426,11 +427,88 @@
     });
   };
 
-  App.prototype.updateRequest = function (path, post) {
+  App.prototype.initPolicies = function () {
+    var self = this, form = this.$("policy-form");
+    if (!form) return;
+    form.addEventListener("submit", function (e) { e.preventDefault(); self.applyPolicy(); });
+    this.$("policy-refresh").addEventListener("click", function () { self.loadPolicies(); });
+    this.loadPolicies();
+  };
+
+  App.prototype.renderPolicyControls = function () {
+    if (!this.$("policy-form")) return;
+    var s = this.m && this.m.snap || {}, busy = !!this.policyBusy || s.control_state === "running" || !!this.pending;
+    this.$("policy-select").disabled = busy || !this.policyData || !this.policyData.controls_enabled;
+    this.$("policy-apply").disabled = busy || !this.policyData || !this.policyData.controls_enabled || s.mode === "off";
+    this.$("policy-refresh").disabled = busy;
+    this.$("policy-form").setAttribute("aria-busy", this.policyBusy ? "true" : "false");
+  };
+
+  App.prototype.loadPolicies = function (requestedId) {
+    var self = this, watch = typeof requestedId === "string";
+    if (!this.$("policy-form") || this.policyLoading) return Promise.resolve();
+    this.policyLoading = true;
+    if (!watch) { this.policyBusy = true; this.$("policy-status").textContent = "Получаем политики Keenetic…"; }
+    this.renderPolicyControls();
+    return this.updateRequest("/api/policies", false).then(function (reply) {
+      if (!reply.ok || !Array.isArray(reply.data.policies)) throw Error(reply.data.message || "Не удалось прочитать политики. Обновите список.");
+      var data = reply.data;
+      self.policyData = data;
+      var changed = watch && data.selected_id !== requestedId;
+      if (!watch || changed) {
+        var select = self.$("policy-select");
+        while (select.firstChild) select.removeChild(select.firstChild);
+        function option(value, text) { var o = self.doc.createElement("option"); o.value = value; o.textContent = text; select.appendChild(o); }
+        option("", "Все устройства");
+        var found = typeof data.selected_id === "string";
+        data.policies.forEach(function (p) { option(p.id, p.name === p.id ? p.name : p.name + " (" + p.id + ")"); });
+        if (!found) option(data.selected, "Недоступная или неоднозначная политика: " + data.selected);
+        select.value = found ? data.selected_id : data.selected;
+        self.$("policy-status").textContent = !found ? "Сохранённая политика не найдена или неоднозначна. D2K не должен обрабатывать устройства; выберите существующую политику." : !data.controls_enabled ? "Панель работает только для просмотра." : data.applied === true ? "Выбранная политика применена к движку." : "Выбор прочитан из конфигурации. Применение к движку пока не подтверждено.";
+      }
+      if (changed) {
+        self.policyBusy = false;
+        self.$("policy-status").textContent = "Сохранённый выбор изменился во время применения. Список обновлён.";
+      } else if (watch) {
+        if (data.apply_state === "running") {
+          if (Date.now() > self.policyDeadline) throw Error("Политика сохранена, но результат применения пока неизвестен. Обновите список и проверьте диагностику.");
+          self.win.setTimeout(function () { self.loadPolicies(requestedId); }, 1000);
+          return;
+        }
+        self.policyBusy = false;
+        self.$("policy-status").textContent = data.apply_state === "done" && data.applied === true ? "Выбранная политика применена к движку." : data.apply_state === "failed" || data.apply_state === "timeout" ? "Политика сохранена, но перезапуск завершился ошибкой. Повторите применение и проверьте диагностику." : "Политика сохранена; применение к движку пока не подтверждено. Повторите применение или проверьте диагностику.";
+      } else self.policyBusy = false;
+    }).catch(function (error) {
+      self.policyBusy = false;
+      if (!watch) self.policyData = null;
+      self.$("policy-status").textContent = error.name === "TypeError" || error.name === "AbortError" ? "Нет связи с панелью. Обновите список и повторите попытку." : error.message || "Не удалось прочитать политики. Обновите список.";
+    }).finally(function () { self.policyLoading = false; self.renderPolicyControls(); });
+  };
+
+  App.prototype.applyPolicy = function () {
+    var self = this;
+    if (this.$("policy-apply").disabled) return Promise.resolve();
+    var id = this.$("policy-select").value;
+    this.policyBusy = true;
+    this.$("policy-status").textContent = "Сохраняем политику и перезапускаем движок…";
+    this.renderPolicyControls();
+    return this.updateRequest("/api/policies", true, { "X-D2K-Policy": id }).then(function (reply) {
+      if (!reply.ok) throw Error(reply.data.message || "Не удалось применить политику. Обновите список и повторите попытку.");
+      self.policyDeadline = Date.now() + 65000;
+      self.$("policy-status").textContent = "Политика сохранена. Ожидаем применения к движку…";
+      self.win.setTimeout(function () { self.loadPolicies(id); }, 500);
+    }).catch(function (error) {
+      self.policyBusy = false;
+      self.$("policy-status").textContent = error.name === "TypeError" || error.name === "AbortError" ? "Результат сохранения неизвестен. Обновите список перед повтором." : error.message || "Не удалось применить политику. Повторите попытку.";
+      self.renderPolicyControls();
+    });
+  };
+
+  App.prototype.updateRequest = function (path, post, headers) {
     var win = this.win, ctrl = typeof AbortController === "function" ? new AbortController() : null;
     var timer = win.setTimeout(function () { if (ctrl) ctrl.abort(); }, 5000);
     return win.fetch(path, {
-      method: post ? "POST" : "GET", cache: "no-store", credentials: "same-origin",
+      headers: headers, method: post ? "POST" : "GET", cache: "no-store", credentials: "same-origin",
       signal: ctrl ? ctrl.signal : undefined
     }).then(function (r) {
       return r.json().then(function (data) { return { ok: r.ok, code: r.status, data: data || {} }; },
@@ -586,6 +664,7 @@
     this.renderNotice();
     this.renderNow(m);
     this.renderCatalog(false);
+    this.renderPolicyControls();
     this.renderTelegram(m);
     this.renderDiagnostics(m);
     this.renderNav(m);
@@ -1428,19 +1507,32 @@
       if (busy[bi0].__tl && busy[bi0].__tl.isActive()) return false;
     }
     var available = this.status.snapshot.catalog_available !== false || m.boxes.length;
-    section(body, JSON.stringify([this.filter, m.linked, available, m.boxes, m.groups]), function () {
+    section(body, JSON.stringify([this.filter, m.linked, available, m.boxes, m.groups, m.k.newchain_bindings]), function () {
       if (!available) {
         var na = el(doc, "p", "empty");
         add(na, el(doc, "b", "", "Каталог не открыт. "), "Сохранённые коробки и решения сейчас недоступны — это не означает, что их нет.");
         return [na];
       }
+      var newchain = list(m.k.newchain_bindings), newchainNodes = [];
+      if (newchain.length) {
+        var nc = el(doc, "section", "newchain-bindings");
+        nc.appendChild(el(doc, "h3", "", "Новая цепочка · " + newchain.length + " привязок"));
+        newchain.forEach(function (b) {
+          if (!self.matches(b.name)) return;
+          var source = b.source === "own" ? "своё знание" : b.source === "questions" ? "вопросы" : "источник не указан";
+          var success = b.last_success_ms ? new Date(b.last_success_ms).toLocaleString() : "не указан";
+          nc.appendChild(el(doc, "p", "", str(b.name) + " · " + str(b.protocol) + " · IPv" + b.family +
+            " · " + source + " · K" + b.knowledge + " / B" + b.box + " · последний успех: " + success));
+        });
+        newchainNodes.push(nc);
+      }
       if (!m.boxes.length) {
         var e = el(doc, "p", "empty");
         add(e, el(doc, "b", "", "Каталог пуст. "),
           "Коробка появится, когда D2K подтвердит блокировку, измерит её поведение и найдёт обход. Начальных списков нет — всё узнаётся по живому трафику.");
-        return [e];
+        return newchainNodes.length ? newchainNodes : [e];
       }
-      var out = [];
+      var out = newchainNodes;
       m.boxes.forEach(function (b, bi) {
         var binds = list(b.bindings);
         var visible = [], covered = [];
@@ -2349,7 +2441,7 @@
       }
       self.moveMarker();
     }, { rootMargin: "-20% 0px -55% 0px", threshold: [0, .1, .3, .6] });
-    ["now", "families", "boxes", "telegram", "updates", "diagnostics"].forEach(function (id) {
+    ["now", "families", "boxes", "policies", "telegram", "updates", "diagnostics"].forEach(function (id) {
       var s = doc.getElementById(id);
       if (s) io.observe(s);
     });

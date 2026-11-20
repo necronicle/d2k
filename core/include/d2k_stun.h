@@ -29,6 +29,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+/* Correlated Binding error, not success or authenticated server identity.
+ * Validate full datagram framing and FINGERPRINT when present. */
+int d2k_stun_parse_error(const uint8_t *,size_t,const uint8_t *,unsigned *);
 
 #define D2K_STUN_TXID_LEN 12
 #define D2K_STUN_HDR_LEN  20

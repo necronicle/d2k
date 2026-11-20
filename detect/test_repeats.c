@@ -24,8 +24,18 @@ static int transport_setsockopt(int, int, int, const void *, socklen_t);
 /* Настоящий вопрос определён в самом classify.c, поэтому подменяется место
  * вызова, а не имя функции. */
 #define D2K_DATA_ACK_PROBE             fake_data_ack
+#define d2k_probe_preflight fake_preflight
 #include "classify.c"
 #include "props.c"
+#undef d2k_probe_preflight
+static int gate_probe_calls;
+int fake_preflight(const char *addr, const d2k_trigger *tr, const d2k_opts *opt,
+                   d2k_preflight_meas *m) {
+    (void)addr; (void)tr; (void)opt;
+    gate_probe_calls++;
+    *m = (d2k_preflight_meas){.response_gate=1, .pieces_pass=1, .window=1, .rtt_ms=13};
+    return 0;
+}
 #undef getaddrinfo
 #undef setsockopt
 static int transport_dns_calls, transport_fail_mark;
@@ -63,6 +73,16 @@ typedef struct { const char *name; const char *pat; } script_ent;
 
 static const script_ent *g_script;
 static const char *g_default = "-";
+static int g_composed_error;
+static const char *g_local_error_once;
+static d2k_run_cache *g_run_cache;
+static int g_checkpoint_stop_enabled, g_checkpoint_stopped;
+static int checkpoint_cancel(void *ctx) { (void)ctx; return g_checkpoint_stopped; }
+static void checkpoint_observed(void *ctx, const d2k_obs *o) {
+    (void)ctx;
+    if (!strncmp(o->probe, "poison:", 7)) g_checkpoint_stopped = 1;
+}
+
 static const char *g_selftest = "+";
 static const d2k_result *g_res;   /* чей прогон идёт: номер строки трассы = вопрос */
 static int g_ask = -1, g_rep;     /* текущий вопрос сырого слоя и номер его повтора */
@@ -86,6 +106,10 @@ static int next_rep(void)
     }
     return g_rep++;
 }
+
+/* Расстояния для модели отрезка прохода: 0 — модель выключена. */
+static int g_hop_box, g_hop_server, g_hop_flaky;
+static int g_hop_takes_badsum = 1;
 
 int fake_raw_supported(void) { return 1; }
 unsigned long fake_rst_fail_count(void) { return 0; }
@@ -126,7 +150,36 @@ int fake_poison(const uint8_t *ip, uint8_t family, uint16_t port, const d2k_trig
         if (g_split_success < 0) snprintf(err, errcap, "raw split: local send failure");
         return g_split_success;
     }
+    /* МОДЕЛЬ ПУТИ ФАЛЬШИВКИ (23.10.2026). Фальшивка доходит до коробки при
+       TTL >= g_hop_box. Дальше важно, ЧЬЯ она:
+         — ЧИСТАЯ доживи до сервера (TTL >= g_hop_server) — тот примет её за
+           данные соединения, и поток сломается: проход у неё ОТРЕЗОК;
+         — С БИТОЙ СУММОЙ сервер отбросит сам, поэтому проход МОНОТОНЕН.
+       Коробка, которая сумму сверяет, битую фальшивку не глотает вовсе
+       (g_hop_takes_badsum = 0). Это физика пути, и сценарий «имя → строка
+       ответов» её не выражает. */
+    if (g_hop_box > 0 && p->ttl > 0) {
+        g_poison_calls++;
+        if (g_hop_flaky) {
+            /* Невоспроизводимо: каждый второй зонд теряется. */
+            return (g_hop_flaky++ % 2) ? 1 : 0;
+        }
+        if (p->badsum) {
+            if (!g_hop_takes_badsum) { return 0; }
+            return p->ttl >= g_hop_box ? 1 : 0;
+        }
+        return (p->ttl >= g_hop_box && p->ttl < g_hop_server) ? 1 : 0;
+    }
+    if (g_composed_error && !strncmp(p->name, "СОБРАНО:", strlen("СОБРАНО:"))) {
+        snprintf(err, errcap, "sendto: Operation not permitted");
+        return -1;
+    }
     g_poison_calls++;
+    if (g_local_error_once && strcmp(g_local_error_once, p->name) == 0) {
+        g_local_error_once = NULL;
+        snprintf(err, errcap, "sendto: Operation not permitted");
+        return -1;
+    }
     for (i = 0; g_script && g_script[i].name; i++) {
         if (strcmp(g_script[i].name, p->name) == 0) { pat = g_script[i].pat; break; }
     }
@@ -158,7 +211,7 @@ int fake_data_ack(const char *host, const char *port, const d2k_opts *opt,
 static const char CTL[] = "BENIGN-CONTROL-PAYLOAD";
 static const char *g_ctl_pat = "+"; /* ответ на контрольную нагрузку по вызовам */
 static int g_ctl_calls;
-static int g_srv_fd, g_silent, g_timeout_seed;
+static int g_srv_fd, g_silent, g_timeout_seed, g_healthy;
 static void *quiet_connection(void *arg) {
     struct timespec pause={0,450000000};
     nanosleep(&pause,NULL);
@@ -175,6 +228,7 @@ static void *srv_thread(void *arg)
         int c = accept(g_srv_fd, NULL, NULL);
         if (c < 0) { return NULL; }
         n = recv(c, buf, sizeof buf, 0);
+        if (g_healthy && n > 0) { (void)send(c, "OK", 2, 0); close(c); continue; }
         if (n == (ssize_t)(sizeof(CTL) - 1) && memcmp(buf, CTL, (size_t)n) == 0 &&
             pat_rc(g_ctl_pat, g_ctl_calls++) > 0) {
             (void)send(c, "OK", 2, 0);
@@ -221,6 +275,8 @@ typedef struct {
     int               vouched;
     const char       *ack;
     int               white;   /* 1 — задать opt.white (белое имя сети приманкой) */
+    const d2k_box_props *known; /* знание о коробке из каталога; NULL — нет */
+    const char       *skip;    /* имя приёма, который опрос НЕ предлагает; NULL — нет */
     int               no_ts;   /* 1 — клиент триггера метку времени НЕ предлагает */
 } scenario;
 
@@ -233,6 +289,11 @@ static void run(const scenario *s, d2k_result *res)
     d2k_trigger t;
     memset(&opt, 0, sizeof opt);
     opt.allow_loopback = 1;
+    opt.run_cache = g_run_cache;
+    if (g_checkpoint_stop_enabled) {
+        opt.cancel.fn = checkpoint_cancel;
+        opt.on_obs = checkpoint_observed;
+    }
     opt.repeats = 3;
     opt.timeout_ms = 400;
     opt.write_gap_ms = 2;
@@ -248,6 +309,9 @@ static void run(const scenario *s, d2k_result *res)
     memcpy(opt.control.payload, CTL, sizeof(CTL) - 1);
     opt.control.len = sizeof(CTL) - 1;
     opt.control.accept = D2K_ACCEPT_ANY;
+    memset(&opt.known, 0, sizeof opt.known);
+    if (s->known) { opt.known = *s->known; }
+    if (s->skip) { snprintf(opt.skip[opt.nskip++], sizeof opt.skip[0], "%s", s->skip); }
     memset(&opt.white, 0, sizeof opt.white);
     if (s->white) {
         /* Белое имя сети приманкой: содержимое для стенда неважно (fake_poison
@@ -320,25 +384,25 @@ static script_ent S_FLAKY[] = {
 static const script_ent S_PROPHIT_L7[] = {{"badsum+hello", "+"}, {NULL, NULL}};
 
 static scenario SC[] = {
-    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL, 0, 0},
-    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL, 0, 0},
-    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL, 0, 0},
-    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL, 0, 0},
-    {"none-pass", NULL, "-", NULL, NULL, 0, NULL, 0, 0},
-    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL, 0, 0},
-    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL, 0, 0},
-    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL, 0, 0},
-    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL, 0, 0},
-    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL, 0, 0},
-    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL, 0, 0},
-    {"errors", NULL, "e", NULL, NULL, 0, NULL, 0, 0},
+    {"youtube", S_YOUTUBE, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"rutracker", S_RUTRACKER, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"flaky", S_FLAKY, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"prop-l7", S_PROPHIT_L7, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"none-pass", NULL, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"selftest-fail", NULL, "-", "e", NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"selftest-late", S_YOUTUBE, NULL, "-e+", NULL, 0, NULL, 0, NULL, NULL, 0},
+    {"ctl-late", S_YOUTUBE, NULL, NULL, "-+", 0, NULL, 0, NULL, NULL, 0},
+    {"ctl-dead", NULL, "-", NULL, "-", 0, NULL, 0, NULL, NULL, 0},
+    {"ctl-dead-vouched", NULL, "-", NULL, "-", 1, NULL, 0, NULL, NULL, 0},
+    {"ctl-dead-hit", S_YOUTUBE, NULL, NULL, "-", 1, NULL, 0, NULL, NULL, 0},
+    {"errors", NULL, "e", NULL, NULL, 0, NULL, 0, NULL, NULL, 0},
     /* Задача 54 (поле 04.10, cdn.cookielaw.org, 104.18.86.0/24): рукопожатие
      * проходит, а сервер не подтверждает ни одного байта данных — ни
      * приветствия, ни контроля, ни одного нейтрального байта. */
-    {"addr-silent", NULL, "-", NULL, "-", 0, "-", 0, 0},
-    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+", 0, 0},
-    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u", 0, 0},
-    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e", 0, 0},
+    {"addr-silent", NULL, "-", NULL, "-", 0, "-", 0, NULL, NULL, 0},
+    {"addr-silent-late", NULL, "-", NULL, "-", 0, "-+", 0, NULL, NULL, 0},
+    {"addr-ack-unseen", NULL, "-", NULL, "-", 0, "u", 0, NULL, NULL, 0},
+    {"addr-ack-err", NULL, "-", NULL, "-", 0, "e", 0, NULL, NULL, 0},
 };
 #define NSC ((int)(sizeof SC / sizeof SC[0]))
 
@@ -358,17 +422,17 @@ static void bind_list_names(void)
  * обязан стоить теперь — в after_count. */
 typedef struct { const char *name; int before; const char *sig; } golden;
 static const golden GOLD[] = {
-{"youtube", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
+{"youtube", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"rutracker", 156, "poisonable|перебор|seqovl-16|--lua-desync=multisplit:payload=tls_client_hello:dir=out:pos=1:seqovl=16|0002100|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «seqovl-16», сервер выбрасывает"},
-{"flaky", 69, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
-{"prop-l7", 24, "poisonable|свойство|badsum+hello|--lua-desync=fake:payload=tls_client_hello:dir=out:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:badsum|0212200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «badsum+hello», сервер выбрасывает"},
+{"flaky", 69, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
+{"prop-l7", 24, "poisonable|свойство|badsum+hello|--lua-desync=fake:payload=tls_client_hello:dir=out:blob=fake_default_tls:tls_mod=rnd,dupsid,sni=www.google.com:badsum|0210000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «badsum+hello», сервер выбрасывает"},
 {"none-pass", 297, "opaque||-||0002200|0|u1|f0|разрез не помогает, контроль проходит, отравить буфер не удалось — содержимое важно, но чем брать, зондами не нашли"},
 {"selftest-fail", 12, "opaque||-||0000000|0|u0|f1|разрез не помогает, контроль проходит; сырые зонды НЕ РАБОТАЮТ (самопроверка не прошла) — про отравление вывода нет"},
-{"selftest-late", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
-{"ctl-late", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
+{"selftest-late", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
+{"ctl-late", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"ctl-dead", 297, "inconclusive||-||0002200|0|u1|f0|контроль не ответил и отравить не удалось: базы нет, отличить блок по адресу от нехватки гипотез нельзя"},
 {"ctl-dead-vouched", 297, "address||-||0002200|0|u1|f0|молчит и контроль на имени, за которое ручается оператор, и ни одна гипотеза не сработала — похоже на блок по адресу"},
-{"ctl-dead-hit", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001200|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
+{"ctl-dead-hit", 18, "poisonable|свойство|disorder|--lua-desync=multidisorder:payload=tls_client_hello:dir=out:pos=1,midsld|0001000|0|u1|f0|поток пересобирается, но буфер травится: коробка глотает «disorder», сервер выбрасывает"},
 {"errors", 297, "opaque||-||0002200|0|u1|f0|разрез не помогает, контроль проходит, отравить буфер не удалось — содержимое важно, но чем брать, зондами не нашли"},
 /* Задача 54: снято не с кода до правки — нового вопроса там не было. Тишина
  * адреса — свой вердикт; остальные три обязаны совпасть с ctl-dead. */
@@ -402,16 +466,34 @@ static int after_count(const char *name)
        `ttl-ae30825-1` того же дня: ни одного исполнения, +4 зонда у целей,
        доходящих до конца списка. Числа ниже — те же, что до их появления.
        Механизм остался в языке плана, см. test_unreachable_axes_not_asked. */
+    /* ЧИСЛА ПЕРЕСНЯТЫ 23.10.2026, когда девятнадцать гипотез TTL ушли из
+     * запасного перебора, а расстояние до коробки стало измеряться делением
+     * отрезка (d2k_hop_search). ПОДПИСИ ИСХОДОВ НЕ ИЗМЕНИЛИСЬ ни в одном
+     * сценарии — вердикт, путь, находка, стратегия и вектор те же, менялась
+     * только цена. Цена разошлась в две стороны, и это ожидаемо: там, где
+     * коробку фальшивкой не взять, ушли девятнадцать заведомо промахивающихся
+     * гипотез (errors 104 -> 86, none-pass 105 -> 98); там, где TTL коробку
+     * берёт, прибавилось измерение САМОГО расстояния (rutracker 64 -> 77).
+     * Ещё один зонд на сценарий — развилка «глотает ли коробка битую сумму»:
+     * её проход делает проход по TTL монотонным и снимает лестницу целиком,
+     * и один зонд за это платится там, где коробку не взять ничем.
+     *
+     * И ещё один-два зонда — вопрос о срочном байте, добавленный по
+     * гистограмме: им взято 111 целей из 124 попаданий запасного перебора,
+     * и раньше за них платил перебор целиком, а не один вопрос.
+     * Прибавка платится один раз на коробку: её запись каталога хранит число,
+     * и следующей цели той же коробки поиск не нужен вовсе. */
+    /* MD5_TS remains a distinct question; full ladder misses add TTL 40 and 20. */
     static const struct { const char *n; int a; } A[] = {
-        {"youtube", 12}, {"rutracker", 64}, {"flaky", 14}, {"prop-l7", 16},
-        {"none-pass", 105}, {"selftest-fail", 10}, {"selftest-late", 14},
-        {"ctl-late", 13}, {"ctl-dead", 108}, {"ctl-dead-vouched", 108},
-        {"ctl-dead-hit", 15}, {"errors", 104},
+        {"youtube", 12}, {"rutracker", 80}, {"flaky", 14}, {"prop-l7", 18},
+        {"none-pass", 103}, {"selftest-fail", 10}, {"selftest-late", 14},
+        {"ctl-late", 13}, {"ctl-dead", 106}, {"ctl-dead-vouched", 106},
+        {"ctl-dead-hit", 15}, {"errors", 89},
         /* Задача 54: молчащий контроль добавляет ОДИН вопрос — нейтральный
          * байт; подтверждённый с первого раза, он стоит один зонд. Молчание
          * адреса стоит три (единогласие) и снимает весь перебор отравлений. */
-        {"addr-silent", 12}, {"addr-silent-late", 109},
-        {"addr-ack-unseen", 107}, {"addr-ack-err", 108}};
+        {"addr-silent", 12}, {"addr-silent-late", 107},
+        {"addr-ack-unseen", 105}, {"addr-ack-err", 106}};
     size_t i;
     for (i = 0; i < sizeof A / sizeof A[0]; i++) {
         if (strcmp(A[i].n, name) == 0) { return A[i].a; }
@@ -520,12 +602,13 @@ static const script_ent S_FIELD_TS[]  = {{"ts", "+"}, {NULL, NULL}};
 static void test_syndata_last(void)
 {
     /* Число берётся из той же константы, что и массив в props.c, через
-       prop_probes: иначе список и тест расходятся молча. Вопросов снова 12 —
+       prop_probes: иначе список и тест расходятся молча. Вопросов 13: двенадцать прежних плюс срочный байт (23.10.2026,
+       111 целей из 124 попаданий запасного перебора по гистограмме) —
        оси `ip_autottl` и `tcp_ts_up` сняты полем 23.10.2026, см.
        test_unreachable_axes_not_asked. */
     prop_probe pp[16];
     int n = prop_probes(pp, 16);
-    CHECK(n == 12 && pp[n - 1].p.syn_data,
+    CHECK(n == 13 && pp[n - 1].p.syn_data,
           "syndata должен быть последним вопросом о свойствах");
     for (int i = 0; i < n - 1; i++) {
         CHECK(!pp[i].p.syn_data, "syndata перед выразимыми вопросами");
@@ -558,7 +641,7 @@ static void test_white_ts(void)
 {
     static const script_ent s_white[] = {
         {"ts", "-"}, {"white-hello-ts", "+"}, {NULL, NULL}};
-    scenario sc = {"white-ts", s_white, "-", NULL, NULL, 0, NULL, 1, 0};
+    scenario sc = {"white-ts", s_white, "-", NULL, NULL, 0, NULL, 1, NULL, NULL, 0};
     d2k_result r;
     memset(&r, 0, sizeof r);
     run(&sc, &r);
@@ -588,8 +671,39 @@ static void test_white_ts(void)
     CHECK(whole && whole->fail==3 && !whole->err[0],"fresh post-trigger silence must replace transport error");
     g_silent=g_timeout_seed=0;
 
+    /* ОПРОВЕРГНУТЫЙ ПРИЁМ НЕ ЗАКРЫВАЕТ ОПРОС (24.10.2026).
+     *
+     * Опрос кончается на первом прошедшем вопросе. Если план из этого приёма
+     * применённый поток опроверг, спрашивать его заново нечего, а НЕЗАДАННЫЕ
+     * вопросы остаются. Поле 24.10.2026, clubtone.net на выпуске 374a6df:
+     * прошёл «разбор протокола», его план получил RST на всех трёх
+     * испытаниях, и поиск взял 8 планов перебора (66 зондов, страница не
+     * открылась) — хотя тот же вопрос «ECH-приветствие под меткой», который в
+     * двух других кругах давал рабочий план, задан не был.
+     *
+     * Здесь проходят ОБА приёма. Без списка «не пробовать» находкой станет
+     * ранний; с ним опрос обязан дойти до позднего. */
+    static const script_ent s_two[] = {
+        {"ts", "-"}, {"badsum+hello", "+"}, {"white-hello-ts", "+"}, {NULL, NULL}};
+    scenario sc2 = {"white-ts-two", s_two, "-", NULL, NULL, 0, NULL, 1, NULL, NULL, 0};
+    memset(&r, 0, sizeof r);
+    run(&sc2, &r);
+    CHECK(r.has_hit && !strcmp(r.hit.name, "badsum+hello"),
+          "без списка «не пробовать» опрос взял не первый прошедший приём, а «%s»",
+          r.has_hit ? r.hit.name : "-");
+    scenario sc3 = {"white-ts-skip", s_two, "-", NULL, NULL, 0, NULL, 1, NULL, "badsum+hello", 0};
+    memset(&r, 0, sizeof r);
+    run(&sc3, &r);
+    CHECK(r.has_hit && !strcmp(r.hit.name, "white-hello-ts"),
+          "опрос не дошёл до следующего прошедшего приёма: находка «%s»",
+          r.has_hit ? r.hit.name : "-");
+    CHECK(!strcmp(r.path, "свойство"),
+          "продолжение опроса записало путь «%s», а не «свойство»", r.path);
+    CHECK(find_obs(&r, "свойство:разбор протокола") == NULL,
+          "опровергнутый приём всё равно задан зондом — продолжение платит за известное");
+
     /* Без ECH-приманки вопрос пропускается: та же раскладка, white=0. */
-    scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0, 0};
+    scenario sc0 = {"white-ts-none", s_white, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
     memset(&r, 0, sizeof r);
     run(&sc0, &r);
     CHECK(find_obs(&r, "свойство:ECH-приветствие под меткой") == NULL,
@@ -601,18 +715,16 @@ static void test_white_ts(void)
 static const script_ent S_FIELD_SYN[] = {{"syndata", "+"}, {NULL, NULL}};
 static void test_syndata_after_misses(void)
 {
-    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL, 0, 0};
+    static const scenario syn = {"props-syn-last", S_FIELD_SYN, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
     d2k_result r;
     fresh_process();
     run(&syn, &r);
     CHECK(r.has_hit && r.hit.syn_data, "последний вопрос syndata не задан");
-    /* The fixture has no SNI: ten questions, nine misses (two probes each
-     * under the majority rule) and two positive syndata repeats, plus eight
-     * baseline/self-test probes = 28. The "TTL по пути" and "метка первой в
-     * опциях" axes were asked here on 23.10.2026 and removed the same day:
-     * the field round never reached them. */
-    CHECK(r.probes == 28, "syndata: зондов %d, ждали 28", r.probes);
-    CHECK(r.nanswered == 10 && r.answered[r.nanswered - 1].syn_data,
+    /* Фикстура без имени: одиннадцать вопросов (с 23.10 добавился срочный
+     * байт), десять промахов по два зонда под правилом большинства и два
+     * прошедших повтора syndata, плюс восемь зондов базы и самопроверки. */
+    CHECK(r.probes == 30, "syndata: зондов %d, ждали 30", r.probes);
+    CHECK(r.nanswered == 11 && r.answered[r.nanswered - 1].syn_data,
           "syndata не последний отвеченный вопрос");
     CHECK(r.props.inspects_syn == D2K_TRI_FALSE, "ответ SYN не записан");
 }
@@ -652,9 +764,9 @@ static void test_unreachable_axes_not_asked(void)
 
 static void test_props_fields(void)
 {
-    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL, 0, 0};
-    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL, 0, 0};
-    static const scenario ts  = {"props-ts",  S_FIELD_TS,  NULL, NULL, NULL, 0, NULL, 0, 0};
+    static const scenario md5 = {"props-md5", S_FIELD_MD5, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    static const scenario seq = {"props-seq", S_FIELD_SEQ, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    static const scenario ts  = {"props-ts", S_FIELD_TS, NULL, NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
     d2k_result r;
     printf("свойства: сверка полей подделки\n");
     fresh_process();
@@ -662,19 +774,20 @@ static void test_props_fields(void)
     CHECK(r.props.validates_md5 == D2K_TRI_FALSE, "MD5: проход не записан");
     CHECK(r.has_hit && !strcmp(r.hit.name, "md5"), "MD5: приём не стал находкой");
     /* syndata stays last and unasked after these findings. Under the
-     * majority rule each earlier miss costs two probes and the finding two:
-     * MD5 20, seq 22, TS 24. */
-    CHECK(r.probes == 20, "MD5: зондов %d, ждали 20", r.probes);
+     * majority rule each earlier miss costs two probes and the finding two.
+     * С 23.10.2026 добавлен вопрос о срочном байте — он третий, и каждый из
+     * этих трёх ответов теперь дороже на два зонда: MD5 22, seq 24, TS 26. */
+    CHECK(r.probes == 22, "MD5: зондов %d, ждали 22", r.probes);
     CHECK(r.props.inspects_syn == D2K_TRI_UNSET, "SYN спросили до MD5");
     fresh_process();
     run(&seq, &r);
     CHECK(r.props.validates_seq_window == D2K_TRI_FALSE, "окно seq: проход не записан");
-    CHECK(r.probes == 22, "seq: зондов %d, ждали 22", r.probes);
+    CHECK(r.probes == 24, "seq: зондов %d, ждали 24", r.probes);
     CHECK(r.props.validates_md5 == D2K_TRI_UNSET, "MD5 записан без прохода");
     fresh_process();
     run(&ts, &r);
     CHECK(r.props.validates_timestamps == D2K_TRI_FALSE, "метка времени: проход не записан");
-    CHECK(r.probes == 24, "TS: зондов %d, ждали 24", r.probes);
+    CHECK(r.probes == 26, "TS: зондов %d, ждали 26", r.probes);
     CHECK(r.props.counts_duplicates == D2K_TRI_UNSET, "дубликаты записаны без прохода");
 }
 
@@ -690,7 +803,7 @@ static int no_syn_md5(const d2k_poison *p, void *ctx)
 static const script_ent S_SYN_TS[] = {{"syndata", "+"}, {"md5", "+"}, {"ts", "+"}, {NULL, NULL}};
 static void test_props_skip_unplannable(void)
 {
-    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL, 0, 0};
+    static const scenario sc = {"syn-ts", S_SYN_TS, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
     d2k_result r;
     printf("свойства: невыразимая находка не останавливает вопросы\n");
     fresh_process();
@@ -716,7 +829,7 @@ static void test_sweep_skips_answered(void)
     static const char *const dup[] = {
         "seqovl-1", "disorder", "badsum", "badsum+hello", "badsum-x2-g20",
         "syndata", "md5", "seq-out-of-window", "badsum-x7"};
-    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL, 0, 0};
+    static const scenario err = {"md5-err", S_MD5_ERR, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
     d2k_result r;
     char nm[96];
     size_t i;
@@ -831,7 +944,7 @@ static void test_selftest_cache(void)
     /* Кэш есть, а сырой слой сломался: первые же отказы этого прогона
      * перепроверяют слой, и провал ведёт себя ровно как провал самопроверки. */
     {
-        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL, 0, 0};
+        scenario broken = {"broken", NULL, "e", "e", NULL, 0, NULL, 0, NULL, NULL, 0};
         fresh_process();
         run(find_sc("youtube"), &r);
         run(&broken, &r);
@@ -861,6 +974,37 @@ static void test_selftest_cache(void)
         CHECK(trace_probes(&r) == r.probes, "трасса показывает %d зондов, сделано %d",
               trace_probes(&r), r.probes);
     }
+}
+
+/* ЭТАП 25: ответ вопроса о свойстве из прежнего прогона ТОГО ЖЕ входа не
+   переспрашивается: зондов нет, трасса несёт прежний счёт с пометкой seeded,
+   свойство и находка применяются как измеренные. Чужое число повторов — не
+   применяется. */
+static void test_known_property_is_not_asked_again(void) {
+    d2k_result r = {0}; d2k_opts opt = {0}; d2k_trigger tr = {0}; d2k_poison hit = {0};
+    opt.repeats = 3; opt.white.len = 2;
+    tr.len = 300; tr.sni_off = 100; tr.sni_len = 11;
+    snprintf(opt.known_answers[0].label, sizeof opt.known_answers[0].label, "метка времени");
+    opt.known_answers[0].pass = 3; opt.known_answers[0].fail = 0; opt.nknown = 1; opt.known_repeats = 3;
+    g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+    int rc = d2k_run_properties((uint8_t[]){192,0,2,1}, 443, &tr, &opt, &r, &hit);
+    CHECK(rc == 1 && hit.tcp_ts == 1, "известный ответ «метка времени 3/3» не стал находкой (rc=%d)", rc);
+    int seeded = 0, ts_obs = -1;
+    for (int i = 0; i < r.ntrace; i++) {
+        if (strstr(r.trace[i].probe, "метка времени")) { ts_obs = i; }
+        if (r.trace[i].seeded) seeded++;
+    }
+    CHECK(ts_obs >= 0 && r.trace[ts_obs].seeded && r.trace[ts_obs].pass == 3 && r.trace[ts_obs].fail == 0,
+          "ответ из прежнего прогона не в трассе с пометкой и прежним счётом");
+    CHECK(seeded == 1, "помечен не ровно один ответ");
+    CHECK(r.probes == trace_probes(&r) - 3, "известный ответ стоил зондов (probes=%d, trace=%d)", r.probes, trace_probes(&r));
+    /* Чужое число повторов — ответ не берётся, вопрос задаётся (промах стенда). */
+    memset(&r, 0, sizeof r); memset(&hit, 0, sizeof hit);
+    opt.known_repeats = 2;
+    g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+    rc = d2k_run_properties((uint8_t[]){192,0,2,1}, 443, &tr, &opt, &r, &hit);
+    seeded = 0; for (int i = 0; i < r.ntrace; i++) if (r.trace[i].seeded) seeded++;
+    CHECK(rc == 0 && seeded == 0, "ответ с чужим числом повторов применён");
 }
 
 static void test_local_plan_error_is_not_a_property(void) {
@@ -922,7 +1066,7 @@ static void test_timestamp_questions_follow_client_profile(void) {
 static void test_composite_assembled_for_client_without_ts(void) {
     static const script_ent s_white[] = {
         {"white-hello-ts", "+"}, {NULL, NULL}};
-    scenario sc = {"white-ts-noopts", s_white, "-", NULL, NULL, 0, NULL, 1, 1};
+    scenario sc = {"white-ts-noopts", s_white, "-", NULL, NULL, 0, NULL, 1, NULL, NULL, 1};
     d2k_result r;
     memset(&r, 0, sizeof r);
     run(&sc, &r);
@@ -951,8 +1095,8 @@ static void test_composite_assembled_for_client_without_ts(void) {
    бы ответами коробки (запрет §2.4). */
 static void test_selftest_uses_client_tcp_profile(void) {
     d2k_result r;
-    scenario with_ts = {"selftest-ts", NULL, "-", NULL, NULL, 0, NULL, 0, 0};
-    scenario no_ts   = {"selftest-no-ts", NULL, "-", NULL, NULL, 0, NULL, 0, 1};
+    scenario with_ts = {"selftest-ts", NULL, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    scenario no_ts   = {"selftest-no-ts", NULL, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 1};
     fresh_process();
     g_hs_offer_ts = -1;
     run(&with_ts, &r);
@@ -964,7 +1108,7 @@ static void test_selftest_uses_client_tcp_profile(void) {
 }
 
 static void test_split_uses_runtime(void) {
-    scenario sc = {"split-runtime", NULL, "-", NULL, "+", 0, NULL, 0, 0};
+    scenario sc = {"split-runtime", NULL, "-", NULL, "+", 0, NULL, 0, NULL, NULL, 0};
     d2k_result r;
     g_split_success = 1; g_split_calls = g_split_gaps = 0;
     run(&sc, &r);
@@ -976,6 +1120,408 @@ static void test_split_uses_runtime(void) {
     CHECK(r.verdict == D2K_DV_FLAKY && g_poison_calls == 0 && g_split_calls == 3,
           "failed raw split is a local failure, not a negative DPI property");
     g_split_success = 0;
+}
+
+/* ЗНАНИЕ О КОРОБКЕ СНИМАЕТ ВОПРОС, НО НЕ ДОКАЗАТЕЛЬСТВО (23.10.2026).
+ *
+ * Вопрос, чей ответ в каталоге означает ПРОМАХ приёма, задавать незачем: он
+ * потратит повторы на уже известный промах и ничего не добавит. Вопрос, чей
+ * ответ означает ПРОХОД, задаётся всё равно: прошедший вопрос и есть
+ * доказательство приёма на проводе (§0.1 ТЗ), а доказательство обязано быть
+ * свежим для этой сети — иначе «обход найден» означало бы «когда-то работало».
+ *
+ * Исход опроса от этого не меняется: порядок вопросов — это цена, а не смысл,
+ * и решает по-прежнему первый ПРОШЕДШИЙ. Поэтому подпись прогона со знанием
+ * обязана совпасть с подписью без него. */
+static void test_known_props_skip_questions(void) {
+    const scenario *base = find_sc("youtube");
+    scenario with_miss, with_pass;
+    d2k_box_props known_miss, known_pass;
+    d2k_result r0, r1, r2;
+    char s0[1400], s1[1400], s2[1400];
+    int i, skipped;
+
+    run(base, &r0);
+    sig(&r0, s0, sizeof s0);
+
+    /* Коробка ТЕРПИТ перекрытие слева — значит вопрос «перекрытие слева»
+       (seqovl-1) заведомо не пройдёт. Его повторы — чистая трата. */
+    memset(&known_miss, 0, sizeof known_miss);
+    known_miss.tolerates_left_overlap = D2K_PROP_YES;
+    with_miss = *base;
+    with_miss.known = &known_miss;
+    run(&with_miss, &r1);
+    CHECK(r0.props.tolerates_left_overlap == D2K_TRI_UNSET &&
+          r1.props.tolerates_left_overlap == D2K_TRI_TRUE,
+          "failed intervention stays unknown; explicit prior knowledge is retained");
+    d2k_result normalized = r1;
+    normalized.props.tolerates_left_overlap = r0.props.tolerates_left_overlap;
+    sig(&normalized, s1, sizeof s1);
+    CHECK(strcmp(s1, s0) == 0,
+          "знание о коробке изменило исход опроса:\n    было  %s\n    стало %s", s0, s1);
+    CHECK(r1.probes < r0.probes,
+          "известный промах не сэкономил ни одного зонда: было %d, стало %d",
+          r0.probes, r1.probes);
+    for (i = 0, skipped = 0; i < r1.ntrace; i++) {
+        if (!r1.trace[i].from_known) { continue; }
+        skipped++;
+        CHECK(r1.trace[i].pass == 0 && r1.trace[i].fail == 0,
+              "незаданный вопрос «%s» посчитан зондами: прошло=%d не прошло=%d",
+              r1.trace[i].probe, r1.trace[i].pass, r1.trace[i].fail);
+    }
+    CHECK(skipped == 1, "в трассе %d незаданных вопросов, ждали один", skipped);
+    CHECK(trace_probes(&r1) == r1.probes,
+          "трасса показывает %d зондов, сделано %d", trace_probes(&r1), r1.probes);
+
+    /* Коробка НЕ терпит сбитый порядок — значит вопрос «порядок сегментов»
+       (disorder) пройдёт. Он всё равно задаётся: это и есть доказательство. */
+    memset(&known_pass, 0, sizeof known_pass);
+    known_pass.tolerates_reorder = D2K_PROP_NO;
+    with_pass = *base;
+    with_pass.known = &known_pass;
+    run(&with_pass, &r2);
+    sig(&r2, s2, sizeof s2);
+    CHECK(strcmp(s2, s0) == 0,
+          "известный проход изменил исход опроса:\n    было  %s\n    стало %s", s0, s2);
+    CHECK(r2.probes == r0.probes,
+          "известный проход не был перепроверен на проводе: было %d, стало %d",
+          r0.probes, r2.probes);
+    for (i = 0; i < r2.ntrace; i++) {
+        CHECK(!r2.trace[i].from_known,
+              "вопрос «%s» взят из каталога, хотя его ответ — доказательство приёма",
+              r2.trace[i].probe);
+    }
+}
+
+/* РАССТОЯНИЕ ДО КОРОБКИ ИЗМЕРЯЕТСЯ, А НЕ УГАДЫВАЕТСЯ (23.10.2026).
+ *
+ * Прежде hop_ttl писался лишь когда в запасном переборе случайно срабатывала
+ * одна из девятнадцати гипотез с готовыми значениями TTL из чужого поля.
+ * Теперь оно ищется делением отрезка и становится числом, которое можно
+ * сохранить в записи коробки и больше не искать. */
+static void test_hop_search(void) {
+    uint8_t ip[4] = {192, 0, 2, 1};
+    {
+        /* КОРОБКА ГЛОТАЕТ БИТУЮ СУММУ — проход монотонен, и расстояние берётся
+           ЧИСТЫМ ДЕЛЕНИЕМ: ни лестницы, ни единого числа из чужого поля.
+           Девятнадцать прежних гипотез стоили бы до 57 зондов. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 0; g_hop_takes_badsum = 1;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == 12, "расстояние до коробки найдено как %d, а коробка в 12 хопах", h);
+        CHECK(r.props.hop_ttl == 12, "найденное расстояние не записано в вектор");
+        CHECK(r.props.validates_checksum == D2K_TRI_FALSE,
+              "битую сумму коробка проглотила, а в вектор это не записано");
+        CHECK(r.probes <= 12, "монотонный поиск стоил %d зондов — дороже деления", r.probes);
+        CHECK(trace_probes(&r) == r.probes, "трасса показывает %d зондов, сделано %d",
+              trace_probes(&r), r.probes);
+    }
+    {
+        /* КОРОБКА СВЕРЯЕТ СУММУ — битую фальшивку не берёт, и поиск уходит на
+           чистую: там проход отрезок, и его ищет лестница. Один зонд на
+           проверку битой суммы — вся цена развилки. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 0; g_hop_takes_badsum = 0;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == 12, "на чистой фальшивке расстояние найдено как %d, ждали 12", h);
+        CHECK(r.props.validates_checksum != D2K_TRI_FALSE,
+              "битую сумму коробка не взяла, а записано, что не сверяет");
+        g_hop_takes_badsum = 1;
+    }
+    {
+        /* ЗНАНИЕ «СУММУ СВЕРЯЕТ» ЭКОНОМИТ И ЭТОТ ЗОНД: развилка решена из
+           каталога, битую фальшивку не пробуем вовсе. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h, probes_known;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        opt.known.validates_checksum = D2K_PROP_YES;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 0; g_hop_takes_badsum = 0;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        probes_known = r.probes;
+        CHECK(h == 12, "со знанием о сумме расстояние найдено как %d, ждали 12", h);
+        memset(&opt, 0, sizeof opt); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        g_res = &r; g_ask = -1;
+        d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(probes_known < r.probes,
+              "знание «сумму сверяет» не сэкономило зонд на развилке: %d против %d",
+              probes_known, r.probes);
+        g_hop_takes_badsum = 1;
+    }
+    {
+        /* Коробка у самого края: проход только на [60, 61]. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_res = &r; g_ask = -1;
+        g_hop_box = 60; g_hop_server = 62; g_hop_flaky = 0; g_hop_takes_badsum = 0;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == 60, "у края отрезка расстояние найдено как %d, ждали 60", h);
+        g_hop_takes_badsum = 1;
+    }
+    {
+        /* ОТРЕЗКА ПРОХОДА НЕТ ВОВСЕ: коробку фальшивкой не взять. Это не
+         * «расстояние 0», а «не измерено» — и ни одной гипотезы отсюда. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_res = &r; g_ask = -1;
+        g_hop_box = 99; g_hop_server = 99; g_hop_flaky = 0;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == 0 && r.props.hop_ttl == 0,
+              "без отрезка прохода расстояние объявлено измеренным: %d", h);
+    }
+    {
+        /* ПОВТОРЫ РАЗОШЛИСЬ — ВЕЛИЧИНА НЕ ИЗМЕРЕНА, а не усреднена: план по
+         * среднему TTL либо не дойдёт до коробки, либо дойдёт до сервера. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 1;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == 0 && r.props.hop_ttl == 0,
+              "невоспроизводимый отрезок дал расстояние %d", h);
+        g_hop_flaky = 0;
+    }
+    {
+        /* ЗНАНИЕ ИЗ КАТАЛОГА ОТМЕНЯЕТ ПОИСК, НО НЕ ДОКАЗАТЕЛЬСТВО: одна
+         * гипотеза с известным числом вместо деления отрезка. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; d2k_poison hit; int rc;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr);
+        memset(&r, 0, sizeof r); memset(&hit, 0, sizeof hit);
+        opt.repeats = 3; opt.timeout_ms = 100; opt.white.len = 2;
+        opt.known.hops = 12;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 0;
+        rc = d2k_run_properties(ip, 443, &tr, &opt, &r, &hit);
+        CHECK(rc == 1 && hit.ttl == 12,
+              "известное расстояние не дало гипотезы: rc=%d ttl=%d", rc, hit.ttl);
+        CHECK(r.props.hop_ttl == 12, "известное расстояние не попало в вектор прогона");
+        g_hop_box = g_hop_server = 0;
+    }
+}
+
+/* ЛЕСТНИЦА ОБЯЗАНА ДОСТАВАТЬ ТО, ЧТО ДОСТАВАЛ УДАЛЁННЫЙ СПИСОК
+ * (ревью 24.10.2026, замечание 1).
+ *
+ * Девятнадцать гипотез TTL из чужого поля ушли (detect/poison.c, 23.10.2026),
+ * и их значения были ttls[] = {62, 60, 58, 55, 50, 40, 20, 8}. Пока список
+ * существовал, коробка с окном прохода шириной в один хоп на этих числах
+ * бралась: гипотеза ttl-20 пробовалась как есть. Лестница замера таких
+ * ступеней не имела — 24 и 16, — и окно [20, 20] объявлялось «не измерено»,
+ * то есть рабочий приём становился недостижимым.
+ *
+ * Окно узкое там, где коробка стоит у самого сервера (верх окна — сервер
+ * минус один), и это бывает на любом расстоянии, а не только на большом.
+ * Поэтому лестница теперь НАДМНОЖЕСТВО удалённого списка: ни одно значение,
+ * которое поле когда-то брало, не потеряно. Шире гарантии нет и здесь: окно
+ * шириной в один хоп на значении вне лестницы по-прежнему не найдётся —
+ * для этого нужен измеренный верх отрезка (расстояние до сервера), а его
+ * TCP-зонд пока не снимает. */
+static void test_hop_ladder_covers_removed_sweep(void) {
+    uint8_t ip[4] = {192, 0, 2, 1};
+    /* Значения удалённого списка ttls[] — каждое с окном шириной один хоп. */
+    static const int was_in_sweep[] = {62, 60, 58, 55, 50, 40, 20, 8};
+    size_t k;
+    for (k = 0; k < sizeof was_in_sweep / sizeof was_in_sweep[0]; k++) {
+        d2k_opts opt; d2k_trigger tr; d2k_result r; int h, box = was_in_sweep[k];
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr); memset(&r, 0, sizeof r);
+        opt.repeats = 3; opt.timeout_ms = 100;
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        /* Коробка СВЕРЯЕТ сумму: битая фальшивка ей не годится, и проход у
+           чистой — именно отрезок [коробка, сервер минус один]. С проглоченной
+           битой суммой проход монотонен, лестница не нужна, и дефект
+           ступеней на таком стенде не виден вовсе. */
+        g_hop_box = box; g_hop_server = box + 1; g_hop_flaky = 0; g_hop_takes_badsum = 0;
+        h = d2k_hop_search(ip, 4, 443, &tr, &opt, &r);
+        CHECK(h == box,
+              "окно [%d, %d] не найдено: расстояние %d, а перебор это значение брал",
+              box, box, h);
+        g_hop_takes_badsum = 1;
+        g_hop_box = g_hop_server = 0;
+    }
+}
+
+/* ОПРОВЕРГНУТОЕ ИМЯ НЕ ПРЕДЛАГАЕТСЯ СНОВА — И ТО, ЧТО НЕСЁТ РАССТОЯНИЕ
+ * (ревью 24.10.2026, замечание 2).
+ *
+ * Доспрос опроса приходит со списком имён, опровергнутых на проводе
+ * (d2k_opts.skip, он же arm_refuted планировщика), и смысл доспроса — ЗАДАТЬ
+ * СЛЕДУЮЩИЙ вопрос, а не повторить проваленный опыт. Вопросы из списка это
+ * соблюдали: prop_probes сверяется с d2k_opts_skipped. Гипотеза с
+ * расстоянием собиралась в обход сверки — и ветка известного числа, и ветка
+ * измеренного отдавали своё имя, даже если ему только что отказали.
+ *
+ * Знание при этом не теряется: расстояние остаётся в векторе прогона, и
+ * собрать из него ДРУГОЙ кандидат (d2k_compose_from_props) никто не мешает.
+ * Отказ касается ровно того имени, которое опровергнуто. */
+static void test_hop_hit_respects_skip(void) {
+    uint8_t ip[4] = {192, 0, 2, 1};
+    {
+        /* ИЗВЕСТНОЕ ЧИСЛО: его имя опровергнуто — гипотезы нет. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; d2k_poison hit; int rc;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr);
+        memset(&r, 0, sizeof r); memset(&hit, 0, sizeof hit);
+        opt.repeats = 3; opt.timeout_ms = 100; opt.white.len = 2;
+        opt.known.hops = 12;
+        snprintf(opt.skip[opt.nskip++], sizeof opt.skip[0], "badsum+ttl-12");
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 12; g_hop_server = 50; g_hop_flaky = 0; g_hop_takes_badsum = 1;
+        rc = d2k_run_properties(ip, 443, &tr, &opt, &r, &hit);
+        CHECK(rc == 0,
+              "опрос предложил опровергнутое имя «%s» из известного расстояния", hit.name);
+        CHECK(r.props.hop_ttl == 12,
+              "отказ от имени стёр измеренное расстояние из вектора: %d", r.props.hop_ttl);
+        g_hop_box = g_hop_server = 0;
+    }
+    {
+        /* ИЗМЕРЕННОЕ ЗДЕСЬ ЖЕ: лестница найдёт то же число, и то же имя. */
+        d2k_opts opt; d2k_trigger tr; d2k_result r; d2k_poison hit; int rc;
+        memset(&opt, 0, sizeof opt); memset(&tr, 0, sizeof tr);
+        memset(&r, 0, sizeof r); memset(&hit, 0, sizeof hit);
+        opt.repeats = 3; opt.timeout_ms = 100; opt.white.len = 2;
+        snprintf(opt.skip[opt.nskip++], sizeof opt.skip[0], "badsum+ttl-16");
+        tr.len = 64; tr.accept = D2K_ACCEPT_ANY;
+        g_script = NULL; g_default = "-"; g_res = &r; g_ask = -1;
+        g_hop_box = 16; g_hop_server = 50; g_hop_flaky = 0; g_hop_takes_badsum = 1;
+        rc = d2k_run_properties(ip, 443, &tr, &opt, &r, &hit);
+        CHECK(rc == 0,
+              "опрос предложил опровергнутое имя «%s» из измеренного расстояния", hit.name);
+        CHECK(r.props.hop_ttl == 16,
+              "отказ от имени стёр измеренное расстояние: %d", r.props.hop_ttl);
+        g_hop_box = g_hop_server = 0;
+    }
+}
+
+/* СОБРАННЫЙ КАНДИДАТ НЕСЁТ ИЗМЕРЕННОЕ РАССТОЯНИЕ (23.10.2026).
+ *
+ * Фальшивка обязана дойти до коробки и умереть перед сервером. Пока
+ * расстояние не измерялось, собранные кандидаты шли без TTL и держались
+ * только на битой сумме. Теперь расстояние известно — и оно в каждом. */
+static void test_compose_carries_measured_hops(void) {
+    d2k_dprops pr;
+    d2k_poison out[8];
+    int n, i;
+    const uint8_t ctl[4] = {0x16, 0x03, 0x01, 0x00};
+
+    memset(&pr, 0, sizeof pr);
+    pr.hop_ttl = 12;
+    pr.counts_duplicates = D2K_TRI_TRUE;
+    pr.tolerates_left_overlap = D2K_TRI_FALSE;
+    pr.tolerates_reorder = D2K_TRI_FALSE;
+    n = d2k_compose_from_props(&pr, ctl, sizeof ctl, out, 8);
+    CHECK(n > 0, "вектор со свойствами не дал ни одного кандидата");
+    for (i = 0; i < n; i++) {
+        CHECK(out[i].ttl == 12, "кандидат «%s» собран без измеренного расстояния (ttl=%d)",
+              out[i].name, out[i].ttl);
+    }
+
+    /* Расстояние НЕ измерено — поле остаётся нулём, а не выдумывается. */
+    memset(&pr, 0, sizeof pr);
+    pr.counts_duplicates = D2K_TRI_TRUE;
+    n = d2k_compose_from_props(&pr, ctl, sizeof ctl, out, 8);
+    CHECK(n > 0, "вектор без расстояния не дал кандидатов");
+    for (i = 0; i < n; i++) {
+        CHECK(out[i].ttl == 0, "неизмеренное расстояние подставлено числом %d", out[i].ttl);
+    }
+
+    /* «Всё сразу» — тоже фальшивка, и ей тоже незачем доезжать до сервера. */
+    memset(&pr, 0, sizeof pr);
+    pr.hop_ttl = 30;
+    n = d2k_compose_from_props(&pr, ctl, sizeof ctl, out, 8);
+    CHECK(n == 1 && out[0].ttl == 30,
+          "«всё сразу» собрано без измеренного расстояния: кандидатов %d, ttl=%d",
+          n, n > 0 ? out[0].ttl : -1);
+}
+
+/* СРОЧНЫЙ БАЙТ СТАЛ ВОПРОСОМ, А НЕ НАХОДКОЙ ПЕРЕБОРА (23.10.2026).
+ *
+ * Гистограмма 2933 полевых журналов: приёмом oob взято 111 целей из 124 всех
+ * попаданий запасного перебора, а вопроса о нём в опросе не было — перебор
+ * был основным поставщиком решений для этого класса коробок. Теперь это
+ * вопрос: коробка отвечает на него своим зондом, ответ ложится в вектор и в
+ * запись каталога, а найденный приём идёт путём «свойство», не «перебор». */
+static void test_urgent_byte_is_a_question(void) {
+    static const script_ent S_OOB[] = {{"oob", "+"}, {NULL, NULL}};
+    scenario sc = {"urgent", S_OOB, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    d2k_result r;
+    const d2k_obs *o;
+
+    fresh_process();
+    run(&sc, &r);
+    o = find_obs(&r, "свойство:срочный байт");
+    CHECK(o != NULL, "вопроса о срочном байте в трассе нет вовсе");
+    CHECK(r.has_hit && strcmp(r.hit.name, "oob") == 0,
+          "срочный байт не стал находкой: has_hit=%d имя «%s»",
+          r.has_hit, r.has_hit ? r.hit.name : "");
+    CHECK(strcmp(r.path, "свойство") == 0,
+          "срочный байт найден путём «%s», а не вопросом о свойстве", r.path);
+    CHECK(r.props.handles_urgent == D2K_TRI_FALSE,
+          "проход срочного байта не записан свойством коробки");
+    /* Приём ТРЕТИЙ по цене: до него задаются ровно два вопроса о свойствах.
+       Проверяем позицию, а не число зондов: в счёт зондов входят база и
+       самопроверка сырого слоя, и они к порядку вопросов отношения не имеют. */
+    {
+        int before = 0, j;
+        for (j = 0; j < r.ntrace; j++) {
+            if (strncmp(r.trace[j].probe, "свойство:", 9) != 0) { continue; }
+            if (strcmp(r.trace[j].probe, "свойство:срочный байт") == 0) { break; }
+            before++;
+        }
+        CHECK(before == 2, "перед вопросом о срочном байте задано %d вопросов, ждали два",
+              before);
+    }
+
+    /* ЗНАНИЕ ИЗ КАТАЛОГА: коробка срочный байт УЧИТЫВАЕТ — вопрос не задаём. */
+    {
+        d2k_box_props known;
+        scenario with_known = sc;
+        d2k_result r2;
+        memset(&known, 0, sizeof known);
+        known.handles_urgent = D2K_PROP_YES;
+        with_known.known = &known;
+        fresh_process();
+        run(&with_known, &r2);
+        CHECK(find_obs(&r2, "свойство:срочный байт") == NULL ||
+              find_obs(&r2, "свойство:срочный байт")->from_known,
+              "вопрос о срочном байте задан, хотя коробка его учитывает");
+    }
+
+    /* СБОРКА ИЗ ВЕКТОРА даёт кандидата со срочным байтом — и без фальшивки:
+       приём не травит буфер, а ломает разбор имени. */
+    {
+        d2k_dprops pr;
+        d2k_poison out[8];
+        int n, i, found = 0;
+        const uint8_t ctl[4] = {0x16, 0x03, 0x01, 0x00};
+        memset(&pr, 0, sizeof pr);
+        pr.handles_urgent = D2K_TRI_FALSE;
+        n = d2k_compose_from_props(&pr, ctl, sizeof ctl, out, 8);
+        for (i = 0; i < n; i++) {
+            if (!out[i].oob) { continue; }
+            found = 1;
+            CHECK(!out[i].badsum && !out[i].decoy_hello && !out[i].ttl,
+                  "кандидат со срочным байтом собран с фальшивкой");
+        }
+        CHECK(found, "вектор «срочный байт не учитывает» не дал кандидата");
+    }
 }
 
 static const char *transport_cancel_at;
@@ -1049,7 +1595,7 @@ static void test_split_recovers_only_unsent_transport_failure(void) {
     transport_cancel_at = NULL; transport_cancelled = 0; opt.cancel.fn = NULL;
 
     /* Exercise the complete classifier, not only its repeat helper. */
-    scenario sc = {"split-recovered", NULL, "-", NULL, "+", 0, NULL, 0, 0};
+    scenario sc = {"split-recovered", NULL, "-", NULL, "+", 0, NULL, 0, NULL, NULL, 0};
     d2k_result before, after;
     g_split_connect_failures = 0; g_split_calls = 0;
     run(&sc, &before);
@@ -1061,9 +1607,262 @@ static void test_split_recovers_only_unsent_transport_failure(void) {
     g_split_success = 0;
 }
 
-int main(void)
+static int reject_candidates(const d2k_poison *p, void *ctx) {
+    (void)p; (void)ctx; return 0;
+}
+static void test_composed_error_is_not_network_failure(void) {
+    scenario sc = {"composed-error", NULL, "+", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    d2k_result r;
+    g_accept = reject_candidates;
+    g_composed_error = 1;
+    run(&sc, &r);
+    int seen = 0;
+    for (int i = 0; i < r.ntrace; i++) {
+        const d2k_obs *o = &r.trace[i];
+        if (strncmp(o->probe, "СОБРАНО:", strlen("СОБРАНО:"))) continue;
+        seen++;
+        CHECK(strstr(o->err, "Operation not permitted") != NULL,
+              "composed local failure lost its cause: %s", o->probe);
+    }
+    CHECK(seen > 0, "composed-error fixture never reached a composed candidate");
+    g_accept = NULL;
+    g_composed_error = 0;
+}
+
+static void test_property_error_does_not_skip_fallback_retry(void) {
+    static const script_ent answers[] = {{"seqovl-1", "+"}, {NULL, NULL}};
+    scenario sc = {"property-error-fallback-retry", answers, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    d2k_result r;
+    g_local_error_once = "seqovl-1";
+    fresh_process();
+    run(&sc, &r);
+    const d2k_obs *property = find_obs(&r, "свойство:перекрытие слева");
+    const d2k_obs *fallback = find_obs(&r, "poison:seqovl-1");
+    CHECK(property && property->pass == 0 && property->fail == 1 && property->err[0],
+          "fixture did not produce the initial local property failure");
+    CHECK(fallback && fallback->pass == 3 && fallback->fail == 0 &&
+          !fallback->err[0] && !fallback->seeded,
+          "local property failure poisoned or skipped the working fallback retry");
+    CHECK(r.has_hit && r.hit.seqovl == 1 && strcmp(r.path, "перебор") == 0,
+          "working fallback did not become the measured strategy");
+    CHECK(!g_local_error_once, "fixture did not consume its one-shot local failure");
+}
+
+static void test_candidate_checkpoint(void) {
+    scenario sc = {"checkpoint", NULL, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    d2k_result a, b;
+    d2k_run_cache cache = {0};
+    g_run_cache = &cache;
+    fresh_process(); run(&sc, &a);
+    int first = g_poison_calls;
+    run(&sc, &b);
+    CHECK(g_poison_calls < first, "checkpoint repeated all candidate probes");
+    int reused = 0;
+    for (int i = 0; i < b.ntrace; i++)
+        if (!strncmp(b.trace[i].probe, "poison:", 7) && b.trace[i].seeded) reused++;
+    CHECK(reused > 0, "candidate checkpoint has no replay evidence");
+    CHECK(a.verdict == b.verdict, "candidate replay changed verdict");
+    const d2k_obs *whole = find_obs(&b, "whole");
+    CHECK(whole && whole->seeded, "completed baseline was repeated");
+    CHECK(g_poison_calls == 0, "completed property/candidate probes were repeated");
+    size_t cache_bytes = cache.context_len;
+    for (d2k_run_entry *e = cache.entries; e; e = e->next)
+        cache_bytes += sizeof *e + e->key_len + e->extra_len;
+    printf("checkpoint: %zu bytes retained for complete test run\n", cache_bytes);
+    CHECK(cache.context_len < 4096, "checkpoint retained unused input buffer capacity");
+    sc.no_ts = 1;
+    run(&sc, &b);
+    for (int i = 0; i < b.ntrace; i++)
+        CHECK(strncmp(b.trace[i].probe, "poison:", 7) || !b.trace[i].seeded,
+              "candidate reused after TCP profile changed");
+    d2k_run_cache_clear(&cache);
+    sc.no_ts = 0;
+    g_checkpoint_stop_enabled = 1; g_checkpoint_stopped = 0;
+    fresh_process(); run(&sc, &a);
+    CHECK(g_checkpoint_stopped, "interruption fixture did not reach candidates");
+    g_checkpoint_stop_enabled = 0; g_checkpoint_stopped = 0;
+    run(&sc, &b);
+    reused = 0;
+    for (int i = 0; i < b.ntrace; i++)
+        if (!strncmp(b.trace[i].probe, "poison:", 7) && b.trace[i].seeded) reused++;
+    CHECK(reused == 1, "interrupted run did not preserve exactly its completed candidate");
+    d2k_run_cache_clear(&cache); g_run_cache = NULL;
+}
+
+static void test_md5ts_measured_hypothesis(void) {
+    static const script_ent answers[] = {{"md5ts", "+"}, {NULL, NULL}};
+    scenario sc = {"md5ts-measured", answers, "-", NULL, NULL, 0, NULL, 0, NULL, NULL, 0};
+    d2k_result r;
+    fresh_process(); run(&sc, &r);
+    CHECK(r.has_hit && r.hit.md5_ts && !r.hit.md5, "MD5_TS not reached after measured baseline/property failures");
+    CHECK(find_obs(&r, "poison:md5ts") != NULL, "MD5_TS missing from actual measurement trace");
+    CHECK(r.props.validates_md5 == D2K_TRI_UNSET && r.props.validates_timestamps == D2K_TRI_UNSET,
+          "combined MD5_TS success invented individual field properties");
+    sc.no_ts = 1;
+    fresh_process(); run(&sc, &r);
+    CHECK(!r.has_hit && find_obs(&r, "poison:md5ts") == NULL,
+          "MD5_TS probed for client without timestamp");
+    sc.no_ts = 0; g_healthy = 1;
+    fresh_process(); run(&sc, &r);
+    g_healthy = 0;
+    CHECK(r.verdict == D2K_DV_CLEAR && !r.has_hit && !g_poison_calls,
+          "healthy direct baseline started strategy probes");
+}
+
+static void test_failed_intervention_keeps_property_unknown(void)
 {
+    d2k_dprops pr = {0};
+    d2k_poison p = {0};
+    apply_set(&pr, SET_LEFT_OVERLAP, 0, &p);
+    apply_set(&pr, SET_REORDER, 0, &p);
+    CHECK(pr.tolerates_left_overlap == D2K_TRI_UNSET,
+          "failed overlap intervention invented reassembly knowledge");
+    CHECK(pr.tolerates_reorder == D2K_TRI_UNSET,
+          "failed reorder intervention invented reassembly knowledge");
+    apply_set(&pr, SET_LEFT_OVERLAP, 1, &p);
+    apply_set(&pr, SET_REORDER, 1, &p);
+    apply_set(&pr, SET_LEFT_OVERLAP, 0, &p);
+    apply_set(&pr, SET_REORDER, 0, &p);
+    CHECK(pr.tolerates_left_overlap == D2K_TRI_FALSE &&
+          pr.tolerates_reorder == D2K_TRI_FALSE,
+          "ambiguous failure erased an observed successful intervention");
+}
+
+struct prefix_peer { int fd; size_t cut; };
+static void *serve_prefix(void *arg)
+{
+    struct prefix_peer *p = arg;
+    const uint8_t reply[] = {0x16, 3, 3, 0, 70, 2};
+    int fd = accept(p->fd, NULL, NULL);
+    if (fd >= 0) {
+        uint8_t request;
+        if (recv(fd, &request, 1, 0) == 1) {
+            (void)d2k_send_nosig(fd, reply, p->cut);
+            struct timespec delay = {0, 20000000};
+            nanosleep(&delay, NULL);
+            (void)d2k_send_nosig(fd, reply + p->cut, sizeof reply - p->cut);
+        }
+        close(fd);
+    }
+    return NULL;
+}
+static void test_socket_fragmented_reply(void)
+{
+    for (size_t cut = 1; cut < 6; cut++) {
+        struct prefix_peer p = {socket(AF_INET, SOCK_STREAM, 0), cut};
+        struct sockaddr_in a = {0}; socklen_t alen = sizeof a;
+        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(0x7f000001u);
+        CHECK(p.fd >= 0, "socket"); if (p.fd < 0) return;
+        if (bind(p.fd, (struct sockaddr *)&a, sizeof a) || listen(p.fd, 1) ||
+            getsockname(p.fd, (struct sockaddr *)&a, &alen)) {
+            CHECK(0, "loopback setup"); close(p.fd); return;
+        }
+        pthread_t th;
+        if (pthread_create(&th, NULL, serve_prefix, &p)) {
+            CHECK(0, "thread"); close(p.fd); return;
+        }
+        char port[16], err[256], peer[64];
+        snprintf(port, sizeof port, "%u", ntohs(a.sin_port));
+        d2k_trigger tr = {0}; tr.len = 1; tr.payload[0] = 1;
+        tr.accept = D2K_ACCEPT_SERVERHELLO;
+        d2k_opts opt = {0}; opt.timeout_ms = 300; opt.no_raw = 1;
+        int rc = once_probe("127.0.0.1", port, &tr, &opt, NULL, 0, 0,
+                            err, sizeof err, peer, sizeof peer);
+        CHECK(rc == 1, "split reply at %zu: rc=%d err=%s", cut, rc, err);
+        pthread_join(th, NULL); close(p.fd);
+    }
+}
+
+static void test_hop_checkpoint_scope(void) {
+    d2k_run_cache cache = {0};
+    d2k_opts opt = {0};
+    d2k_result result = {0};
+    d2k_trigger trigger = {0};
+    const uint8_t ip[4] = {192, 0, 2, 1};
+    unsigned context = 1;
+    CHECK(d2k_run_cache_bind(&cache, &context, sizeof context), "bind hop checkpoint");
+    opt.run_cache = &cache;
+    g_res = &result; g_script = NULL; g_default = "+";
+    g_poison_calls = 0; g_hop_box = 0; g_composed_error = 0;
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 12, 1, 1) == 1,
+          "initial hop sample");
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 12, 3, 1) == 1 &&
+          g_poison_calls == 4, "one sample cannot satisfy three-repeat confirmation");
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 12, 3, 1) == 1 &&
+          g_poison_calls == 4, "completed identical hop question repeated");
+    context++;
+    CHECK(d2k_run_cache_bind(&cache, &context, sizeof context), "rebind hop context");
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 12, 3, 1) == 1 &&
+          g_poison_calls == 7, "changed context reused old hop evidence");
+    g_default = "e";
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 13, 1, 1) == -1,
+          "local hop error not reported");
+    g_default = "+";
+    CHECK(hop_step(ip, 4, 443, &trigger, &opt, &result, 13, 1, 1) == 1 &&
+          g_poison_calls == 9, "local error was cached as a network answer");
+    d2k_run_cache_clear(&cache);
+    g_default = "-"; g_res = NULL;
+    fresh_process();
+}
+
+
+static void test_gate_question_not_repeated(void) {
+    d2k_box_props known = {0}; d2k_preflight_meas m; int verdict = -99;
+    CHECK(!d2k_preflight_known(&known, &m, &verdict), "unknown gate skipped measurement");
+    known.response_gate = D2K_PROP_YES; known.gate_carry = D2K_PROP_NO;
+    CHECK(d2k_preflight_known(&known, &m, &verdict) && verdict == 0 && !m.carry_over_rst,
+          "test_gate_question_not_repeated: measured negative asked again");
+    known.gate_carry = D2K_PROP_YES; known.gate_window = 9; known.gate_pieces = 400;
+    known.gate_hello_own = D2K_PROP_YES; known.gate_rtt_ms = 53;
+    CHECK(d2k_preflight_known(&known, &m, &verdict) && verdict == 1 &&
+          m.window == 9 && m.pieces_needed == 400 && m.hello_own && m.rtt_ms == 53 && !m.probes,
+          "test_gate_question_not_repeated: measured positive lost");
+    known.gate_window = 0;
+    CHECK(!d2k_preflight_known(&known, &m, &verdict), "incomplete positive treated as usable");
+    /* A conflict can leave the hello tri unknown while carry=NO survives.
+     * Reuse must preserve that UNKNOWN instead of inventing a white hello. */
+    known.gate_carry = D2K_PROP_NO; known.gate_window = 1;
+    known.gate_hello_own = D2K_PROP_UNKNOWN;
+    CHECK(d2k_preflight_known(&known, &m, &verdict) && verdict == 0 && !m.pieces_pass,
+          "reusing negative carry invented knowledge of hello source");
+    /* Exercise the actual caller: known NO/YES must avoid raw preflight;
+     * an unknown answer must still ask it. Other raw questions use this
+     * file's existing script, without a socket listener. */
+    for (int state = 0; state < 3; state++) {
+        d2k_opts opt = {0}; d2k_trigger tr; d2k_result r; char err[100];
+        CHECK(!d2k_trigger_tls("gate.example", 1, &tr, err, sizeof err), "gate TLS fixture");
+        opt.repeats = opt.seed_repeats = 1; opt.seed_whole = opt.seed_fail = 1;
+        opt.control_vouched = 1; opt.timeout_ms = 20;
+        snprintf(opt.only, sizeof opt.only, "model-no-poison");
+        if (state) opt.known = (d2k_box_props){.response_gate=D2K_PROP_YES,
+            .gate_carry=state == 1 ? D2K_PROP_NO : D2K_PROP_YES,
+            .gate_window=9, .gate_pieces=400, .gate_hello_own=D2K_PROP_YES, .gate_rtt_ms=53};
+        fresh_process();
+        g_res = &r; g_ask = -1; g_selftest = "+"; g_default = "-"; g_script = NULL;
+        g_split_success = 0; gate_probe_calls = 0;
+        d2k_classify_run("198.51.100.7:443", &tr, &opt, &r);
+        CHECK(gate_probe_calls == (state == 0), "classifier repeated a known gate question (state=%d)", state);
+        const d2k_obs *o = find_obs(&r, "response-gate");
+        CHECK(o && o->from_known == (state != 0), "gate knowledge provenance lost");
+        CHECK((r.verdict == D2K_DV_RESPONSE_GATE) == (state == 2), "known carry verdict lost");
+        if (state) CHECK(!r.preflight.probes, "known answer charged new probes");
+    }
+    g_res = NULL; fresh_process();
+    puts("test_gate_question_not_repeated: checked");
+}
+
+int main(void)
+
+{
+    test_gate_question_not_repeated();
+    if (getenv("GATE_ONLY")) return fails ? 1 : 0;
+    test_socket_fragmented_reply();
+    if (getenv("PREFIX_ONLY")) return fails ? 1 : 0;
+    test_failed_intervention_keeps_property_unknown();
+    test_hop_checkpoint_scope();
+    if (getenv("INFERENCE_ONLY")) return fails ? 1 : 0;
     test_local_plan_error_is_not_a_property();
+    test_known_property_is_not_asked_again();
     test_timestamp_questions_follow_client_profile();
     srv_start();
     test_split_uses_runtime();
@@ -1080,6 +1879,10 @@ int main(void)
         }
         return 0;
     }
+    test_md5ts_measured_hypothesis();
+    test_candidate_checkpoint();
+    test_composed_error_is_not_network_failure();
+    test_property_error_does_not_skip_fallback_retry();
     test_equivalence();
     test_counts_per_question();
     test_syndata_last();
@@ -1090,6 +1893,12 @@ int main(void)
     test_unreachable_axes_not_asked();
     test_props_fields();
     test_sweep_skips_answered();
+    test_known_props_skip_questions();
+    test_hop_search();
+    test_hop_ladder_covers_removed_sweep();
+    test_hop_hit_respects_skip();
+    test_compose_carries_measured_hops();
+    test_urgent_byte_is_a_question();
     test_props_skip_unplannable();
     test_address_silence();
     test_selftest_cache();

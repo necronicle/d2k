@@ -7,12 +7,12 @@
 #include "d2k_packet.h"
 
 typedef struct {
-    int used;
+    int used, visited;
     uint64_t due_ns;
     uint64_t seq;
     uint64_t token;
     d2k_key key;
-    size_t count;
+    size_t count, sent;
     uint32_t *ids;
     uint32_t *verdicts;
 } release_slot;
@@ -77,6 +77,7 @@ int d2k_udp_release_enqueue(d2k_udp_release *q, uint64_t due_ns,
     free_slot->key = *key;
     free_slot->token = token;
     free_slot->count = count;
+    free_slot->sent = 0;
     return 0;
 }
 
@@ -84,7 +85,7 @@ static release_slot *next_due(d2k_udp_release *q, uint64_t now_ns) {
     release_slot *best = NULL;
     for (size_t i = 0; i < q->slots; i++) {
         release_slot *s = &q->slot[i];
-        if (!s->used || s->due_ns > now_ns) continue;
+        if (!s->used || s->visited || s->due_ns > now_ns) continue;
         if (!best || s->due_ns < best->due_ns ||
             (s->due_ns == best->due_ns && s->seq < best->seq)) {
             best = s;
@@ -98,27 +99,52 @@ size_t d2k_udp_release_flush(d2k_udp_release *q, uint64_t now_ns,
                              void *ctx) {
     size_t released = 0;
     if (!q) return 0;
+    for (size_t i = 0; i < q->slots; i++) q->slot[i].visited = 0;
     for (;;) {
         release_slot *s = next_due(q, now_ns);
         if (!s) break;
-        int complete = 1;
-        uint64_t token = s->token;
-        d2k_key key = s->key;
-        size_t count = s->count;
-        size_t sent = 0;
-        for (size_t i = 0; i < count; i++) {
+        s->visited = 1;
+        size_t pending = 0;
+        for (size_t i = 0; i < s->count; i++) {
             if (!send || send(ctx, s->ids[i], s->verdicts[i]) != 0) {
-                complete = 0;
+                s->ids[pending] = s->ids[i];
+                s->verdicts[pending++] = s->verdicts[i];
             } else {
-                sent++;
+                s->sent++;
             }
         }
+        s->count = pending;
+        if (pending) {
+            const uint64_t retry_ns = UINT64_C(10000000);
+            s->due_ns = now_ns > UINT64_MAX - retry_ns ? UINT64_MAX : now_ns + retry_ns;
+            continue;
+        }
+        uint64_t token = s->token;
+        d2k_key key = s->key;
+        size_t sent = s->sent;
         s->used = 0;
-        s->count = 0;
-        if (done) done(ctx, &key, token, complete, sent);
+        if (done) done(ctx, &key, token, 1, sent);
         released++;
     }
     return released;
+}
+
+size_t d2k_udp_release_cancel(d2k_udp_release *q, d2k_udp_release_done done,
+                              void *ctx) {
+    if (!q) return 0;
+    size_t cancelled = 0;
+    for (size_t i = 0; i < q->slots; i++) {
+        release_slot *s = &q->slot[i];
+        if (!s->used) continue;
+        uint64_t token = s->token;
+        d2k_key key = s->key;
+        size_t sent = s->sent;
+        s->used = 0;
+        s->count = 0;
+        if (done) done(ctx, &key, token, 0, sent);
+        cancelled++;
+    }
+    return cancelled;
 }
 
 uint64_t d2k_udp_release_next_ns(const d2k_udp_release *q) {

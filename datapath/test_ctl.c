@@ -11,7 +11,9 @@
 
 #include "test_nat_stub.h"
 #include "d2k_nat.h"
+#include "d2k_lateobs.h"
 #include <stdio.h>
+#include <arpa/inet.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <string.h>
@@ -22,8 +24,10 @@
 #include <sys/un.h>
 
 #include "d2k_ctl.h"
+#include "d2k_crypto.h"
 #include "../runtime/d2k_runtime.h"
 #include "d2k_ctlsrv.h"
+#include "d2k_rawmeasure_wire.h"
 #include "d2k_http80.h"
 #include "d2k_plan.h"
 
@@ -36,7 +40,7 @@ static int fails;
         }                                                  \
     } while (0)
 
-static const char *SOCK = "/tmp/d2k-test-ctl.sock";
+static char SOCK[108];
 
 static void check_execution(const uint8_t *p, const d2k_result *r) {
     uint64_t id = 0, generation = 0;
@@ -161,6 +165,23 @@ static int read_ack(int fd, uint16_t *cmd, int *ok, uint8_t *reason) {
    его часть (см. d2k_link.h). Дедушкино право здесь потому, что эти
    проверки про разбор команды, а не про ограничение по форме: оно проверяется
    отдельно, ниже. */
+/* Этап 17: записывающие крючки точных проб. */
+static int hook_addr_calls, hook_name_calls;
+static struct { d2k_addr_probe_flow flow; uint64_t expires_ns; int installed; } hook_addr_last;
+static struct { uint8_t name[64]; size_t len; uint8_t transport, family; uint16_t sport_be; int installed; } hook_name_last;
+static void rec_addr_hook(void *ctx, const d2k_addr_probe_flow *flow, uint64_t expires_ns, int installed) {
+    (void)ctx; hook_addr_calls++;
+    hook_addr_last.flow = *flow; hook_addr_last.expires_ns = expires_ns; hook_addr_last.installed = installed;
+}
+static void rec_name_hook(void *ctx, const uint8_t *name, size_t len, uint8_t transport, uint8_t family,
+                          uint16_t sport_be, uint64_t expires_ns, int installed) {
+    (void)ctx; (void)expires_ns; hook_name_calls++;
+    if (len > sizeof hook_name_last.name) len = sizeof hook_name_last.name;
+    memcpy(hook_name_last.name, name, len); hook_name_last.len = len;
+    hook_name_last.transport = transport; hook_name_last.family = family;
+    hook_name_last.sport_be = sport_be; hook_name_last.installed = installed;
+}
+
 static size_t set_name_body_shaped(uint8_t *body, const char *name,
                                    const uint8_t *plan, size_t planlen,
                                    uint8_t shape) {
@@ -311,6 +332,68 @@ static ssize_t read_event(int fd, uint16_t *type, uint8_t *body, size_t cap) {
  * подтверждений. Процедурной защиты мало: она бережёт от невнимательности, но
  * не от незнания. Здесь проверяется, что версия объявляется вообще и что
  * объявляется ИМЕННО она. */
+/* Счётчики (D2K_EV_STATS) — тем же ключом, что и прочие события без потока.
+ * Контроллер отвергает кадр с неизвестным семейством ключа (link.c), и до
+ * 28.10.2026 d2kd слал STATS с нулевым первым байтом: каждый кадр отвергался,
+ * dropped_seen у контроллера не менялся никогда, и потерянный датапатом
+ * обмен выглядел как провал плана (ровно то, от чего STATS и заведён).
+ * Найдено на Linux-стенде lab-pair после того, как d2kc стал называть
+ * отвергнутые события (очередь 28.10, задания 02/09). */
+static void check_stats_event(void) {
+    unlink(SOCK);
+    char err[160];
+    d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    CHECK(c != NULL, "сокет для проверки счётчиков не создался");
+    if (!c) { return; }
+    int cli = dial();
+    CHECK(cli >= 0, "клиент для проверки счётчиков не подключился");
+    d2k_ctl_accept(c);
+    d2k_ctlsrv_greet(c, 1500u);
+    d2k_session *overflow = d2k_session_new(4, 1);
+    CHECK(overflow != NULL, "journal overflow session");
+    uint64_t seen = 0;
+    if (overflow) {
+        d2k_journal *journal = (d2k_journal *)d2k_session_journal(overflow);
+        for (unsigned i=0;i<3;i++)
+            d2k_journal_add(journal,i,NULL,255,0,0,NULL,NULL,0,NULL);
+        d2k_ctlsrv_pump(c,overflow,&seen);
+        CHECK(d2k_ctl_dropped(c)==2,"journal overwrite missing from delivery loss counter");
+        d2k_ctlsrv_pump(c,overflow,&seen);
+        CHECK(d2k_ctl_dropped(c)==2,"journal loss counted twice");
+        d2k_journal_add(journal,4,NULL,255,0,0,NULL,NULL,0,NULL);
+        d2k_ctlsrv_pump(c,overflow,&seen);
+        CHECK(d2k_ctl_dropped(c)==2,"delivered journal history counted as lost");
+        d2k_session_free(overflow);
+    }
+    d2k_ctlsrv_stats(c);
+    d2k_ctl_flush(c);
+    uint16_t type = 0;
+    uint8_t ev[160];
+    ssize_t n = read_event(cli, &type, ev, sizeof ev);
+    CHECK(n > 0 && type == D2K_EV_PROTO, "перед счётчиками должна прийти версия");
+    n = read_event(cli, &type, ev, sizeof ev);
+    CHECK(n == (ssize_t)(D2K_KEY_WIRE_LEN + 8) && type == D2K_EV_STATS,
+          "счётчики не приехали телом «ключ + 4 байта потерь + 4 байта отправленных»");
+    if (n == (ssize_t)(D2K_KEY_WIRE_LEN + 8)) {
+        CHECK(ev[0] == 4, "ключ события счётчиков без семейства — контроллер такой кадр отвергает");
+        uint32_t dropped = (uint32_t)ev[D2K_KEY_WIRE_LEN] << 24 |
+                           (uint32_t)ev[D2K_KEY_WIRE_LEN + 1] << 16 |
+                           (uint32_t)ev[D2K_KEY_WIRE_LEN + 2] << 8 |
+                           ev[D2K_KEY_WIRE_LEN + 3];
+        CHECK(dropped == 2, "journal losses absent from STATS wire event");
+        unsigned long sent = (unsigned long)ev[D2K_KEY_WIRE_LEN + 4] << 24 | (unsigned long)ev[D2K_KEY_WIRE_LEN + 5] << 16 |
+                             (unsigned long)ev[D2K_KEY_WIRE_LEN + 6] << 8 | ev[D2K_KEY_WIRE_LEN + 7];
+        CHECK(sent >= 1, "счётчик отправленных не учёл приветствие");
+    }
+    d2k_ctl_note_dropped(c, UINT64_MAX);
+    CHECK(d2k_ctl_dropped(c) == UINT64_MAX, "loss counter did not saturate");
+    d2k_ctl_event(c, D2K_EV_STATS, NULL, D2K_CTL_FRAME_MAX);
+    CHECK(d2k_ctl_dropped(c) == UINT64_MAX, "socket loss wrapped saturated counter");
+    close(cli);
+    d2k_ctl_close(c);
+    unlink(SOCK);
+}
+
 static void check_proto_greeting(void) {
     unlink(SOCK);
     char err[160];
@@ -353,6 +436,9 @@ static void check_proto_greeting(void) {
 
 static void count_disconnect(void *ctx) { (*(unsigned *)ctx)++; }
 
+static unsigned immediate_closes;
+static void record_peer_close(void *ctx) { (void)ctx; immediate_closes++; }
+
 static void test_probe_owner_disconnect(void) {
     char err[256];
     d2k_ctl *ctl = d2k_ctl_open(SOCK, err, sizeof err);
@@ -361,6 +447,12 @@ static void test_probe_owner_disconnect(void) {
     if (!ctl || !sess) { d2k_ctl_close(ctl); d2k_session_free(sess); return; }
     d2k_ctlsrv cx = {.sess = sess, .ctl = ctl, .now_ns = 1000000};
     d2k_ctl_set_disconnect_hook(ctl, d2k_ctlsrv_peer_closed, &cx);
+    immediate_closes = 0; cx.peer_closed_hook = record_peer_close;
+    /* Этап 17: установка/снятие ТОЧНОЙ пробы сообщается крючками (d2kd ставит
+       метку записи conntrack); адресная — с 5-tuple и сроком, именная порта —
+       с именем/семейством/портом. */
+    hook_addr_calls = hook_name_calls = 0;
+    cx.addr_probe_hook = rec_addr_hook; cx.name_probe_hook = rec_name_hook; cx.probe_hook_ctx = &cx;
     int peer = dial();
     CHECK(peer >= 0, "probe owner connects");
     d2k_ctl_accept(ctl);
@@ -414,10 +506,107 @@ static void test_probe_owner_disconnect(void) {
     }
     CHECK(d2k_session_plan_count(sess) == 2, "permanent and named trial installed");
     CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL), "address trial installed");
+    CHECK(hook_name_calls == 1 && hook_name_last.installed == 1 && hook_name_last.family == 6 &&
+          hook_name_last.sport_be == sport && hook_name_last.transport == 6 &&
+          hook_name_last.len == nl && !memcmp(hook_name_last.name, name, nl),
+          "name probe hook not called once with name/family/port on SET_NAME_PROBE");
+    CHECK(hook_addr_calls == 1 && hook_addr_last.installed == 1 &&
+          hook_addr_last.expires_ns == 1000000ull + 60000ull * 1000000ull &&
+          hook_addr_last.flow.transport == 17 && hook_addr_last.flow.family == 6 &&
+          hook_addr_last.flow.src_port_be == sport && hook_addr_last.flow.dst_port_be == flow.dst_port_be,
+          "addr probe hook not called once with exact flow and lease expiry on SET_ADDR_PROBE");
+    {   /* Снятие — крючок с installed=0 на тот же кортеж. */
+        memset(body, 0, 54);
+        body[0] = 6;
+        memcpy(body + 1, flow.src_ip6, 16);
+        memcpy(body + 17, flow.dst_ip6, 16);
+        memcpy(body + 33, port, 2);
+        memcpy(body + 35, https, 2);
+        body[37] = 17; body[38] = 1;
+        frame(packet, D2K_CMD_DEL_ADDR_PROBE, body, 54);
+        CHECK(write(peer, packet, 60) == 60, "del addr probe written");
+        CHECK(poll_frames(ctl, d2k_ctlsrv_command, &cx, 1) == 1, "del addr probe parsed");
+        d2k_ctl_flush(ctl);
+        uint16_t cmd; int ok; uint8_t reason;
+        CHECK(read_ack(peer, &cmd, &ok, &reason) && ok, "del addr probe acked");
+        CHECK(hook_addr_calls == 2 && hook_addr_last.installed == 0 &&
+              hook_addr_last.flow.src_port_be == sport, "addr probe hook not called with installed=0 on DEL_ADDR_PROBE");
+    }
+    const uint8_t question[] = {0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
+    body[38] = 9;
+    memset(body + 54, 0, D2K_DNS_PROBE_FIXED - 54);
+    body[56] = 0xea; body[57] = 0x60;
+    body[59] = sizeof question;
+    d2k_sha256(question, sizeof question, body + 60);
+    uint8_t *plan = body + D2K_DNS_PROBE_FIXED;
+    const uint8_t udp_proto[] = {0, 2, 0, 2, 17, 2};
+    memcpy(plan, tiny, sizeof tiny);
+    plan[11] = 2;
+    memcpy(plan + sizeof tiny, udp_proto, sizeof udp_proto);
+    size_t len = D2K_DNS_PROBE_FIXED + sizeof tiny + sizeof udp_proto;
+    frame(packet, D2K_CMD_SET_DNS_PROBE, body, len);
+    CHECK(write(peer, packet, len + 6) == (ssize_t)(len + 6), "DNS owner command written");
+    CHECK(poll_frames(ctl, d2k_ctlsrv_command, &cx, 1) == 1, "DNS owner command parsed");
+    d2k_ctl_flush(ctl);
+    uint16_t cmd; int ok; uint8_t reason;
+    CHECK(read_ack(peer, &cmd, &ok, &reason) && ok && cmd == D2K_CMD_SET_DNS_PROBE &&
+          !memcmp(last_ack_id, body + 38, sizeof last_ack_id), "DNS ACK identifies accepted trial");
+    CHECK(d2k_plantab_find_dns_probe(tab, &flow, 1, question, sizeof question, cx.now_ns, NULL, NULL) &&
+          !d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL) && hook_addr_calls == 2,
+          "DNS trial requires its own selector, without a conntrack lease");
+    uint8_t direct[sizeof question];
+    memcpy(direct,question,sizeof direct);direct[0]^=1;
+    int reserved=0;
+    CHECK(!d2k_plantab_find_dns_probe(tab,&flow,1,direct,sizeof direct,cx.now_ns,NULL,&reserved) && reserved,
+          "a different query on the reserved UDP flow may pass without applying the candidate");
+    body[38] = 1;
+    frame(packet, D2K_CMD_DEL_ADDR_PROBE, body, D2K_ADDR_PROBE_FLOW_WIRE_LEN + D2K_TRIAL_ID_LEN);
+    CHECK(write(peer, packet, 60) == 60, "stale DNS retirement written");
+    CHECK(poll_frames(ctl, d2k_ctlsrv_command, &cx, 1) == 1, "stale DNS retirement parsed");
+    d2k_ctl_flush(ctl);
+    CHECK(read_ack(peer, &cmd, &ok, &reason) && ok &&
+          d2k_plantab_find_dns_probe(tab, &flow, 1, question, sizeof question, cx.now_ns, NULL, NULL) &&
+          hook_addr_calls == 2, "stale retirement leaves the DNS owner in place");
+    uint8_t endpoint[80]={0};
+    endpoint[0]=6;memcpy(endpoint+1,flow.dst_ip6,16);
+    endpoint[17]=D2K_PLAN_SHAPE_DNS;memcpy(endpoint+18,&flow.dst_port_be,2);
+    endpoint[21]=sizeof question;
+    memcpy(endpoint+22,plan,sizeof tiny+sizeof udp_proto);
+    size_t binding_len=22+sizeof tiny+sizeof udp_proto;
+    uint8_t request[D2K_TRIAL_ID_LEN]={3};
+    memcpy(endpoint+binding_len,request,sizeof request);
+    binding_len+=sizeof request;
+    frame(packet,D2K_CMD_SET_DNS_ENDPOINT,endpoint,binding_len);
+    CHECK(write(peer,packet,binding_len+6)==(ssize_t)(binding_len+6),"DNS endpoint installation written");
+    CHECK(poll_frames(ctl,d2k_ctlsrv_command,&cx,1)==1,"DNS endpoint installation parsed");
+    d2k_ctl_flush(ctl);
+    CHECK(read_ack(peer,&cmd,&ok,&reason) && ok && cmd==D2K_CMD_SET_DNS_ENDPOINT &&
+          !memcmp(last_ack_id,request,sizeof request) &&
+          d2k_plantab_find_dns_endpoint(tab,flow.dst_ip6,6,flow.dst_port_be,17,question,sizeof question,cx.now_ns),
+          "DNS endpoint is authorized only for the carried wire length and DNS framing");
+    endpoint[20]=6;
+    frame(packet,D2K_CMD_DEL_ENDPOINT,endpoint,21);
+    CHECK(write(peer,packet,27)==27 && poll_frames(ctl,d2k_ctlsrv_command,&cx,1)==1,
+          "other DNS endpoint transport retirement parsed");
+    d2k_ctl_flush(ctl);
+    CHECK(read_ack(peer,&cmd,&ok,&reason) && ok &&
+          d2k_plantab_find_dns_endpoint(tab,flow.dst_ip6,6,flow.dst_port_be,17,question,sizeof question,cx.now_ns),
+          "transport-specific delete preserves another DNS binding");
+    endpoint[20]=17;
+    frame(packet,D2K_CMD_DEL_ENDPOINT,endpoint,21);
+    CHECK(write(peer,packet,27)==27 && poll_frames(ctl,d2k_ctlsrv_command,&cx,1)==1,
+          "exact DNS endpoint retirement parsed");
+    d2k_ctl_flush(ctl);
+    CHECK(read_ack(peer,&cmd,&ok,&reason) && ok &&
+          !d2k_plantab_find_dns_endpoint(tab,flow.dst_ip6,6,flow.dst_port_be,17,question,sizeof question,cx.now_ns),
+          "transport-specific delete retires exact endpoint");
     close(peer);
     CHECK(d2k_ctl_poll(ctl, d2k_ctlsrv_command, &cx) < 0, "owner EOF observed");
+    CHECK(immediate_closes == 1, "late owner cancellation hook must run immediately on EOF before reconnect or tick");
     CHECK(d2k_session_plan_count(sess) == 1, "disconnect removes named trial only");
     CHECK(!d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL), "disconnect removes address trial");
+    CHECK(!d2k_plantab_find_dns_probe(tab, &flow, 1, question, sizeof question, cx.now_ns, NULL, NULL),
+          "disconnect removes DNS trial");
     CHECK(d2k_plantab_find_family(tab, (const uint8_t *)name, nl, 0,
           cx.now_ns, D2K_PLAN_SHAPE_QUIC, 0, 6), "disconnect preserves confirmed strategy");
     peer = dial();
@@ -634,7 +823,11 @@ static void test_tcp_stall_wire(void) {
         if (m < 0) break;
         if (type != D2K_EV_SUSPECT) continue;
         found = 1;
-        CHECK(m == (ssize_t)(D2K_KEY_WIRE_LEN + 10), "тело SUSPECT без оценки пакетов");
+        CHECK(m == (ssize_t)(D2K_KEY_WIRE_LEN + 11), "SUSPECT missing packet estimate or observed endpoint");
+        if (m >= (ssize_t)(D2K_KEY_WIRE_LEN + 11)) {
+            CHECK(ev[D2K_KEY_WIRE_LEN + 10] == D2K_CLIENT_SIDE_HIGH,
+                  "TCP stall lost observed client endpoint on wire");
+        }
         CHECK(ev[D2K_KEY_WIRE_LEN] == D2K_SUSPECT_TCP_STALL, "код «TCP встал на бюджете» потерян");
         if (m >= (ssize_t)(D2K_KEY_WIRE_LEN + 10)) {
             CHECK((ev[D2K_KEY_WIRE_LEN + 8] << 8 | ev[D2K_KEY_WIRE_LEN + 9]) == 25,
@@ -651,11 +844,314 @@ static void test_tcp_stall_wire(void) {
     d2k_session_free(sess);
 }
 
+/* ПОЯВЛЕНИЕ ПОТОКА БЕЗ ПРОТОКОЛА НА ПРОВОДЕ (этап 42): D2K_EV_FLOW — ключ и
+   байт наблюдённой стороны клиента; один на поток, повтор сегмента не даёт. */
+static void test_flow_fact_wire(void) {
+    unlink(SOCK);
+    char err[160];
+    d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    CHECK(c != NULL, "сокет для факта появления не создался");
+    if (!c) { return; }
+    int cli = dial();
+    d2k_ctl_accept(c);
+    struct timeval tv = { 1, 0 };
+    (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    d2k_session *sess = d2k_session_new(16, 16);
+    static const uint8_t game[] = "\x7f\x01GAME-HELLO\x00\x00\x00\x10";
+    uint8_t pkt[1024], obuf[2048];
+    d2k_result r;
+    size_t n = build_pkt(pkt, 40400, NULL, 0);
+    pkt[33] = 0x02; wr32(pkt + 24, 999);
+    d2k_session_packet(sess, pkt, n, 1000, obuf, sizeof obuf, &r);
+    n = build_rev(pkt, 40400, 0x12, 4999, NULL, 0);
+    d2k_session_packet(sess, pkt, n, 2000, obuf, sizeof obuf, &r);
+    n = build_pkt(pkt, 40400, game, sizeof game - 1);
+    d2k_session_packet(sess, pkt, n, 3000, obuf, sizeof obuf, &r);
+    d2k_session_packet(sess, pkt, n, 4000, obuf, sizeof obuf, &r);
+    uint64_t seen = 0;
+    d2k_ctlsrv_pump(c, sess, &seen);
+    d2k_ctl_flush(c);
+    int found = 0;
+    for (int i = 0; i < 8; i++) {
+        uint16_t type = 0;
+        uint8_t ev[256];
+        ssize_t m = read_event(cli, &type, ev, sizeof ev);
+        if (m < 0) break;
+        if (type != D2K_EV_RAW_FLOW) continue;
+        found++;
+        CHECK(m == (ssize_t)(D2K_KEY_WIRE_LEN + 1 + 24) && ev[D2K_KEY_WIRE_LEN] == D2K_CLIENT_SIDE_HIGH &&
+              ev[D2K_KEY_WIRE_LEN - 1] == 6,
+              "факт появления: на проводе не ключ TCP и сторона клиента");
+        CHECK(d2k_rm_nonzero(ev+D2K_KEY_WIRE_LEN+1,16)&&d2k_rm_nonzero(ev+D2K_KEY_WIRE_LEN+17,8),
+              "факт появления без поколения соединения");
+    }
+    CHECK(found == 1, "факт появления потока без протокола не вышел на провод один раз");
+    close(cli);
+    d2k_ctl_close(c);
+    d2k_session_free(sess);
+}
+
+/* ПОЗДНЕЕ НАБЛЮДЕНИЕ ТОЧНОГО ПОТОКА (этап 49): команда доходит до крючка с
+   тем кортежем и сроком; неверное тело — отказ; без крючка (поздняя доставка
+   выключена) — итог «недоступно» событием D2K_EV_LATE_OBS с ключом потока. */
+static d2k_ct_tuple lo_seen;
+static uint32_t lo_secs;
+static int lo_calls;
+static uint8_t lo_token[D2K_TRIAL_ID_LEN];
+static void lo_hook(void *ctx, const d2k_ct_tuple *t, uint32_t seconds, const uint8_t token[D2K_TRIAL_ID_LEN]) {
+    (void)ctx; lo_seen = *t; lo_secs = seconds; lo_calls++; memcpy(lo_token, token, D2K_TRIAL_ID_LEN);
+}
+/* ACK с хвостом-токеном (как у проб): 1 — прочитан. */
+static int read_ack_token(int fd, uint16_t *cmd, int *ok, uint8_t tok[D2K_TRIAL_ID_LEN]) {
+    for (int i = 0; i < 8; i++) {
+        uint16_t type = 0;
+        uint8_t ev[256];
+        ssize_t m = read_event(fd, &type, ev, sizeof ev);
+        if (m < 0) return 0;
+        if (type != D2K_EV_ACK || m < (ssize_t)(D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN)) continue;
+        *cmd = (uint16_t)(ev[D2K_KEY_WIRE_LEN] << 8 | ev[D2K_KEY_WIRE_LEN + 1]);
+        *ok = ev[D2K_KEY_WIRE_LEN + 2];
+        memcpy(tok, ev + D2K_KEY_WIRE_LEN + 4, D2K_TRIAL_ID_LEN);
+        return 1;
+    }
+    return 0;
+}
+static void test_late_observe_wire(void) {
+    unlink(SOCK);
+    char err[160];
+    d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
+    CHECK(c != NULL, "сокет для LATE_OBSERVE не создался");
+    if (!c) { return; }
+    int cli = dial();
+    d2k_ctl_accept(c);
+    struct timeval tv = { 1, 0 };
+    (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    d2k_session *sess = d2k_session_new(16, 16);
+    d2k_ctlsrv cx;
+    memset(&cx, 0, sizeof cx);
+    cx.sess = sess; cx.ctl = c;
+    uint8_t body[D2K_LATE_OBSERVE_LEN];
+    memset(body, 0, sizeof body);
+    body[0] = 4; body[1] = 6;
+    body[2] = 192; body[3] = 168; body[4] = 1; body[5] = 67;     /* клиент */
+    body[18] = 93; body[19] = 184; body[20] = 216; body[21] = 34; /* сервер */
+    body[34] = 0xa0; body[35] = 0x01; body[37] = 0xbb; body[38] = 60;
+    for (int i = 0; i < D2K_TRIAL_ID_LEN; i++) body[39 + i] = (uint8_t)(0xc0 + i);
+    uint16_t cmd = 0; int ok = 0;
+    uint8_t tok[D2K_TRIAL_ID_LEN];
+    cx.late_observe_hook = lo_hook;
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, body, sizeof body);
+    d2k_ctl_flush(c);
+    /* Этап 53: подтверждение — не сразу, а по готовности доставки (его шлёт
+       модуль поздней доставки через d2k_ctlsrv_ack_late). */
+    {
+        struct timeval qt = { 0, 200000 };
+        (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &qt, sizeof qt);
+        CHECK(read_ack_token(cli, &cmd, &ok, tok) == 0, "LATE_OBSERVE подтверждён до готовности доставки");
+        (void)setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    }
+    d2k_ctlsrv_ack_late(&cx, 1, D2K_ACK_OK, lo_token);
+    d2k_ctl_flush(c);
+    CHECK(read_ack_token(cli, &cmd, &ok, tok) == 1 && cmd == D2K_CMD_LATE_OBSERVE && ok &&
+          !memcmp(tok, body + 39, D2K_TRIAL_ID_LEN), "готовность LATE_OBSERVE не подтверждена своим токеном");
+    CHECK(lo_calls == 1 && lo_secs == 60 && lo_seen.proto == 6 && lo_seen.family == 4 &&
+          lo_seen.src[0] == 192 && lo_seen.dst[0] == 93 && lo_seen.sport_be[0] == 0xa0 && lo_seen.dport_be[1] == 0xbb &&
+          !memcmp(lo_token, body + 39, D2K_TRIAL_ID_LEN),
+          "LATE_OBSERVE дошёл до крючка не тем кортежем, сроком или токеном");
+    uint8_t bad[D2K_LATE_OBSERVE_LEN];
+    memcpy(bad, body, sizeof bad); bad[1] = 17;
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, bad, sizeof bad);
+    memcpy(bad, body, sizeof bad); bad[38] = 0;
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, bad, sizeof bad);
+    memcpy(bad, body, sizeof bad); bad[10] = 1;                   /* хвост IPv4 не нулевой */
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, bad, sizeof bad);
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, body, sizeof body - 1);
+    memcpy(bad, body, sizeof bad); memset(bad + 39, 0, D2K_TRIAL_ID_LEN);   /* нулевой токен */
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, bad, sizeof bad);
+    d2k_ctl_flush(c);
+    for (int i = 0; i < 5; i++) {
+        CHECK(read_ack_token(cli, &cmd, &ok, tok) == 1 && !ok, "неверное LATE_OBSERVE принято");
+        if (i < 3) CHECK(!memcmp(tok, body + 39, D2K_TRIAL_ID_LEN), "отказ LATE_OBSERVE без своего токена");
+    }
+    CHECK(lo_calls == 1, "неверное LATE_OBSERVE дошло до крючка");
+    /* Нечем наблюдать (поздней доставки нет) — отказ сразу, со своим токеном. */
+    cx.late_observe_hook = NULL;
+    d2k_ctlsrv_command(&cx, D2K_CMD_LATE_OBSERVE, body, sizeof body);
+    d2k_ctl_flush(c);
+    CHECK(read_ack_token(cli, &cmd, &ok, tok) == 1 && !ok && !memcmp(tok, body + 39, D2K_TRIAL_ID_LEN),
+          "без поздней доставки LATE_OBSERVE не отвергнут своим токеном");
+    /* Итог наблюдения на проводе (его пишет модуль в журнал сессии). */
+    {
+        d2k_ct_tuple nt; memset(&nt, 0, sizeof nt);
+        nt.family = 4; nt.proto = 6; memcpy(nt.src, body + 2, 4); memcpy(nt.dst, body + 18, 4);
+        memcpy(nt.sport_be, body + 34, 2); memcpy(nt.dport_be, body + 36, 2);
+        d2k_session_note_lateobs(sess, &nt, D2K_LATEOBS_UNAVAILABLE, 0, body + 39, 1);
+    }
+    uint64_t seen = 0;
+    d2k_ctlsrv_pump(c, sess, &seen);
+    d2k_ctl_flush(c);
+    int found = 0;
+    for (int i = 0; i < 8; i++) {
+        uint16_t type = 0;
+        uint8_t ev[256];
+        ssize_t m = read_event(cli, &type, ev, sizeof ev);
+        if (m < 0) break;
+        if (type != D2K_EV_LATE_OBS) continue;
+        found++;
+        CHECK(m == (ssize_t)(D2K_KEY_WIRE_LEN + 4 + D2K_TRIAL_ID_LEN) && ev[D2K_KEY_WIRE_LEN] == D2K_LATEOBS_UNAVAILABLE &&
+              ev[D2K_KEY_WIRE_LEN + 1] == D2K_CLIENT_SIDE_HIGH && ev[D2K_KEY_WIRE_LEN - 1] == 6 &&
+              !memcmp(ev + D2K_KEY_WIRE_LEN + 4, body + 39, D2K_TRIAL_ID_LEN),
+              "итог «недоступно» без ключа TCP, стороны клиента или токена");
+    }
+    CHECK(found == 1, "без крючка итог наблюдения не вышел на провод один раз");
+    close(cli);
+    d2k_ctl_close(c);
+    d2k_session_free(sess);
+}
+
+static unsigned rm_calls;
+static struct d2k_rawmeasure_request rm_request;
+static void rm_hook(void *ctx,const struct d2k_rawmeasure_request *request) {
+    (void)ctx;rm_calls++;rm_request=*request;
+}
+static void test_raw_measure_command(void) {
+    unlink(SOCK);char err[160];d2k_ctl *c=d2k_ctl_open(SOCK,err,sizeof err);
+    CHECK(c!=NULL,"RAW_MEASURE socket");if(!c)return;
+    int cli=dial();d2k_ctl_accept(c);struct timeval tv={0,200000};
+    (void)setsockopt(cli,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    d2k_session *sess=d2k_session_new(16,16);d2k_ctlsrv cx;memset(&cx,0,sizeof cx);
+    cx.sess=sess;cx.ctl=c;cx.raw_measure_hook=rm_hook;cx.addr_probe_hook=rec_addr_hook;
+    struct d2k_rawmeasure_request request;memset(&request,0,sizeof request);
+    request.tuple.family=4;request.tuple.proto=6;request.tuple.src[0]=1;request.tuple.dst[0]=2;
+    request.tuple.sport_be[1]=9;request.tuple.dport_be[1]=8;request.epoch[0]=3;
+    request.generation=7;request.token[0]=5;request.seconds=10;
+    uint8_t body[D2K_RM_REQUEST_LEN],tok[16];uint16_t cmd=0;int ok=0;
+    CHECK(!d2k_rawmeasure_request_write(body,sizeof body,&request),"RAW_MEASURE encode");
+    d2k_ctlsrv_command(&cx,D2K_CMD_RAW_MEASURE,body,sizeof body);d2k_ctl_flush(c);
+    CHECK(rm_calls==1 && rm_request.generation==7 && rm_request.epoch[0]==3,"RAW_MEASURE lost identity");
+    CHECK(!read_ack_token(cli,&cmd,&ok,tok),"RAW_MEASURE ACK before actual readiness");
+    d2k_ctlsrv_ack_raw_measure(&cx,1,D2K_ACK_OK,request.token);d2k_ctl_flush(c);
+    CHECK(read_ack_token(cli,&cmd,&ok,tok)&&cmd==D2K_CMD_RAW_MEASURE&&ok&&!memcmp(tok,request.token,16),"RAW_MEASURE readiness ACK context");
+    body[54]=0;memset(body+54,0,8);
+    d2k_ctlsrv_command(&cx,D2K_CMD_RAW_MEASURE,body,sizeof body);d2k_ctl_flush(c);
+    CHECK(read_ack_token(cli,&cmd,&ok,tok)&&!ok&&!memcmp(tok,request.token,16),"RAW_MEASURE zero generation accepted");
+    CHECK(rm_calls==1,"RAW_MEASURE invalid request dispatched");
+    CHECK(!d2k_rawmeasure_request_write(body,sizeof body,&request),"RAW_MEASURE encode repeat");
+    cx.raw_measure_hook=NULL;d2k_ctlsrv_command(&cx,D2K_CMD_RAW_MEASURE,body,sizeof body);d2k_ctl_flush(c);
+    CHECK(read_ack_token(cli,&cmd,&ok,tok)&&!ok&&!memcmp(tok,request.token,16),"RAW_MEASURE unavailable must refuse");
+
+#ifndef D2K_RAWMEASURE_EMITTER
+    CHECK(0,"measurement report emitter missing");
+#else
+    struct d2k_rawmeasure_report report={0},decoded;
+    report.request=request;report.code=D2K_RM_SERVER_PRESENT;report.server_packets=1;
+    report.flags=D2K_RM_TCP_ACK;report.tcp_ack=1;
+    report.sample_len=report.smallest_data=report.largest_data=1;
+    report.client_data=1;report.sample_digest[0]=1;
+
+    CHECK(!d2k_ctlsrv_raw_measure(&cx,&report),"measurement emit failed");d2k_ctl_flush(c);
+    uint8_t result[D2K_KEY_WIRE_LEN+D2K_RM_REPORT_LEN];uint16_t kind=0;
+    CHECK(read_event(cli,&kind,result,sizeof result)==sizeof result && kind==D2K_EV_RAW_MEASURE,"measurement result missing");
+    CHECK(result[0]==4&&result[1]==1&&result[17]==2&&result[34]==9&&result[36]==8&&result[37]==6,"measurement event tuple wrong");
+    CHECK(!d2k_rawmeasure_report_read(&decoded,result+D2K_KEY_WIRE_LEN,D2K_RM_REPORT_LEN)&&
+          decoded.request.generation==7&&decoded.request.token[0]==5&&decoded.server_packets==1,"measurement result lost context");
+    report.request.tuple.src[0]=3; /* Client sorts after server: key builder returns 0, not failure. */
+    CHECK(!d2k_ctlsrv_raw_measure(&cx,&report),"reverse-sorted client emit failed");d2k_ctl_flush(c);
+    CHECK(read_event(cli,&kind,result,sizeof result)==sizeof result && result[1]==2 && result[17]==3 && result[34]==8 && result[36]==9,"reverse-sorted client key wrong");
+    report.server_packets=0;CHECK(d2k_ctlsrv_raw_measure(&cx,&report)<0,"contradictory result emitted");
+#endif
+    {
+        d2k_flow observed={0};d2k_addr a={0},b={0};a.family=b.family=4;a.bytes[0]=1;b.bytes[0]=2;
+        d2k_key_make_addr(&observed.key,6,&a,&b,request.tuple.sport_be,request.tuple.dport_be);
+        observed.incarnation=123;observed.flow_epoch[0]=9;
+        d2k_jrn_detail detail={0};detail.client_shape=D2K_PLAN_SHAPE_RAW;detail.client_side=D2K_CLIENT_SIDE_LOW;
+        detail.planned=D2K_PLANNED_NO;
+        d2k_journal_add_suspect_bound((d2k_journal *)d2k_session_journal(sess),10,&observed.key,D2K_SUSPECT_SILENT,0,&detail,&observed);
+        observed.incarnation=999;observed.flow_epoch[0]=7;uint64_t seen=0;
+        d2k_ctlsrv_pump(c,sess,&seen);d2k_ctl_flush(c);
+        uint8_t event[256];uint16_t type;ssize_t n=read_event(cli,&type,event,sizeof event);
+        CHECK(n==D2K_KEY_WIRE_LEN+11+24&&type==D2K_EV_RAW_SUSPECT,"raw suspicion identity not serialized");
+        if(n==D2K_KEY_WIRE_LEN+11+24)
+            CHECK(event[D2K_KEY_WIRE_LEN+11]==9&&event[n-1]==123,"delayed raw suspicion got replacement identity");
+    }
+
+#ifndef D2K_CMD_SET_RAW_PROBE
+    CHECK(0,"measured trial command missing");
+#else
+    {
+        uint8_t packet[41]={0},scratch[4096];d2k_result outcome;
+        packet[0]=0x45;packet[3]=40;packet[9]=6;packet[12]=1;packet[16]=2;
+        packet[21]=9;packet[23]=8;packet[26]=3;packet[27]=0xe8;packet[32]=0x50;packet[33]=2;
+        d2k_session_packet(sess,packet,40,1,scratch,sizeof scratch,&outcome);
+        packet[3]=41;packet[33]=0x18;packet[40]='q';
+        d2k_session_packet(sess,packet,41,2,scratch,sizeof scratch,&outcome);
+        struct d2k_rawmeasure_report measured={0};measured.request=request;
+        int prior=0;CHECK(!d2k_session_raw_identity(sess,&request.tuple,measured.request.epoch,&measured.request.generation,&prior),"trial command live identity fixture");
+        measured.code=D2K_RM_REPEAT_SILENT;measured.sample_len=measured.smallest_data=measured.largest_data=1;
+        measured.sample_seq=1000;measured.client_data=2;measured.exact_repeats=1;
+        static const uint8_t digest[32]={0x8e,0x35,0xc2,0xcd,0x3b,0xf6,0x64,0x1b,0xdb,0x0e,0x20,0x50,0xb7,0x69,0x32,0xcb,0xb2,0xe6,0x03,0x4a,0x0d,0xda,0xcc,0x1d,0x9b,0xea,0x82,0xa6,0xba,0x57,0xf7,0xcf};
+        memcpy(measured.sample_digest,digest,32);
+        static const uint8_t program[]={'D','2','K','P',0,1,0,1,0,0,0,2,0,2,0,2,6,1,1,3,0,1,0};
+        uint8_t command[D2K_RM_REPORT_LEN+20+sizeof program]={0};
+        CHECK(!d2k_rawmeasure_report_write(command,D2K_RM_REPORT_LEN,&measured),"trial report encode");
+        command[D2K_RM_REPORT_LEN]=0x55;command[D2K_RM_REPORT_LEN+18]=1;command[D2K_RM_REPORT_LEN+19]=0xf4;
+        memcpy(command+D2K_RM_REPORT_LEN+20,program,sizeof program);
+        command[61]^=1;d2k_ctlsrv_command(&cx,D2K_CMD_SET_RAW_PROBE,command,sizeof command);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&!ok&&tok[0]==0x55&&!d2k_plantab_probe_count(d2k_session_plans(sess)),"stale incarnation installed candidate");
+        command[61]^=1;d2k_ctlsrv_command(&cx,D2K_CMD_SET_RAW_PROBE,command,sizeof command);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&ok&&cmd==D2K_CMD_SET_RAW_PROBE&&tok[0]==0x55,"measured trial not accepted with own token");
+        CHECK(d2k_plantab_find_measured_probe(d2k_session_plans(sess),&request.tuple,measured.request.epoch,
+              measured.request.generation,1000,(const uint8_t *)"q",1,3,tok)!=NULL,"accepted command did not install guarded plan");
+        /* v27 lease renewal through the real command parser: identical
+           report/trial/plan moves the expiry (and late delivery) only;
+           changed evidence is refused and leaves the installed expiry. */
+        const uint64_t ms=1000000ull;int hooks_before_renew=hook_addr_calls;
+        cx.now_ns=200*ms;command[D2K_RM_REPORT_LEN+18]=0x03;command[D2K_RM_REPORT_LEN+19]=0xe8;
+        d2k_ctlsrv_command(&cx,D2K_CMD_SET_RAW_PROBE,command,sizeof command);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&ok&&tok[0]==0x55&&d2k_plantab_probe_count(d2k_session_plans(sess))==1,
+              "identical renewal refused or duplicated");
+        CHECK(hook_addr_calls==hooks_before_renew+1&&hook_addr_last.installed&&hook_addr_last.expires_ns==1200*ms,
+              "renewal did not extend late delivery to the new lease");
+        CHECK(d2k_plantab_find_measured_probe(d2k_session_plans(sess),&request.tuple,measured.request.epoch,
+              measured.request.generation,1000,(const uint8_t *)"q",1,700*ms,tok)!=NULL,"renewal did not outlive the first lease");
+        struct d2k_rawmeasure_report altered=measured;altered.repeat_gap_ms=5;
+        uint8_t changed[sizeof command];memcpy(changed,command,sizeof command);
+        CHECK(!d2k_rawmeasure_report_write(changed,D2K_RM_REPORT_LEN,&altered),"altered report encode");
+        changed[D2K_RM_REPORT_LEN+17]=0x10;cx.now_ns=300*ms;
+        d2k_ctlsrv_command(&cx,D2K_CMD_SET_RAW_PROBE,changed,sizeof changed);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&!ok&&tok[0]==0x55,"renewal with altered evidence accepted");
+        CHECK(hook_addr_calls==hooks_before_renew+1,"refused renewal touched late delivery");
+        CHECK(d2k_plantab_find_measured_probe(d2k_session_plans(sess),&request.tuple,measured.request.epoch,
+              measured.request.generation,1000,(const uint8_t *)"q",1,1100*ms,tok)!=NULL&&
+              !d2k_plantab_find_measured_probe(d2k_session_plans(sess),&request.tuple,measured.request.epoch,
+              measured.request.generation,1000,(const uint8_t *)"q",1,1200*ms,tok),"refused renewal moved the installed expiry");
+        cx.now_ns=0;command[D2K_RM_REPORT_LEN+18]=1;command[D2K_RM_REPORT_LEN+19]=0xf4;
+        d2k_ctlsrv_command(&cx,D2K_CMD_SET_RAW_PROBE,command,sizeof command);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&ok,"trial reinstall for cleanup checks");
+        int hooks_before_delete=hook_addr_calls;
+        uint8_t deletion[38+16]={0};deletion[0]=4;deletion[1]=1;deletion[17]=2;deletion[34]=9;deletion[36]=8;deletion[37]=6;deletion[38]=0x56;
+        d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ADDR_PROBE,deletion,sizeof deletion);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&ok&&d2k_plantab_probe_count(d2k_session_plans(sess))==1,"stale TCP cleanup removed another trial");
+        CHECK(hook_addr_calls==hooks_before_delete,"stale TCP cleanup disabled active delivery");
+        deletion[38]=0x55;d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ADDR_PROBE,deletion,sizeof deletion);d2k_ctl_flush(c);
+        CHECK(read_ack_token(cli,&cmd,&ok,tok)&&ok&&!d2k_plantab_probe_count(d2k_session_plans(sess)),"own TCP trial cleanup failed");
+        CHECK(hook_addr_calls==hooks_before_delete+1 && !hook_addr_last.installed,"own TCP cleanup did not release delivery");
+
+    }
+#endif
+    close(cli);d2k_ctl_close(c);d2k_session_free(sess);
+}
+
 int main(void) {
+    snprintf(SOCK, sizeof SOCK, "/tmp/d2k-test-ctl-%ld.sock", (long)getpid());
     D2K_TEST_NAT_NO_TABLE();
     test_tcp_stall_wire();
+    test_flow_fact_wire();
+    test_late_observe_wire();
+    test_raw_measure_command();
     test_probe_owner_disconnect();
     check_proto_greeting();
+    check_stats_event();
     test_set_https();
     char err[160];
     d2k_ctl *c = d2k_ctl_open(SOCK, err, sizeof err);
@@ -894,6 +1390,108 @@ int main(void) {
         CHECK(cli >= 0, "клиент для разбора команд не подключился");
         d2k_ctl_accept(c);
         CHECK(d2k_ctl_peer_fd(c) >= 0, "подключение для разбора команд не принято");
+        /* Exercise exact service commands through the real command decoder. */
+        {
+            d2k_session *services = d2k_session_new(8,0);
+            CHECK(services != NULL,"endpoint command session");
+            cx.sess = services;
+            d2k_plantab *tab = d2k_session_plans(services);
+            for (unsigned family=4; family<=6; family+=2) {
+                uint8_t body[20+sizeof tiny];
+                memset(body,0,sizeof body);
+                body[0]=family; body[1]=0x20; body[2]=1; body[3]=0xd; body[4]=0xb8;
+                if (family==6) body[16]=1;
+                body[17]=D2K_PLAN_SHAPE_MODERN;
+                memcpy(body+20,tiny,sizeof tiny);
+                uint16_t cmd; int ok; uint8_t reason;
+                for (unsigned port=443;port<=444;port++) {
+                    body[18]=port>>8; body[19]=port;
+                    d2k_ctlsrv_command(&cx,D2K_CMD_SET_ENDPOINT,body,sizeof body);
+                    d2k_ctl_flush(c);
+                    CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && cmd==D2K_CMD_SET_ENDPOINT && ok,
+                          "exact service SET acknowledgement");
+                }
+                CHECK(d2k_plantab_find_target_endpoint(tab,NULL,0,body+1,family,1,
+                    D2K_PLAN_SHAPE_MODERN,0,htons(443)) != NULL,"decoded service port 443");
+                CHECK(d2k_plantab_find_target_endpoint(tab,NULL,0,body+1,family,1,
+                    D2K_PLAN_SHAPE_MODERN,0,htons(445)) == NULL,"decoder cannot broaden service");
+                {
+                    uint8_t bound[sizeof body+D2K_TRIAL_ID_LEN], response[256];
+                    memcpy(bound,body,sizeof body);
+                    memset(bound+sizeof body,0,D2K_TRIAL_ID_LEN);
+                    bound[sizeof body]=0x71;
+                    bound[18]=1;bound[19]=0xbf;
+                    d2k_ctlsrv_command(&cx,D2K_CMD_SET_ENDPOINT_BOUND,bound,sizeof bound);
+                    d2k_ctl_flush(c);
+                    uint16_t kind=0;
+                    ssize_t nr=read_event(cli,&kind,response,sizeof response);
+                    size_t base=D2K_KEY_WIRE_LEN;
+                    d2k_binding_context binding={0};
+                    CHECK(kind==D2K_EV_ACK && nr==(ssize_t)(base+4+D2K_TRIAL_ID_LEN+D2K_CTL_BINDING_LEN) &&
+                          response[base+1]==D2K_CMD_SET_ENDPOINT_BOUND && response[base+2]==1 &&
+                          !memcmp(response+base+4,bound+sizeof body,D2K_TRIAL_ID_LEN) &&
+                          !d2k_ctl_binding_read(&binding,response+base+4+D2K_TRIAL_ID_LEN,D2K_CTL_BINDING_LEN) &&
+                          d2k_binding_known(&binding) && binding.kind==D2K_BIND_ADDR &&
+                          binding.family==family && !binding.temporary,
+                          "service installation ACK binds request token to installed generation");
+                    bound[18]=bound[19]=0;
+                    d2k_ctlsrv_command(&cx,D2K_CMD_SET_ENDPOINT_BOUND,bound,sizeof bound);
+                    d2k_ctl_flush(c);
+                    uint8_t returned[D2K_TRIAL_ID_LEN];
+                    CHECK(read_ack_token(cli,&cmd,&ok,returned) && !ok &&
+                          cmd==D2K_CMD_SET_ENDPOINT_BOUND &&
+                          !memcmp(returned,bound+sizeof body,D2K_TRIAL_ID_LEN),
+                          "rejected service installation echoes its own request token");
+                }
+                body[18]=1;body[19]=0xbb;
+                d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT,body,20);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && cmd==D2K_CMD_DEL_ENDPOINT && ok,
+                      "exact service DEL acknowledgement");
+                CHECK(d2k_plantab_find_target_endpoint(tab,NULL,0,body+1,family,1,
+                    D2K_PLAN_SHAPE_MODERN,0,htons(443)) == NULL,"decoded deletion removes exact service");
+                CHECK(d2k_plantab_find_target_endpoint(tab,NULL,0,body+1,family,1,
+                    D2K_PLAN_SHAPE_MODERN,0,htons(444)) != NULL,"decoded deletion preserves other port");
+                body[18]=body[19]=0;
+                d2k_ctlsrv_command(&cx,D2K_CMD_SET_ENDPOINT,body,sizeof body);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && !ok && reason==D2K_ACK_BAD_ARGS,
+                      "zero service port rejected");
+                d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT,body,19);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && !ok && reason==D2K_ACK_BAD_ARGS,
+                      "truncated service delete rejected");
+            }
+            for (unsigned family=4;family<=6;family+=2) {
+                uint8_t rawplan[]={'D','2','K','P',0,1,0,1,0,0,0,2,0,2,0,2,6,1,1,3,0,1,0};
+                uint8_t body[20+sizeof rawplan]; memset(body,0,sizeof body);
+                body[0]=family; body[1]=192; body[4]=9; body[17]=D2K_PLAN_SHAPE_RAW;
+                body[18]=1;body[19]=187;
+                uint16_t cmd;int ok;uint8_t reason;
+                for (unsigned tr=6;tr<=17;tr+=11) {
+                    rawplan[16]=tr;rawplan[17]=tr==6?1:2;memcpy(body+20,rawplan,sizeof rawplan);
+                    d2k_ctlsrv_command(&cx,D2K_CMD_SET_ENDPOINT,body,sizeof body);d2k_ctl_flush(c);
+                    CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && ok,"RAW service SET acknowledged");
+                }
+                CHECK(d2k_plantab_find_target_endpoint_tr(tab,NULL,0,body+1,family,1,D2K_PLAN_SHAPE_RAW,0,htons(443),6)!=NULL,
+                      "RAW TCP installed through control");
+                CHECK(d2k_plantab_find_target_endpoint_tr(tab,NULL,0,body+1,family,1,D2K_PLAN_SHAPE_RAW,0,htons(443),17)!=NULL,
+                      "RAW UDP coexists through control");
+                d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT,body,20);d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && !ok,"ambiguous RAW wire deletion refused");
+                body[20]=6;d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT,body,21);d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && ok,"RAW TCP wire deletion acknowledged");
+                CHECK(d2k_plantab_find_target_endpoint_tr(tab,NULL,0,body+1,family,1,D2K_PLAN_SHAPE_RAW,0,htons(443),6)==NULL,
+                      "RAW TCP removed through control");
+                CHECK(d2k_plantab_find_target_endpoint_tr(tab,NULL,0,body+1,family,1,D2K_PLAN_SHAPE_RAW,0,htons(443),17)!=NULL,
+                      "RAW UDP survives TCP wire deletion");
+                body[20]=17;d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT,body,21);d2k_ctl_flush(c);
+                CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && ok,"RAW UDP wire deletion acknowledged");
+            }
+            cx.sess=sess;
+            d2k_session_free(services);
+        }
+
 
         {
             uint8_t body[64];
@@ -1120,8 +1718,17 @@ int main(void) {
             d2k_ctl_flush(c);
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1,
                   "stale delete не получил идемпотентный ACK");
+            CHECK(!memcmp(last_ack_id,body+38,D2K_TRIAL_ID_LEN),
+                  "stale delete ACK must name the stale trial, never the active owner");
             CHECK(d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL) != NULL,
                   "stale delete снял probe другого поколения");
+            memcpy(body+38,trial,sizeof trial);body[37]=1;
+            d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ADDR_PROBE,body,54);
+            d2k_ctl_flush(c);
+            CHECK(read_ack(cli,&cmd,&ok,&reason)==1 && !ok && reason==D2K_ACK_BAD_ARGS &&
+                  !memcmp(last_ack_id,trial,sizeof trial),"rejected delete ACK retains trial identity");
+            CHECK(d2k_plantab_find_addr_probe(tab,&flow,cx.now_ns,NULL)!=NULL,
+                  "rejected delete preserves active trial");
 
             memcpy(body, flow_wire, sizeof flow_wire);
             memcpy(body + 38, trial, sizeof trial);
@@ -1133,6 +1740,7 @@ int main(void) {
             CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok == 1 &&
                   d2k_plantab_find_addr_probe(tab, &flow, cx.now_ns, NULL) == NULL,
                   "точный delete не удалил только свой probe");
+            CHECK(!memcmp(last_ack_id,trial,sizeof trial),"successful delete ACK retains exact trial identity");
         }
 
         /* Байты плана не разбираются: ack ok=0, причина D2K_ACK_BAD_PLAN —
@@ -1199,6 +1807,41 @@ int main(void) {
             }
             CHECK(d2k_session_plan_count(sess) == before + 2,
                   "QUIC and voice address bindings of one IP did not coexist");
+            /* Этап 21 (аудит контракта RAW): форма RAW (8) по адресу принимается и
+               снимается своей формой; неизвестная форма 9 отвергается BAD_ARGS и
+               НИЧЕГО не ставит (нет ложного успеха). Другой адрес, чтобы блок
+               ниже считал от прежней таблицы. */
+            {
+                uint8_t ip2[4] = {198, 51, 100, 24};
+                size_t b0 = d2k_session_plan_count(sess);
+                memset(body, 0, sizeof body);
+                body[0] = 4; memcpy(body + 1, ip2, 4); body[17] = D2K_PLAN_SHAPE_RAW + 1;
+                memcpy(body + 18, tiny, sizeof tiny);
+                d2k_ctlsrv_command(&cx, D2K_CMD_SET_ADDR, body, 18 + sizeof tiny);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && cmd == D2K_CMD_SET_ADDR && !ok &&
+                      reason == D2K_ACK_BAD_ARGS && d2k_session_plan_count(sess) == b0,
+                      "SET_ADDR with unknown shape 9 accepted or installed something");
+                body[17] = D2K_PLAN_SHAPE_RAW;
+                d2k_ctlsrv_command(&cx, D2K_CMD_SET_ADDR, body, 18 + sizeof tiny);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok && d2k_session_plan_count(sess) == b0 + 1,
+                      "SET_ADDR with shape RAW refused or not installed");
+                memset(body, 0, 18);
+                body[0] = 4; memcpy(body + 1, ip2, 4); body[17] = D2K_PLAN_SHAPE_RAW + 1;
+                d2k_ctlsrv_command(&cx, D2K_CMD_DEL_ADDR, body, 18);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && !ok && d2k_session_plan_count(sess) == b0 + 1,
+                      "DEL_ADDR with unknown shape 9 accepted");
+                body[17] = D2K_PLAN_SHAPE_RAW;
+                d2k_ctlsrv_command(&cx, D2K_CMD_DEL_ADDR, body, 18);
+                d2k_ctl_flush(c);
+                CHECK(read_ack(cli, &cmd, &ok, &reason) == 1 && ok && d2k_session_plan_count(sess) == b0,
+                      "DEL_ADDR with shape RAW did not remove the RAW binding");
+                /* Блок ниже переиспользует body с прежним адресом. */
+                memset(body, 0, sizeof body);
+                body[0] = 4; memcpy(body + 1, ip, 4);
+            }
             const d2k_plan *q = d2k_plantab_find(tab, NULL, 0, ip_be, 1, D2K_PLAN_SHAPE_QUIC);
             const d2k_plan *v = d2k_plantab_find(tab, voice, sizeof voice - 1, ip_be, 1,
                                                  D2K_PLAN_SHAPE_VOICE);
@@ -1514,6 +2157,68 @@ int main(void) {
             }
         }
         CHECK(found, "события применения не пришло вовсе");
+
+        /* Request-bound EXCHANGE must serialize the saved execution, even
+           though the table entry was already replaced above. */
+        {
+            uint8_t trial[D2K_TRIAL_ID_LEN]; memset(trial,0x63,sizeof trial);
+            d2k_journal_add_fate_bound((d2k_journal *)d2k_session_journal(sess),
+                1011,&r.key,D2K_JRN_EXCHANGE,D2K_UDP_PROOF_STUN,
+                r.plan_id,trial,r.execution_id,&r.binding);
+            d2k_ctlsrv_pump(c,sess,&seen);d2k_ctl_flush(c);
+            int got=0;
+            for(int i=0;i<8 && !got;i++) {
+                uint16_t kind;uint8_t ev[256];ssize_t n=read_event(cli,&kind,ev,sizeof ev);
+                if(n<0)break;
+                if(kind!=D2K_EV_EXCHANGE)continue;
+                got=1;size_t off=D2K_KEY_WIRE_LEN+8;
+                CHECK(n==(ssize_t)(off+32+D2K_CTL_EXECUTION_LEN),"bound EXCHANGE wire length");
+                CHECK(!memcmp(ev+off,r.plan_id,16) && !memcmp(ev+off+16,trial,16),
+                      "bound EXCHANGE plan/trial IDs");
+                uint64_t execution=0;for(unsigned b=0;b<8;b++)execution=(execution<<8)|ev[off+32+b];
+                d2k_binding_context saved={0};
+                CHECK(execution==r.execution_id &&
+                      !d2k_ctl_binding_read(&saved,ev+off+40,D2K_CTL_BINDING_LEN) &&
+                      d2k_binding_equal(&saved,&r.binding),"EXCHANGE changed request snapshot during serialization");
+            }
+            CHECK(got,"bound EXCHANGE not emitted");
+        }
+
+        /* Request-bound SUSPECT must serialize the saved execution, even
+           though the table entry was already replaced above. */
+        {
+            uint8_t trial[D2K_TRIAL_ID_LEN]; memset(trial,0x63,sizeof trial);
+            d2k_flow observed={0};
+            observed.execution_id=r.execution_id;observed.execution_binding=r.binding;
+            memcpy(observed.execution_plan_id,r.plan_id,16);
+            memcpy(observed.execution_trial_id,trial,16);
+            d2k_jrn_detail detail={0};detail.planned=D2K_PLANNED_YES;
+            detail.client_shape=D2K_PLAN_SHAPE_VOICE;
+            d2k_journal_add_suspect_bound((d2k_journal *)d2k_session_journal(sess),
+                1012,&r.key,D2K_SUSPECT_SILENT,37,&detail,&observed);
+            memset(&observed,0,sizeof observed);
+            d2k_ctlsrv_pump(c,sess,&seen);d2k_ctl_flush(c);
+            int got=0;
+            for(int i=0;i<8 && !got;i++) {
+                uint16_t kind;uint8_t ev[256];ssize_t n=read_event(cli,&kind,ev,sizeof ev);
+                if(n<0)break;
+                if(kind!=D2K_EV_SUSPECT)continue;
+                got=1;
+                CHECK(ev[D2K_KEY_WIRE_LEN]==D2K_SUSPECT_SILENT &&
+                      ev[D2K_KEY_WIRE_LEN+6]==D2K_PLANNED_YES &&
+                      ev[D2K_KEY_WIRE_LEN+9]==37,"SUSPECT lost detail or count");
+                size_t off=D2K_KEY_WIRE_LEN+11;
+                CHECK(n==(ssize_t)(off+32+D2K_CTL_EXECUTION_LEN),"bound SUSPECT wire length");
+                CHECK(!memcmp(ev+off,r.plan_id,16) && !memcmp(ev+off+16,trial,16),
+                      "bound SUSPECT plan/trial IDs");
+                uint64_t execution=0;for(unsigned b=0;b<8;b++)execution=(execution<<8)|ev[off+32+b];
+                d2k_binding_context saved={0};
+                CHECK(execution==r.execution_id &&
+                      !d2k_ctl_binding_read(&saved,ev+off+40,D2K_CTL_BINDING_LEN) &&
+                      d2k_binding_equal(&saved,&r.binding),"SUSPECT changed request snapshot during serialization");
+            }
+            CHECK(got,"bound SUSPECT not emitted");
+        }
 
         /* --- НАБОР ОПЦИЙ TCP КЛИЕНТА ЕДЕТ ПЕРЕД СНИМКОМ (замысел 2026-10-23,
            п. 5.1). Снимок приветствия по запросу (ARM_SHAPE) контроллер уже

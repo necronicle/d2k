@@ -262,6 +262,9 @@ int main(void) {
         e2.seq_shift = -10000;
         CHECK(d2k_wire_build_udp(&c, &e2, pkt, sizeof pkt) == 0,
               "сдвиг seq обязан отвергаться для UDP, а не собираться как обычная дейтаграмма");
+        e2.seq_shift = 0; e2.ack_shift = -66000;
+        CHECK(d2k_wire_build_udp(&c, &e2, pkt, sizeof pkt) == 0,
+              "ACK shift must be rejected for UDP");
     }
 
     /* --- метка времени со сдвигом — опция TCP, у UDP опций нет: отказ ----- */
@@ -273,6 +276,27 @@ int main(void) {
         e2.poison = D2K_POISON_TCPTS_BACK;
         CHECK(d2k_wire_build_udp(&c, &e2, pkt, sizeof pkt) == 0,
               "метка времени TCP обязана отвергаться для UDP, а не тихо игнорироваться");
+    }
+
+    /* --- autottl: для фальшивки QUIC неизмерим — отказ ------------------
+     *
+     * Поле 24.10.2026 (h3-1024): TCP-сборка разрешает autottl по TTL ТОГО, что
+     * отвечало по соединению (wire.c, auto_ttl). У фальшивки QUIC ответа ещё
+     * не было: она идёт ПЕРЕД первым Initial свежей четвёрки, rev_ttl ноль, и
+     * длину пути вывести не из чего. Прежде это поле здесь просто не читалось:
+     * план просил autottl, а на провод уходила датаграмма с обычным TTL 64 —
+     * то есть фальшивка доживала до сервера. Тихая подмена запрошенного
+     * запрещена (d2k_wire.h), поэтому — отказ. */
+    {
+        d2k_emit e2;
+        memset(&e2, 0, sizeof e2);
+        e2.bytes = body;
+        e2.len = sizeof body;
+        e2.autottl = 1; e2.autottl_delta = 1; e2.autottl_min = 3; e2.autottl_max = 20;
+        d2k_conn ca = c;
+        ca.rev_ttl = 56; /* даже при известном TTL ответа: у фальшивки QUIC его нет */
+        CHECK(d2k_wire_build_udp(&ca, &e2, pkt, sizeof pkt) == 0,
+              "autottl обязан отвергаться для UDP, а не тихо уезжать с обычным TTL");
     }
 
     /* --- порченая сумма по требованию — эта сборка её не умеет: отказ ----- */

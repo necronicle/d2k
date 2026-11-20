@@ -527,6 +527,77 @@ static void check_free_is_safe(void) {
     }
 }
 
+static void check_dns_context_persistence(void) {
+    const char *path = "/tmp/d2k-cat-dns-context.json";
+    const char *out = "/tmp/d2k-cat-dns-context-out.json";
+    char err[200], buf[8192];
+    d2k_catalog c;
+    write_tmp(path, "{\"boxes\":[{\"bindings\":["
+        "{\"kind\":\"name\",\"target\":\"resolver.test\",\"family\":4,"
+        "\"dns_name\":\"resolver.test\",\"dns_port\":8443,\"dns_address\":\"192.0.2.53\",\"probe_path\":\"/dns-query\"},"
+        "{\"kind\":\"name\",\"target\":\"resolver.test\",\"family\":6,"
+        "\"dns_address\":\"2001:db8::53\",\"dns_port\":65535,\"probe_path\":\"/dns-query\"}]}]}");
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load DNS context");
+    CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save DNS context");
+    d2k_catalog_free(&c);
+    FILE *f = fopen(out, "r");
+    CHECK(f != NULL, "open saved DNS context");
+    if (f) {
+        size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+        CHECK(strstr(buf, "\"dns_port\": 8443") != NULL, "DNS port lost on save");
+        CHECK(strstr(buf, "\"dns_address\": \"192.0.2.53\"") != NULL,
+              "IPv4 DNS address lost on save");
+        CHECK(strstr(buf, "\"dns_address\": \"2001:db8::53\"") != NULL,
+              "IPv6 DNS address lost on save");
+        CHECK(strstr(buf, "\"server_port\"") == NULL, "DNS proof changed legacy binding kind");
+    }
+    CHECK(d2k_catalog_load(out, &c, err, sizeof err) == 0, "reload DNS context");
+    CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2, "DNS contexts survive reload");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
+        const d2k_cat_binding *v4 = &c.boxes[0].binds[0], *v6 = &c.boxes[0].binds[1];
+        CHECK(v4->dns_port == 8443 && !strcmp(v4->dns_name, "resolver.test") && !strcmp(v4->dns_address, "192.0.2.53") &&
+              !strcmp(v4->probe_path, "/dns-query"), "IPv4 DNS context roundtrip");
+        CHECK(v6->dns_port == 65535 && !strcmp(v6->dns_address, "2001:db8::53") &&
+              !strcmp(v6->probe_path, "/dns-query"), "IPv6 DNS context roundtrip");
+        CHECK(v4->server_port == 0 && v6->server_port == 0, "DNS port changed legacy service port");
+    }
+    d2k_catalog_free(&c);
+
+    /* An HTTP resource alone is not a DNS-contract witness. */
+    write_tmp(path, "{\"boxes\":[{\"bindings\":[{\"kind\":\"name\","
+        "\"target\":\"resolver.test\",\"probe_path\":\"/main.css\"}]}]}");
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "load legacy HTTP context");
+    if (c.n_boxes == 1 && c.boxes[0].n_binds == 1)
+        CHECK(c.boxes[0].binds[0].dns_port == 0 && !c.boxes[0].binds[0].dns_address[0] &&
+              !c.boxes[0].binds[0].dns_name[0],
+              "legacy HTTP context invented DNS witness");
+    CHECK(d2k_catalog_save(&c, out, err, sizeof err) == 0, "save legacy HTTP context");
+    d2k_catalog_free(&c);
+    f = fopen(out, "r");
+    CHECK(f != NULL, "open saved legacy HTTP context");
+    if (f) {
+        size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+        CHECK(strstr(buf, "\"dns_port\"") == NULL && strstr(buf, "\"dns_address\"") == NULL,
+              "HTTP resource invented DNS proof");
+    }
+    const char *bad[] = {
+        "\"dns_port\":0", "\"dns_port\":-1", "\"dns_port\":65536",
+        "\"dns_port\":443.0", "\"dns_port\":\"443\"", "\"dns_port\":null",
+        "\"dns_address\":\"resolver.test\"", "\"dns_address\":\"192.0.2.999\"",
+        "\"dns_address\":\"\"", "\"dns_address\":\"fe80::1%en0\"",
+        "\"dns_address\":\"2001:db8::53\",\"family\":4",
+        "\"family\":6,\"dns_address\":\"192.0.2.53\""
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        snprintf(buf, sizeof buf, "{\"boxes\":[{\"bindings\":[{%s}]}]}", bad[i]);
+        write_tmp(path, buf);
+        int rc = d2k_catalog_load(path, &c, err, sizeof err);
+        CHECK(rc != 0, "invalid DNS context accepted");
+        CHECK(rc == 0 || err[0] != 0, "invalid DNS context has no diagnostic");
+        d2k_catalog_free(&c);
+    }
+}
+
 static void check_binding_family_persistence(void) {
     const char *path = "/tmp/d2k-cat-family.json";
     const char *out = "/tmp/d2k-cat-family-out.json";
@@ -764,10 +835,175 @@ static void check_network_whitelist_roundtrip(void) {
     }
 }
 
+static void check_raw_service_persistence(void) {
+    const char *path = "/tmp/d2k-cat-raw-service.json";
+    const char *out = "/tmp/d2k-cat-raw-service-out.json";
+    for (unsigned family = 4; family <= 6; family += 2) {
+        const char *ip = family == 4 ? "192.0.2.8" : "2001:db8::8";
+        char json[1024], err[200];
+        snprintf(json, sizeof json, "{\"boxes\":[{\"endpoints\":["
+            "{\"kind\":\"service\",\"target\":\"%s\",\"family\":%u,\"server_port\":443,\"transport\":6,\"shape\":8},"
+            "{\"kind\":\"service\",\"target\":\"%s\",\"family\":%u,\"server_port\":443,\"transport\":17,\"shape\":8}]}]}",
+            ip, family, ip, family);
+        write_tmp(path, json);
+        d2k_catalog c;
+        int loaded = d2k_catalog_load(path, &c, err, sizeof err);
+        CHECK(!loaded, "RAW service: accept explicit TCP and UDP endpoints");
+        if (loaded) continue;
+        CHECK(!d2k_catalog_save(&c, out, err, sizeof err), "RAW service: persist endpoints");
+        d2k_catalog_free(&c);
+        loaded = d2k_catalog_load(out, &c, err, sizeof err);
+        CHECK(!loaded, "RAW service: reload endpoints");
+        if (loaded) continue;
+        CHECK(c.n_boxes == 1 && c.boxes[0].n_binds == 2, "RAW service: both transports retained");
+        if (c.n_boxes == 1 && c.boxes[0].n_binds == 2) {
+            for (unsigned j = 0; j < 2; j++) {
+                d2k_cat_binding *b = &c.boxes[0].binds[j];
+                CHECK(!strcmp(b->kind, "service") && b->server_port == 443 &&
+                      b->family == family && b->shape == 8 &&
+                      b->transport == (j ? 17 : 6) && !strcmp(b->target, ip),
+                      "RAW service: address, port, shape and transport survive restart");
+            }
+            c.boxes[0].binds[0].transport = 0;
+            CHECK(d2k_catalog_save(&c, out, err, sizeof err) != 0,
+                  "RAW service: unspecified transport refused");
+        }
+        d2k_catalog_free(&c);
+    }
+}
+
+static void check_service_persistence(void) {
+    const char *path="/tmp/d2k-cat-service.json", *out="/tmp/d2k-cat-service-out.json";
+    char err[200];
+    write_tmp(path,"{\"boxes\":[{\"endpoints\":["
+        "{\"kind\":\"service\",\"target\":\"192.0.2.1\",\"server_port\":3478,\"family\":4,\"transport\":17,\"shape\":5,\"enabled\":true},"
+        "{\"kind\":\"service\",\"target\":\"2001:db8::1\",\"server_port\":65535,\"family\":6,\"transport\":17,\"shape\":5,\"enabled\":true}],"
+        "\"bindings\":[{\"kind\":\"addr\",\"target\":\"192.0.2.1\",\"enabled\":true}]}]}");
+    d2k_catalog c;
+    CHECK(d2k_catalog_load(path,&c,err,sizeof err)==0,"load exact services with legacy binding");
+    CHECK(c.n_boxes==1 && c.boxes[0].n_binds==3,"append both arrays independent of order");
+    if (c.n_boxes==1 && c.boxes[0].n_binds==3) {
+        CHECK(c.boxes[0].binds[0].server_port==3478 && c.boxes[0].binds[1].server_port==65535,
+              "service ports survive input");
+        CHECK(c.boxes[0].binds[2].server_port==0,"legacy binding does not invent port");
+    }
+    CHECK(d2k_catalog_save(&c,out,err,sizeof err)==0,"save exact services");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load(out,&c,err,sizeof err)==0,"reload service catalog");
+    CHECK(c.n_boxes==1 && c.boxes[0].n_binds==3,"reload keeps service and legacy entries");
+    if (c.n_boxes==1 && c.boxes[0].n_binds==3) {
+        CHECK(!strcmp(c.boxes[0].binds[0].kind,"addr") && c.boxes[0].binds[0].server_port==0,
+              "legacy array stays portless");
+        CHECK(!strcmp(c.boxes[0].binds[1].kind,"service") && c.boxes[0].binds[1].server_port==3478 &&
+              c.boxes[0].binds[2].server_port==65535 && c.boxes[0].binds[2].family==6,
+              "exact service identity survives roundtrip");
+        c.boxes[0].binds[1].server_port=0;
+        CHECK(d2k_catalog_save(&c,"/tmp/d2k-cat-service-invalid.json",err,sizeof err)!=0,
+              "save refuses wildcard service authority");
+    }
+    d2k_catalog_free(&c);
+    const char *bad[]={
+        "{\"kind\":\"service\",\"server_port\":0}",
+        "{\"kind\":\"service\",\"server_port\":65536}",
+        "{\"kind\":\"service\",\"server_port\":-1}",
+        "{\"kind\":\"name\",\"server_port\":443}",
+        "{\"kind\":\"service\",\"server_port\":443,\"target\":\"example.com\",\"transport\":6,\"shape\":1}",
+        "{\"kind\":\"service\",\"server_port\":443,\"target\":\"192.0.2.1\",\"transport\":17,\"shape\":1}"
+    };
+    for(size_t i=0;i<sizeof bad/sizeof bad[0];i++) {
+        char buf[600];snprintf(buf,sizeof buf,"{\"boxes\":[{\"endpoints\":[%s]}]}",bad[i]);
+        write_tmp(path,buf);
+        CHECK(d2k_catalog_load(path,&c,err,sizeof err)!=0,"invalid service key rejected");
+        d2k_catalog_free(&c);
+    }
+    write_tmp(path,"{\"boxes\":[{\"bindings\":[{\"kind\":\"addr\",\"server_port\":443}]}]}");
+    CHECK(d2k_catalog_load(path,&c,err,sizeof err)!=0,"legacy array cannot hide new port semantics");
+    d2k_catalog_free(&c);
+}
+
+
+static void test_gate_props_roundtrip(void) {
+    d2k_catalog c; char err[200] = {0};
+    const char *path = "/tmp/d2k-cat-gate.json";
+    write_tmp(path, "{\"boxes\":[{\"id\":\"gate\",\"properties\":[{\"handles_urgent\":\"no\",\"hops\":12}]}]}");
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "gate: load old properties");
+    if (!c.n_boxes || !c.boxes[0].n_props) { d2k_catalog_free(&c); return; }
+    d2k_box_props *p = &c.boxes[0].props[0].p;
+    CHECK(p->response_gate == D2K_PROP_UNKNOWN && p->gate_carry == D2K_PROP_UNKNOWN &&
+          p->gate_hello_own == D2K_PROP_UNKNOWN && !p->gate_window &&
+          !p->gate_pieces && !p->gate_rtt_ms, "gate: old fields must be unknown");
+    p->response_gate = D2K_PROP_YES; p->gate_window = 17; p->gate_pieces = 1234;
+    p->gate_carry = D2K_PROP_YES; p->gate_hello_own = D2K_PROP_NO; p->gate_rtt_ms = 42;
+    CHECK(d2k_catalog_save(&c, path, err, sizeof err) == 0, "gate: save");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "gate: reload");
+    if (c.n_boxes && c.boxes[0].n_props) {
+        p = &c.boxes[0].props[0].p;
+        CHECK(p->response_gate == D2K_PROP_YES && p->gate_window == 17 &&
+              p->gate_pieces == 1234 && p->gate_carry == D2K_PROP_YES &&
+              p->gate_hello_own == D2K_PROP_NO && p->gate_rtt_ms == 42,
+              "test_gate_props_roundtrip: measured fields lost");
+        CHECK(p->handles_urgent == D2K_PROP_NO && p->hops == 12, "gate: old fields lost");
+    } else CHECK(0, "gate: properties lost");
+    d2k_catalog_free(&c);
+}
+static void test_gate_negative_is_known(void) {
+    d2k_catalog c; char err[200] = {0};
+    const char *path = "/tmp/d2k-cat-gate-negative.json";
+    write_tmp(path, "{\"boxes\":[{\"id\":\"gate\",\"properties\":[{\"response_gate\":\"yes\",\"gate_carry\":\"no\"}]}]}");
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "negative: load");
+    CHECK(c.n_boxes && c.boxes[0].n_props &&
+          c.boxes[0].props[0].p.gate_carry == D2K_PROP_NO,
+          "test_gate_negative_is_known: no read as unknown");
+    CHECK(d2k_catalog_save(&c, path, err, sizeof err) == 0, "negative: save");
+    d2k_catalog_free(&c);
+    CHECK(d2k_catalog_load(path, &c, err, sizeof err) == 0, "negative: reload");
+    CHECK(c.n_boxes && c.boxes[0].n_props &&
+          c.boxes[0].props[0].p.gate_carry == D2K_PROP_NO,
+          "test_gate_negative_is_known: no lost on roundtrip");
+    d2k_catalog_free(&c);
+}
+
+
+static void test_preflight_catalog_endpoint_only(void) {
+    const char *path="/tmp/d2k-cat-preflight.json";
+    char err[200];d2k_catalog c={0};d2k_cat_box box={0};
+    d2k_cat_plan plan={0};d2k_cat_binding bind={0};
+    c.boxes=&box;c.n_boxes=1;box.plans=&plan;box.n_plans=1;box.binds=&bind;box.n_binds=1;
+    strcpy(box.id,"gate");strcpy(plan.id,"pf");strcpy(plan.proto,"tls");plan.enabled=1;
+    plan.text="d2k-plan 1 18\nproto tcp tls\npreflight window=7 wscale=0 pieces=9 hello=own timeout=2400 data=1\npayload 1 160301\n";
+    strcpy(bind.plan_id,"pf");strcpy(bind.kind,"name");strcpy(bind.target,"x.example");
+    bind.enabled=1;bind.transport=6;bind.family=4;bind.shape=1;
+    CHECK(d2k_catalog_save(&c,path,err,sizeof err)!=0,"preflight catalog accepted name binding");
+    strcpy(bind.kind,"service");strcpy(bind.target,"192.0.2.1");bind.server_port=443;
+    CHECK(d2k_catalog_save(&c,path,err,sizeof err)==0,"preflight catalog rejected IPv4 endpoint");
+    d2k_catalog loaded={0};
+    CHECK(d2k_catalog_load(path,&loaded,err,sizeof err)==0,"preflight catalog roundtrip failed");
+    d2k_catalog_free(&loaded);
+    bind.family=6;strcpy(bind.target,"2001:db8::1");
+    strcpy(bind.preflight_name,"video.example");
+    CHECK(d2k_catalog_save(&c,path,err,sizeof err)==0,"preflight catalog rejected IPv6 endpoint");
+    CHECK(d2k_catalog_load(path,&loaded,err,sizeof err)==0,"preflight IPv6 catalog roundtrip failed");
+    CHECK(loaded.n_boxes==1 && loaded.boxes[0].n_binds==1 &&
+          loaded.boxes[0].binds[0].family==6 &&
+          !strcmp(loaded.boxes[0].binds[0].target,"2001:db8::1") &&
+          !strcmp(loaded.boxes[0].binds[0].preflight_name,"video.example"),
+          "preflight IPv6 endpoint lost on reload");
+    d2k_catalog_free(&loaded);
+    write_tmp(path,"{\"boxes\":[{\"id\":\"gate\",\"plans\":[{\"id\":\"pf\",\"text\":\"d2k-plan 1 18\\nproto tcp tls\\npreflight window=7 wscale=0 pieces=9 hello=own timeout=2400 data=1\\npayload 1 160301\\n\"}],\"bindings\":[{\"kind\":\"name\",\"target\":\"x.example\",\"plan_id\":\"pf\"}]}]}");
+    CHECK(d2k_catalog_load(path,&loaded,err,sizeof err)!=0,"preflight catalog loaded legacy name binding");
+    d2k_catalog_free(&loaded);remove(path);
+}
 int main(void) {
+    test_preflight_catalog_endpoint_only();
+    test_gate_props_roundtrip();
+    test_gate_negative_is_known();
+    check_service_persistence();
+    check_raw_service_persistence();
     check_network_whitelist_roundtrip();
     check_volume_box_fingerprint_persistence();
     check_binding_family_persistence();
+    check_dns_context_persistence();
     check_recheck_mark_persistence();
     check_budget_persistence();
     check_time_roundtrip();
@@ -842,6 +1078,91 @@ int main(void) {
               strcmp(c.boxes[0].binds[0].target, "203.0.113.7") == 0,
               "kind=addr/IPv4 target потерялись при круговом обходе");
         d2k_catalog_free(&c);
+    }
+    /* --- ВЕКТОР СВОЙСТВ КОРОБКИ (23.10.2026) ------------------------------
+     *
+     * Отпечаток до правки отвечал только на вопрос «та же коробка?»
+     * (приметы узнавания), а знание «чем её брать» нигде не хранилось: оно
+     * измерялось заново на каждой цели. Вектор лежит рядом с приметами, в
+     * сравнение d2k_fp_same не входит и хранится С ФОРМОЙ КЛИЕНТА, которой
+     * измерен (issue #7: клиент без метки времени не исполняет план со
+     * сдвигом метки назад).
+     *
+     * ОТСУТСТВИЕ ПОЛЯ — «НЕ ИЗМЕРЕНО», А НЕ «НЕТ» (§2.4): поэтому в файл
+     * пишутся только измеренные поля, а старый файл без ключа читается как
+     * пустое знание, а не как отрицание всех свойств. */
+    {
+        d2k_catalog c; char err[200] = {0};
+        write_tmp("/tmp/d2k-cat-props.json",
+                  "{\"boxes\":[{\"id\":\"box-1\",\"properties\":[{"
+                  "\"client_shape\":3,\"validates_checksum\":\"no\","
+                  "\"counts_duplicates\":\"yes\",\"hops\":58,"
+                  "\"reasm_boundary\":517,\"measured_utc\":\"2026-10-23T18:10:18Z\"}]}]}");
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-props.json", &c, err, sizeof err) == 0,
+              "каталог с вектором свойств не разобрался");
+        CHECK(c.n_boxes == 1 && c.boxes[0].n_props == 1, "вектор свойств не прочитан");
+        if (c.n_boxes == 1 && c.boxes[0].n_props == 1) {
+            const d2k_cat_props *r = &c.boxes[0].props[0];
+            CHECK(r->p.client_shape == 3, "форма клиента потерялась");
+            CHECK(r->p.validates_checksum == D2K_PROP_NO, "\"no\" прочитано не как НЕТ");
+            CHECK(r->p.counts_duplicates == D2K_PROP_YES, "\"yes\" прочитано не как ДА");
+            CHECK(r->p.hops == 58 && r->p.reasm_boundary == 517, "величины потерялись");
+            CHECK(r->p.parses_l7 == D2K_PROP_UNKNOWN,
+                  "отсутствующее поле прочитано не как «не измерено»");
+            CHECK(r->measured_at == 1792779018, "время замера вектора потерялось");
+        }
+        /* Круговой обход: пишем и перечитываем — измеренное обязано дойти,
+         * неизмеренное обязано остаться неизмеренным. */
+        CHECK(d2k_catalog_save(&c, "/tmp/d2k-cat-props-out.json", err, sizeof err) == 0,
+              "запись вектора свойств");
+        d2k_catalog_free(&c);
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-props-out.json", &c, err, sizeof err) == 0,
+              "перечитывание вектора свойств");
+        if (c.n_boxes == 1 && c.boxes[0].n_props == 1) {
+            const d2k_cat_props *r = &c.boxes[0].props[0];
+            CHECK(r->p.validates_checksum == D2K_PROP_NO &&
+                  r->p.counts_duplicates == D2K_PROP_YES &&
+                  r->p.hops == 58 && r->p.reasm_boundary == 517 &&
+                  r->p.client_shape == 3 && r->measured_at == 1792779018,
+                  "вектор свойств потерялся при круговом обходе");
+            CHECK(r->p.parses_l7 == D2K_PROP_UNKNOWN,
+                  "неизмеренное свойство записалось отрицанием");
+        } else {
+            CHECK(0, "вектор свойств не дошёл до перечитывания");
+        }
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Файл БЕЗ ключа — пустое знание, а не отрицание. */
+        d2k_catalog c; char err[200] = {0};
+        CHECK(d2k_catalog_load("testdata/catalog-real.json", &c, err, sizeof err) == 0,
+              "настоящий каталог не разобрался");
+        CHECK(c.boxes[0].n_props == 0, "файл без ключа дал вектор из ниоткуда");
+        d2k_catalog_free(&c);
+    }
+    {
+        /* Девятая запись вектора — ОТКАЗ С ПРИЧИНОЙ, как девятая примета:
+         * буфер фиксирован, и молчаливая потеря одной из девяти хуже отказа. */
+        d2k_catalog c; char err[200] = {0};
+        write_tmp("/tmp/d2k-cat-props-many.json",
+                  "{\"boxes\":[{\"id\":\"box-1\",\"properties\":["
+                  "{\"client_shape\":1},{\"client_shape\":2},{\"client_shape\":3},"
+                  "{\"client_shape\":4},{\"client_shape\":5},{\"client_shape\":6},"
+                  "{\"client_shape\":7},{\"client_shape\":8},{\"client_shape\":9}]}]}");
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-props-many.json", &c, err, sizeof err) != 0,
+              "девятая запись вектора принята — буфер фиксирован на восьми");
+        CHECK(err[0] != 0, "отказ без причины — человеку нечитаемо");
+    }
+    {
+        /* Неизвестное значение признака — отказ, а не тихое «не измерено»:
+         * иначе опечатка в файле читалась бы как отсутствие знания. */
+        d2k_catalog c; char err[200] = {0};
+        write_tmp("/tmp/d2k-cat-props-bad.json",
+                  "{\"boxes\":[{\"id\":\"box-1\",\"properties\":["
+                  "{\"client_shape\":3,\"parses_l7\":\"maybe\"}]}]}");
+        CHECK(d2k_catalog_load("/tmp/d2k-cat-props-bad.json", &c, err, sizeof err) != 0,
+              "значение \"maybe\" принято за тройственную логику");
+        CHECK(err[0] != 0, "отказ без причины");
     }
     /* --- битый ввод отвергается, а не разбирается наполовину --------------- */
     {

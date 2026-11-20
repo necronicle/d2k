@@ -175,7 +175,37 @@ d2k_quic_arm d2k_quic_strategy_arms(d2k_quic_arm_context *ctx);
 d2k_quic_arm d2k_quic_strategy_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark);
 /* Immutable instrument data; NULL is not replaced with a similar packet. */
+/* Приманки лестницы: четыре донорских плюс 0x00…0 и quic_initial_nofix —
+ * форма, которую коробка читает как Initial, а сервер обязан отбросить
+ * (см. quicarms.c). */
+#define D2K_QUIC_BLOBS 6
 const uint8_t *d2k_quic_original_blob(size_t index, size_t *len, const char **name);
+
+/* ОТВЕТИТ ЛИ СЕРВЕР НА ЭТУ ФАЛЬШИВКУ (поле 24.10.2026, h3-1024).
+ *
+ * 1 — датаграмма выглядит для сервера настоящим Initial нашей версии:
+ * длинный заголовок (бит 0x80), фиксированный бит (0x40), версия 1 и не
+ * меньше 1200 байт (RFC 9000 §14.1). Такая копия, дойдя до сервера, заводит
+ * ему СВОЁ соединение: ответ приходит с её DCID, а настоящий Initial клиента
+ * проигрывает гонку. Поэтому она обязана нести измеренный TTL и умереть по
+ * дороге — документация zapret о том же: фальшивка либо не доходит до
+ * сервера, либо доходит и там отбрасывается.
+ *
+ * 0 — сервер отбросит сам: погашенный фиксированный бит (§17.3.1), короткий
+ * заголовок без состояния, чужая версия или слишком малый размер. Такой
+ * фальшивке TTL не нужен — она безвредна на любом расстоянии. */
+/* static inline, как судьи вердиктов в d2k_quicprobe.h: предикат над байтами
+ * нужен и ядру, и сборщику плана из libd2k_udp.a, которую d2kvoice линкует без
+ * quicarms.o — отдельная единица трансляции сломала бы линковку деплой-бинарей,
+ * и зелёный make check этого бы не поймал. */
+static inline int d2k_quic_blob_answerable(const uint8_t *bytes, size_t len) {
+    if (!bytes || len < 1200) { return 0; }                    /* RFC 9000 §14.1 */
+    if (!(bytes[0] & 0x80) || !(bytes[0] & 0x40)) { return 0; } /* короткий заголовок / §17.3.1 */
+    if (((bytes[0] >> 4) & 3) != 0) { return 0; }               /* длинный заголовок не Initial */
+    uint32_t ver = (uint32_t)bytes[1] << 24 | (uint32_t)bytes[2] << 16 |
+                   (uint32_t)bytes[3] << 8 | bytes[4];
+    return ver == 1;
+}
 d2k_quic_arm d2k_quic_original_measure(d2k_quic_arm_context *ctx, uint16_t port,
     d2k_hello trigger, d2k_hello control, uint32_t wait_ms, uint32_t mark);
 /* Exact original raw-IP shapes; independent from the legacy midpoint hook. */

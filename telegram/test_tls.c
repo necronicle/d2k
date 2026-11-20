@@ -26,9 +26,10 @@
 
 typedef struct { int listener; const char *cert; const char *key; char sni[128]; int status; } server_args;
 
-typedef struct { uint8_t data[16]; size_t len; int received; } pump_capture;
+typedef struct { uint8_t data[16]; size_t len; int received; size_t big; } pump_capture;
 static int capture_message(void *ctx,const uint8_t *data,size_t len) {
-    pump_capture *c=ctx; if(len>sizeof(c->data))return -1;
+    pump_capture *c=ctx;
+    if(len>sizeof(c->data)){c->big=len;for(size_t i=0;i<len;i++)if(data[i]!=(uint8_t)i)return -1;return 0;}
     memcpy(c->data,data,len);c->len=len;c->received=1;return 0;
 }
 
@@ -195,6 +196,15 @@ static void *serve_ws(void *opaque) {
     assert(ssl_write_exact(ssl, ping, sizeof(ping)) == 0);
     assert(ssl_read_exact(ssl, frame, 7) == 0);
     assert(frame[0] == 0x8a && frame[1] == 0x81 && frame[6] == ('p' ^ frame[2]));
+    /* Большой кадр: буфер приёма клиента растёт под него и после разбора
+       отдаёт память обратно. */
+    size_t big_len = 300000;
+    uint8_t *big = malloc(10 + big_len); assert(big);
+    big[0]=0x82; big[1]=127;
+    for (int i=0;i<8;i++) big[2+i]=(uint8_t)((uint64_t)big_len >> (56-8*i));
+    for (size_t i=0;i<big_len;i++) big[10+i]=(uint8_t)i;
+    assert(ssl_write_exact(ssl, big, 10 + big_len) == 0);
+    free(big);
     const uint8_t binary[] = {0x82,0x02,'o','k'};
     assert(ssl_write_exact(ssl, binary, sizeof(binary)) == 0);
     const uint8_t close_frame[] = {0x88,0x00};
@@ -363,13 +373,18 @@ static void test_websocket_upgrade_binary_and_ping(void) {
     ssl=tg_tls_connect_fd(client_ctx,connect_loopback(args.listener),"relay.test"); assert(ssl);
     assert(tg_ws_upgrade(ssl,"relay.test:443","/ws")==0);
     assert(tg_ws_pump_init(&pump,ssl)==0);
+    /* Буфер приёма не занимает предел сообщения заранее. */
+    assert(pump.rx_cap==TG_WS_RX_BASE);
     assert(tg_ws_pump_queue_binary(&pump,(const uint8_t *)"hello",5)==0);
-    for(unsigned i=0;i<50&&!capture.received;i++) {
+    for(unsigned i=0;i<100&&!capture.received;i++) {
         struct pollfd pfd={.fd=tg_ws_pump_fd(&pump),.events=tg_ws_pump_events(&pump)};
         int rc=poll(&pfd,1,200); assert(rc>=0);
         assert(tg_ws_pump_process(&pump,pfd.revents,capture_message,&capture)==0);
     }
     assert(capture.received && capture.len==2 && memcmp(capture.data,"ok",2)==0);
+    assert(capture.big==300000);
+    /* Кадр разобран — память буфера отдана, остался исходный малый буфер. */
+    assert(pump.rx_len==0 && pump.rx_cap==TG_WS_RX_BASE);
     assert(pump.tx_bytes==0 && pump.tx_memory_bytes==0 && pump.tx_head==NULL);
     tg_ws_pump_destroy(&pump);
     SSL_free(ssl); SSL_CTX_free(client_ctx); pthread_join(thread,NULL); close(args.listener);

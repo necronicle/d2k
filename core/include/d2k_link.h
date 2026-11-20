@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "d2k_preflight_lease.h"
 
 int d2k_link_set_suffix_family(int, const char *, uint8_t transport,
     const char *plan_text, uint8_t shape, uint8_t family, char *, size_t);
@@ -34,7 +35,10 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * датапат. d2k_ev.kind сравнивается с D2K_EV_*, d2k_link_next возвращает
  * ошибки, различимые по D2K_ACK_* через err (см. ниже). */
 #include "d2k_ctl.h"
+#include "d2k_rawmeasure_wire.h"
 #include "d2k_quicsnap.h"
+#include "d2k_ctq.h"
+#include "d2k_lateobs.h"
 
 /* Разобранное событие датапата. Поля общие для всех видов события, но
  * заполнены только те, что данный вид события несёт (см. комментарии у
@@ -81,7 +85,11 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * shape_len — 0). Для D2K_EV_SHAPE, наоборот, code/num/seen_types не несут
  * значения.
  *
- * plan_id и trial_id значимы при D2K_EV_APPLIED/D2K_EV_REFUSED; у остальных
+ * PREFLIGHT_*: num — K, preflight_elapsed_ns — время с SYN, client_side —
+ * инициатор; plan_id/trial_id/execution_binding — снимок контекста плана.
+ * Это диагностические факты, не подтверждение исполнения или приложения.
+ *
+ * plan_id и trial_id значимы при D2K_EV_APPLIED/D2K_EV_REFUSED/PREFLIGHT_*; у остальных
  * событий нулевые. Для адресной пробы планировщик требует точный ненулевой
  * trial_id в дополнение к Plan ID и ключу потока.
  *
@@ -99,11 +107,15 @@ int d2k_link_del_bypass_family(int, const char *, uint8_t transport,
  * файла) — НАБЛЮДЕНИЕ, а не порог успеха. Проверено на настоящем ctlprobe (см.
  * test_link.c: hello + два reply — 22, потом 23 — на одном потоке). */
 typedef struct {
+    uint8_t flow_epoch[16];
+    uint64_t flow_incarnation;
+    struct d2k_rawmeasure_report raw_measure;
     char release_id[65]; /* validated release greeting; empty for legacy */
     uint16_t kind;          /* D2K_EV_* */
     uint8_t  family;
     uint8_t  low_ip[16], high_ip[16];
     uint16_t low_port, high_port;
+    uint8_t client_side; /* D2K_CLIENT_SIDE_*; observed, not inferred from ports */
     uint8_t  transport;     /* 6 TCP, 17 UDP — см. большой комментарий выше */
     uint16_t code;          /* SUSPECT: причина; EXCHANGE: тип TLS-записи; ACK: тип команды;
                                REFUSED: D2K_REFUSE_* — НЕНУЛЕВОЙ означает нашу
@@ -158,6 +170,7 @@ typedef struct {
      * и его нельзя приписать кандидату. */
     uint8_t  plan_id[D2K_PLAN_ID_LEN];
     uint8_t  trial_id[D2K_TRIAL_ID_LEN];
+    uint64_t preflight_elapsed_ns; /* PREFLIGHT_*: num=K, client_side and IDs/binding */
     uint64_t execution_id; /* APPLIED/REFUSED: snapshot from the executed plan */
     d2k_binding_context execution_binding; /* table epoch + generation; not application proof */
     uint64_t live_execution; /* HTTP_PORTAL: completed request execution, 0 = unbound */
@@ -240,6 +253,16 @@ int  d2k_link_peer_closed(int fd);
  * невозможная длина кадра. */
 int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
 
+/* Приветствие датапата — первое событие нового соединения. Совместимая пара
+ * — ТОЧНО своя версия провода (D2K_CTL_PROTO_VERSION) и свой выпуск
+ * (D2K_RELEASE_ID): у чужой версии другая раскладка команд, а её ACK могут
+ * не нести полей, по которым снимаются опыты (trial ID у DEL_ADDR_PROBE,
+ * v23). Одно решение для всех клиентов канала (d2kc, d2kask).
+ * 0 — совместимо, событие в *out (out может быть NULL); -1 — отказ, причина
+ * в err: нет приветствия за wait_ms, первым пришло не приветствие, чужая
+ * версия или чужой выпуск. */
+int  d2k_link_greeting(int fd, int wait_ms, d2k_ev *out, char *err, size_t errcap);
+
 /* Ставит план на имя цели: команда D2K_CMD_SET_NAME (длина имени, имя, план
  * TLV). plan_text — план в HEX (та же условность, что и везде в этом дереве
  * для двоичных вставок в текстовый протокол — см. datapath/ctlprobe.c,
@@ -302,6 +325,10 @@ int  d2k_link_next(int fd, d2k_ev *out, int wait_ms, char *err, size_t errcap);
 #define D2K_LINK_SHAPE_ECH_TCP 6
 /* Открытый HTTP (v11, задача 51, шаг 4) — то же число, что D2K_PLAN_SHAPE_HTTP. */
 #define D2K_LINK_SHAPE_HTTP 7
+/* Нагрузка без распознанного протокола (не TLS, не QUIC, не STUN/голос):
+ * только признак наблюдения в SUSPECT (client_shape), не ключ плана (этап 12). */
+#define D2K_LINK_SHAPE_RAW 8
+#define D2K_LINK_SHAPE_DNS 9
 #define D2K_LINK_VOICE_CLASS "@discord-voice"
 
 /* Имя с подтверждённым HTTPS на ttl_s секунд (D2K_CMD_SET_HTTPS, v10,
@@ -311,6 +338,17 @@ int  d2k_link_set_https(int fd, const char *name, uint32_t ttl_s, char *err, siz
    56): n значений (0..D2K_STALL_BUDGETS_MAX), каждый не ноль; n == 0 —
    полевой бюджет датапата. */
 int  d2k_link_set_stall_budgets(int fd, const uint16_t *b, size_t n, char *err, size_t errcap);
+/* Этап 49: понаблюдать точный поток TCP (кортеж orig клиент → сервер) не
+ * дольше seconds (1..120) под токеном token (ненулевой). Итог придёт событием
+ * D2K_EV_LATE_OBS: code — D2K_LATEOBS_*, num — повторы данных клиента,
+ * client_side, trial_id — токен; ACK несёт токен в trial_id. */
+/* Sends a read-only observation request, not a plan or application probe. */
+#define D2K_LINK_RAW_PROBE 1
+int d2k_link_set_raw_probe(int fd,const struct d2k_rawmeasure_report *,const uint8_t trial[16],
+    uint32_t lease_ms,const char *plan_hex,char *err,size_t errcap);
+int d2k_link_raw_measure(int fd, const struct d2k_rawmeasure_request *, char *err, size_t errcap);
+int  d2k_link_late_observe(int fd, const d2k_ct_tuple *t, uint8_t seconds,
+                           const uint8_t token[D2K_TRIAL_ID_LEN], char *err, size_t errcap);
 
 int  d2k_link_set_name(int fd, const char *name, uint8_t transport,
                        const char *plan_text, uint8_t shape,
@@ -353,6 +391,13 @@ int d2k_link_set_name_probe_trial(int fd, const char *name, uint8_t transport,
                                   char *err, size_t errcap);
 int  d2k_link_arm_shape(int fd, const char *name, uint8_t transport,
                         char *err, size_t errcap);
+/* Cached SHAPE precedes ACK; the ACK echoes request_id even with no cached
+ * shape. NULL retains the legacy uncorrelated request. */
+/* Ordered no-op fence: deliberately invalid ARM_SHAPE transport/family.
+ * Datapath echoes token with BAD_ARGS before touching its shape observer. */
+int d2k_link_fence(int fd,const uint8_t token[16],char *err,size_t errcap);
+int d2k_link_arm_shape_request(int fd, const char *name, uint8_t transport,
+    uint8_t family, const uint8_t request_id[16], char *err, size_t errcap);
 int d2k_link_arm_shape_family(int fd, const char *name, uint8_t transport,
                               uint8_t family, char *err, size_t errcap);
 
@@ -372,6 +417,11 @@ int d2k_link_del_name_family(int fd, const char *name, uint8_t transport,
 int d2k_link_del_name_probe_family(int fd, const char *name, uint8_t transport,
                                    uint8_t shape, uint16_t sport_be, uint8_t family,
                                    char *err, size_t errcap);
+/* Conditional cleanup: the trailing trial token must still own this probe.
+ * A peer without the extension rejects the longer body without deleting. */
+int d2k_link_del_name_probe_trial(int fd,const char *name,uint8_t transport,
+    uint8_t shape,uint16_t sport_be,uint8_t family,const uint8_t trial[D2K_TRIAL_ID_LEN],
+    char *err,size_t errcap);
 int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
                              uint8_t shape, uint16_t sport_be,
                              char *err, size_t errcap);
@@ -389,6 +439,30 @@ int  d2k_link_del_name_probe(int fd, const char *name, uint8_t transport,
  * не затирают друг друга и не применяются к чужим пакетам (D2K_SPEC §5).
  * Ноль и D2K_LINK_SHAPE_GRANDFATHER отвергаются (-1): «подходит всем
  * протоколам адреса» по сокету не ставится. DEL_ADDR снимает ровно эту форму. */
+/* Permanent exact service binding. Address is 4/16 bytes, port network order.
+ * No fallback to a whole-address command on an older peer. */
+int d2k_link_set_endpoint(int fd, const uint8_t *address, uint8_t family,
+    uint16_t port_be, uint8_t shape, const char *plan_text, char *err, size_t errcap);
+int d2k_link_set_dns_endpoint(int,const uint8_t *,uint8_t,uint16_t,uint16_t,const char *,
+    const uint8_t request[D2K_TRIAL_ID_LEN],char *,size_t);
+int d2k_link_del_dns_endpoint(int,const uint8_t *,uint8_t,uint16_t,uint8_t,char *,size_t);
+int d2k_link_set_endpoint_bound(int fd, const uint8_t *address, uint8_t family,
+    uint16_t port_be, uint8_t shape, const char *plan_text,
+    const uint8_t token[D2K_TRIAL_ID_LEN], char *err, size_t errcap);
+int d2k_link_set_preflight_trial(int fd,const uint8_t *ip,uint8_t family,uint16_t port_be,uint16_t sport_be,
+    uint8_t shape,const char *plan,const uint8_t token[D2K_TRIAL_ID_LEN],char *err,size_t errcap);
+int d2k_link_set_preflight_lease(int,const d2k_pf_scope *,uint32_t,const char *,
+    const uint8_t [16],char *,size_t);
+int d2k_link_del_preflight_lease(int,const d2k_pf_scope *,const uint8_t [16],char *,size_t);
+int d2k_link_commit_endpoint_trial(int, const uint8_t *, uint8_t, uint16_t, uint8_t,
+    const uint8_t trial[16], char *, size_t);
+int d2k_link_del_endpoint_trial(int, const uint8_t *, uint8_t, uint16_t, uint8_t,
+    const uint8_t trial[16], char *, size_t);
+int d2k_link_del_endpoint(int fd, const uint8_t *address, uint8_t family,
+    uint16_t port_be, uint8_t shape, char *err, size_t errcap);
+/* RAW service deletion carries explicit TCP/UDP transport. */
+int d2k_link_del_raw_endpoint(int fd, const uint8_t *address, uint8_t family,
+    uint16_t port_be, uint8_t transport, char *err, size_t errcap);
 int  d2k_link_set_addr(int fd, const uint8_t ip4[4], uint8_t shape,
                        const char *plan_text, char *err, size_t errcap);
 int d2k_link_set_addr_family(int fd, const uint8_t *ip, uint8_t family,
@@ -403,6 +477,9 @@ int d2k_link_set_addr_probe_family(int fd, const uint8_t *src, uint16_t src_port
     const uint8_t *dst, uint16_t dst_port_be, uint8_t transport, uint8_t family,
     const uint8_t trial_id[D2K_TRIAL_ID_LEN], uint32_t lease_ms,
     const char *plan_hex, char *err, size_t errcap);
+int d2k_link_set_dns_probe(int,const uint8_t *,uint16_t,const uint8_t *,uint16_t,
+    uint8_t,uint8_t,const uint8_t [16],uint32_t,const char *,uint16_t,const uint8_t [32],
+    char *,size_t);
 int d2k_link_del_addr_probe_family(int fd, const uint8_t *src, uint16_t src_port_be,
     const uint8_t *dst, uint16_t dst_port_be, uint8_t transport, uint8_t family,
     const uint8_t trial_id[D2K_TRIAL_ID_LEN], char *err, size_t errcap);
@@ -478,6 +555,8 @@ int  d2k_link_del_addr(int fd, const uint8_t ip4[4], uint8_t shape,
  * прихода записей. Семь байт, засчитанные донором за обмен по Дискорду, —
  * это, вероятнее всего, ровно 7-байтовый TLS Alert (заголовок записи 5 байт
  * + 2 байта тела), то есть отказ. */
+/* Pure wire decoder, also used by network-free regressions. */
+int d2k_link_decode(uint16_t,const uint8_t *,size_t,d2k_ev *,char *,size_t);
 int d2k_ev_outer_appdata(const d2k_ev *ev);
 
 /* v6 area commands carry a correlation ID echoed in ACK.trial_id. */

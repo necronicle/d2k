@@ -14,6 +14,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync, execFileSync } = require('node:child_process');
 
+const engineFixture = require('./test-engine-fixture.cjs');
 const root = path.resolve(__dirname, '..');
 const tmp = fs.realpathSync(fs.mkdtempSync('/tmp/install-release-test.'));
 const sh = (body) => `#!/bin/sh\n${body}\n`;
@@ -98,8 +99,13 @@ exit 0`));
   for (const name of ['check-cpu.sh', 'select-panel-ip.sh']) fixture(`scripts/${name}`, sh('exit 0'));
   fixture('builds/d2kpanel-linux-amd64', sh('echo features=telegram-control'));
   fixture('builds/d2ktg-linux-amd64', sh('echo features=per-install-enrollment,instagram-ip-probe,meta-hosts-v3'));
-  fixture('builds/d2kd-linux-amd64', sh('exit 0'));
-  fixture('builds/d2kc-linux-amd64', sh('exit 2'));
+  fixture('builds/d2kd-linux-amd64', engineFixture('d2kd'));
+  fixture('builds/d2kshadow-linux-amd64', sh('exit 2'));
+  for (const profile of ['modern', 'legacy']) {
+    const file = `core/profiles/${profile}.hex`;
+    fixture(file, fs.readFileSync(path.join(root, file)));
+  }
+  fixture('builds/d2kc-linux-amd64', engineFixture('d2kc'));
   fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch ${D2K_RELEASE_ID:-dev}'));
   fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
@@ -143,7 +149,7 @@ exit 0`));
   function publish({ sum, arch = 'amd64', sign = true } = {}) {
     const tar = path.join(src, rid, 'd2k-amd64.tar.gz');
     fs.mkdirSync(path.dirname(tar), { recursive: true });
-    execFileSync('tar', ['-czf', tar, '-C', src, 'builds', 'scripts', 'files', 'internal']);
+    execFileSync('tar', ['-czf', tar, '-C', src, 'builds', 'scripts', 'files', 'internal', 'core']);
     const real = execFileSync(openssl, ['dgst', '-sha256', '-r', tar]).toString().split(' ')[0];
     const latest = path.join(src, 'latest/latest.json');
     fs.mkdirSync(path.dirname(latest), { recursive: true });
@@ -218,6 +224,25 @@ exit 0`));
   fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch ${D2K_RELEASE_ID:-dev}'));
 
   const before = fs.readFileSync(d2kd);
+  for (const [controller, datapath] of [
+    [engineFixture('d2kc', rid), engineFixture('d2kd', 'dev')],
+    [engineFixture('d2kc', rid, 32), engineFixture('d2kd', rid, 33)],
+    [engineFixture('d2kc', 'dev'), engineFixture('d2kd', 'dev')],
+    [engineFixture('d2kc', rid, ''), engineFixture('d2kd', rid, '')],
+  ]) {
+    fixture('builds/d2kc-linux-amd64', controller);
+    fixture('builds/d2kd-linux-amd64', datapath);
+    publish();
+    reset();
+    const mixed = run();
+    assert.notEqual(mixed.status, 0, 'несовместимый комплект должен быть отклонён');
+    assert.match(mixed.stdout + mixed.stderr, /верси[яи] движка/);
+    assert(!read(calls).includes('service-stop'), 'отказ до остановки службы');
+    assert.deepEqual(fs.readFileSync(d2kd), before);
+  }
+  fixture('builds/d2kc-linux-amd64', engineFixture('d2kc'));
+  fixture('builds/d2kd-linux-amd64', engineFixture('d2kd'));
+
   publish({ sign: false });
   reset();
   let bad = run();

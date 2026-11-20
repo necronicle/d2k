@@ -11,12 +11,14 @@
  * первом же пакете, потому что у последнего атрибута хвоста выравнивания в
  * буфере не оказалось, а счётчик размера беззнаковый.
  */
+#include "include/d2k_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "d2k_plan.h"
 #include "plan_internal.h"
+#include "d2k_preflight_plan.h"
 
 #define HEADER_LEN 12
 
@@ -39,7 +41,7 @@ static void fail(char *err, size_t errlen, const char *msg) {
  * наращивать массивы по ходу. Проход дешёвый, а realloc в датапате — лишний
  * источник ошибок. */
 struct counts {
-    size_t payloads, poisons, splits, fakes, seqovls, oob;
+    size_t payloads, poisons, splits, fakes, seqovls, oob, stream_offset,after_split,preflight,pf_resyn,pf_handover;
 };
 
 static int scan(const uint8_t *b, size_t len, struct counts *c,
@@ -66,6 +68,30 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             fail(err, errlen, "измеренный план требует minexec=3"); return -1;
         }
         switch (typ) {
+        case REC_HANDOVER_APPLY:
+            if(rd16(b+6)<20 || ln!=1 || b[off]!=1 || ++c->pf_handover>1) {
+                fail(err,errlen,"invalid handover apply or minexec");return -1;
+            }
+            break;
+        case REC_PREFLIGHT_RESYN:
+            if(rd16(b+6)<19 || ln!=7 || ++c->pf_resyn>1 || !rd16(b+off) ||
+               rd16(b+off)>4999 || !b[off+2] || !rd32(b+off+3) ||
+               rd32(b+off+3)>D2K_PF_EXEC_MAX_TIMEOUT_MS ||
+               rd32(b+off+3)<(uint64_t)rd16(b+off)*b[off+2]) {
+                fail(err,errlen,"invalid preflight resyn timing or minexec");return -1;
+            }
+            break;
+        case REC_PREFLIGHT:
+            if(rd16(b+6)<18 || ln<11 || ln>264 || ++c->preflight>1 ||
+               !rd16(b+off) || b[off+2]>14 || !b[off+3] || b[off+4]>1 ||
+               rd32(b+off+5)<1000 || rd32(b+off+5)>(rd16(b+6)<19 ? 5000u : D2K_PF_EXEC_MAX_TIMEOUT_MS) ||
+               (!rd16(b+off+9)) || (b[off+4] ? ln!=11 : ln==11)) {
+                fail(err,errlen,"invalid preflight parameters or minexec");return -1;
+            }
+            if(!b[off+4] && !d2k_pf_name_valid(b+off+11,ln-11)) {
+                fail(err,errlen,"invalid preflight white name");return -1;
+            }
+            break;
         case REC_IPFRAG:
             if (rd16(b + 6) < 7 || ln != 1 || b[off] < 1 || b[off] > 4) {
                 fail(err, errlen, "ipfrag требует minexec=7 и форму 1..4"); return -1;
@@ -93,7 +119,7 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             }
             break;
         case REC_OOB:
-            if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SNI_MIDDLE) {
+            if (rd16(b + 6) < 8 || ln != 3 || rd16(b + off) > ANCHOR_SLD_MIDDLE) {
                 fail(err, errlen, "oob требует minexec=8, якорь и один байт"); return -1;
             }
             c->oob++;
@@ -116,9 +142,15 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             c->payloads++;
             break;
         case REC_POISON:
-            if (ln != 8) { fail(err, errlen, "порча не 8 байт"); return -1; }
+            if (ln != 8 && ln != 12) { fail(err, errlen, "poison must be 8 or 12 bytes"); return -1; }
+            if (ln == 12 && rd16(b + 6) < 14) {
+                fail(err, errlen, "ackshift requires minexec=14"); return -1;
+            }
             if ((b[off + 3] & D2K_POISON_MD5) && rd16(b + 6) < 12) {
                 fail(err, errlen, "md5 требует minexec=12"); return -1;
+            }
+            if ((b[off + 3] & D2K_POISON_MD5_TS) && rd16(b + 6) < 15) {
+                fail(err, errlen, "md5ts требует minexec=15"); return -1;
             }
             c->poisons++;
             break;
@@ -183,6 +215,19 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
                 fail(err, errlen, "input tls-sni требует minexec=5 и пустую запись"); return -1;
             }
             break;
+        case REC_STREAM_OFFSET:
+            if(rd16(b+6)<16 || ln!=4 || rd32(b+off)>=UINT32_C(0x80000000) || c->stream_offset++) {
+                fail(err,errlen,"invalid or duplicate stream-offset, requires minexec=16");return -1;
+            }
+            break;
+        case REC_AFTER_SPLIT:
+            if(rd16(b+6)<17 || ln!=12 || c->after_split++ || !rd32(b+off) ||
+               rd32(b+off)>=UINT32_C(0x80000000) || rd32(b+off+4)<2 || rd32(b+off+4)>65535 ||
+               rd32(b+off+4)>=UINT32_C(0x80000000)-rd32(b+off) ||
+               !rd32(b+off+8) || rd32(b+off+8)>=rd32(b+off+4) || rd32(b+off+8)>32767) {
+                fail(err,errlen,"invalid or duplicate after-split, requires minexec=17");return -1;
+            }
+            break;
         case REC_SETTLE:
             if (ln != 4 || rd32(b + off) == 0) {
                 fail(err, errlen, "недопустимая пауза перед правдой"); return -1;
@@ -221,11 +266,24 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
 
 /* Ссылки обязаны разрешаться. Ноль означает «ничего» и висячей ссылкой не
  * является: фальшивка без порчи законна. */
-static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
+static int check_refs(d2k_plan *p, char *err, size_t errlen) {
+    if(p->after_length && (p->transport!=6 || p->proto!=1 ||
+       p->has_stream_offset || !p->input_len || p->input_len>p->after_offset ||
+       (p->wire_profile!=D2K_WIRE_DETECT_TCP && p->wire_profile!=D2K_WIRE_TCP_TEMPLATE))) {
+        fail(err,errlen,"after-split requires exact first TCP/TLS input and a TCP wire profile");return -1;
+    }
     for (size_t i = 0; i < p->n_poisons; i++) {
+        if (p->poisons[i].ack_shift && p->transport != 6) {
+            fail(err, errlen, "ackshift requires TCP"); return -1;
+        }
         if ((p->poisons[i].flags & D2K_POISON_MD5) &&
             (p->minexec < 12 || p->transport != 6 || p->wire_profile != D2K_WIRE_DETECT_TCP)) {
             fail(err, errlen, "md5 требует minexec=12 и wire detect-tcp-v1 TCP");
+            return -1;
+        }
+        if ((p->poisons[i].flags & D2K_POISON_MD5_TS) &&
+            (p->minexec < 15 || p->transport != 6 || p->wire_profile != D2K_WIRE_DETECT_TCP)) {
+            fail(err, errlen, "md5ts требует minexec=15 и wire detect-tcp-v1 TCP");
             return -1;
         }
     }
@@ -262,6 +320,26 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         fail(err, errlen, "quicdeny требует UDP и план без воздействий");
         return -1;
     }
+    if(p->pf_handover_apply && (!p->preflight || p->minexec<20)) {
+        fail(err,errlen,"handover apply requires preflight and minexec=20");return -1;
+    }
+    if(p->preflight && (p->minexec<18 || p->transport!=6 || p->proto!=1)) {
+        fail(err,errlen,"preflight requires TCP/TLS and minexec=18");return -1;
+    }
+    if(p->preflight && !p->pf_handover_apply && (
+       p->n_payloads!=1 || p->n_poisons || p->n_splits || p->n_fakes || p->n_seqovls ||
+       p->order || p->guards || p->pace_us || p->input_len || p->settle_us || p->segment_size ||
+       p->wire_profile || p->input_tls || p->has_stream_offset || p->after_length ||
+       p->delay_us || p->ipfrag || p->oob_enabled || p->udplen || p->qsplit || p->qdeny)) {
+        fail(err,errlen,"preflight requires minexec=18 and a standalone TCP/TLS plan");return -1;
+    }
+    if(p->preflight) {
+        const struct d2k_payload *hello=d2k_find_payload(p,p->pf_data);
+        if(!hello || !hello->len || hello->len>D2K_CAPTURE_BYTES) {
+            fail(err,errlen,"preflight needs its referenced hello payload, 1..4096 bytes");return -1;
+        }
+        p->pf_hello=hello->bytes;p->pf_hello_len=hello->len;
+    }
     if (p->oob_enabled && (p->minexec < 8 || p->transport != 6 || p->proto != 1 ||
         !p->input_tls || !p->wire_profile || p->n_splits || p->n_seqovls || p->n_fakes ||
         p->ipfrag || p->pace_us || p->settle_us || p->delay_us)) {
@@ -293,6 +371,9 @@ static int check_refs(const d2k_plan *p, char *err, size_t errlen) {
         }
     }
 
+    if (p->pf_resyn_delay_ms && (!p->preflight || p->pf_resyn_timeout_ms>=p->pf_timeout_ms)) {
+        fail(err,errlen,"resyn timing requires preflight and a delay below its timeout");return -1;
+    }
     /* Фальшивке «между кусками» нужны куски. План, который просит положить её
        туда, где кусков нет, невыполним — и отвергается здесь, а не
        приближается размещением «перед всеми». Приблизить неподдерживаемую
@@ -410,6 +491,17 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         off += 4 + ln;
 
         switch (typ) {
+        case REC_PREFLIGHT_RESYN:
+            p->pf_resyn_delay_ms=rd16(v);p->pf_resyn_sends=v[2];p->pf_resyn_timeout_ms=rd32(v+3);
+            break;
+        case REC_PREFLIGHT:
+            p->preflight=1;p->pf_window=rd16(v);p->pf_wscale=v[2];p->pf_pieces=v[3];
+            p->pf_hello_own=v[4];p->pf_timeout_ms=rd32(v+5);
+            p->pf_data=rd16(v+9);
+            memcpy(p->pf_name,v+11,ln-11);p->pf_name[ln-11]=0;
+            break;
+        case REC_HANDOVER_APPLY:
+            p->pf_handover_apply=1;break;
         case REC_IPFRAG:
             if (p->ipfrag) {
                 d2k_plan_free(p); fail(err, errlen, "повторная запись ipfrag"); return -1;
@@ -468,6 +560,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             po->flags = v[3];
             po->ts_up = (v[3] & D2K_POISON_TS_UP) ? 1 : 0;
             po->seq_shift = (int32_t)rd32(v + 4);
+            po->ack_shift = ln == 12 ? (int32_t)rd32(v + 8) : 0;
             break;
         }
         case REC_AUTOTTL: {
@@ -478,7 +571,11 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
             for (size_t k = 0; k < p->n_poisons; k++) {
                 if (p->poisons[k].id == pid) { po = &p->poisons[k]; break; }
             }
-            if (!po) { fail(err, errlen, "autottl ссылается на неизвестную порчу"); return -1; }
+            if (!po) {
+                d2k_plan_free(p);
+                fail(err, errlen, "autottl ссылается на неизвестную порчу");
+                return -1;
+            }
             po->autottl = 1;
             po->autottl_delta = (int8_t)v[2];
             po->autottl_min = v[3];
@@ -529,6 +626,12 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         case REC_INPUT_TLS:
             p->input_tls = 1;
             break;
+        case REC_STREAM_OFFSET:
+            p->has_stream_offset=1;p->stream_offset=rd32(v);
+            break;
+        case REC_AFTER_SPLIT:
+            p->after_offset=rd32(v);p->after_length=rd32(v+4);p->after_cut=rd32(v+8);
+            break;
         case REC_WIRE:
             p->wire_profile = v[0];
             break;
@@ -555,7 +658,7 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         d2k_plan_free(p);
         return -1;
     }
-    if (p->transport != 6 && (p->input_len || p->input_tls || p->settle_us || p->segment_size || p->wire_profile)) {
+    if (p->transport != 6 && (p->has_stream_offset || p->input_len || p->input_tls || p->settle_us || p->segment_size || p->wire_profile)) {
         d2k_plan_free(p);
         fail(err, errlen, "измеренные TCP-операции требуют явного транспорта TCP");
         return -1;
@@ -592,10 +695,34 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p) {
 }
 
 uint8_t d2k_plan_flow_needs(const d2k_plan *p) {
-    if (!p || p->wire_profile != D2K_WIRE_TCP_TEMPLATE) {
-        return 0;
+    if (!p) { return 0; }
+    uint8_t used = d2k_plan_poison_used(p);
+    uint8_t need = 0;
+    /* Профиль tcp-template-v1 со сдвигом метки исполним только на потоке,
+       предлагающем метку. */
+    if (p->wire_profile == D2K_WIRE_TCP_TEMPLATE && (used & D2K_POISON_TCPTS_BACK)) {
+        need |= D2K_FLOW_NEED_TCPTS;
     }
-    return (d2k_plan_poison_used(p) & D2K_POISON_TCPTS_BACK) ? D2K_FLOW_NEED_TCPTS : 0;
+    /* MD5+метка несёт РЕАЛЬНУЮ метку потока даже на измеренном профиле
+       detect-tcp-v1: без метки у клиента подделать её нечем — поток требует
+       метку, и контроллер перемеряет цель для такого клиента (как issue #7). */
+    if (used & D2K_POISON_MD5_TS) {
+        need |= D2K_FLOW_NEED_TCPTS;
+    }
+    return need;
+}
+
+int d2k_plan_stream_offset(const d2k_plan *p, uint32_t *offset) {
+    if(!p || !p->has_stream_offset)return 0;
+    if(offset)*offset=p->stream_offset;
+    return 1;
+}
+int d2k_plan_after_split(const d2k_plan *p,uint32_t *offset,uint32_t *length,uint32_t *cut) {
+    if(!p || !p->after_length)return 0;
+    if(offset)*offset=p->after_offset;
+    if(length)*length=p->after_length;
+    if(cut)*cut=p->after_cut;
+    return 1;
 }
 
 int d2k_plan_quic_deny(const d2k_plan *p) {

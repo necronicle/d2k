@@ -44,7 +44,14 @@
  * чтобы клиент ушёл на TCP; это не обход QUIC. Старый исполнитель такие
  * планы не принимает. */
 /* Version 12: raw TCP-MD5 poison in detect-tcp-v1. */
-#define D2K_EXEC_VERSION 13
+/* Version 14: independent TCP ACK shift in extended poison records. */
+/* Version 15: MD5-first + timestamp fake option layout (D2K_POISON_MD5_TS). */
+/* Version 16: explicit offset from the first TCP data byte, never inferred
+ * from a packet's absolute sequence number or its application protocol. */
+/* Version 18: TCP preflight program (window, scale, pieces, hello payload reference, timeout). */
+/* Version 19: explicit delayed SYN handover and finite retry count. */
+/* Version 20: explicit outgoing program after owned preflight handover. */
+#define D2K_EXEC_VERSION 20
 #define D2K_PLAN_PROTO_HTTP 4
 /* Shared result capacity for measured and live packet programs. */
 #define D2K_WIRE_BATCH_MAX 26
@@ -87,6 +94,17 @@ typedef enum {
  * не отдельной записью, потому что живёт ровно там же, где TCPTS_BACK, и
  * без неё смысла не имеет. */
 #define D2K_POISON_TS_UP      (1u << 4)
+
+/* MD5-первой + метка времени, как собирает nfqws1
+ * (tcp_md5:tcp_ts_up:tcp_md5_first): опция MD5 (kind 19, len 18) ПЕРВОЙ, за
+ * ней метка времени (kind 8, len 10). 18+10 = 28 байт, уже кратно четырём —
+ * добивка не нужна; если бы понадобилась, добивать NOP, а не EOL (донор
+ * 74725023). ОТДЕЛЬНЫЙ БИТ, а не сочетание MD5|TCPTS_BACK: это сочетание
+ * исторически значит «MD5 ЗАМЕЩАЕТ опции, метку отбрасывает» (test_measured
+ * md5_wire это закрепляет), и менять его молча нельзя. Только измеренная
+ * гипотеза профиля detect-tcp-v1, minexec=15. MD5-одиночка (бит 3) не
+ * трогается. */
+#define D2K_POISON_MD5_TS     (1u << 5)
 
 /* Защита потока от подделанных ответов. Не порча и не преобразование
  * исходящего: это решение о ЧУЖОМ входящем пакете, и потому отдельное поле.
@@ -131,6 +149,7 @@ typedef struct {
     uint8_t  autottl_max;
     uint8_t  poison;     /* биты D2K_POISON_* */
     int32_t  seq_shift;
+    int32_t  ack_shift;
     uint8_t  wire_profile; /* 0 legacy, D2K_WIRE_DETECT_TCP measured raw TCP */
     /* Original QUIC IPv4 fragment shape 1..4; zero = whole datagram.
        One PAYLOAD action owns the entire UDP datagram. Session expands it
@@ -191,9 +210,19 @@ typedef struct {
        уходил повтор клиента без плана. Без фальшивок гонки нет — флаг ничего
        не меняет. */
     int      own_after_fakes;
+    /* Raw experiments have no queued kernel original to ACCEPT. */
+    int      emit_original;
     /* Вход — запрос HTTP (sni_off/sni_len — имя в Host). План протокола
        http исполняется только на таком входе, иной план — только на ином. */
     int      is_http;
+    int      have_stream_offset;
+    uint32_t stream_offset;
+    /* Session-authorized retransmission of an already completed late range. */
+    int after_split_retry;
+    /* Optional immutable complete IP packet for preflight (not payload).
+     * Borrowed for the duration of the call; existing Plan users omit it. */
+    const uint8_t *wire;
+    size_t wire_len;
 } d2k_pkt;
 
 /* Состояние потока определяется в d2k_track.h. Здесь только опережающее
@@ -263,6 +292,10 @@ uint8_t d2k_plan_poison_used(const d2k_plan *p);
  * метку сам и от потока ничего не требует. */
 #define D2K_FLOW_NEED_TCPTS (1u << 0)
 uint8_t d2k_plan_flow_needs(const d2k_plan *p);
+/* 1 for an explicit TCP stream coordinate, 0 for an unscoped plan. */
+int d2k_plan_stream_offset(const d2k_plan *p, uint32_t *offset);
+/* Additional measured request partition; first-input actions remain intact. */
+int d2k_plan_after_split(const d2k_plan *,uint32_t *,uint32_t *,uint32_t *);
 
 /* САМАЯ ДЛИННАЯ ПОСЫЛКА, которую план объявляет САМ, в байтах на проводе —
  * вместе с заголовками и опциями, то есть ровно то число, которое увидит

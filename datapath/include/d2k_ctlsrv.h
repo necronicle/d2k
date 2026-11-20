@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "d2k_ctl.h"
+#include "d2k_rawmeasure_wire.h"
 /* Только ради констант D2K_RAW_CANT_*: сам d2k_raw.c — Linux, а его
  * заголовок переносим и объявляет пределы способа отправки. */
 #include "d2k_raw.h"
@@ -55,7 +56,35 @@ typedef struct {
     /* Имена с подтверждённым HTTPS (D2K_CMD_SET_HTTPS). NULL — команда
        отвергается. */
     d2k_http80  *http80;
+    /* ПОЗДНЯЯ ДОСТАВКА (этап 17): кому сказать об установке/снятии опыта
+       на ТОЧНОМ потоке — d2kd ставит/снимает метку записи conntrack, чтобы
+       пакеты уже идущего потока (за окном connbytes) попадали в очередь.
+       NULL — никому. installed 1 — поставлен (expires_ns — срок, 0 — без
+       срока у команды), 0 — снят. Адресная проба несёт 5-tuple; именная
+       проба порта (TCP без протокола, этап 12) — имя-адрес, транспорт,
+       семейство и порт клиента. Зовётся ПОСЛЕ успешной записи в таблицу. */
+    void (*addr_probe_hook)(void *ctx, const d2k_addr_probe_flow *flow,
+                            uint64_t expires_ns, int installed);
+    void (*name_probe_hook)(void *ctx, const uint8_t *name, size_t len,
+                            uint8_t transport, uint8_t family, uint16_t sport_be,
+                            uint64_t expires_ns, int installed);
+    void *probe_hook_ctx;
+    /* ПОЗДНЕЕ НАБЛЮДЕНИЕ ТОЧНОГО ПОТОКА (этап 49, D2K_CMD_LATE_OBSERVE): d2kd
+       ставит метку и наблюдает; итог он сам кладёт в журнал. NULL — наблюдать
+       нечем: ctlsrv сразу пишет итог «недоступно». */
+    void (*late_observe_hook)(void *ctx, const d2k_ct_tuple *t, uint32_t seconds,
+                              const uint8_t token[D2K_TRIAL_ID_LEN]);
+    /* Контроллер отключился (этап 53): отменить его наблюдения и опыты сразу,
+       по событию, а не следующим тактом. NULL — нечего. */
+    void (*peer_closed_hook)(void *ctx);
+    /* Hook must validate live connection identity and acknowledge only after
+       delivery is ready. Absence is an explicit unavailable response. */
+    void (*raw_measure_hook)(void *ctx, const struct d2k_rawmeasure_request *request);
 } d2k_ctlsrv;
+
+/* Подтверждение D2K_CMD_LATE_OBSERVE (этап 53): шлёт модуль поздней доставки,
+   когда доставка своего поколения готова (ok) или поставить её не удалось. */
+void d2k_ctlsrv_ack_late(d2k_ctlsrv *cx, int ok, uint8_t reason, const uint8_t token[D2K_TRIAL_ID_LEN]);
 
 /* Может ли способ отправки исполнить план ЧЕСТНО — не «примерно».
  * §2.5 запрещает молча приближать неподдерживаемую операцию другой.
@@ -72,10 +101,22 @@ int d2k_plan_fits(const d2k_plan *p, uint32_t send_limits, uint32_t send_maxlen,
  * контроллеру вместе с версией: без него тот собирает планы, не зная, что
  * унесёт канал (см. D2K_EV_PROTO в d2k_ctl.h). */
 void d2k_ctlsrv_greet(d2k_ctl *ctl, uint32_t send_maxlen);
+/* Счётчики канала (D2K_EV_STATS): сколько событий датапат потерял и сколько
+ * отправил. Тот же ключ без потока, что у приветствия и ACK: кадр с нулевым
+ * семейством контроллер отвергает. Зовётся раз в секунду из d2kd. */
+void d2k_ctlsrv_stats(d2k_ctl *ctl);
 void d2k_ctlsrv_peer_closed(void *ctx);
 
 /* Обработчик для d2k_ctl_poll. ctx — d2k_ctlsrv *. */
 void d2k_ctlsrv_command(void *ctx, uint16_t type, const uint8_t *body, size_t len);
+/* Обработчик второго (опытного) управляющего: только пробный план на
+   местный порт потока опыта и его снятие; остальное — отказ. */
+void d2k_ctlsrv_command_exp(void *ctx, uint16_t type, const uint8_t *body, size_t len);
+/* Four shadow workers plus a manual experiment and reconnect headroom.
+ * Resource ceiling on independent input/output buffers, not a search budget. */
+#define D2K_EXP_PEERS_MAX 8u
+/* Forget stream ownership before freeing/reusing a disconnected peer. */
+void d2k_ctlsrv_forget_exp_ctl(d2k_ctl *x);
 
 /* Выкладывает контроллеру записи журнала, появившиеся с прошлого раза.
  * *seen — курсор вызывающего по счётчику «добавлено за всё время». Если
@@ -85,4 +126,8 @@ void d2k_ctlsrv_pump(d2k_ctl *ctl, const d2k_session *s, uint64_t *seen);
 
 void d2k_ctlsrv_http80_event(d2k_ctl *,const d2k_http80_res *);
 
+#define D2K_RAWMEASURE_EMITTER 1
+int d2k_ctlsrv_raw_measure(d2k_ctlsrv *, const struct d2k_rawmeasure_report *);
+void d2k_ctlsrv_ack_raw_measure(d2k_ctlsrv *, int ok, uint8_t reason,
+                                const uint8_t token[D2K_TRIAL_ID_LEN]);
 #endif /* D2K_CTLSRV_H */

@@ -7,6 +7,8 @@
 #include "d2k_capture.h"
 #define D2K_HOLD_TLS 1
 #define D2K_HOLD_HTTP 2
+#define D2K_HOLD_EXACT_BASE 3
+#define D2K_HOLD_EXACT(length) ((int)(length)+D2K_HOLD_EXACT_BASE)
 #define D2K_HOLD_SLOTS 16
 #define D2K_HOLD_IDS 8
 #define D2K_HOLD_PACKET 1600
@@ -46,7 +48,8 @@ d2k_hold *d2k_hold_new(void);
 void d2k_hold_free(d2k_hold *h); /* flush ALL first */
 /* 0 PASS (caller owns current ID), 1 WAIT/RELEASED (module consumed ID),
  * 2 READY (caller owns exactly batch.ids, including current ID).
- * allow_start is 0 or D2K_HOLD_TLS/HTTP: a prefilter, NOT execution authority.
+ * allow_start is 0, D2K_HOLD_TLS/HTTP or D2K_HOLD_EXACT(measured_length):
+ * a prefilter, NOT execution authority. Exact collection requires an anchor.
  * Existing groups always consume tails even when allow_start is false.
  */
 /* anchor/have_anchor — известное начало входа плана: SYN+1 для TLS или

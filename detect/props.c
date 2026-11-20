@@ -21,8 +21,8 @@
  * здесь — перечисление, потому что каждый случай записан явным литералом и
  * читать их полезнее списком, чем через указатель на функцию. */
 typedef enum {
-    SET_LEFT_OVERLAP,   /* проход → не терпит перекрытие; промах → терпит */
-    SET_REORDER,        /* проход → не терпит порядок;     промах → терпит */
+    SET_LEFT_OVERLAP,   /* ТОЛЬКО по проходу; промах неоднозначен */
+    SET_REORDER,        /* ТОЛЬКО по проходу; промах неоднозначен */
     SET_CHECKSUM,       /* ТОЛЬКО по проходу */
     SET_PARSES_L7,      /* ТОЛЬКО по проходу */
     SET_DUPLICATES,     /* ТОЛЬКО по проходу */
@@ -32,7 +32,8 @@ typedef enum {
     SET_TIMESTAMPS,     /* ТОЛЬКО по проходу */
     SET_OVERLAP_SNI,    /* ТОЛЬКО по проходу */
     SET_DUP_DENSE,      /* ТОЛЬКО по проходу, то же поле, что SET_DUPLICATES */
-    SET_WHITE_TS        /* проход → не сверяет метку И разбирает L7 (белое имя) */
+    SET_WHITE_TS,       /* проход → не сверяет метку И разбирает L7 (белое имя) */
+    SET_URGENT          /* ТОЛЬКО по проходу: не учитывает срочный байт TCP */
 } prop_set;
 
 typedef struct {
@@ -44,7 +45,7 @@ typedef struct {
 /* СКОЛЬКО ВОПРОСОВ О СВОЙСТВАХ. Одна константа на массив, его обнуление и
    вызов: прежде число 12 стояло в четырёх местах, и добавление вопроса писало
    за границу массива молча. */
-#define PROP_QUESTIONS 12
+#define PROP_QUESTIONS 13
 
 static int prop_probes(prop_probe *out, int cap)
 {
@@ -64,6 +65,24 @@ static int prop_probes(prop_probe *out, int cap)
     snprintf(out[k].p.name, sizeof(out[k].p.name), "disorder");
     out[k].p.disorder = 1;
     out[k].set = SET_REORDER;
+    k++;
+
+    /* СРОЧНЫЙ БАЙТ — ТРЕТЬИМ, И ЭТО МЕСТО ВЫБРАНО ЗАМЕРОМ (23.10.2026).
+     *
+     * Гистограмма 2933 полевых журналов (scripts/field19/sweep-histogram.py):
+     * этим приёмом взято 111 целей из 124 ВСЕХ попаданий запасного перебора,
+     * медиана шесть зондов. Вопроса о нём в опросе не было вовсе — значит
+     * перебор был не страховкой, а основным поставщиком решений для этого
+     * класса коробок, и каждое его попадание было промахом классификатора
+     * (§0.1 ТЗ: повод добавить вопрос о свойстве, которое его объясняет).
+     *
+     * Пишется ТОЛЬКО по проходу: взяла зонд со срочным байтом в середине имени
+     * — значит прочла имя с лишним байтом и не узнала его, тогда как сервер
+     * этот байт из потока уберёт. Промах объясняется чем угодно (§2.4). */
+    out[k].label = "срочный байт";
+    snprintf(out[k].p.name, sizeof(out[k].p.name), "oob");
+    out[k].p.oob = 1;
+    out[k].set = SET_URGENT;
     k++;
 
     /* Пишем ТОЛЬКО по проходу. Проход однозначен: коробка проглотила фальшивку
@@ -199,10 +218,10 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
 {
     switch (s) {
     case SET_LEFT_OVERLAP:
-        pr->tolerates_left_overlap = ok ? D2K_TRI_FALSE : D2K_TRI_TRUE;
+        if (ok) { pr->tolerates_left_overlap = D2K_TRI_FALSE; }
         break;
     case SET_REORDER:
-        pr->tolerates_reorder = ok ? D2K_TRI_FALSE : D2K_TRI_TRUE;
+        if (ok) { pr->tolerates_reorder = D2K_TRI_FALSE; }
         break;
     case SET_CHECKSUM:
         if (ok) {
@@ -240,6 +259,9 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
     case SET_DUP_DENSE:
         if (ok) { pr->counts_duplicates = D2K_TRI_TRUE; }
         break;
+    case SET_URGENT:
+        if (ok) { pr->handles_urgent = D2K_TRI_FALSE; }
+        break;
     case SET_WHITE_TS:
         /* Проход: коробка разобрала фальшивое ECH-приветствие (разбирает L7),
          * зацепившись за ECH-поток вместо имени. Про ПОРЧУ утверждаем только
@@ -256,12 +278,290 @@ static void apply_set(d2k_dprops *pr, prop_set s, int ok, const d2k_poison *p)
     }
 }
 
+/* ЗНАНИЕ О КОРОБКЕ ВМЕСТО ПОВТОРНОГО ВОПРОСА (23.10.2026).
+ *
+ * Возвращает записанный ответ на вопрос s и кладёт в pass_v то значение
+ * поля, которое означает ПРОХОД вопроса. D2K_PROP_UNKNOWN — знания нет.
+ *
+ * ПОЧЕМУ МИМО ПРОХОДИТ ТОЛЬКО ДВА ВОПРОСА. Промах пишется знанием лишь там,
+ * где он однозначен: приём не ломает коробку — значит она к нему терпима
+ * (d2k_note_props_miss). У остальных вопросов промах объясняется и разбором
+ * L7, и чем угодно ещё, поэтому их поля ставятся ТОЛЬКО по проходу (§2.4), и
+ * «известного промаха» у них не бывает по построению. Сокращать опрос
+ * догадкой о тишине здесь нельзя — это ровно та ошибка, от которой защищает
+ * тройственная логика. */
+static int8_t known_of(const d2k_box_props *k, prop_set s, int8_t *pass_v)
+{
+    switch (s) {
+    case SET_LEFT_OVERLAP: *pass_v = D2K_PROP_NO;  return k->tolerates_left_overlap;
+    case SET_REORDER:      *pass_v = D2K_PROP_NO;  return k->tolerates_reorder;
+    case SET_CHECKSUM:     *pass_v = D2K_PROP_NO;  return k->validates_checksum;
+    case SET_SYN:          *pass_v = D2K_PROP_NO;  return k->inspects_syn;
+    case SET_MD5:          *pass_v = D2K_PROP_NO;  return k->validates_md5;
+    case SET_SEQ_WINDOW:   *pass_v = D2K_PROP_NO;  return k->validates_seq_window;
+    case SET_TIMESTAMPS:   *pass_v = D2K_PROP_NO;  return k->validates_timestamps;
+    case SET_DUPLICATES:
+    case SET_DUP_DENSE:    *pass_v = D2K_PROP_YES; return k->counts_duplicates;
+    case SET_OVERLAP_SNI:  *pass_v = D2K_PROP_YES; return k->overlap_covers_sni;
+    case SET_URGENT:       *pass_v = D2K_PROP_NO;  return k->handles_urgent;
+    /* Два вопроса пишут ДВА поля из ОДНОГО факта (разбор протокола — parses_l7
+     * и сумму; ECH-приветствие под меткой — метку и parses_l7). По одному полю
+     * исход такого вопроса не восстановим: parses_l7=да мог записать и сосед.
+     * Поэтому знания о них здесь нет, и они задаются как раньше. */
+    case SET_PARSES_L7:
+    case SET_WHITE_TS:     break;
+    }
+    *pass_v = D2K_PROP_UNKNOWN;
+    return D2K_PROP_UNKNOWN;
+}
+
+/* Кладёт записанный ответ в вектор ПРОГОНА: дальше план собирается из него
+ * (d2k_compose_from_props), и потерять здесь знание значило бы снова
+ * предлагать приём, про который уже известно, что он не проходит. */
+static void known_into(d2k_dprops *pr, prop_set s, int8_t v)
+{
+    switch (s) {
+    case SET_LEFT_OVERLAP: pr->tolerates_left_overlap = (d2k_tri)v; break;
+    case SET_REORDER:      pr->tolerates_reorder = (d2k_tri)v; break;
+    case SET_CHECKSUM:     pr->validates_checksum = (d2k_tri)v; break;
+    case SET_SYN:          pr->inspects_syn = (d2k_tri)v; break;
+    case SET_MD5:          pr->validates_md5 = (d2k_tri)v; break;
+    case SET_SEQ_WINDOW:   pr->validates_seq_window = (d2k_tri)v; break;
+    case SET_TIMESTAMPS:   pr->validates_timestamps = (d2k_tri)v; break;
+    case SET_DUPLICATES:
+    case SET_DUP_DENSE:    pr->counts_duplicates = (d2k_tri)v; break;
+    case SET_OVERLAP_SNI:  pr->overlap_covers_sni = (d2k_tri)v; break;
+    case SET_URGENT:       pr->handles_urgent = (d2k_tri)v; break;
+    case SET_PARSES_L7:
+    case SET_WHITE_TS:     break;
+    }
+}
+
+/* РАССТОЯНИЕ ДО КОРОБКИ — ДВОИЧНЫМ ПОИСКОМ, А НЕ ЛЕСТНИЦЕЙ ИЗ СПИСКА
+ * (23.10.2026).
+ *
+ * ЧТО НЕ ТАК БЫЛО. Расстояние до коробки — её собственное свойство: она стоит
+ * на фиксированном числе хопов от нас, сколько бы целей за ней ни было. Но
+ * измерялось оно случайно: hop_ttl писался лишь тогда, когда в запасном
+ * переборе срабатывала одна из 19 гипотез с готовыми значениями TTL
+ * (ttl-62, ttl-60, …, badsum+ttl-8, disorder+badsum+ttl-50). Числа взяты из
+ * чужого поля, и на другой линии они мимо; а узнав рабочее значение, мы не
+ * узнавали САМО РАССТОЯНИЕ и на следующей цели той же коробки перебирали
+ * список заново.
+ *
+ * ЧТО ИЗМЕРЯЕМ. Фальшивка с TTL = T доходит до коробки, если T не меньше
+ * расстояния до неё, и НЕ доходит до сервера, если T меньше расстояния до
+ * сервера. Значит проход зонда — это отрезок [H, S−1], где H — расстояние до
+ * коробки, S — до сервера. Нижняя граница отрезка и есть H.
+ *
+ * БИТАЯ СУММА ДЕЛАЕТ ПРОХОД МОНОТОННЫМ, И ЭТО ГЛАВНОЕ. Верхняя граница
+ * отрезка существует только у ЧИСТОЙ фальшивки: доживи она до сервера, тот
+ * примет её за данные соединения и поток сломается. Фальшивка с БИТОЙ СУММОЙ
+ * безвредна и у сервера — он отбросит её сам, — поэтому проход у неё верен
+ * для всех T не меньше расстояния до коробки. Монотонный предикат ищется
+ * чистым делением: шесть зондов, ни одного числа из чужого поля.
+ *
+ * Битую сумму коробка должна глотать, и это известно из вектора: если она
+ * сумму СВЕРЯЕТ, фальшивку с битой суммой она не возьмёт, и тогда остаётся
+ * чистая — с отрезком вместо монотонности и с лестницей, которая этот отрезок
+ * ищет. Лестница плотная сверху: там окно узкое (коробка близко к серверу), и
+ * чисто геометрическая лестница окно [60, 61] пропускала целиком.
+ *
+ * ПОИСК — ОДНИМ ЗОНДОМ НА ШАГ, ИЗМЕРЕНИЕ — ЕДИНОГЛАСИЕМ. Шаги лестницы и
+ * деления отвечают на вопрос «куда идти», и платить за каждый тремя зондами
+ * значило бы втрое дороже за дорогу, а не за ответ: найденное число всё равно
+ * проверяется повторами в конце, и невоспроизводимость там и видна. Разница
+ * та же, что между поиском и замером во всём остальном коде.
+ *
+ * ЕДИНОГЛАСИЕ И НЕВОСПРОИЗВОДИМОСТЬ — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО У ПОИСКА РАЗРЕЗА
+ * (classify.c): шаг решён, только если прошли все повторы либо не прошёл ни
+ * один. Разошлись — величина НЕ ИЗМЕРЕНА (возврат 0), а не усреднена:
+ * фальшивка с усреднённым TTL либо не дойдёт до коробки, либо дойдёт до
+ * сервера, и план по такому числу не исполнится ни в одном из двух случаев.
+ * Локальный отказ зонда — тоже «не измерено» (§2.4). */
+#define D2K_HOP_CEIL 62
+
+/* Один шаг поиска: 1 — прошли все повторы, 0 — ни один, -1 — не решено
+ * (повторы разошлись либо зонд не ушёл). */
+static int hop_step(const uint8_t *ip4, uint8_t family, uint16_t port,
+                    const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res,
+                    int ttl, int reps, int badsum)
+{
+    d2k_poison p;
+    d2k_obs *obs;
+    char err[160];
+    char label[160];
+    int j, pass = 0, done = 0;
+
+    if (reps <= 0) { reps = 1; }
+    memset(&p, 0, sizeof p);
+    p.ttl = ttl;
+    p.badsum = badsum ? 1 : 0;
+    snprintf(p.name, sizeof p.name, badsum ? "badsum+ttl-%d" : "ttl-%d", ttl);
+    snprintf(label, sizeof label, "свойство:расстояние до коробки, TTL %d%s", ttl,
+             badsum ? ", битая сумма" : "");
+    obs = d2k_trace_add(res, label);
+    struct { int kind, ttl, repeats, badsum; } cache_key = {4, ttl, reps, !!badsum};
+    d2k_run_entry *cached = d2k_run_cache_get(opt->run_cache,
+        &cache_key, sizeof cache_key, NULL, 0);
+    if (cached && !d2k_detect_stopped(&opt->cancel) &&
+        ((cached->pass == reps && cached->fail == 0) ||
+         (cached->pass == 0 && cached->fail > 0))) {
+        obs->pass = cached->pass;
+        obs->fail = cached->fail;
+        obs->seeded = 1;
+        if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
+        return cached->pass == reps ? 1 : 0;
+    }
+    for (j = 0; j < reps; j++) {
+        int rc = d2k_raw_probe_poison_family(ip4, family, port, tr, &p, opt->timeout_ms,
+                                             opt->mark, &opt->cancel, err, sizeof err);
+        res->probes++;
+        done++;
+        d2k_raw_note_rc(res, family, rc);
+        if (rc < 0) {
+            if (obs->err[0] == '\0') { snprintf(obs->err, sizeof obs->err, "%s", err); }
+            obs->fail = done - pass;
+            if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
+            return -1;
+        }
+        if (rc > 0) { pass++; continue; }
+        /* ПЕРВЫЙ ПРОВАЛ РЕШАЕТ: единогласие уже недостижимо, и остальные
+           повторы его не вернут — тем же правилом, что в переборе отрав. */
+        break;
+    }
+    obs->pass = pass;
+    obs->fail = done - pass;
+    if (!d2k_detect_stopped(&opt->cancel) && (pass == reps || pass == 0)) {
+        d2k_run_cache_put(opt->run_cache, &cache_key, sizeof cache_key,
+                          NULL, 0, obs->pass, obs->fail);
+    }
+    if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
+    if (pass == reps) { return 1; }
+    if (pass == 0) { return 0; }
+    return -1; /* повторы разошлись — шаг не решён */
+}
+
+int d2k_hop_search(const uint8_t *ip4, uint8_t family, uint16_t port,
+                   const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res)
+{
+    /* Сумму коробка сверяет — битую фальшивку не возьмёт; иначе берём её и
+       получаем монотонный проход. «Не измерено» здесь читается как «можно
+       пробовать»: промах на первом же зонде стоит один зонд и сразу уводит на
+       чистую фальшивку. */
+    int badsum = opt && opt->known.validates_checksum != D2K_PROP_YES;
+    if (badsum) {
+        int lo = 0, hi = D2K_HOP_CEIL;
+        if (d2k_detect_stopped(&opt->cancel)) { return 0; }
+        /* Потолок обязан проходить: иначе фальшивку с битой суммой не глотает
+           ни коробка (и тогда лестница ниже бесполезна), ни путь. */
+        if (hop_step(ip4, family, port, tr, opt, res, hi, 1, 1) == 1) {
+            while (hi - lo > 1) {
+                int mid = (lo + hi) / 2;
+                int rc;
+                if (d2k_detect_stopped(&opt->cancel)) { return 0; }
+                rc = hop_step(ip4, family, port, tr, opt, res, mid, 1, 1);
+                if (rc < 0) { return 0; }
+                if (rc > 0) { hi = mid; } else { lo = mid; }
+            }
+            if (hop_step(ip4, family, port, tr, opt, res, hi, opt->repeats, 1) != 1) { return 0; }
+            res->props.hop_ttl = hi;
+            /* Сумму коробка не сверяет — это тот же факт, добытый этим же
+               зондом, и терять его незачем (§2.4: пишем только по проходу). */
+            res->props.validates_checksum = D2K_TRI_FALSE;
+            return hi;
+        }
+        /* Битую сумму не взяла — дальше чистой фальшивкой, с отрезком. */
+    }
+
+    /* ЛЕСТНИЦА ПОИСКА ОТРЕЗКА — ПЛОТНАЯ СВЕРХУ, РЕДКАЯ СНИЗУ.
+     *
+     * Верхняя граница отрезка — расстояние до СЕРВЕРА минус один, и его мы
+     * пока не измеряем (TTL входящих пакетов снимает только путь QUIC,
+     * core/quicprobe.c). Коробка у самого сервера даёт узкое окно: с чисто
+     * геометрической лестницей (62, 32, 16, …) окно [60, 61] не попадалось
+     * ни одной ступенью, и расстояние объявлялось неизмеренным. Поэтому
+     * сверху ступени частые — там окно узкое, — а снизу редкие: там оно
+     * широкое, и попасть в него легко.
+     *
+     * Это ЕДИНСТВЕННОЕ место, где остались значения не из замера, и они
+     * выбирают только ПОРЯДОК ПОИСКА, а не ответ: ответ даёт деление отрезка
+     * ниже. Полный промах всей лестницы — доказательство отсутствия отрезка,
+     * и стоит он четырнадцати зондов против девятнадцати гипотез, которые
+     * платили за то же (см. init_poisons, detect/poison.c).
+     *
+     * ЛЕСТНИЦА — НАДМНОЖЕСТВО УДАЛЁННОГО СПИСКА (ревью 24.10.2026). У ушедших
+     * гипотез были значения ttls[] = {62, 60, 58, 55, 50, 40, 20, 8}, и пока
+     * они существовали, окно шириной в ОДИН хоп на любом из этих чисел
+     * бралось: гипотеза пробовалась как есть. Ступеней 40 и 20 у лестницы не
+     * было, и окно [20, 20] объявлялось неизмеренным — рабочий приём
+     * становился недостижимым. Два зонда в случае полного промаха дешевле
+     * потерянного приёма.
+     *
+     * ЧЕГО ЛЕСТНИЦА НЕ ДАЁТ. Окно шириной в один хоп на значении ВНЕ списка
+     * ступеней не найдётся: промах ступени неоднозначен, и сузить отрезок по
+     * нему нечем. Честно закрыть это можно только измеренным верхом отрезка —
+     * расстоянием до сервера, — а его TCP-зонд пока не снимает: TTL входящих
+     * пакетов читает только путь QUIC (core/quicprobe.c), и живым потокам его
+     * знает датапат (fl->rev_ttl), не сообщая контроллеру. */
+    static const int ladder[] = { D2K_HOP_CEIL, 60, 58, 55, 50, 44, 40, 38, 32,
+                                  24, 20, 16, 8, 2 };
+    size_t k;
+    int lo = 0, hi = 0;
+
+    if (!opt || opt->repeats <= 0) { return 0; }
+    for (k = 0; k < sizeof ladder / sizeof ladder[0]; k++) {
+        int rc;
+        if (d2k_detect_stopped(&opt->cancel)) { return 0; }
+        rc = hop_step(ip4, family, port, tr, opt, res, ladder[k], 1, 0);
+        if (rc < 0) { return 0; }
+        if (rc > 0) { hi = ladder[k]; break; }
+        /* ПРОМАХ НА ЛЕСТНИЦЕ НИЧЕГО НЕ ГОВОРИТ О ГРАНИЦЕ. Он объясняется и
+           «слишком высоко» (фальшивка дошла до сервера, тот её отбросил), и
+           «слишком низко» (не дошла до коробки). Различить нечем, поэтому
+           нижняя граница остаётся нулём — вывод из неоднозначного промаха был
+           бы ровно той ошибкой, от которой защищает тройственная логика. */
+    }
+    if (hi == 0) { return 0; } /* отрезка прохода не нашли — расстояние не измерено */
+    /* lo не проходит (ноль хопов не бывает), hi проходит: граница между ними. */
+    while (hi - lo > 1) {
+        int mid = (lo + hi) / 2;
+        int rc;
+        if (d2k_detect_stopped(&opt->cancel)) { return 0; }
+        rc = hop_step(ip4, family, port, tr, opt, res, mid, 1, 0);
+        if (rc < 0) { return 0; }
+        if (rc > 0) { hi = mid; } else { lo = mid; }
+    }
+    /* НАЙДЕННОЕ ЧИСЛО ПРОВЕРЯЕТСЯ ПОВТОРАМИ: до этой строки был поиск, здесь
+       — замер. Не прошло единогласно — расстояние НЕ ИЗМЕРЕНО (§2.4), и
+       гипотезы из него не берутся. */
+    if (hop_step(ip4, family, port, tr, opt, res, hi, opt->repeats, 0) != 1) { return 0; }
+    res->props.hop_ttl = hi;
+    return hi;
+}
+
 /* runProperties задаёт вопросы и заполняет вектор. Возвращает первую
  * гипотезу, которая сама по себе сработала, если такая была. */
 int d2k_run_properties(const uint8_t ip4[4], uint16_t port,
     const d2k_trigger *tr, const d2k_opts *opt, d2k_result *res, d2k_poison *hit)
 {
     return d2k_run_properties_family(ip4, 4, port, tr, opt, res, hit);
+}
+
+/* Ответ этого вопроса уже получен прежним прогоном того же входа (этап 25):
+ * тот же ярлык, то же число повторов. NULL — спрашивать. */
+static const d2k_known_prop *known_answer(const d2k_opts *opt, const char *label)
+{
+    int k;
+    if (!opt || opt->nknown <= 0 || opt->known_repeats != opt->repeats) {
+        return NULL;
+    }
+    for (k = 0; k < opt->nknown && k < D2K_KNOWN_MAX; k++) {
+        if (strcmp(opt->known_answers[k].label, label) == 0) {
+            return &opt->known_answers[k];
+        }
+    }
+    return NULL;
 }
 
 int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
@@ -285,6 +585,25 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         }
         if (d2k_opts_skipped(opt, p.name)) {
             continue;
+        }
+        {
+            /* ОТВЕТ УЖЕ ЕСТЬ И ОН ОЗНАЧАЕТ ПРОМАХ — вопрос не задаём: его
+               повторы ушли бы на уже известный промах. Знание кладём в вектор
+               прогона, чтобы план собирался из него.
+               ОТВЕТ «ПРОХОДИТ» — ВОПРОС ЗАДАЁМ ВСЁ РАВНО: прошедший вопрос и
+               есть доказательство приёма на проводе (§0.1 ТЗ), а
+               доказательство обязано быть свежим для ЭТОЙ сети; иначе «обход
+               найден» означало бы «когда-то работало». */
+            int8_t pass_v = D2K_PROP_UNKNOWN;
+            int8_t was = known_of(&opt->known, pp[i].set, &pass_v);
+            if (was != D2K_PROP_UNKNOWN && was != pass_v) {
+                snprintf(label, sizeof(label), "свойство:%s", pp[i].label);
+                obs = d2k_trace_add(res, label);
+                obs->from_known = 1;
+                known_into(&res->props, pp[i].set, was);
+                if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
+                continue;
+            }
         }
         /* ВОПРОС ЗАДАЁТСЯ КАК КЛИЕНТ (замысел 2026-10-23, п. 5.1 и 5.2).
          *
@@ -365,6 +684,39 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         }
         obs = d2k_trace_add(res, label);
         obs->delay_ms = p.gap_ms;
+        struct { int kind; d2k_poison poison; } cache_key;
+        memset(&cache_key, 0, sizeof cache_key);
+        cache_key.kind = 2; cache_key.poison = p; cache_key.poison.decoy = NULL;
+        {
+            d2k_run_entry *cached = d2k_run_cache_get(opt->run_cache,
+                &cache_key, sizeof cache_key, p.decoy, p.decoy_len);
+            d2k_known_prop saved;
+            memset(&saved, 0, sizeof saved);
+            if (cached) { saved.pass = cached->pass; saved.fail = cached->fail; }
+            /* ОТВЕТ УЖЕ ЕСТЬ (этап 25): прогон тем же входом был прерван
+             * (уступка, отмена) после этого вопроса — его исход берётся как
+             * измеренный, зондов не тратится, в трассе пометка seeded. */
+            const d2k_known_prop *kn = cached ? &saved :
+                (opt->run_cache ? NULL : known_answer(opt, pp[i].label));
+            if (kn) {
+                pass = kn->pass;
+                done = kn->pass + kn->fail;
+                obs->pass = pass;
+                obs->fail = kn->fail;
+                obs->seeded = 1;
+                if (res->nanswered < D2K_ANSWERED_MAX) {
+                    res->answered[res->nanswered++] = p;
+                }
+                if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
+                got = d2k_prop_majority(pass, opt->repeats);
+                apply_set(&res->props, pp[i].set, got, &p);
+                if (got && d2k_opts_acceptable(opt, &p)) {
+                    *hit = p;
+                    return 1;
+                }
+                continue;
+            }
+        }
         /* ОТВЕТ — БОЛЬШИНСТВОМ ПОВТОРОВ (поле 14.10.2026, fost.club с роутера,
          * d2k-detect с меткой замера): «ECH-приветствие под меткой» к одному
          * адресу дало 3/3, 0/1, 2/3, 1/2 — приём срабатывает в ~2 попытках из
@@ -400,6 +752,12 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         }
         obs->pass = pass;
         obs->fail = done - pass;
+        if (!local_err && !d2k_detect_stopped(&opt->cancel) &&
+            (d2k_prop_majority(pass, opt->repeats) ||
+             !d2k_prop_majority(pass + opt->repeats - done, opt->repeats))) {
+            d2k_run_cache_put(opt->run_cache, &cache_key, sizeof cache_key,
+                              p.decoy, p.decoy_len, obs->pass, obs->fail);
+        }
         if (opt->on_obs) { opt->on_obs(opt->on_obs_ctx, obs); }
         got = d2k_prop_majority(pass, opt->repeats);
         /* A local compile/apply/send refusal is not an answer from the box. */
@@ -410,6 +768,55 @@ int d2k_run_properties_family(const uint8_t *ip4, uint8_t family, uint16_t port,
         if (got && d2k_opts_acceptable(opt, &p)) {
             *hit = p;
             return 1;
+        }
+    }
+    /* РАССТОЯНИЕ ДО КОРОБКИ — ПОСЛЕДНИЙ ВОПРОС ОПРОСА (23.10.2026).
+     *
+     * Последний по цене: он стоит нескольких зондов, тогда как каждый вопрос
+     * выше — одного-трёх, и спрашивать его раньше значило бы платить за него
+     * на целях, которые берёт первый же дешёвый приём.
+     *
+     * ЗНАНИЕ ИЗ КАТАЛОГА ПОИСК ОТМЕНЯЕТ, НО НЕ ДОКАЗАТЕЛЬСТВО. Расстояние —
+     * свойство коробки, и измеренное один раз, оно верно для всех её целей:
+     * искать его заново — те же зонды впустую. Но «коробка в 12 хопах» не
+     * значит «фальшивка с TTL 12 снимает блок ЗДЕСЬ И СЕЙЧАС»: приём обязан
+     * пройти на проводе (§0.1), поэтому одна гипотеза с известным числом
+     * задаётся. Три зонда вместо девятнадцати гипотез запасного перебора. */
+    if (opt->known.hops > 0) {
+        d2k_poison kp;
+        int kb = opt->known.validates_checksum != D2K_PROP_YES;
+        res->props.hop_ttl = opt->known.hops;
+        memset(&kp, 0, sizeof kp);
+        kp.ttl = opt->known.hops;
+        kp.badsum = kb ? 1 : 0;
+        snprintf(kp.name, sizeof kp.name, kb ? "badsum+ttl-%d" : "ttl-%d", opt->known.hops);
+        /* ОПРОВЕРГНУТОЕ ИМЯ НЕ ПРОВЕРЯЕМ ВОВСЕ. Зонд здесь покупает ровно одно
+           — доказательство на проводе для кандидата, и если этого кандидата
+           опрос больше не предлагает (доспрос пришёл с его именем в skip),
+           то зонд повторяет проваленный опыт. Расстояние при этом остаётся в
+           векторе: оно знание из каталога, а не находка этого зонда. */
+        if (!d2k_opts_skipped(opt, kp.name) && !d2k_detect_stopped(&opt->cancel) &&
+            hop_step(ip4, family, port, tr, opt, res, opt->known.hops, opt->repeats,
+                     kb) > 0) {
+            if (d2k_opts_acceptable(opt, &kp)) { *hit = kp; return 1; }
+        }
+    } else if (!d2k_detect_stopped(&opt->cancel)) {
+        int hops = d2k_hop_search(ip4, family, port, tr, opt, res);
+        if (hops > 0) {
+            /* Последний шаг поиска прошёл единогласно — это и есть
+               доказательство на проводе, второй раз его не покупаем. */
+            d2k_poison hp;
+            int hb = res->props.validates_checksum == D2K_TRI_FALSE;
+            memset(&hp, 0, sizeof hp);
+            hp.ttl = hops;
+            hp.badsum = hb ? 1 : 0;
+            snprintf(hp.name, sizeof hp.name, hb ? "badsum+ttl-%d" : "ttl-%d", hops);
+            /* Измерение остаётся в векторе и тогда, когда имя опровергнуто:
+               деление отрезка — замер свойства коробки, а не этот кандидат. */
+            if (!d2k_opts_skipped(opt, hp.name) && d2k_opts_acceptable(opt, &hp)) {
+                *hit = hp;
+                return 1;
+            }
         }
     }
     return 0;
@@ -434,6 +841,20 @@ int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_
      * «нет», которое при «не измерено» давало ложь и выключало единственный
      * признак, работающий на коробках, не сверяющих сумму. */
     base.badsum = !tri_yes(pr->validates_checksum);
+    /* ИЗМЕРЕННОЕ РАССТОЯНИЕ — В КАЖДУЮ СОБРАННУЮ ФАЛЬШИВКУ (23.10.2026).
+     *
+     * Фальшивка должна дойти до коробки и умереть перед сервером. Пока
+     * расстояние не измерялось, собранные кандидаты шли БЕЗ TTL вовсе: они
+     * держались только на том, что сервер отбросит их по битой сумме, а
+     * коробка — нет. Теперь расстояние известно (d2k_hop_search либо запись
+     * коробки), и фальшивка до сервера просто не доезжает — это и есть
+     * механизм, который прежде изображали девятнадцать гипотез с готовыми
+     * значениями TTL.
+     *
+     * Ноль — не измерено, и тогда поле остаётся нулём: выдумывать расстояние
+     * нельзя, фальшивка с неверным TTL либо не дойдёт до коробки, либо
+     * сломает поток у сервера. */
+    if (pr->hop_ttl > 0) { base.ttl = pr->hop_ttl; }
     if (tri_yes(pr->parses_l7)) {
         base.decoy_hello = 1;
     }
@@ -472,6 +893,17 @@ int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_
         n++;
     }
 
+    /* СРОЧНЫЙ БАЙТ КОРОБКА НЕ УЧИТЫВАЕТ — вставляем его в середину имени.
+     * Фальшивки здесь нет и быть не может: приём не травит буфер, а ломает
+     * РАЗБОР имени, и сервер тот же байт из потока уберёт сам. Поэтому
+     * кандидат собирается не из base, а чистым. */
+    if (tri_no(pr->handles_urgent) && n < cap) {
+        memset(&out[n], 0, sizeof(out[n]));
+        snprintf(out[n].name, sizeof(out[n].name), "СОБРАНО: срочный байт");
+        out[n].oob = 1;
+        n++;
+    }
+
     /* Ничего одиночного не сработало — пробуем всё вместе. Это последний
      * собранный кандидат перед падением в перебор. */
     if (n == 0 && cap > 0) {
@@ -482,6 +914,9 @@ int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_
         out[0].seqovl_exact = 1;
         out[0].disorder = 1;
         out[0].repeats = 7;
+        /* И здесь измеренное расстояние, если оно есть: «всё сразу» — тоже
+           фальшивка, и ей тоже незачем доезжать до сервера. */
+        if (pr->hop_ttl > 0) { out[0].ttl = pr->hop_ttl; }
         n = 1;
     }
 
@@ -495,4 +930,32 @@ int d2k_compose_from_props(const d2k_dprops *pr, const uint8_t *ctl, size_t ctl_
         }
     }
     return n;
+}
+
+/* This question uses raw episodes, not a poison candidate: it cannot be
+ * represented by prop_set. Both successful carry and measured NO are known.
+ * The caller has selected the compatible box/client shape; this does not
+ * prove application success on the new target. An alternate ClientHello
+ * must be measured again because the box record does not contain its name. */
+int d2k_preflight_known(const d2k_box_props *k, d2k_preflight_meas *m, int *verdict)
+{
+    if (k->response_gate != D2K_PROP_YES ||
+        (k->gate_carry != D2K_PROP_NO && k->gate_carry != D2K_PROP_YES)) return 0;
+    if (k->gate_carry == D2K_PROP_YES &&
+        (!k->gate_window || !k->gate_pieces || !k->gate_rtt_ms ||
+         k->gate_hello_own != D2K_PROP_YES)) return 0;
+    memset(m, 0, sizeof *m);
+    m->response_gate = 1;
+    /* pieces_pass also witnesses the hello source at the bridge. A prior
+     * conflict can erase that tri without erasing the measured window. */
+    m->pieces_pass = k->gate_window != 0 &&
+        (k->gate_hello_own == D2K_PROP_NO || k->gate_hello_own == D2K_PROP_YES);
+    m->window = k->gate_window;
+    m->pieces_needed = k->gate_pieces;
+    m->carry_over_rst = k->gate_carry == D2K_PROP_YES;
+    m->hello_own = k->gate_hello_own == D2K_PROP_YES;
+    m->rtt_ms = k->gate_rtt_ms;
+    *verdict = m->carry_over_rst;
+    if (!*verdict) snprintf(m->reason, sizeof m->reason, "известный промах: перенос через RST не наступил");
+    return 1;
 }

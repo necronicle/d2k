@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "d2k_link.h"
+#include "d2k_rawmeasure_wire.h"
 #include "d2k_quicsnap.h"
 #include "test_quic_pq.h"
 /* Только ради D2K_KEY_WIRE_LEN — строим синтетические кадры руками (см.
@@ -222,6 +223,286 @@ static d2k_ev ev_with_seen(uint8_t seen_types) {
 }
 
 int main(void) {
+#ifndef D2K_EV_RAW_SUSPECT
+    CHECK(0,"incarnation-bound suspicion event missing");
+#else
+    {
+        int sv[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"flow incarnation socketpair");
+        uint8_t rest[11+24]={0};rest[0]=D2K_SUSPECT_SILENT;rest[6]=D2K_LINK_PLANNED_NO;
+        rest[7]=D2K_LINK_SHAPE_RAW;rest[10]=D2K_CLIENT_SIDE_HIGH;rest[11]=9;rest[34]=7;
+        d2k_ev ev;char err[128];
+        send_synthetic(sv[0],D2K_EV_RAW_SUSPECT,rest,sizeof rest);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err)&&ev.kind==D2K_EV_SUSPECT&&
+              ev.flow_incarnation==7&&ev.flow_epoch[0]==9&&ev.client_side==D2K_CLIENT_SIDE_HIGH,"suspicion incarnation lost");
+        for(size_t n=0;n<sizeof rest;n++) {
+            send_synthetic(sv[0],D2K_EV_RAW_SUSPECT,rest,n);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"partial incarnation accepted");
+        }
+#ifdef D2K_EV_RAW_FLOW
+        uint8_t flow[25]={0};flow[0]=D2K_CLIENT_SIDE_HIGH;flow[1]=9;flow[24]=7;
+        send_synthetic(sv[0],D2K_EV_RAW_FLOW,flow,sizeof flow);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err)&&ev.kind==D2K_EV_FLOW&&ev.flow_incarnation==7&&ev.flow_epoch[0]==9,"flow birth lost identity");
+        for(size_t n=0;n<sizeof flow;n++) {send_synthetic(sv[0],D2K_EV_RAW_FLOW,flow,n);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"partial flow identity accepted");}
+#else
+        CHECK(0,"flow birth identity missing");
+#endif
+        rest[34]=0;send_synthetic(sv[0],D2K_EV_RAW_SUSPECT,rest,sizeof rest);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"zero incarnation accepted");rest[34]=7;
+        rest[11]=0;send_synthetic(sv[0],D2K_EV_RAW_SUSPECT,rest,sizeof rest);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"zero table epoch accepted");
+        close(sv[0]);close(sv[1]);
+    }
+#endif
+
+#ifndef D2K_EV_RAW_MEASURE
+    CHECK(0,"measurement result event missing");
+#else
+    {
+        int sv[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"measurement result socketpair");
+        struct d2k_rawmeasure_report r={0};
+        r.request.tuple.family=6;r.request.tuple.proto=17;
+        r.request.tuple.src[15]=1;r.request.tuple.dst[15]=2;
+        r.request.tuple.sport_be[1]=9;r.request.tuple.dport_be[1]=8;
+        r.request.epoch[0]=3;r.request.generation=7;r.request.token[0]=4;r.request.seconds=10;
+        r.code=D2K_RM_REPEAT_SILENT;r.flags=D2K_RM_PRIOR_REPLY;
+        r.sample_digest[0]=1;
+        r.sample_len=20;r.smallest_data=20;r.largest_data=20;r.client_data=2;r.exact_repeats=1;
+        r.repeat_gap_ms=64000;r.repeat_age_ms=12;
+        uint8_t frame[6+D2K_KEY_WIRE_LEN+D2K_RM_REPORT_LEN]={0};
+        frame[3]=(uint8_t)(sizeof frame-4);frame[5]=D2K_EV_RAW_MEASURE;
+        uint8_t *key=frame+6;key[0]=6;key[16]=1;key[32]=2;key[34]=9;key[36]=8;key[37]=17;
+        CHECK(!d2k_rawmeasure_report_write(key+D2K_KEY_WIRE_LEN,D2K_RM_REPORT_LEN,&r),"measurement result encode");
+        d2k_ev ev;char err[128];
+        CHECK(write(sv[0],frame,sizeof frame)==sizeof frame,"measurement result write");
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.raw_measure.request.generation==7 &&
+              ev.raw_measure.exact_repeats==1 && ev.raw_measure.request.token[0]==4,"measurement result context lost");
+        CHECK(ev.raw_measure.repeat_gap_ms==64000 && ev.raw_measure.repeat_age_ms==12,
+              "controller codec lost v27 repeat timing facts");
+        frame[3]=(uint8_t)(sizeof frame-4-8); /* v26 body: timing absent */
+        CHECK(write(sv[0],frame,sizeof frame-8)==(ssize_t)(sizeof frame-8),"short result write");
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"v26 report length accepted by v27 controller");
+        frame[3]=(uint8_t)(sizeof frame-4);
+        key[36]=7; /* valid report but envelope points at another service */
+        CHECK(write(sv[0],frame,sizeof frame)==sizeof frame,"foreign result write");
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"foreign service accepted");
+        key[36]=8;key[37]=6;
+        CHECK(write(sv[0],frame,sizeof frame)==sizeof frame,"foreign transport write");
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)<0,"foreign transport accepted");
+        key[37]=17;key[16]=2;key[32]=1;key[34]=8;key[36]=9;
+        CHECK(write(sv[0],frame,sizeof frame)==sizeof frame,"reverse result write");
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err),"reversed envelope rejected");
+        close(sv[0]);close(sv[1]);
+    }
+#endif
+
+    {
+        int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair),"RAW_MEASURE socketpair");
+        struct d2k_rawmeasure_request request;memset(&request,0,sizeof request);
+        request.tuple.family=6;request.tuple.proto=17;request.tuple.src[15]=1;request.tuple.dst[15]=2;
+        request.tuple.sport_be[0]=1;request.tuple.dport_be[0]=2;request.epoch[0]=3;request.generation=0x0102030405060708ULL;
+        request.token[15]=9;request.seconds=20;char err[128];uint8_t wire[6+D2K_RM_REQUEST_LEN];
+        CHECK(!d2k_link_raw_measure(pair[0],&request,err,sizeof err),"RAW_MEASURE send");
+        CHECK(read(pair[1],wire,sizeof wire)==(ssize_t)sizeof wire,"RAW_MEASURE frame length");
+        CHECK(wire[0]==0&&wire[1]==0&&wire[2]==0&&wire[3]==2+D2K_RM_REQUEST_LEN&&
+              wire[4]==(D2K_CMD_RAW_MEASURE>>8)&&wire[5]==(D2K_CMD_RAW_MEASURE&255),"RAW_MEASURE frame header");
+        struct d2k_rawmeasure_request got;
+        CHECK(!d2k_rawmeasure_request_read(&got,wire+6,D2K_RM_REQUEST_LEN)&&got.generation==request.generation&&
+              got.tuple.proto==17&&got.tuple.family==6&&!memcmp(got.token,request.token,16),"RAW_MEASURE wire context");
+
+#ifndef D2K_LINK_RAW_PROBE
+        CHECK(0,"measured trial sender missing");
+#else
+        struct d2k_rawmeasure_report report={0};report.request=request;
+        report.code=D2K_RM_REPEAT_SILENT;report.flags=D2K_RM_PRIOR_REPLY;
+        report.sample_len=report.smallest_data=report.largest_data=1;report.client_data=2;report.exact_repeats=1;report.sample_digest[0]=5;
+        static const uint8_t program[]={'D','2','K','P',0,1,0,1,0,0,0,2,0,2,0,2,17,2,1,3,0,1,0};
+        char hex[2*sizeof program+1];to_hex(program,sizeof program,hex);uint8_t trial[16]={0x55};
+        uint8_t trialwire[6+D2K_RM_REPORT_LEN+20+sizeof program];
+        CHECK(!d2k_link_set_raw_probe(pair[0],&report,trial,500,hex,err,sizeof err),"measured trial send");
+        CHECK(read(pair[1],trialwire,sizeof trialwire)==sizeof trialwire,"measured trial frame length");
+        struct d2k_rawmeasure_report decoded;
+        CHECK(trialwire[4]==(D2K_CMD_SET_RAW_PROBE>>8)&&trialwire[5]==(D2K_CMD_SET_RAW_PROBE&255)&&
+              !d2k_rawmeasure_report_read(&decoded,trialwire+6,D2K_RM_REPORT_LEN)&&decoded.request.generation==request.generation,
+              "trial sender changed measured identity");
+        CHECK(!memcmp(trialwire+6+D2K_RM_REPORT_LEN,trial,16)&&
+              d2k_rm_get32(trialwire+6+D2K_RM_REPORT_LEN+16)==500&&
+              !memcmp(trialwire+6+D2K_RM_REPORT_LEN+20,program,sizeof program),"trial sender lost token/lease/program");
+        CHECK(d2k_link_set_raw_probe(pair[0],&report,trial,0,hex,err,sizeof err)<0,"zero trial lease sent");
+        uint16_t sp=htons(49001),dp=htons(7777);
+        CHECK(!d2k_link_del_addr_probe_family(pair[0],request.tuple.src,sp,request.tuple.dst,dp,6,6,trial,err,sizeof err),"TCP exact trial cleanup rejected");
+        uint8_t deletion[6+38+16];CHECK(read(pair[1],deletion,sizeof deletion)==sizeof deletion&&deletion[43]==6&&
+            !memcmp(deletion+44,trial,16),"TCP cleanup lost transport or ownership token");
+#endif
+        memset(request.token,0,16);CHECK(d2k_link_raw_measure(pair[0],&request,err,sizeof err)<0,"RAW_MEASURE empty token allowed");
+        close(pair[0]);close(pair[1]);
+    }
+
+    {
+        int sv[2]; CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"bound exchange socketpair");
+        uint8_t owned[32]={22,0,0,0,0,64,1,D2K_LINK_PLANNED_NO};
+        owned[8]=9;owned[31]=7;
+        d2k_ev observed;char message[128];
+        send_synthetic(sv[0],D2K_EV_OWNED_EXCHANGE,owned,sizeof owned);
+        CHECK(!d2k_link_next(sv[1],&observed,100,message,sizeof message) &&
+              observed.kind==D2K_EV_EXCHANGE && observed.flow_incarnation==7 &&
+              observed.flow_epoch[0]==9 && observed.num==64 && !observed.execution_id,
+              "owned direct exchange identity lost");
+        for(size_t n=0;n<sizeof owned;n++) {
+            send_synthetic(sv[0],D2K_EV_OWNED_EXCHANGE,owned,n);
+            CHECK(d2k_link_next(sv[1],&observed,100,message,sizeof message)<0,"truncated owned exchange accepted");
+        }
+        owned[31]=0;send_synthetic(sv[0],D2K_EV_OWNED_EXCHANGE,owned,sizeof owned);
+        CHECK(d2k_link_next(sv[1],&observed,100,message,sizeof message)<0,"zero exchange incarnation accepted");
+        owned[31]=7;owned[8]=0;send_synthetic(sv[0],D2K_EV_OWNED_EXCHANGE,owned,sizeof owned);
+        CHECK(d2k_link_next(sv[1],&observed,100,message,sizeof message)<0,"zero exchange epoch accepted");
+        uint8_t rest[8+32+D2K_CTL_EXECUTION_LEN]={0};
+        rest[0]=D2K_UDP_PROOF_STUN; rest[7]=D2K_LINK_PLANNED_YES;
+        memset(rest+8,0x51,16);memset(rest+24,0x72,16);
+        uint8_t *p=rest+40;
+        for(unsigned b=0;b<8;b++){p[b]=(uint8_t)(1+b);p[8+b]=(uint8_t)(0x81+b);}
+        p[16]=D2K_BIND_FLOW;p[17]=4;p[18]=D2K_PLAN_SHAPE_VOICE;p[19]=1;
+        memset(p+20,0x91,16);
+        d2k_ev ev;char err[128];
+        send_synthetic(sv[0],D2K_EV_EXCHANGE,rest,sizeof rest);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) &&
+              ev.execution_id==UINT64_C(0x0102030405060708) &&
+              ev.execution_binding.generation==UINT64_C(0x8182838485868788) &&
+              !memcmp(ev.plan_id,rest+8,16) && !memcmp(ev.trial_id,rest+24,16) &&
+              !memcmp(ev.execution_binding.epoch,p+20,16),"EXCHANGE lost request context");
+        uint8_t bound_owned[sizeof rest+24];
+        memcpy(bound_owned,rest,sizeof rest);
+        memset(bound_owned+sizeof rest,0,24);
+        bound_owned[sizeof rest]=9;
+        bound_owned[sizeof bound_owned-1]=7;
+        send_synthetic(sv[0],D2K_EV_OWNED_EXCHANGE,bound_owned,sizeof bound_owned);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) &&
+              ev.kind==D2K_EV_EXCHANGE && ev.flow_incarnation==7 && ev.flow_epoch[0]==9 &&
+              ev.execution_id==UINT64_C(0x0102030405060708) &&
+              ev.execution_binding.generation==UINT64_C(0x8182838485868788) &&
+              !memcmp(ev.plan_id,rest+8,16) && !memcmp(ev.trial_id,rest+24,16) &&
+              !memcmp(ev.execution_binding.epoch,p+20,16),"owned EXCHANGE lost execution binding");
+        for(size_t n=9;n<sizeof rest;n++) {
+            send_synthetic(sv[0],D2K_EV_EXCHANGE,rest,n);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)!=0,"partial EXCHANGE context accepted");
+        }
+        send_synthetic(sv[0],D2K_EV_EXCHANGE,rest,8);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && !ev.execution_id &&
+              !d2k_binding_known(&ev.execution_binding),"unbound EXCHANGE must remain unknown");
+        close(sv[0]);close(sv[1]);
+    }
+    {
+        int sv[2]; CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"bound suspicion socketpair");
+        uint8_t rest[11+32+D2K_CTL_EXECUTION_LEN]={0};
+        rest[0]=D2K_UDP_PROOF_STUN; rest[6]=D2K_LINK_PLANNED_YES;
+        memset(rest+11,0x51,16);memset(rest+27,0x72,16);
+        uint8_t *p=rest+43;
+        for(unsigned b=0;b<8;b++){p[b]=(uint8_t)(1+b);p[8+b]=(uint8_t)(0x81+b);}
+        p[16]=D2K_BIND_FLOW;p[17]=4;p[18]=D2K_PLAN_SHAPE_VOICE;p[19]=1;
+        memset(p+20,0x91,16);
+        d2k_ev ev;char err[128];
+        send_synthetic(sv[0],D2K_EV_SUSPECT,rest,sizeof rest);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) &&
+              ev.execution_id==UINT64_C(0x0102030405060708) &&
+              ev.execution_binding.generation==UINT64_C(0x8182838485868788) &&
+              !memcmp(ev.plan_id,rest+11,16) && !memcmp(ev.trial_id,rest+27,16) &&
+              !memcmp(ev.execution_binding.epoch,p+20,16),"SUSPECT lost request context");
+        for(size_t n=12;n<sizeof rest;n++) {
+            send_synthetic(sv[0],D2K_EV_SUSPECT,rest,n);
+            CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)!=0,"partial SUSPECT context accepted");
+        }
+        send_synthetic(sv[0],D2K_EV_SUSPECT,rest,11);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && !ev.execution_id &&
+              !d2k_binding_known(&ev.execution_binding),"unbound SUSPECT must remain unknown");
+        close(sv[0]);close(sv[1]);
+    }
+
+    {   /* Этап 49: итог позднего наблюдения — итог, сторона, повторы; вне
+           диапазона и короче — порча. */
+        int sv[2]; CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"late obs socketpair");
+        uint8_t rest[4+D2K_TRIAL_ID_LEN]={D2K_LATEOBS_REPEAT_SILENT,D2K_CLIENT_SIDE_LOW,0x01,0x02};
+        for(int i=0;i<D2K_TRIAL_ID_LEN;i++) rest[4+i]=(uint8_t)(0x30+i);
+        d2k_ev ev;char err[128];
+        send_synthetic(sv[0],D2K_EV_LATE_OBS,rest,sizeof rest);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.kind==D2K_EV_LATE_OBS &&
+              ev.code==D2K_LATEOBS_REPEAT_SILENT && ev.client_side==D2K_CLIENT_SIDE_LOW && ev.num==0x0102 &&
+              !memcmp(ev.trial_id,rest+4,D2K_TRIAL_ID_LEN),
+              "LATE_OBS разобран неверно (итог, сторона, повторы, токен)");
+        send_synthetic(sv[0],D2K_EV_LATE_OBS,rest,4);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)!=0,"LATE_OBS без токена принят");
+        rest[0]=D2K_LATEOBS_UNAVAILABLE+1;
+        send_synthetic(sv[0],D2K_EV_LATE_OBS,rest,sizeof rest);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)!=0,"LATE_OBS с неизвестным итогом принят");
+        close(sv[0]);close(sv[1]);
+    }
+
+    {   /* Этап 42: факт появления потока — сторона клиента необязательна по
+           длине; вне диапазона — порча. */
+        int sv[2]; CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"flow fact socketpair");
+        uint8_t rest[1]={D2K_CLIENT_SIDE_HIGH};
+        d2k_ev ev;char err[128];
+        send_synthetic(sv[0],D2K_EV_FLOW,rest,1);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.kind==D2K_EV_FLOW &&
+              ev.client_side==D2K_CLIENT_SIDE_HIGH,"FLOW lost observed client endpoint");
+        send_synthetic(sv[0],D2K_EV_FLOW,rest,0);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.kind==D2K_EV_FLOW &&
+              ev.client_side==0,"FLOW without endpoint must stay unknown");
+        rest[0]=3;
+        send_synthetic(sv[0],D2K_EV_FLOW,rest,1);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)!=0,"FLOW with invalid endpoint accepted");
+        close(sv[0]);close(sv[1]);
+    }
+
+    {   /* Приветствие: совместимая и несовместимые пары (очередь 28.10, задание 02).
+           Контракт проекта — точная версия провода и свой выпуск; иначе
+           команды другой раскладки и ACK без нужных полей. */
+        int sv[2]; CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"greeting socketpair");
+        size_t idlen=strlen(D2K_RELEASE_ID);
+        uint8_t rest[7+64]; memset(rest,0,sizeof rest);
+        rest[0]=(uint8_t)(D2K_CTL_PROTO_VERSION>>8); rest[1]=(uint8_t)D2K_CTL_PROTO_VERSION;
+        rest[4]=0x05; rest[5]=0xdc; rest[6]=(uint8_t)idlen; memcpy(rest+7,D2K_RELEASE_ID,idlen);
+        d2k_ev ev; char why[160];
+        send_synthetic(sv[1],D2K_EV_PROTO,rest,7+idlen);
+        CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==0 && ev.kind==D2K_EV_PROTO &&
+              ev.num==D2K_CTL_PROTO_VERSION && ev.send_maxlen==1500 && !strcmp(ev.release_id,D2K_RELEASE_ID),
+              "own greeting accepted with its fields");
+        rest[1]=(uint8_t)(D2K_CTL_PROTO_VERSION-1); why[0]=0;
+        send_synthetic(sv[1],D2K_EV_PROTO,rest,7+idlen);
+        CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==-1 && strstr(why,"несовместимое приветствие"),
+              "previous wire version refused by name");
+        /* Этап 21: датапат ДО формы RAW (v23) отвергал бы SET_ADDR формы 8 — такая
+           пара не должна начинать работу вовсе; версия поднята до 24. */
+        CHECK(D2K_CTL_PROTO_VERSION >= 24u, "wire version not bumped for shape RAW (8)");
+        CHECK(D2K_CTL_PROTO_VERSION >= 27u && D2K_RM_REPORT_LEN == 147u,
+              "RAW report timing changed without wire version bump");
+        rest[1]=23; why[0]=0;
+        send_synthetic(sv[1],D2K_EV_PROTO,rest,7+idlen);
+        CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==-1, "pre-RAW datapath (v23) greeting accepted");
+        rest[1]=(uint8_t)(D2K_CTL_PROTO_VERSION+1); why[0]=0;
+        send_synthetic(sv[1],D2K_EV_PROTO,rest,7+idlen);
+        CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==-1 && strstr(why,"несовместимое приветствие"),
+              "future wire version refused — exact match, not minimum");
+        rest[1]=(uint8_t)D2K_CTL_PROTO_VERSION;
+        {   /* чужой выпуск той же версии провода: тот же алфавит, другая длина */
+            uint8_t other[7+64]; memcpy(other,rest,sizeof other);
+            size_t olen = idlen>1 ? idlen-1 : idlen+1;
+            if (olen>idlen) other[7+idlen]='x';
+            other[6]=(uint8_t)olen; why[0]=0;
+            send_synthetic(sv[1],D2K_EV_PROTO,other,7+olen);
+            CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==-1 && strstr(why,"выпуск"),
+                  "same wire version but foreign release refused");
+        }
+        {   /* первым пришло не приветствие */
+            uint8_t hello[2]={0,0}; why[0]=0;
+            send_synthetic(sv[1],D2K_EV_HELLO,hello,1);
+            CHECK(d2k_link_greeting(sv[0],1000,&ev,why,sizeof why)==-1 && strstr(why,"не приветствие"),
+                  "non-greeting first event refused");
+        }
+        why[0]=0;
+        CHECK(d2k_link_greeting(sv[0],20,&ev,why,sizeof why)==-1 && why[0],
+              "silent peer is not a compatible peer");
+        close(sv[0]); close(sv[1]);
+    }
     {
         int sv[2];d2k_ev ev;char err[160];
         CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,sv),"bound ACK fixture socket");
@@ -244,6 +525,27 @@ int main(void) {
         CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"oversized permanent ACK accepted");
         rest[29]=5;send_synthetic(sv[0],D2K_EV_ACK,rest,48);
         CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"invalid ACK binding family accepted");
+        /* Форма RAW (8, этапы 12/16) в контексте привязки — законна: постоянный
+           адресный план формы RAW иначе терял APPLIED/EXCHANGE у контроллера как
+           «повреждённый контекст» (стенд lab-udp-raw.sh, 28.10.2026). */
+        rest[29]=6;rest[30]=D2K_PLAN_SHAPE_RAW;send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.execution_binding.shape==D2K_PLAN_SHAPE_RAW,
+              "binding context with shape RAW refused as corrupted");
+        rest[0]=D2K_CMD_SET_DNS_ENDPOINT>>8;rest[1]=(uint8_t)D2K_CMD_SET_DNS_ENDPOINT;
+        rest[28]=D2K_BIND_ADDR;rest[30]=D2K_PLAN_SHAPE_DNS;
+        send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.trial_id[0]==0x87 &&
+              ev.execution_binding.shape==D2K_PLAN_SHAPE_DNS && d2k_binding_known(&ev.execution_binding),
+              "DNS endpoint ACK loses request ID or binding generation");
+        rest[0]=D2K_CMD_SET_PREFLIGHT_LEASE>>8;rest[1]=(uint8_t)D2K_CMD_SET_PREFLIGHT_LEASE;
+        rest[30]=D2K_PLAN_SHAPE_MODERN;rest[31]=1;
+        send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.trial_id[0]==0x87 &&
+              ev.execution_binding.kind==D2K_BIND_ADDR && ev.execution_binding.temporary &&
+              ev.execution_binding.shape==D2K_PLAN_SHAPE_MODERN,
+              "preflight lease ACK loses lease ID or temporary binding");
+        rest[30]=D2K_PLAN_SHAPE_DNS+1;send_synthetic(sv[0],D2K_EV_ACK,rest,48);
+        CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"unknown binding shape accepted");
         close(sv[0]);close(sv[1]);
     }
 
@@ -742,14 +1044,24 @@ int main(void) {
         int sv[2];
         CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair (SUSPECT v12) не создался");
         if (sv[0] >= 0) {
-            uint8_t rest[10] = { D2K_SUSPECT_TCP_STALL, 0, 0, 0, 0, 0, D2K_LINK_PLANNED_NO, 1, 0, 25 };
+            uint8_t rest[11] = { D2K_SUSPECT_TCP_STALL, 0, 0, 0, 0, 0, D2K_LINK_PLANNED_NO, 1, 0, 25, D2K_CLIENT_SIDE_HIGH };
             send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
             d2k_ev ev; char e[200] = {0};
             CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
                   ev.code == D2K_SUSPECT_TCP_STALL && ev.num == 25,
                   "оценка пакетов в подозрении «TCP встал на бюджете» потеряна");
+            CHECK(ev.client_side == D2K_CLIENT_SIDE_HIGH,
+                  "observed client endpoint lost on control wire");
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, 10);
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 &&
+                  ev.num == 25 && ev.client_side == D2K_CLIENT_SIDE_UNKNOWN,
+                  "old suspicion fabricated an observed endpoint");
+            rest[10] = 3;
+            send_synthetic(sv[1], D2K_EV_SUSPECT, rest, sizeof rest);
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == -1,
+                  "invalid observed endpoint accepted");
             send_synthetic(sv[1], D2K_EV_SUSPECT, rest, 8);
-            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 && ev.num == 0,
+            CHECK(d2k_link_next(sv[0], &ev, 1000, e, sizeof e) == 0 && ev.num == 0 && ev.client_side == 0,
                   "подозрение без хвоста v12 получило выдуманное число");
             close(sv[0]); close(sv[1]);
         }
@@ -904,6 +1216,22 @@ int main(void) {
             close(sv[0]); close(sv[1]);
         }
     }
+    /* Successful v23 removal ACK cannot release an unidentified owner. */
+    {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0,"delete ACK decoder pair");
+        uint8_t rest[4+D2K_TRIAL_ID_LEN]={0,D2K_CMD_DEL_ADDR_PROBE,1,0};
+        d2k_ev ev;char why[160];
+        send_synthetic(sv[1],D2K_EV_ACK,rest,4);
+        CHECK(d2k_link_next(sv[0],&ev,1000,why,sizeof why)==-1,"successful delete ACK without identity rejected");
+        send_synthetic(sv[1],D2K_EV_ACK,rest,sizeof rest);
+        CHECK(d2k_link_next(sv[0],&ev,1000,why,sizeof why)==-1,"successful delete ACK with zero identity rejected");
+        rest[2]=0;rest[3]=D2K_ACK_BAD_ARGS;
+        send_synthetic(sv[1],D2K_EV_ACK,rest,4);
+        CHECK(d2k_link_next(sv[0],&ev,1000,why,sizeof why)==0 && ev.num==D2K_ACK_BAD_ARGS,
+              "unidentified malformed-command rejection remains diagnostic only");
+        close(sv[0]);close(sv[1]);
+    }
     /* ЗАМЫСЕЛ 2026-10-23, п. 5.1: CLIENT_TCP — набор опций TCP клиента перед
        его SHAPE. Пустое тело — известный пустой набор; длиннее 40 — отказ. */
     {
@@ -1040,6 +1368,68 @@ int main(void) {
         CHECK(read(sv[1], wire, sizeof wire) == 24 && wire[6] == 6 &&
               !memcmp(wire + 7, ip6, 16) && wire[23] == D2K_LINK_SHAPE_VOICE,
               "IPv6 address unbind wire carries protocol shape");
+        for (unsigned family=4;family<=6;family+=2) {
+            CHECK(d2k_link_set_endpoint(sv[0],ip6,family,htons(3478),D2K_LINK_SHAPE_VOICE,
+                  "aabb",err,sizeof err)==0,"service endpoint command encodes");
+            CHECK(read(sv[1],wire,sizeof wire)==28 && wire[3]==24 &&
+                  wire[4]==0 && wire[5]==D2K_CMD_SET_ENDPOINT && wire[6]==family &&
+                  !memcmp(wire+7,ip6,family==6?16:4) && wire[23]==D2K_LINK_SHAPE_VOICE &&
+                  wire[24]==0x0d && wire[25]==0x96 && wire[26]==0xaa && wire[27]==0xbb,
+                  "service endpoint wire preserves port and plan boundary");
+            if (family==4) {
+                const uint8_t zero[12]={0};
+                CHECK(!memcmp(wire+11,zero,12),"IPv4 service address padding canonical");
+            }
+            const uint8_t token[D2K_TRIAL_ID_LEN]={0x55,0x33};
+            CHECK(d2k_link_set_endpoint_bound(sv[0],ip6,family,htons(3478),
+                  D2K_LINK_SHAPE_VOICE,"aabb",token,err,sizeof err)==0,
+                  "bound service command encodes");
+            CHECK(read(sv[1],wire,sizeof wire)==44 && wire[3]==40 &&
+                  wire[5]==D2K_CMD_SET_ENDPOINT_BOUND && wire[6]==family &&
+                  wire[24]==0x0d && wire[25]==0x96 && wire[26]==0xaa && wire[27]==0xbb &&
+                  !memcmp(wire+28,token,sizeof token),
+                  "bound service retains plan boundary and appends exact request token");
+            CHECK(d2k_link_del_endpoint(sv[0],ip6,family,htons(3478),D2K_LINK_SHAPE_VOICE,
+                  err,sizeof err)==0,"service endpoint delete encodes");
+            CHECK(read(sv[1],wire,sizeof wire)==26 && wire[3]==22 &&
+                  wire[4]==0 && wire[5]==D2K_CMD_DEL_ENDPOINT && wire[6]==family &&
+                  !memcmp(wire+7,ip6,family==6?16:4) && wire[23]==D2K_LINK_SHAPE_VOICE &&
+                  wire[24]==0x0d && wire[25]==0x96,"service deletion retains exact port");
+        }
+        CHECK(d2k_link_set_endpoint(sv[0],ip6,6,0,D2K_LINK_SHAPE_VOICE,"aabb",err,sizeof err)!=0 &&
+              d2k_link_del_endpoint(sv[0],ip6,6,0,D2K_LINK_SHAPE_VOICE,err,sizeof err)!=0,
+              "zero service port never sent");
+        for (unsigned family=4;family<=6;family+=2) {
+            CHECK(d2k_link_del_endpoint(sv[0],ip6,family,htons(443),D2K_LINK_SHAPE_RAW,
+                  err,sizeof err)!=0,"RAW deletion without transport rejected locally");
+            for (unsigned tr=6;tr<=17;tr+=11) {
+                CHECK(d2k_link_del_raw_endpoint(sv[0],ip6,family,htons(443),tr,err,sizeof err)==0,
+                      "RAW endpoint deletion encodes transport");
+                CHECK(read(sv[1],wire,sizeof wire)==27 && wire[3]==23 && wire[5]==D2K_CMD_DEL_ENDPOINT &&
+                      wire[6]==family && wire[23]==D2K_LINK_SHAPE_RAW && wire[24]==1 && wire[25]==187 &&
+                      wire[26]==tr,"RAW endpoint deletion wire exact");
+            }
+        }
+        /* Форма RAW (этапы 12/16: доказанный путь без протокола) — законная
+           адресная форма: подтверждённая RAW-привязка обязана доехать до
+           датапата как SET_ADDR с формой 8, иначе каталог знает решение,
+           а провод — нет. */
+        {
+            int rc = d2k_link_set_addr_family(sv[0], ip6, 6, D2K_LINK_SHAPE_RAW, "aabb",
+                                              err, sizeof err);
+            CHECK(rc == 0, "RAW address binding command refused");
+            if (rc == 0) {
+                CHECK(read(sv[1], wire, sizeof wire) == 26 && wire[23] == D2K_LINK_SHAPE_RAW &&
+                      wire[24] == 0xaa && wire[25] == 0xbb,
+                      "RAW address binding wire carries shape 8 before the plan");
+            }
+            rc = d2k_link_del_addr_family(sv[0], ip6, 6, D2K_LINK_SHAPE_RAW, err, sizeof err);
+            CHECK(rc == 0, "RAW address unbind refused");
+            if (rc == 0) {
+                CHECK(read(sv[1], wire, sizeof wire) == 24 && wire[23] == D2K_LINK_SHAPE_RAW,
+                      "RAW address unbind wire carries shape 8");
+            }
+        }
         /* Адресная привязка без формы или с дедушкиным правом «подходила бы
            всем протоколам IP» (задача 16) — на провод не уходит. */
         CHECK(d2k_link_set_addr_family(sv[0], ip6, 6, 0, "aabb", err, sizeof err) != 0 &&
@@ -1047,6 +1437,11 @@ int main(void) {
                                        err, sizeof err) != 0 &&
               d2k_link_del_addr_family(sv[0], ip6, 6, 0, err, sizeof err) != 0,
               "address command without protocol shape accepted");
+        /* Этап 21: неизвестная форма (9) на провод не уходит — старый датапат
+           ответил бы отказом, а здесь не должно быть даже попытки. */
+        CHECK(d2k_link_set_addr_family(sv[0], ip6, 6, D2K_LINK_SHAPE_RAW + 1, "aabb", err, sizeof err) != 0 &&
+              d2k_link_del_addr_family(sv[0], ip6, 6, D2K_LINK_SHAPE_RAW + 1, err, sizeof err) != 0,
+              "address command with unknown shape 9 sent");
         close(sv[0]); close(sv[1]);
     }
     /* Address-trial command encoding is byte-level protocol, not a struct ABI. */
@@ -1087,6 +1482,27 @@ int main(void) {
             n = read(sv[1], frame, sizeof frame);
             CHECK(n == 65 && frame[6] == 6 && memcmp(frame + 7, src6, 16) == 0 &&
                   memcmp(frame + 23, dst6, 16) == 0, "IPv6 tuple full addresses");
+            const uint8_t digest[32] = {0x38, 0xb1};
+            CHECK(d2k_link_set_dns_probe(sv[0], src6, htons(40000), dst6,
+                  htons(53), 6, 6, trial, 1000, "00", 19, digest, err, sizeof err) == 0,
+                  "DNS exact tuple command");
+            n = read(sv[1], frame, sizeof frame);
+            CHECK(n == 99 && frame[5] == 0x9c && frame[43] == 6 &&
+                  memcmp(frame + 44, trial, sizeof trial) == 0 &&
+                  memcmp(frame + 60, (uint8_t[]){0, 0, 3, 0xe8, 0, 19}, 6) == 0 &&
+                  memcmp(frame + 66, digest, sizeof digest) == 0 && frame[98] == 0,
+                  "DNS command wire fields");
+            CHECK(d2k_link_set_dns_endpoint(sv[0],dst6,6,htons(53),37,"00",trial,err,sizeof err)==0,
+                  "DNS endpoint install command");
+            n=read(sv[1],frame,sizeof frame);
+            CHECK(n==45 && frame[5]==0x9d && frame[6]==6 && !memcmp(frame+7,dst6,16) &&
+                  !memcmp(frame+23,(uint8_t[]){9,0,53,0,37,0},6) &&
+                  !memcmp(frame+29,trial,16),"DNS endpoint wire fields");
+            CHECK(d2k_link_del_dns_endpoint(sv[0],dst6,6,htons(53),17,err,sizeof err)==0,
+                  "DNS endpoint retirement command");
+            n=read(sv[1],frame,sizeof frame);
+            CHECK(n==27 && frame[5]==0x95 && !memcmp(frame+23,(uint8_t[]){9,0,53,17},4),
+                  "DNS endpoint retirement includes transport");
             close(sv[0]); close(sv[1]);
         }
     }
@@ -1113,6 +1529,21 @@ int main(void) {
         fails++;
         printf("ПРОВАЛОВ: %d\n", fails);
         return 1;
+    }
+
+    /* Full controller -> socket -> command handler -> decoder roundtrip.
+       Idempotent deletion still identifies exactly which trial is gone. */
+    for (unsigned family=4;family<=6;family+=2) {
+        uint8_t src[16]={0},dst[16]={0},trial[D2K_TRIAL_ID_LEN]={0};
+        inet_pton(family==4?AF_INET:AF_INET6,family==4?"192.0.2.1":"2001:db8::1",src);
+        inet_pton(family==4?AF_INET:AF_INET6,family==4?"192.0.2.2":"2001:db8::2",dst);
+        trial[0]=(uint8_t)family;trial[15]=0x71;
+        CHECK(d2k_link_del_addr_probe_family(fd,src,htons(40000),dst,htons(3478),17,family,
+              trial,err,sizeof err)==0,"send exact trial deletion");
+        d2k_ev ack;
+        CHECK(next_of_kind(fd,D2K_EV_ACK,5,&ack,err,sizeof err)==0 &&
+              ack.code==D2K_CMD_DEL_ADDR_PROBE && ack.num==0x100 &&
+              !memcmp(ack.trial_id,trial,sizeof trial),"decoded deletion ACK carries exact trial identity");
     }
 
     /* --- транспорт доезжает и различает TCP- и QUIC-поток к ОДНОМУ и тому
@@ -1231,25 +1662,53 @@ int main(void) {
         CHECK((ack.num & 0xFFu) == D2K_ACK_BAD_PLAN, "негодный план не помечен D2K_ACK_BAD_PLAN");
     }
 
-    /* --- ARM_SHAPE: форма приходит РАНЬШЕ ack на саму команду, если она уже
-     * поймана (ctlsrv.c) — проверяем порядок на настоящем сервере, а не по
-     * тому, что нам кажется по чтению кода. ------------------------------- */
+    /* --- Пассивная форма и ответ ARM_SHAPE — ДВА разных снимка. Первый
+     * привязан к потоку клиента; ответ из кэша имеет нулевые адреса/порты.
+     * Для каждого TCP-снимка CLIENT_TCP идёт непосредственно перед SHAPE,
+     * а за ответом из кэша — непосредственно ACK самой команды. ---------- */
     {
         (void)probe_say(&p, "hello shape.example");
 
         char e1[200] = {0};
-        CHECK(d2k_link_arm_shape(fd, "shape.example", 6, e1, sizeof e1) == 0, "ARM_SHAPE не отправилась");
+        d2k_ev hello = {0}, passive_options = {0}, passive = {0}, options = {0}, ev = {0};
+        CHECK(next_of_kind(fd, D2K_EV_HELLO, 6, &hello, e1, sizeof e1) == 0 &&
+              !strcmp(hello.name, "shape.example"), "passive shape HELLO missing");
+        CHECK(d2k_link_next(fd, &passive_options, 2000, e1, sizeof e1) == 0 &&
+              passive_options.kind == D2K_EV_CLIENT_TCP, "passive CLIENT_TCP must follow HELLO");
+        CHECK(d2k_link_next(fd, &passive, 2000, e1, sizeof e1) == 0 &&
+              passive.kind == D2K_EV_SHAPE, "passive SHAPE must follow CLIENT_TCP without ARM_SHAPE");
+        CHECK(passive.transport == 6 && passive.family == 4 &&
+              passive.low_port == hello.low_port && passive.high_port == hello.high_port &&
+              !memcmp(passive.low_ip, hello.low_ip, sizeof hello.low_ip) &&
+              !memcmp(passive.high_ip, hello.high_ip, sizeof hello.high_ip) &&
+              passive_options.transport == passive.transport && passive_options.family == passive.family &&
+              passive_options.low_port == passive.low_port && passive_options.high_port == passive.high_port &&
+              !memcmp(passive_options.low_ip, passive.low_ip, sizeof passive.low_ip) &&
+              !memcmp(passive_options.high_ip, passive.high_ip, sizeof passive.high_ip),
+              "passive snapshot/options lost observed flow key");
+        const uint8_t request_id[16] = {0x45, 0x67, 0x89};
+        CHECK(d2k_link_arm_shape_request(fd, "shape.example", 6, 4, request_id, e1, sizeof e1) == 0, "ARM_SHAPE не отправилась");
 
-        d2k_ev ev;
-        int found_shape = 0;
-        for (int i = 0; i < 6 && !found_shape; i++) {
-            char e2[200] = {0};
-            int rc = d2k_link_next(fd, &ev, 2000, e2, sizeof e2);
-            CHECK(rc == 0, "событие в очереди после ARM_SHAPE не пришло");
-            if (rc != 0) { break; }
-            if (ev.kind == D2K_EV_SHAPE) { found_shape = 1; }
-        }
-        CHECK(found_shape, "форма приветствия не пришла после ARM_SHAPE");
+        /* REFUSED на поток без плана ещё может стоять в очереди. Ищем
+         * начало ответа команды, затем проверяем порядок без пропусков. */
+        CHECK(next_of_kind(fd, D2K_EV_CLIENT_TCP, 6, &options, e1, sizeof e1) == 0 &&
+              options.transport == 6 && options.family == 4 &&
+              options.low_port == 0 && options.high_port == 0 &&
+              !memcmp(options.low_ip, (const uint8_t[16]){0}, sizeof options.low_ip) &&
+              !memcmp(options.high_ip, (const uint8_t[16]){0}, sizeof options.high_ip),
+              "cached CLIENT_TCP must identify a command snapshot, not a live flow");
+        CHECK(d2k_link_next(fd, &ev, 2000, e1, sizeof e1) == 0 &&
+              ev.kind == D2K_EV_SHAPE && ev.transport == 6 && ev.family == 4 &&
+              ev.low_port == 0 && ev.high_port == 0 &&
+              !memcmp(ev.low_ip, options.low_ip, sizeof ev.low_ip) &&
+              !memcmp(ev.high_ip, options.high_ip, sizeof ev.high_ip),
+              "cached SHAPE must immediately follow its CLIENT_TCP with the same key");
+        CHECK(ev.shape_len == passive.shape_len &&
+              !memcmp(ev.shape, passive.shape, ev.shape_len),
+              "cached request did not return the observed client form");
+        CHECK(options.tcp_options_len == passive_options.tcp_options_len &&
+              !memcmp(options.tcp_options, passive_options.tcp_options, options.tcp_options_len),
+              "cached request changed the observed TCP options");
         CHECK(ev.shape_len >= 3 && ev.shape[0] == 0x16 && ev.shape[1] == 0x03 && ev.shape[2] == 0x01,
               "форма приветствия не похожа на снятый ClientHello (build_hello, ctlprobe.c)");
 
@@ -1258,7 +1717,18 @@ int main(void) {
         CHECK(d2k_link_next(fd, &ack, 2000, e3, sizeof e3) == 0, "ack на ARM_SHAPE не пришёл следом за формой");
         CHECK(ack.kind == D2K_EV_ACK, "событие сразу после формы — не ack (нарушен документированный порядок)");
         CHECK(ack.code == D2K_CMD_ARM_SHAPE, "ack не на команду ARM_SHAPE");
+        CHECK(!memcmp(ack.trial_id, request_id, sizeof request_id), "snapshot ACK lost request identity");
         CHECK(((ack.num >> 8) & 0xFFu) == 1, "ARM_SHAPE не подтверждена как принятая");
+        const uint8_t missing_id[16] = {0x45, 0x67, 0x90};
+        CHECK(d2k_link_arm_shape_request(fd, "uncached-shape.example", 6, 4,
+            missing_id, e1, sizeof e1) == 0, "uncached snapshot request failed");
+        CHECK(d2k_link_next(fd, &ack, 2000, e1, sizeof e1) == 0 &&
+              ack.kind == D2K_EV_ACK && ack.code == D2K_CMD_ARM_SHAPE &&
+              !memcmp(ack.trial_id, missing_id, sizeof missing_id),
+              "uncached snapshot must acknowledge its own request without waiting for traffic");
+        const uint8_t zero_id[16] = {0};
+        CHECK(d2k_link_arm_shape_request(fd, "shape.example", 6, 4,
+            zero_id, e1, sizeof e1) != 0, "zero snapshot identity accepted");
     }
 
     /* --- EXCHANGE: code липкий (первый тип), поэтому появление прикладных
@@ -1279,6 +1749,8 @@ int main(void) {
            НАКОПЛЕННЫЙ счёт с момента приветствия, не размер текущего
            пакета, поэтому после ВТОРОГО reply это 128, а не снова 64. */
         CHECK(ev1.num == 64, "первый обмен: число байт не 64 — порядок байт длины разобрался неверно");
+        CHECK(ev1.flow_incarnation && d2k_rm_nonzero(ev1.flow_epoch,16),
+              "live TLS exchange lost immutable flow identity");
         CHECK(d2k_ev_outer_appdata(&ev1) == 0,
               "рукопожатие в настоящем обмене принято за внешний тип 23");
 
@@ -1290,6 +1762,8 @@ int main(void) {
         CHECK(ev2.code == 22,
               "второй обмен: code изменился — липкое поле ведёт себя иначе, чем задокументировано в d2k_link.h");
         CHECK(ev2.num == 128, "второй обмен: накопленное число байт не 128 (64+64)");
+        CHECK(ev1.flow_incarnation==ev2.flow_incarnation &&
+              !memcmp(ev1.flow_epoch,ev2.flow_epoch,16),"same TLS flow changed incarnation");
         /* Ровно тот вход, на котором старый (удалённый по ревью) подход —
            «тип ПЕРВОЙ записи == 23» — солгал бы: code второй записи EXCHANGE
            всё равно 22 (липкое поле, проверено строкой выше), а не 23.
@@ -1325,6 +1799,21 @@ int main(void) {
         int rc = d2k_link_next(fd, &ack, -1, e2, sizeof e2);
         CHECK(rc == 0, "wait_ms<0 не увидел уже лежащее в буфере событие");
         CHECK(ack.kind == D2K_EV_ACK, "wait_ms<0 прочитал не то событие");
+    }
+
+    /* Real serializer path: SYN establishes direction, RST generates the
+       suspicion, journal -> ctlsrv -> Unix socket -> controller decoder. */
+    {
+        d2k_ev hello, suspicion;
+        char e[200] = {0};
+        (void)probe_say(&p, "hello direction.example");
+        CHECK(next_of_kind(fd, D2K_EV_HELLO, 8, &hello, e, sizeof e) == 0,
+              "direction fixture hello missing");
+        (void)probe_say(&p, "rst");
+        CHECK(next_of_kind(fd, D2K_EV_SUSPECT, 8, &suspicion, e, sizeof e) == 0 &&
+              suspicion.client_side == D2K_CLIENT_SIDE_HIGH &&
+              suspicion.high_port == hello.high_port,
+              "observed direction lost between real datapath and controller");
     }
 
     d2k_link_close(fd);

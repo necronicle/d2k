@@ -70,7 +70,7 @@ int d2k_wire_tcp_checksum_ok(const uint8_t *pkt, size_t len);
  * проза, чтобы не приходилось его выводить):
  *   применимо:  e->ttl, D2K_POISON_IPID_ZERO — оба поля лежат в IP и общие
  *               с TCP;
- *   отказ (0):  e->pre_len != 0, e->seq_shift != 0, D2K_POISON_TCPTS_BACK,
+ *   отказ (0):  e->pre_len != 0, e->seq_shift != 0, e->ack_shift != 0, D2K_POISON_TCPTS_BACK,
  *               D2K_POISON_BADSUM — первые два (приставка и сдвиг) — один и
  *               тот же класс, манипуляция номером последовательности TCP,
  *               только с копией байт впереди либо напрямую; все четыре

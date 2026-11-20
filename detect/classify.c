@@ -26,6 +26,7 @@
  * «покрасивее» нельзя: расхождение здесь — дефект переноса.
  */
 #include "d2k_detect.h"
+#include "d2k_preflight_probe.h"
 
 #include <errno.h>
 #include <netdb.h>
@@ -70,6 +71,7 @@ const char *d2k_verdict_name(d2k_verdict_t v)
     case D2K_DV_POISONABLE:   return "poisonable";
     case D2K_DV_FLAKY:        return "flaky";
     case D2K_DV_UNREACHABLE:  return "unreachable";
+    case D2K_DV_RESPONSE_GATE: return "response_gate";
     case D2K_DV_RESPONSE:     return "response";
     default:                 return "";
     }
@@ -107,10 +109,26 @@ void d2k_sleep_ms(int ms)
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
 }
+int d2k_sleep_us(uint32_t us)
+{
+    struct timespec left={.tv_sec=us/1000000u,.tv_nsec=(long)(us%1000000u)*1000L};
+    while(nanosleep(&left,&left))if(errno!=EINTR)return -1;
+    return 0;
+}
 
 /* Доказательством прохода считается ТОЛЬКО то, что назвал триггер.
  * Пустой ответ доказательством НЕ является ни при каком accept. */
-int d2k_trigger_accepts(const d2k_trigger *t, const uint8_t *b, size_t n)
+size_t d2k_trigger_prefix_size(const d2k_trigger *t)
+{
+    switch (t->accept) {
+    case D2K_ACCEPT_SERVERHELLO: return 6;
+    case D2K_ACCEPT_TLSRECORD: return 3;
+    default: return 1;
+    }
+}
+
+int d2k_trigger_accepts(
+const d2k_trigger *t, const uint8_t *b, size_t n)
 {
     switch (t->accept) {
     case D2K_ACCEPT_SERVERHELLO:
@@ -188,10 +206,10 @@ d2k_obs *d2k_trace_add(d2k_result *res, const char *probe)
 {
     d2k_obs *o;
     size_t n;
-    if (res->ntrace >= D2K_TRACE_MAX) {
-        return &res->trace[D2K_TRACE_MAX - 1];
-    }
-    o = &res->trace[res->ntrace++];
+    /* The live observer records every completed observation. Once the
+     * diagnostic array fills, reuse its last slot without stale labels/counts. */
+    o = res->ntrace >= D2K_TRACE_MAX
+        ? &res->trace[D2K_TRACE_MAX - 1] : &res->trace[res->ntrace++];
     memset(o, 0, sizeof(*o));
     /* Копия с явной границей, а не snprintf: имя зонда приходит из разных
      * мест (гипотеза, свойство, собранный кандидат), длину его ни один
@@ -475,24 +493,34 @@ static int once_probe(const char *host, const char *port, const d2k_trigger *tr,
     pfd.fd = fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
-    {
-        int left = (int)(deadline - d2k_now_ms());
-        if (left < 0) {
-            left = 0;
+    size_t have = 0, minimum = d2k_trigger_prefix_size(tr);
+    while (have < minimum) {
+        if (d2k_detect_stopped(&opt->cancel)) {
+            snprintf(err, errcap, "context canceled");
+            close(fd); return -1;
         }
-        /* Тишина и обрыв — это и есть «убито». Ошибкой зонда не считаем:
-         * иначе блокировка выглядела бы как неисправность инструмента. */
-        if (poll(&pfd, 1, left) <= 0) {
-            close(fd);
-            return 0;
+        int64_t left = deadline - d2k_now_ms();
+        if (left <= 0) { close(fd); return 0; }
+        int ready = poll(&pfd, 1, left > 100 ? 100 : (int)left);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            snprintf(err, errcap, "poll: %s", strerror(errno));
+            close(fd); return -1;
         }
+        if (!ready) continue;
+        n = recv(fd, buf + have, sizeof buf - have, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (errno == ECONNRESET) { close(fd); return 0; }
+            snprintf(err, errcap, "recv: %s", strerror(errno));
+            close(fd); return -1;
+        }
+        if (!n) { close(fd); return 0; }
+        have += (size_t)n;
     }
-    n = recv(fd, buf, sizeof(buf), 0);
     close(fd);
-    if (n <= 0) {
-        return 0;
-    }
-    return d2k_trigger_accepts(tr, buf, (size_t)n);
+    return d2k_trigger_accepts(tr, buf, have);
+
 }
 
 /* Неподтверждённых сервером байт в очереди отправки; -1 — не наблюдается.
@@ -603,6 +631,20 @@ typedef struct {
     char err[160];
 } d2k_tally;
 
+/* Store only actual input bytes, not the unused 16 KiB buffer capacity. */
+static size_t cache_trigger_pack(unsigned char *dst, const d2k_trigger *tr) {
+    unsigned char *p = dst;
+    if (tr->len > sizeof tr->payload || tr->client_tcp_options_len > sizeof tr->client_tcp_options)
+        return 0;
+#define PACK_FIELD(field) do { memcpy(p, &tr->field, sizeof tr->field); p += sizeof tr->field; } while (0)
+    PACK_FIELD(name); PACK_FIELD(len); PACK_FIELD(sni_off); PACK_FIELD(sni_len);
+    PACK_FIELD(accept); PACK_FIELD(client_tcp_known); PACK_FIELD(client_tcp_options_len);
+#undef PACK_FIELD
+    memcpy(p, tr->payload, tr->len); p += tr->len;
+    memcpy(p, tr->client_tcp_options, tr->client_tcp_options_len); p += tr->client_tcp_options_len;
+    return (size_t)(p - dst);
+}
+
 /* measure гоняет один зонд Repeats раз и записывает наблюдение в трассу.
  *
  * until_pass — остановиться на первом проходе. Это для вопроса, исход
@@ -625,6 +667,24 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
         obs->cuts[obs->ncuts++] = cuts[i];
     }
     obs->delay_ms = gap_ms;
+    struct measure_key {
+        char kind[8], name[160];
+        int cuts[4], ncuts, gap, until_pass;
+    } key;
+    memset(&key, 0, sizeof key);
+    memcpy(key.kind, "measure", 7);
+    snprintf(key.name, sizeof key.name, "%s", name);
+    key.ncuts = ncuts; key.gap = gap_ms; key.until_pass = until_pass;
+    unsigned char input[sizeof(d2k_trigger)];
+    size_t input_len = cache_trigger_pack(input, tr);
+    for (i = 0; i < ncuts && i < 4; i++) key.cuts[i] = cuts[i];
+    d2k_run_entry *cached = input_len ? d2k_run_cache_get(opt->run_cache, &key, sizeof key, input, input_len) : NULL;
+    if (cached) {
+        t.pass = obs->pass = cached->pass; t.fail = obs->fail = cached->fail;
+        obs->seeded = 1;
+        obs_done(opt, obs);
+        return t;
+    }
 
     if (opt->seed_whole && ncuts == 0 && strcmp(name, "whole") == 0 &&
         opt->seed_repeats == opt->repeats &&
@@ -709,6 +769,10 @@ static d2k_tally measure(const char *host, const char *port, const d2k_trigger *
     }
     obs->pass = t.pass;
     obs->fail = t.fail;
+    if (input_len && !t.has_err && !d2k_detect_stopped(&opt->cancel) &&
+        (t.pass + t.fail == opt->repeats || (until_pass && t.pass > 0))) {
+        d2k_run_cache_put(opt->run_cache, &key, sizeof key, input, input_len, t.pass, t.fail);
+    }
     obs_done(opt, obs);
     return t;
 }
@@ -888,6 +952,57 @@ static int raw_recheck(const uint8_t *ip, uint8_t family, uint16_t pnum,
  * Порядок в poisons() не случайный: сначала то, что не требует знания
  * топологии, потом перебор TTL. TTL идёт последним не только по цене —
  * сработавшее значение попутно называет хоп, на котором стоит коробка. */
+/* Exact run input, including control/decoy bytes and TCP profile. The cache
+ * belongs to one scheduler task; task reset supplies the generation boundary. */
+static void bind_run_cache(const char *addr, const d2k_trigger *tr, d2k_opts *opt) {
+    struct context {
+        char addr[192];
+        int repeats, timeout, gap, long_gap, no_raw, vouched, cross;
+        uint32_t mark;
+    } c;
+    if (!opt->run_cache) return;
+    memset(&c, 0, sizeof c);
+    snprintf(c.addr, sizeof c.addr, "%s", addr);
+    c.repeats = opt->repeats; c.timeout = opt->timeout_ms;
+    c.gap = opt->write_gap_ms; c.long_gap = opt->long_gap_ms;
+    c.mark = opt->mark; c.no_raw = opt->no_raw;
+    c.vouched = opt->control_vouched; c.cross = opt->cross_check_tls12;
+    unsigned char *bytes = malloc(sizeof c + 4 * sizeof(d2k_trigger));
+    if (!bytes) { d2k_run_cache_clear(opt->run_cache); return; }
+    memcpy(bytes, &c, sizeof c);
+    size_t used = sizeof c;
+    const d2k_trigger *inputs[] = {tr, &opt->control, &opt->decoy, &opt->white};
+    for (size_t i = 0; i < 4; i++) {
+        size_t n = cache_trigger_pack(bytes + used, inputs[i]);
+        if (!n) { free(bytes); d2k_run_cache_clear(opt->run_cache); return; }
+        used += n;
+    }
+    if (opt->run_cache->context &&
+        (opt->run_cache->context_len != used ||
+         memcmp(opt->run_cache->context, bytes, used))) {
+        opt->nknown = 0;
+    }
+    (void)d2k_run_cache_bind(opt->run_cache, bytes, used);
+    free(bytes);
+}
+static int candidate_replay(const d2k_opts *opt, const d2k_poison *p, d2k_obs *obs) {
+    d2k_poison key = *p;
+    key.decoy = NULL;
+    d2k_run_entry *e = d2k_run_cache_get(opt->run_cache, &key, sizeof key,
+                                         p->decoy, p->decoy_len);
+    if (!e) return 0;
+    obs->pass = e->pass; obs->fail = e->fail; obs->seeded = 1;
+    return 1;
+}
+static void candidate_save(const d2k_opts *opt, const d2k_poison *p, const d2k_obs *obs) {
+    if (obs->seeded || obs->err[0] || d2k_detect_stopped(&opt->cancel) ||
+        (obs->fail == 0 && obs->pass != opt->repeats)) return;
+    d2k_poison key = *p;
+    key.decoy = NULL;
+    d2k_run_cache_put(opt->run_cache, &key, sizeof key, p->decoy, p->decoy_len,
+                      obs->pass, obs->fail);
+}
+
 static int sweep_poisons(const char *host, const char *port, const d2k_trigger *tr,
                          const d2k_opts *opt, d2k_result *res, d2k_poison *hit)
 {
@@ -984,19 +1099,27 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
             obs->delay_ms = cands[k].gap_ms;
             /* Единогласие: первый провал решает исход, остальные повторы
              * его не изменят. */
-            for (i = 0; i < opt->repeats; i++) {
+            int replayed = candidate_replay(opt, &cands[k], obs);
+            if (replayed) { pass = obs->pass; done = pass + obs->fail; }
+            for (i = 0; !replayed && i < opt->repeats; i++) {
+                if (d2k_detect_stopped(&opt->cancel)) break;
+                err[0] = '\0';
                 int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &cands[k], opt->timeout_ms,
                                               opt->mark, &opt->cancel, err, sizeof(err));
                 res->probes++;
                 done++;
                 d2k_raw_note_rc(res, family, rc);
                 if (rc <= 0) {
+                    if (rc < 0) {
+                        snprintf(obs->err, sizeof(obs->err), "%s", err[0] ? err : "local probe failure");
+                    }
                     break;
                 }
                 pass++;
             }
             obs->pass = pass;
             obs->fail = done - pass;
+            candidate_save(opt, &cands[k], obs);
             obs_done(opt, obs);
             if (raw_doubted(res) &&
             !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
@@ -1038,7 +1161,10 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
         obs = d2k_trace_add(res, pname);
         obs->delay_ms = p.gap_ms;
         /* Единогласие (см. ниже): первый провал решает исход гипотезы. */
-        for (r = 0; r < opt->repeats; r++) {
+        int replayed = candidate_replay(opt, &p, obs);
+        for (r = 0; !replayed && r < opt->repeats; r++) {
+            if (d2k_detect_stopped(&opt->cancel)) break;
+            err[0] = '\0';
             int rc = d2k_raw_probe_poison_family(ip4, family, pnum, tr, &p, opt->timeout_ms, opt->mark,
                                           &opt->cancel, err, sizeof(err));
             res->probes++;
@@ -1056,6 +1182,7 @@ static int sweep_poisons(const char *host, const char *port, const d2k_trigger *
                 break;
             }
         }
+        candidate_save(opt, &p, obs);
         obs_done(opt, obs);
         if (raw_doubted(res) &&
             !raw_recheck(ip4, family, pnum, opt, res, &props0, d2k_trigger_offers_ts(tr))) {
@@ -1096,6 +1223,60 @@ static void cross_check_tls12(d2k_result *res, const d2k_opts *opt, const char *
 }
 
 /* Run прогоняет дерево зондов по адресу addr ("host:port"). */
+static int measure_response_gate(const char *addr, const char *host, const d2k_trigger *tr,
+                                 const d2k_opts *opt, d2k_result *res)
+{
+    uint8_t gate_ip[16];
+    if (d2k_detect_stopped(&opt->cancel) || opt->no_raw || !d2k_raw_supported() ||
+        tr->accept != D2K_ACCEPT_SERVERHELLO ||
+        (inet_pton(AF_INET, host, gate_ip) != 1 &&
+         (!opt->preflight_ipv6 || inet_pton(AF_INET6, host, gate_ip) != 1)))
+        return 0;
+    unsigned long before = d2k_raw_dial_count();
+    int gate;
+    int from_known = d2k_preflight_known(&opt->known, &res->preflight, &gate);
+    /* A negative result in the catalog does not identify the alternate
+     * ClientHello, so it cannot rule out the candidate supplied now. */
+    if (from_known && !gate && opt->preflight_auto)
+        from_known = 0;
+    if (!from_known) gate = d2k_probe_preflight(addr, tr, opt, &res->preflight);
+    res->probes += (int)(d2k_raw_dial_count() - before);
+    d2k_obs *o = d2k_trace_add(res, "response-gate");
+    o->pass = gate == 1; o->fail = gate == 0;
+    o->from_known = from_known;
+    if (gate < 0) snprintf(o->err, sizeof o->err, "опыт response-gate не завершён");
+    if (gate == 3) snprintf(o->err,sizeof o->err,"перенос напрямую не подтверждён; кандидат для составного испытания");
+    if (gate == 0 && res->preflight.reason[0])
+        snprintf(o->err, sizeof o->err, "%.*s", (int)sizeof o->err-1, res->preflight.reason);
+    obs_done(opt, o);
+    if (gate == 2) {
+        res->verdict = D2K_DV_FLAKY;
+        snprintf(res->reason, sizeof res->reason,
+                 "свежая прямая сырая проба получила ответ после тихой базы — вопросы прекращены");
+        return 1;
+    }
+    if(gate==3) {
+        res->verdict=D2K_DV_INCONCLUSIVE;
+        snprintf(res->reason,sizeof res->reason,
+            "малое окно дало ответ (%u байт); перенос напрямую не подтверждён — только кандидат для проверки с исходящей программой",
+            res->preflight.candidate.response_bytes);
+        return 1;
+    }
+    if (gate == 0 && res->preflight.reason[0]) {
+        size_t used = strlen(res->reason);
+        snprintf(res->reason + used, sizeof res->reason - used, "; %s",res->preflight.reason);
+    }
+    if (gate == 1) {
+        res->verdict = D2K_DV_RESPONSE_GATE;
+        snprintf(res->reason, sizeof res->reason,
+                 "обычный ответ молчит (ACK %u/%zu); окно %u и перенос через RST после %u кусков проверены",
+                 res->preflight.baseline_acked,tr->len,
+                 res->preflight.window, res->preflight.pieces_needed);
+        return 1;
+    }
+    return 0;
+}
+
 void d2k_classify_run(const char *addr, const d2k_trigger *tr,
                       d2k_opts *opt, d2k_result *res)
 {
@@ -1108,6 +1289,7 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     int lo, hi;
 
     d2k_opts_defaults(opt);
+    bind_run_cache(addr, tr, opt);
     start = d2k_now_ms();
     memset(res, 0, sizeof(*res));
     /* Отложенные снятия правил подавления RST — перед пачкой зондов, а не
@@ -1267,6 +1449,10 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
         goto done;
     }
     if (one.pass == 0) {
+        /* Automatic response measurement has its own ACK/silence baseline.
+         * Ask after the cheap split control and before outbound fallbacks. */
+        if (opt->preflight_auto && measure_response_gate(addr, host, tr, opt, res))
+            goto gate_finished;
         /* 2а. КОНТРОЛЬ. Разрез не спас — но прежде чем говорить «пересборка»,
          * надо исключить, что содержимое вообще ни при чём. */
         int control_ok = 1;
@@ -1471,6 +1657,16 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     }
 
 done:
+    if (!opt->preflight_auto && opt->control_vouched &&
+        (res->verdict == D2K_DV_OPAQUE || res->verdict == D2K_DV_INCONCLUSIVE) &&
+        measure_response_gate(addr, host, tr, opt, res))
+        goto gate_finished;
+    if (res->preflight.reason[0]) {
+        size_t used = strlen(res->reason);
+        snprintf(res->reason + used, sizeof(res->reason) - used, "; %s", res->preflight.reason);
+    }
+
+gate_finished:
     /* Пометка ставится ОДИН раз и в конце: флаг отмены липкий (см. заголовок),
      * а проверять его в каждой точке выхода значило бы двадцать шансов забыть
      * одну. Брошенный замер не выдаётся за измеренный нигде. */

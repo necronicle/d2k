@@ -64,6 +64,7 @@
 #include <stdint.h>
 
 #include "d2k_hello.h" /* d2k_shape — значения поля d2k_cat_binding.shape */
+#include "d2k_boxprops.h" /* d2k_box_props — знание о коробке рядом с её приметами */
 #include "d2k_groups.h"
 
 /* Одна наблюдавшаяся примета коробки (см. internal/catalog/catalog.go,
@@ -179,7 +180,7 @@ typedef struct {
  * со старой записью вторую, и каталог из 376 подтверждённых целей удвоился
  * бы вместо того, чтобы обновиться. */
 typedef struct {
-    char     kind[8];      /* "name" | "addr" */
+    char     kind[8];      /* "name" | "addr" | "service" */
     char     target[256];
     char     plan_id[40];
     int      level;
@@ -188,12 +189,24 @@ typedef struct {
     int      enabled;
     uint8_t  transport;    /* 6 TCP, 17 UDP, 0 — не записано (старый файл) */
     uint8_t  family;       /* 4 or 6; legacy in-memory zero means IPv4, never wildcard */
+    uint16_t server_port;  /* host order; service requires 1..65535, legacy kinds require 0 */
     uint8_t  shape;        /* d2k_shape: 1 MODERN, 2 LEGACY, 0 — не измерено */
     uint8_t  verified_by;  /* D2K_VERBY_*, 0 — не измерено */
     /* ЧЕМ ГОВОРИЛ ЗАМЕР, ИЗ КОТОРОГО ВЫВЕДЕН ЭТОТ ПЛАН. D2K_INPUT_* ниже,
        0 — не записано (файл снят до появления поля). */
     uint8_t  input;
-    char probe_path[512]; /* public stylesheet witness; empty means legacy / */
+    char probe_path[512]; /* checked HTTP/DoH resource; empty means legacy / */
+    char preflight_name[256]; /* name used by the preflight application verifier */
+    /* Exact endpoint of a successful DNS-contract probe, alongside probe_path.
+       Zero/empty means no DNS witness; HTTP success alone never sets these.
+       dns_port is independent of server_port and does not change binding kind. */
+    uint16_t dns_port;     /* host order; 1..65535 when recorded */
+    int dns_authenticated; /* DNS contract ran over authenticated TLS */
+    int dns_dot;           /* RFC7858 framing, rather than a DoH resource */
+    uint8_t dns_http_version; /* negotiated DoH protocol, zero on non-DoH bindings */
+    uint16_t dns_query_bytes; /* plain DNS request size on wire, including TCP prefix */
+    char dns_name[256];    /* TLS/owner identity of the exact DNS service proof */
+    char dns_address[46];  /* numeric IPv4/IPv6 in binding.family, no zone suffix */
     char ech_origin[256]; /* explicit own-probe witness, NOT decrypted client SNI */
     /* «ТРЕБУЕТ ПОВТОРНОЙ ПРОВЕРКИ» (задача 21, D2K_SPEC §3.7, §9.7).
      *
@@ -229,6 +242,7 @@ typedef struct {
    применении к потоку зонда (задача 55, ревью I-3): новая улика меняет
    отметку, привязку не удаляет. Установка ставит такую последней. */
 #define D2K_CAT_BUDGET_CUT       3
+#define D2K_CAT_SHAPE_DNS        9
 
 /* ПОЛНОТА ВХОДА ЗАМЕРА.
  *
@@ -302,6 +316,35 @@ typedef struct {
  * любой стороны одинаково молчит. */
 int d2k_cat_shape_fits(uint8_t stored, uint8_t got);
 
+/* ЗНАНИЕ О КОРОБКЕ, ИЗМЕРЕННОЕ ОДНОЙ ФОРМОЙ КЛИЕНТА (23.10.2026).
+ *
+ * Отпечаток (d2k_cat_fp выше) отвечает на вопрос «ТА ЖЕ коробка?» и входит в
+ * сравнение d2k_fp_same. Эта запись отвечает на другой вопрос — «ЧЕМ её
+ * брать?» — и в сравнение НЕ входит: иначе коробка, измеренная полнее,
+ * перестала бы узнаваться в себе же. До правки такого знания в файле не было
+ * вовсе, и каждая новая цель узнанной коробки задавала ей те же вопросы
+ * заново (разбор выпуска 374a6df, 23.10.2026).
+ *
+ * ПОЧЕМУ ЗАПИСЕЙ НЕСКОЛЬКО. План зависит от пары «коробка + форма клиента»:
+ * клиент без метки времени не исполняет план со сдвигом метки назад, и
+ * вектор, измеренный клиентом с меткой, для него ложь (issue #7, поле
+ * 23.10.2026 — 498 сбросов зонда за прогон). Ключ записи — client_shape
+ * внутри самого вектора; записей не больше D2K_CAT_PROPS_MAX, и лишняя — отказ
+ * разбора с причиной, тем же правилом, что девятая примета отпечатка. Восемь,
+ * а не четыре: TCP-форм клиента на одной линии уже пять (modern, legacy, ECH,
+ * дедушкино право, HTTP), и четвёртая запись отказывала бы знанию на живой
+ * сети, а не на выдуманной.
+ *
+ * measured_at — когда вектор измерен. Нужен для §0 «повторная проверка при
+ * деградации»: знание устаревает вместе с сетью, и по этому времени решается,
+ * перемерять ли, а не по тому, что запись вообще есть. */
+#define D2K_CAT_PROPS_MAX 8
+
+typedef struct {
+    d2k_box_props p;
+    int64_t       measured_at; /* секунды эпохи; 0 — время не записано */
+} d2k_cat_props;
+
 /* Изученная модель поведения одной DPI-коробки (см. Box). plans/binds —
  * массивы на куче переменной длины (в отличие от d2k_cat_fp.sig, здесь
  * реальные размеры — сотни привязок на коробку, см. testdata), растут по
@@ -312,8 +355,15 @@ typedef struct {
     d2k_cat_fp       fp;
     d2k_cat_plan    *plans;
     size_t           n_plans;
+    size_t           cap_plans; /* diagnostic allocation metadata only */
     d2k_cat_binding *binds;
     size_t           n_binds;
+    size_t           cap_binds; /* retained even when a binding is removed */
+    /* Знание о коробке по формам клиента (см. d2k_cat_props выше). Массив
+       фиксированный, как fp.sig: n_props == 0 означает «не измерено», а не
+       «свойств нет». */
+    d2k_cat_props    props[D2K_CAT_PROPS_MAX];
+    size_t           n_props;
 } d2k_cat_box;
 
 /* БЕЛОЕ ИМЯ СЕТИ (поле 10.10.2026). SNI-whitelist коробки различается по
@@ -348,6 +398,7 @@ typedef struct {
 typedef struct {
     d2k_cat_box *boxes;
     size_t       n_boxes;
+    size_t       cap_boxes; /* requested allocation, never drives growth */
     /* Process-local mutation counter for controller persistence decisions;
        deliberately omitted from the on-disk catalog schema. */
     uint64_t     revision;
