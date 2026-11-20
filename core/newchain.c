@@ -103,7 +103,8 @@ int d2k_newchain_poll(d2k_newchain *n,int fd,int64_t now,d2k_newchain_log log,vo
         d2km_target normalized;
         if(d2km_target_name(&normalized,k->context.target.name) || strcmp(normalized.name,k->context.target.name)) {
             note(log,ctx,"load",NULL,"invalid or noncanonical knowledge name; previous bindings retained");
-            if(fresh)free(store);return -1;
+            if(fresh)free(store);
+            return -1;
         }
         d2k_newchain_value v;value(&v,k);size_t j=0;for(;j<count;j++)if(key(&wanted[j],&v))break;
         if(j<count) {
