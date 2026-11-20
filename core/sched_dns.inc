@@ -286,6 +286,24 @@ static int dns_add_address(doh_target *rows,size_t *used,size_t cap,const doh_ta
     if(*used==cap){errno=ENOBUFS;return -1;}
     rows[*used]=*d;snprintf(rows[*used].ip,sizeof rows[*used].ip,"%s",ip);(*used)++;return 0;
 }
+/* Keenetic keeps bootstrap addresses in show dns-proxy even when its own
+ * resolver cannot answer. Only addresses for this exact upstream are useful. */
+static int dns_static_addresses(const char *path,const doh_target *d,doh_target *rows,size_t *used,size_t cap) {
+    FILE *f=fopen(path,"r");if(!f)return -1;
+    char line[512],key[16],equal[2],name[256],ip[INET6_ADDRSTRLEN],extra;
+    unsigned ttl;int bad=0;
+    while(fgets(line,sizeof line,f)) {
+        uint8_t address[16];
+        if(sscanf(line," %15s %1s %255s %45s %u %c",key,equal,name,ip,&ttl,&extra)!=5 ||
+           strcmp(equal,"=") || strcasecmp(name,d->host))continue;
+        int family=!strcmp(key,"static_a") ? AF_INET : !strcmp(key,"static_aaaa") ? AF_INET6 : 0;
+        if(!family || inet_pton(family,ip,address)!=1)continue;
+        if(dns_add_address(rows,used,cap,d,ip)){bad=1;break;}
+    }
+    if(ferror(f))bad=1;
+    if(fclose(f))bad=1;
+    return bad?-1:0;
+}
 static int dns_observed_addresses(const char *path,const doh_target *d,doh_target *rows,size_t *used,size_t cap) {
     if(!path)return 0;
     FILE *f=fopen(path,"r");if(!f)return errno==ENOENT?0:-1;
@@ -337,6 +355,7 @@ int d2k_sched_doh_discover(d2k_sched *s,const char *configuration,const char *ad
         doh_target rows[sizeof pending/sizeof *pending];size_t addresses_used=0;
         if(d.ip[0]) {rows[0]=d;addresses_used=1;}
         else {
+            if(dns_static_addresses(configuration,&d,rows,&addresses_used,sizeof rows/sizeof *rows))return -1;
             if(dns_observed_addresses(addresses,&d,rows,&addresses_used,sizeof rows/sizeof *rows))return -1;
             if(!addresses_used)for(size_t j=0;j<s->n_doh;j++)
                 if(dns_same_service(s->doh+j,&d) && s->doh[j].ip[0] &&

@@ -15103,35 +15103,38 @@ static int doh_health_target(d2k_sched *s,doh_target *d) {
 static void __attribute__((unused)) doh_health_tick(d2k_sched *s) {
     for (size_t i=0; i<s->n_doh; i++) (void)doh_health_target(s,&s->doh[i]);
 }
-static int dns_journal_solved(d2k_sched *s,const char *base) {
-    if(!s->cat)return 0;
+static int dns_journal_target_solved(d2k_sched *s,const doh_target *d) {
+    if(!s->cat || !d->ip[0])return 0;
     for(size_t i=0;i<s->cat->n_boxes;i++)
         for(size_t j=0;j<s->cat->boxes[i].n_binds;j++) {
-            const d2k_cat_binding *b=&s->cat->boxes[i].binds[j];char own[256];
+            const d2k_cat_binding *b=&s->cat->boxes[i].binds[j];
             if(strcmp(b->kind,"service") || b->level<3 || !b->confirmed ||
                b->budget!=D2K_CAT_BUDGET_PASSED ||
                (!b->dns_authenticated && b->shape!=D2K_CAT_SHAPE_DNS) ||
-               d2k_domain_base(b->dns_name,own) || strcmp(own,base))continue;
-            return 1; /* Durable catalog proof; even a later disabled binding stays solved. */
+               strcasecmp(b->dns_name,d->host) || strcmp(b->dns_address,d->ip) ||
+               b->dns_port!=d->port || b->dns_dot!=d->dot ||
+               strcmp(b->probe_path,d->path))continue;
+            return 1; /* Exact endpoint proof remains solved even if disabled later. */
         }
     return 0;
 }
 int d2k_sched_dns_journal_error(d2k_sched *s,const char *domain) {
     char base[256];
-    if(!s || d2k_domain_base(domain,base) || dns_journal_solved(s,base))return 0;
+    if(!s || d2k_domain_base(domain,base))return 0;
     int matched=0;
     for(size_t i=0;i<s->n_doh;i++) {
         doh_target *d=&s->doh[i];char own[256];
         if(d2k_domain_base(d->host,own) || strcmp(own,base))continue;
+        if(dns_journal_target_solved(s,d))continue;
         d->journal_pending=1;d->next_ms=0;matched++;
     }
     return matched;
 }
 static void dns_journal_pending_tick(d2k_sched *s) {
     for(size_t i=0;i<s->n_doh;i++) {
-        doh_target *d=&s->doh[i];char base[256];
+        doh_target *d=&s->doh[i];
         if(!d->journal_pending)continue;
-        if(!d2k_domain_base(d->host,base) && dns_journal_solved(s,base)) {
+        if(dns_journal_target_solved(s,d)) {
             d->journal_pending=0;continue;
         }
         if(doh_health_target(s,d))d->journal_pending=0;
