@@ -48,7 +48,8 @@ int main(void) {
         else {memcpy(response,h2,sizeof h2);response_len=sizeof h2;}
         response_pos=0;tls_status=D2K_DOH_TLS_OK;
         d2k_ver_result r=d2k_verify_preflight_on(-1,"192.0.2.8",443,"video.example",1000,0,shape);
-        assert(r.level==D2K_VER_APPLICATION && r.body_complete && r.body_bytes==3 || http_kind==2 && r.level==D2K_VER_APPLICATION && r.body_complete);
+        assert((r.level==D2K_VER_APPLICATION && r.body_complete && r.body_bytes==3) ||
+               (http_kind==2 && r.level==D2K_VER_APPLICATION && r.body_complete));
         assert(r.peer_authenticated && !r.peer_auth_failed && r.http_version==http_kind);
         assert(r.negotiated_tls==(shape?0x0303:0x0304) && opened_version==r.negotiated_tls);
         assert(r.local_port==41008 && r.family==4 && r.fd==-1);
