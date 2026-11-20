@@ -1700,10 +1700,13 @@ dns_excl_apply() { # [fresh] — цепочки только что собран
         case $dx_h in *:*) echo "$dx_h $dx_h $dx_p"; continue ;; esac
         # Keenetic's own bootstrap survives a DoH outage; the resolver we
         # would otherwise ask is precisely the component that may be down.
-        dx_static_ips=$(awk -v h="$dx_h" '
-            $1 == "static_a" && $2 == "=" && $3 == h && $4 ~ /^[0-9.]+$/ { print $4 }
-            $1 == "static_aaaa" && $2 == "=" && $3 == h && $4 ~ /^[0-9a-fA-F:]+$/ { print $4 }
-        ' "$RUN/dns-upstreams")
+        dx_static_ips=
+        if [ -r "$RUN/dns-upstreams" ]; then
+            dx_static_ips=$(awk -v h="$dx_h" '
+                $1 == "static_a" && $2 == "=" && $3 == h && $4 ~ /^[0-9.]+$/ { print $4 }
+                $1 == "static_aaaa" && $2 == "=" && $3 == h && $4 ~ /^[0-9a-fA-F:]+$/ { print $4 }
+            ' "$RUN/dns-upstreams")
+        fi
         dx_ips=$(nslookup "$dx_h" 127.0.0.1 2>/dev/null |
             awk '/^Name:/ { n = 1; next } n && /^Address/ { print $3 }')
         for dx_ip in $dx_static_ips $dx_ips; do echo "$dx_h $dx_ip $dx_p"; done
