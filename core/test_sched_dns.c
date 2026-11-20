@@ -644,6 +644,14 @@ static void journal_driven_dns(void) {
     box->plans[0].text=strdup("proto tls\n");assert(box->plans[0].text);
     assert(d2k_sched_dns_journal_error(s,"another.example.com")==0);
     d2k_sched_tick(s,8000);assert(started==before+1);
+    write_file(config,"upstream https://gw.example.com/dns-query\n"
+        "static_a = gw.example.com 192.0.2.55 0\n"
+        "static_a = gw.example.com 192.0.2.56 0\n");
+    assert(d2k_sched_doh_discover(s,config,addresses)==2);
+    assert(d2k_sched_dns_journal_error(s,"gw.example.com")==1);
+    for(size_t i=0;i<s->n_doh;i++)
+        assert(s->doh[i].journal_pending==(!strcmp(s->doh[i].ip,"192.0.2.56")));
+    d2k_sched_tick(s,8100);assert(started==before+2);
     d2k_sched_free(s);d2k_catalog_free(&cat);
     unlink(config);unlink(addresses);
 }
