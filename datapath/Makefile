@@ -563,7 +563,10 @@ san: san-build
 # Берётся кросс-компилятор под mipsel, потому что это настоящий gcc и он уже
 # нужен для переносимости. Переопределяется через GCC=.
 GCC ?= mipsel-unknown-linux-gnu-gcc
-gcc-warn:
+../core/tcp1620_whitelist.inc:
+	$(MAKE) -C ../core tcp1620_whitelist.inc
+
+gcc-warn: ../core/hello_profiles.inc ../core/tcp1620_whitelist.inc
 	@for f in $(SRC) $(CORESRC) $(LINUXSRC) $(DAEMON) planlab.c ctlprobe.c $(TESTS:=.c); do \
 		$(GCC) $(CFLAGS) -c -o /tmp/d2k-gccwarn.o $$f || exit 1; \
 	done
