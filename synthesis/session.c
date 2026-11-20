@@ -74,7 +74,8 @@ static d2k_learner_status check_reference(d2k_tls_learning *s,const d2k_experime
 d2k_learner_status d2k_tls_learning_step(d2k_tls_learning *s,const d2k_tls_stream *stream,
     const d2k_experiment *base,const void *initial,size_t initial_len,
     d2k_learning_round *out,char *err,size_t cap) {
-    if(out)memset(out,0,sizeof *out);if(err && cap)err[0]=0;
+    if(out)memset(out,0,sizeof *out);
+    if(err && cap)err[0]=0;
     if(!s || !base || !out || !err || !cap)return D2K_L_ERROR;
     if(s->halted){snprintf(err,cap,"reference guard stopped this learning context");return s->halted;}
     d2k_learning_context current={0};
@@ -118,7 +119,8 @@ d2k_learner_status d2k_tls_learning_request(d2k_tls_learning *s,const size_t *wo
     return s?(s->halted?s->halted:d2k_learner_request(s->learner,word,n)):D2K_L_ERROR;
 }
 d2k_syn_result d2k_tls_learning_propose(d2k_tls_learning *s,char **plan,char *err,size_t cap) {
-    if(plan)*plan=NULL;if(err && cap)err[0]=0;
+    if(plan)*plan=NULL;
+    if(err && cap)err[0]=0;
     d2k_syn_result error={.status=D2K_SYN_ERROR};
     if(!s || !plan || !err || !cap)return error;
     if(s->halted){snprintf(err,cap,"reference guard stopped this learning context");return error;}

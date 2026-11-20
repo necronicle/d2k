@@ -15,7 +15,9 @@ static int decode_stream(void *ctx,size_t index,const d2k_raw_observation *obs,
 d2k_experiment_status d2k_tls_stream_run(const d2k_tls_stream *s,const d2k_experiment *base,
     const size_t *word,size_t n,d2k_sample *samples,size_t *completed,
     d2k_raw_observation *last,char *err,size_t cap) {
-    if(completed)*completed=0;if(last)memset(last,0,sizeof *last);if(err && cap)err[0]=0;
+    if(completed)*completed=0;
+    if(last)memset(last,0,sizeof *last);
+    if(err && cap)err[0]=0;
     if(!base || !completed || !last || !err || !cap || (n && (!samples || !word)) ||
        n>SIZE_MAX/sizeof *samples)return D2K_EXPERIMENT_ERROR;
     if(n)memset(samples,0,n*sizeof *samples);

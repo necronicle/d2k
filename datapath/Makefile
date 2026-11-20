@@ -538,7 +538,7 @@ SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=al
 san-force:
 /tmp/d2k-san-%: %.c san-force Makefile $(SRC) $(CORESRC) $(HDR) $(CORE_DIR)/hello_profiles.inc $(CORE_DIR)/plantlv.c $(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c
 	@set -e; t=$*; \
-		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ] || [ "$$t" = test_udp_path ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/hello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
+		extra=; if [ "$$t" = test_quic_session ] || [ "$$t" = test_stun_session ] || [ "$$t" = test_udp_path ]; then extra="$(CORE_DIR)/quichello.c $(CORE_DIR)/tls13core.c $(CORE_DIR)/x25519.c"; fi; \
 		if [ "$$t" = test_session ] || [ "$$t" = test_preflight_wiring ]; then extra="$(CORE_DIR)/plantlv.c"; fi; \
 		sources="$(SRC)"; if [ "$$t" = test_postnat_alloc ]; then sources="postnat_packet.c"; fi; \
 		if [ "$$t" = test_plan_alloc ]; then sources="$(filter-out plan_parse.c,$(SRC))"; fi; \
@@ -634,7 +634,7 @@ TARGET_FLAGS ?=
 ARCH ?= arm64
 .PHONY: release
 d2kd-linux-arm64: release
-release:
+release: ../core/hello_profiles.inc ../core/tcp1620_whitelist.inc
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -static -Wl,-S \
 		-o $(BUILDDIR)/d2kd-linux-$(ARCH) $(DAEMON) $(LINUXSRC) $(SRC) $(CORESRC) $(DAEMON_LIBS)

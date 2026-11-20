@@ -1346,12 +1346,12 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c $(DOH_TLS_SRC) $(DOH_TLS_HDR) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
+d2kc: d2kc.c $(DOH_TLS_SRC) $(DOH_TLS_HDR) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o udpplan.o udpruntime.o \
       hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-      $(DETECT_OBJ) $(HDR) $(D2KC_CT_SRC)
+      $(DETECT_OBJ) $(HDR) $(D2KC_CT_SRC) ../datapath/wire_udp.c
 	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -DD2K_TRUSTED_DOH -o $@ $< $(DOH_TLS_SRC) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
-		voice.o voice_discovery.o stun.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
-		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c \
+		voice.o voice_discovery.o stun.o udpplan.o udpruntime.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
+		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c \
 		$(D2KC_CT_SRC) $(OPENSSL_LIBS) $(TEST_LDFLAGS)
 
 clean:

@@ -24,7 +24,8 @@ void d2k_learner_free(d2k_learner *l) {
     d2k_distinction_free(&l->pending);d2k_evidence_free(l->evidence);free(l);
 }
 int d2k_learner_snapshot(const d2k_learner *l,d2k_hypothesis **out) {
-    if(!out)return -1;*out=NULL;
+    if(!out)return -1;
+    *out=NULL;
     if(!l)return -1;
     if(l->waiting || l->conflict || l->inconclusive)return 0;
     return d2k_evidence_generalize(l->evidence,out);

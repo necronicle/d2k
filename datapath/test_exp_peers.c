@@ -57,7 +57,8 @@ static ssize_t io_write(int f,const void *p,size_t n) {
 
 static const uint8_t tiny[]={ 'D','2','K','P',0,1,0,1,0,0,0,1,1,3,0,1,0 };
 static void command(d2k_ctl *peer,d2k_session *session,uint16_t type,const uint8_t id[16],uint16_t port) {
-    uint8_t *p=streams[d2k_ctl_peer_fd(peer)].input;
+    int fd=d2k_ctl_peer_fd(peer);if(fd<0||fd>=16)abort();
+    uint8_t *p=streams[fd].input;
     size_t n=6;
     p[n++]=1;p[n++]='x';p[n++]=1;p[n++]=4;
     p[n++]=(uint8_t)(port>>8);p[n++]=(uint8_t)port;
@@ -66,15 +67,16 @@ static void command(d2k_ctl *peer,d2k_session *session,uint16_t type,const uint8
     size_t length=n-4;
     p[0]=p[1]=0;p[2]=(uint8_t)(length>>8);p[3]=(uint8_t)length;
     p[4]=(uint8_t)(type>>8);p[5]=(uint8_t)type;
-    streams[d2k_ctl_peer_fd(peer)].in=n;
+    streams[fd].in=n;
     d2k_ctlsrv cx={.ctl=peer,.sess=session};
     assert(d2k_ctl_poll(peer,d2k_ctlsrv_command_exp,&cx)==1);
 }
 static void remove_probe(d2k_ctl *peer,d2k_session *session,const uint8_t id[16],uint16_t port) {
-    uint8_t *p=streams[d2k_ctl_peer_fd(peer)].input;
+    int fd=d2k_ctl_peer_fd(peer);if(fd<0||fd>=16)abort();
+    uint8_t *p=streams[fd].input;
     memset(p,0,28);p[3]=24;p[5]=D2K_CMD_DEL_NAME_PROBE;
     p[6]=1;p[7]='x';p[8]=1;p[9]=4;p[10]=(uint8_t)(port>>8);p[11]=(uint8_t)port;
-    memcpy(p+12,id,16);streams[d2k_ctl_peer_fd(peer)].in=28;
+    memcpy(p+12,id,16);streams[fd].in=28;
     d2k_ctlsrv cx={.ctl=peer,.sess=session};
     assert(d2k_ctl_poll(peer,d2k_ctlsrv_command_exp,&cx)==1);
 }

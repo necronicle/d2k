@@ -976,7 +976,7 @@ static int raw_recv(raw_conn *c, uint8_t *flags, uint32_t *seq, uint32_t *ack,
          * busy router unrelated packets otherwise keep a silent probe alive
          * forever, also preventing cancellation and occupying its worker. */
         if (d2k_now_ms() >= deadline || d2k_detect_stopped(cancel)) return -1;
-        struct sockaddr_storage peer;
+        struct sockaddr_storage peer={0};
         socklen_t peerlen = sizeof peer;
         ssize_t n = recvfrom(c->recv_fd, buf, sizeof(c->buffers->recv), 0,
                               (struct sockaddr *)&peer, &peerlen);

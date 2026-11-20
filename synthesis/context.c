@@ -4,7 +4,8 @@
 typedef struct {uint8_t *bytes;size_t at,cap;int failed;} encoder;
 static void bytes(encoder *e,const void *p,size_t n) {
     if(e->failed || n>e->cap-e->at){e->failed=1;return;}
-    if(n)memcpy(e->bytes+e->at,p,n);e->at+=n;
+    if(n)memcpy(e->bytes+e->at,p,n);
+    e->at+=n;
 }
 static void number(encoder *e,uint64_t value) {
     uint8_t b[8];for(size_t i=0;i<8;i++)b[7-i]=(uint8_t)(value>>(i*8));bytes(e,b,8);
@@ -17,7 +18,8 @@ void d2k_learning_context_free(d2k_learning_context *c) {
 int d2k_tls_stream_context(const d2k_tls_stream *s,const d2k_experiment *e,
     uint64_t generation,uint64_t decoder_schema,const void *initial,size_t initial_len,
     d2k_learning_context *out) {
-    if(!out)return -1;memset(out,0,sizeof *out);
+    if(!out)return -1;
+    memset(out,0,sizeof *out);
     if(!s || !e || !generation || !decoder_schema || !initial || !initial_len ||
        (e->family!=4 && e->family!=6) || !e->port || e->connect_ms<=0 ||
        !d2k_tls_stream_domain(s).states || s->read_minimum>e->reply_capacity)return -1;

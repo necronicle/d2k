@@ -71,7 +71,8 @@ static int read_name(const uint8_t *dns,size_t len,size_t *pos,char out[256]) {
             if(p>=len)return 0;
             size_t next=((n&0x3f)<<8)|dns[p++];
             if(!jumped){end=p;jumped=1;}
-            if(next>=len)return 0;p=next;continue;
+            if(next>=len)return 0;
+            p=next;continue;
         }
         if(n&0xc0)return 0;
         if(!n) {if(!jumped)end=p;break;}
@@ -83,7 +84,8 @@ static int read_name(const uint8_t *dns,size_t len,size_t *pos,char out[256]) {
             out[used++]=(char)c;
         }
     }
-    if(!used)return 0;out[used]=0;*pos=end;return 1;
+    if(!used)return 0;
+    out[used]=0;*pos=end;return 1;
 }
 
 int d2k_dns_capture_answer(const uint8_t *packet,size_t len,d2k_dns_answer *out) {
@@ -97,16 +99,20 @@ int d2k_dns_capture_answer(const uint8_t *packet,size_t len,d2k_dns_answer *out)
         if(at<20||total<at||total>len)return 0;
         memcpy(out->client,packet+16,4);memcpy(out->server,packet+12,4);
     } else if((packet[0]>>4)==6) {
-        if(len<40)return 0;at=40;total=40+read16(packet+4);protocol=packet[6];out->family=6;
-        if(total>len)return 0;memcpy(out->client,packet+24,16);memcpy(out->server,packet+8,16);
+        if(len<40)return 0;
+        at=40;total=40+read16(packet+4);protocol=packet[6];out->family=6;
+        if(total>len)return 0;
+        memcpy(out->client,packet+24,16);memcpy(out->server,packet+8,16);
     } else return 0;
     packet+=at;len=total-at;
     if(len<4||read16(packet)!=53)return 0;
     const uint8_t *dns;size_t dns_len;
     if(protocol==17) {
-        if(len<8||read16(packet+4)!=len)return 0;dns=packet+8;dns_len=len-8;
+        if(len<8||read16(packet+4)!=len)return 0;
+        dns=packet+8;dns_len=len-8;
     } else if(protocol==6) {
-        if(len<22)return 0;size_t offset=(packet[12]>>4)*4;
+        if(len<22)return 0;
+        size_t offset=(packet[12]>>4)*4;
         if(offset<20||offset+2>len||(packet[13]&7))return 0;
         dns_len=read16(packet+offset);dns=packet+offset+2;
         if(dns_len!=len-offset-2)return 0;

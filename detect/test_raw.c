@@ -1821,7 +1821,8 @@ static void test_application_worker(void)
         else if(mode==2 || mode==7)CHECK(result==D2K_SYN_ERROR && f.runs==1);
         size_t count,failures=0,successes=0;const d2k_path_event *events=d2k_tls_path_session_history(w,&count);
         for(size_t i=0;i<count;i++)if(events[i].sample.operation==w->stream.chunks+3 && events[i].sample.conclusive) {
-            uint64_t value;int terminal;CHECK(d2k_path_run_output(w->path,events[i].sample.observation,&value,&terminal));
+            uint64_t value=0;int terminal=0;
+            CHECK(d2k_path_run_output(w->path,events[i].sample.observation,&value,&terminal));
             failures+=value==7;successes+=value==42;
         }
         if(mode==0 || mode==3)CHECK(failures>=2 && successes==1);

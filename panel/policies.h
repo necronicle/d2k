@@ -48,7 +48,8 @@ static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items
         if(setpgid(0,0))_exit(125);
         close(pipes[0]);if(dup2(pipes[1],STDOUT_FILENO)<0)_exit(125);close(pipes[1]);
         int nullfd=open("/dev/null",O_WRONLY);if(nullfd>=0){dup2(nullfd,STDERR_FILENO);close(nullfd);}
-        if(client>2)close(client);if(cfg&&cfg->listener_fd>2)close(cfg->listener_fd);
+        if(client>2)close(client);
+        if(cfg&&cfg->listener_fd>2)close(cfg->listener_fd);
         execlp("ndmc","ndmc","-c","show ip policy",(char*)NULL);_exit(127);
     }
     (void)setpgid(pid,pid);
@@ -57,9 +58,11 @@ static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items
     for(;;){
         long long left=deadline-monotonic_ms();if(left<=0)break;
         struct pollfd p={.fd=pipes[0],.events=POLLIN};int rc=poll(&p,1,(int)left);
-        if(rc<0&&errno==EINTR)continue;if(rc<=0)break;
+        if(rc<0&&errno==EINTR)continue;
+        if(rc<=0)break;
         ssize_t n=read(pipes[0],text+used,sizeof text-1-used);
-        if(n<0&&errno==EINTR)continue;if(n<0)break;
+        if(n<0&&errno==EINTR)continue;
+        if(n<0)break;
         if(!n){ok=1;break;}used+=(size_t)n;if(used==sizeof text-1)break;
     }
     close(pipes[0]);
@@ -81,7 +84,8 @@ static int policy_key(const char *line,size_t n,size_t *offset) {
     static const char key[]="KEENETIC_POLICY";
     if(n-i<sizeof key-1||memcmp(line+i,key,sizeof key-1))return 0;
     i+=sizeof key-1;while(i<n&&(line[i]==' '||line[i]=='\t'))i++;
-    if(i==n||line[i]!='=')return 0;*offset=i+1;return 1;
+    if(i==n||line[i]!='=')return 0;
+    *offset=i+1;return 1;
 }
 /* Editing is supported only for physical, literal assignment lines. Reject
  * shell control syntax before interpreting any key, including keys inside
@@ -123,7 +127,8 @@ static char *policy_config_load(const char *path,struct stat *st) {
     close(fd);raw[len]=0;if(memchr(raw,0,len)||policy_config_layout(raw)){free(raw);return NULL;}return raw;
 }
 static int policy_config_read(const char *path,char *out,size_t cap) {
-    if(!path)return -1;struct stat st;char *raw=policy_config_load(path,&st);if(!raw)return -1;
+    if(!path)return -1;
+    struct stat st;char *raw=policy_config_load(path,&st);if(!raw)return -1;
     out[0]=0;int rc=0;char *save=NULL;
     for(char *line=strtok_r(raw,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
         size_t off;if(!policy_key(line,strlen(line),&off))continue;
@@ -150,13 +155,16 @@ static int policy_config_save(const char *path,const char *id) {
         p+=len;
     }
     if(ok&&!found){size_t len=strlen(raw);if(len&&raw[len-1]!='\n'&&fputc('\n',f)==EOF)ok=0;if(fprintf(f,"KEENETIC_POLICY='%s'\n",id)<0)ok=0;}
-    if(fflush(f)||fsync(fd))ok=0;if(fclose(f))ok=0;
+    if(fflush(f)||fsync(fd))ok=0;
+    if(fclose(f))ok=0;
     /* Refuse replacement after an observed concurrent owner edit. */
     struct stat check;char *current=policy_config_load(path,&check);
     if(!current||check.st_size!=st.st_size||memcmp(raw,current,(size_t)st.st_size))ok=0;
     free(current);
     if(lstat(path,&now)||now.st_dev!=st.st_dev||now.st_ino!=st.st_ino||now.st_size!=st.st_size||now.st_mtime!=st.st_mtime||now.st_ctime!=st.st_ctime)ok=0;
-    if(ok&&rename(temp,path))ok=0;if(!ok)unlink(temp);free(raw);return ok?0:-1;
+    if(ok&&rename(temp,path))ok=0;
+    if(!ok)unlink(temp);
+    free(raw);return ok?0:-1;
 }
 static int policy_reply(int fd,int code,const char *message) {
     char text[1024]={0};panel_buf b={.p=text,.cap=sizeof text};buf_puts(&b,"{\"ok\":false,\"message\":");buf_json_string(&b,message);buf_puts(&b,"}");
@@ -170,7 +178,8 @@ static int policy_argv_matches(const char *args,size_t len,const char *mark) {
     size_t at=0;int found=0;
     while(at<len){size_t n=strnlen(args+at,len-at);if(n==len-at)return 0;
         if(!strcmp(args+at,"--only-mark")){
-            if(found++)return 0;at+=n+1;if(at>=len)return 0;n=strnlen(args+at,len-at);if(n==len-at)return 0;
+            if(found++)return 0;
+            at+=n+1;if(at>=len)return 0;n=strnlen(args+at,len-at);if(n==len-at)return 0;
             if(!mark||!*mark)return 0;
             char expected[64];snprintf(expected,sizeof expected,"0x%s/0xffffffff",mark);
             if(strcmp(args+at,expected))return 0;

@@ -628,7 +628,7 @@ static void *fakeend_run(void *arg) {
     (void)setsockopt(a->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     for (size_t i = 0; i < a->n; i++) {
         uint8_t cmd[4096]; size_t cmdlen = 0;
-        uint8_t qid[D2K_PLAN_ID_LEN];
+        uint8_t qid[D2K_PLAN_ID_LEN]={0};
         uint16_t kind;
         /* Не прошедший вопрос снимается своей DEL_NAME_PROBE (задача 21) —
            это не новый раунд: считаем и читаем дальше. */
