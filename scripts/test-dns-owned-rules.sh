@@ -40,7 +40,7 @@ dns_local_routes_prune "$RUN/targets"
 MODE_TEST=protocol
 dns_local_routes_prune "$RUN/targets"
 [ "$(wc -l < "$RUN/deleted" | tr -d ' ')" = 1 ]
-rg -q -- '-p udp' "$RUN/deleted"
+grep -q -- '-p udp' "$RUN/deleted"
 : > "$RUN/deleted"
 printf '%s\n' 'resolver.example.test 192.0.2.53 853 udp' >> "$RUN/dns-routes"
 dns_local_routes_prune "$RUN/targets"

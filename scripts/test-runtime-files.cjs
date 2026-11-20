@@ -52,7 +52,8 @@ stop
 `;
   fs.writeFileSync(path.join(tmp, 'harness'), harness);
   const result = spawnSync('/bin/sh', [path.join(tmp, 'harness')], {
-    env: { ...process.env, TEST_DIR: tmp, TEST_HELPER: path.join(root, 'files/d2k-log-maintenance.sh') }, encoding: 'utf8'
+    env: { ...process.env, TEST_DIR: tmp, D2K_RUNTIME_DIR: path.join(tmp, 'runtime'),
+      TEST_HELPER: path.join(root, 'files/d2k-log-maintenance.sh') }, encoding: 'utf8'
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const calls = fs.readFileSync(path.join(tmp, 'calls'), 'utf8').split('\n');

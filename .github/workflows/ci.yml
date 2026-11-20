@@ -157,8 +157,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install OpenSSL headers
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev pkg-config
+      - name: Install OpenSSL and curl headers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev libcurl4-openssl-dev pkg-config
       - uses: ./.github/actions/setup-zig
         with:
           version: ${{ env.ZIG_VERSION }}

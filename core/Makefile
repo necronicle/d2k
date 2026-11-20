@@ -816,6 +816,8 @@ san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datap
 		if [ "$$t" = test_netarm ]; then srcs="$(NETARM_SRC) tls13core.c tls12.c p256.c x25519.c crypto.c"; fi; \
 		if [ "$$t" = test_exp_local ]; then srcs="$(filter-out exp_task.c netarm.c,$(D2KEXP_COMMON_SRC))"; fi; \
 		if [ "$$t" = test_doh_contract ]; then srcs=""; fi; \
+		if [ "$$t" = test_appget ]; then srcs="../model/check.c"; fi; \
+		if [ "$$t" = test_d2kapplication ]; then srcs="../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_late.c ../synthesis/token_content.c ../synthesis/lower.c ../synthesis/application_history.c plantlv.c"; fi; \
 		if [ "$$t" = test_shadow_daemon ]; then srcs="shadow_queue.c"; fi; \
 		$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-core-san-$$t $$t.c $$srcs -lpthread ; \
 		/tmp/d2k-core-san-$$t; \
@@ -1440,7 +1442,7 @@ LDFLAGS += libd2k_udp.a
 
 # session.c is also included by test_udp_runtime.c (and test_quic_sink.c).
 # Keep its FSM dependency in the shared native/sanitizer/cross source group.
-UDP_SESSION_SRC = ../datapath/preflight.c ../datapath/preflight_lease.c httpup_logic.c ../datapath/http80.c ../datapath/hold.c ../datapath/capture.c ../datapath/nat.c ../datapath/ctq.c ../datapath/nl.c ../datapath/track.c ../datapath/tls.c ../datapath/journal.c ../datapath/plans.c ../core/stun.c
+UDP_SESSION_SRC = ../datapath/preflight.c ../datapath/preflight_lease.c httpup_logic.c provider_ips.c ../datapath/http80.c ../datapath/hold.c ../datapath/capture.c ../datapath/nat.c ../datapath/ctq.c ../datapath/nl.c ../datapath/track.c ../datapath/tls.c ../datapath/journal.c ../datapath/plans.c ../core/stun.c
 # Include-chain and header changes must also invalidate the runtime gates.
 test_udp_runtime test_quic_sink test_http_runtime test_http_live: ../datapath/session.c ../datapath/include/d2k_preflight.h ../datapath/include/d2k_preflight_lease.h ../datapath/include/d2k_preflight_plan.h ../datapath/include/d2k_session.h ../datapath/plan_internal.h
 TESTS += test_udp_runtime

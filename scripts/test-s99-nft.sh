@@ -130,6 +130,10 @@ want 'ip daddr 224.0.0.0/4 return'
 want 'ip6 daddr ff00::/8 return'
 want 'meta mark 0x2d return'
 want 'meta mark 0x2f return'
+want 'meta l4proto tcp meta mark 0x32 queue num 2000 bypass'
+want 'meta l4proto tcp meta mark 0x33 queue num 2000 bypass'
+want 'meta l4proto tcp ct direction original ct mark & 0x08000000 != 0 queue num 2000 bypass'
+want 'meta l4proto tcp ct direction reply ct mark & 0x08000000 != 0 queue num 2000 bypass'
 want 'meta l4proto { tcp, udp } th dport { 53, 853 } return'
 want 'meta l4proto { tcp, udp } th sport { 53, 853 } return'
 want 'meta l4proto tcp ct direction original th dport { 0-65535 } ct original packets 1-8 queue num 2000 bypass'
@@ -143,19 +147,19 @@ want 'icmp type time-exceeded icmp code 0 queue num 2000 bypass'
 want 'icmpv6 type time-exceeded icmpv6 code 0 queue num 2000 bypass'
 want 'meta nfproto ipv4 meta l4proto udp meta mark 0x2d masquerade'
 want 'jump in_rules'
-[ "$(printf '%s\n' "$r" | grep -c 'queue num 2000 bypass')" -eq 14 ] || fail "expected 14 queue rules (6 out, 8 in)"
-# Order inside out: exclusions before the first queue rule.
-first_queue=$(printf '%s\n' "$r" | grep -n 'queue num' | head -1 | cut -d: -f1)
-last_return=$(printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | grep -n 'return' | tail -1 | cut -d: -f1)
-if [ -z "$last_return" ] || [ -z "$first_queue" ]; then fail "cannot locate rules"; fi
-printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | awk '/queue num/{q=1} q && /return/{bad=1} END{exit bad}' \
-    || fail "a RETURN after a queue rule in chain out"
+[ "$(printf '%s\n' "$r" | grep -c 'queue num 2000 bypass')" -eq 18 ] || fail "expected 18 queue rules with preflight"
+# Marked preflight packets enter the queue before ordinary exclusions. Every
+# unmarked client packet must encounter the exclusions before its first queue.
+printf '%s\n' "$r" | sed -n '/chain out {/,/^	}/p' | awk '
+    /queue num/ && !/meta mark 0x32 queue/ && !/meta mark 0x33 queue/ && !/ct mark & 0x08000000/ {q=1}
+    q && /return/ {bad=1}
+    END{exit bad||!q}' || fail "a RETURN after an ordinary queue rule in chain out"
 # Issue #23: a port-forwarded connection (DNAT) never enters the queue, in
 # either direction; the exclusion comes before the first queue rule.
 for c in out in_rules; do
     printf '%s\n' "$r" | sed -n "/chain $c {/,/^	}/p" | awk '
         /ct status dnat return/ { if (!q) seen = 1 }
-        /queue num/ { q = 1 }
+        /queue num/ && !/meta mark 0x32 queue/ && !/meta mark 0x33 queue/ && !/ct mark & 0x08000000/ { q = 1 }
         END { exit !seen }' || fail "chain $c: no 'ct status dnat return' before the first queue rule"
 done
 # The VPS install gate is D2K's own channel (field 14.10.2026): RETURN in
@@ -165,7 +169,7 @@ want 'ip saddr 85.192.60.175 tcp sport 9444 return'
 for c in out in_rules; do
     printf '%s\n' "$r" | sed -n "/chain $c {/,/^	}/p" | awk '
         /85\.192\.60\.175 tcp [ds]port 9444 return/ { if (!q) seen = 1 }
-        /queue num/ { q = 1 }
+        /queue num/ && !/meta mark 0x32 queue/ && !/meta mark 0x33 queue/ && !/ct mark & 0x08000000/ { q = 1 }
         END { exit !seen }' || fail "chain $c: no gate return before the first queue rule"
 done
 S99_SNIPPET='fw_up' s99 "$TMP/nftonly" D2K_GATE= || fail "nft fw_up without a gate failed"

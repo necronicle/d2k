@@ -4,10 +4,11 @@ set -eu
 task_tmp=$(mktemp -d)
 trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
 mkdir "$task_tmp/run" "$task_tmp/state"
-awk '/^dns_excl_sync_unlocked\(\)/,/^}/' "${DNS_TEST_SERVICE:-files/S99d2k}" > "$task_tmp/functions"
+awk '/^dns_excl_apply\(\)/,/^}/' "${DNS_TEST_SERVICE:-files/S99d2k}" > "$task_tmp/functions"
+awk '/^dns_excl_sync_unlocked\(\)/,/^}/' "${DNS_TEST_SERVICE:-files/S99d2k}" >> "$task_tmp/functions"
 awk '/^dns_excl_sync\(\)/,/^}/' "${DNS_TEST_SERVICE:-files/S99d2k}" >> "$task_tmp/functions"
 . "$task_tmp/functions"
-RUN="$task_tmp/run" STATE_DIR="$task_tmp/state" FW_BACKEND=iptables
+RUN="$task_tmp/run" STATE_DIR="$task_tmp/state" FW_BACKEND=iptables FW_V4ONLY="$task_tmp/run/v4-only"
 fw_lock_acquire() { return 0; }
 fw_lock_release() { return 0; }
 dns_config_snapshot() { return 0; }

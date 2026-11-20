@@ -199,7 +199,8 @@ static ssize_t box_sendto(int fd,const void *buf,size_t n,int flags,
             int own=parsed && len==strlen(own_name) && !memcmp(p+h+off,own_name,len);
             int white=parsed && len==strlen(white_name) && !memcmp(p+h+off,white_name,len);
             if(!classifier_fixture)CHECK(parsed && (own || white));
-            if(white) white_sent++; if(own) own_sent++;
+            if(white) white_sent++;
+            if(own) own_sent++;
             int alternate=parsed && len==strlen(accepted_alternate) &&
                           !memcmp(p+h+off,accepted_alternate,len);
             eligible=alternate || (own && cfg.own_hello_passes);

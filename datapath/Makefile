@@ -542,6 +542,7 @@ san-force:
 		if [ "$$t" = test_session ] || [ "$$t" = test_preflight_wiring ]; then extra="$(CORE_DIR)/plantlv.c"; fi; \
 		sources="$(SRC)"; if [ "$$t" = test_postnat_alloc ]; then sources="postnat_packet.c"; fi; \
 		if [ "$$t" = test_plan_alloc ]; then sources="$(filter-out plan_parse.c,$(SRC))"; fi; \
+		if [ "$$t" = test_exp_peers ]; then sources="$(filter-out ctl.c,$(SRC))"; fi; \
 		$(CC) $(SANFLAGS) -o $@ $*.c $$sources $(CORESRC) $$extra
 /tmp/d2k-san-planlab: san-force Makefile planlab.c plan_parse.c plan_apply.c $(CORESRC) $(HDR)
 	$(CC) $(SANFLAGS) -o $@ planlab.c plan_parse.c plan_apply.c $(CORESRC)
@@ -738,9 +739,6 @@ check: test-preflight-wiring
 
 TESTS += test_endpoint_trial
 
-# Expand TESTS after all additions, including preflight wiring.
-san-build: $(addprefix /tmp/d2k-san-,$(TESTS)) /tmp/d2k-san-planlab
-
 # Conditional candidate removal through the actual decoder, without listen.
 test_endpoint_trial: test_endpoint_trial.c ctl.o ctlsrv.o session.o preflight.o preflight_lease.o http80.o hold.o capture.o nat.o ctq.o nl.o journal.o track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< ctl.o ctlsrv.o session.o preflight.o preflight_lease.o http80.o hold.o capture.o nat.o ctq.o nl.o journal.o track.o tls.o wire.o wire_udp.o plans.o plan_parse.o plan_apply.o $(COREOBJ) $(LDFLAGS)
@@ -776,3 +774,6 @@ check: test-exp-peers
 test-exp-peers: test_exp_peers
 	./test_exp_peers
 TESTS += test_exp_peers
+
+# Expand TESTS after every test has been added.
+san-build: $(addprefix /tmp/d2k-san-,$(TESTS)) /tmp/d2k-san-planlab
