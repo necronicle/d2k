@@ -332,7 +332,8 @@ static void test_permanent_preflight_does_not_guess_syn_context(void) {
 static const uint8_t lease_wire[]={'D','2','K','P',0,1,0,18,0,0,0,3,0,2,0,2,6,1,1,0x14,0,11,0,7,3,9,1,0,0,9,96,0,1,0,0x10,0,5,0,1,0x16,3,1};
 static d2k_session *lease_session(d2k_pf_scope *scope) {
     d2k_session *s=d2k_session_new(16,64);CHECK(s&&d2k_session_set_preflight(s,1)==0);
-    if(!s)return NULL;d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
+    if(!s)return NULL;
+    d2k_session_set_hook(s,D2K_HOOK_POSTROUTING);
     d2k_plan *plan=NULL;char err[200];CHECK(!d2k_plan_load(lease_wire,sizeof lease_wire,&plan,err,sizeof err));
     memset(scope,0,sizeof *scope);scope->family=4;scope->shape=D2K_PLAN_SHAPE_MODERN;
     scope->server_port=htons(443);scope->path=7;scope->client[0]=192;scope->client[1]=168;

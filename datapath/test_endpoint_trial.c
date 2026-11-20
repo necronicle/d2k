@@ -29,5 +29,8 @@ int main(void){
     d2k_plantab_binding(t,p,&binding);CHECK(!binding.temporary,"matching commit promotes endpoint candidate");
     d2k_ctlsrv_command(&cx,D2K_CMD_DEL_ENDPOINT_TRIAL,del,sizeof del);CHECK(FIND()==p,"late cleanup preserves promoted owner");
     d2k_plantab_clear_probes(t);CHECK(FIND()==p,"promoted endpoint survives disconnect");
-    d2k_session_free(cx.sess);if(fails)return 1;puts("endpoint trial decoder: all checks passed");return 0;
+    d2k_session_free(cx.sess);
+    if(fails)return 1;
+    puts("endpoint trial decoder: all checks passed");
+    return 0;
 }
