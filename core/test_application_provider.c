@@ -138,7 +138,9 @@ int main(void) {
     }
     DIR *dir=opendir(directory);assert(dir);struct dirent *entry;
     while((entry=readdir(dir)))if(entry->d_name[0]!='.') {
-        char path[1024];snprintf(path,sizeof path,"%s/%s",directory,entry->d_name);assert(!unlink(path));
+        char path[sizeof directory+sizeof entry->d_name+1];
+        snprintf(path,sizeof path,"%s/%s",directory,entry->d_name);
+        assert(!unlink(path));
     }
     closedir(dir);assert(!rmdir(directory));free(trigger);free(result);return 0;
 }

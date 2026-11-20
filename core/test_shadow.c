@@ -325,7 +325,8 @@ int main(void)
     simulator=net;d2km_net inspect={.run=capture};d2km_store_init(&store);
     assert(!d2k_shadow_run(&r,&options,&store,&j,&inspect,log,&report));
     assert(capture_calls && !references && report.outcome!=D2KM_NO_REFERENCE);
-    assert(d2k_shadow_snapshot_read(queue,&r,(d2k_shadow_snapshot[1]){{0}})<0);
+    d2k_shadow_snapshot absent={0};
+    assert(d2k_shadow_snapshot_read(queue,&r,&absent)<0);
     /* No candidates means no name-control; history still proves liveness. */
     f=fopen(log,"r");assert(f);int marked=0;while(fgets(line,sizeof line,f))if(strstr(line,"form=client"))marked++;
     fclose(f);assert(marked==1);
@@ -371,7 +372,7 @@ int main(void)
     d2km_net count_net={.run=count_reference};d2km_store_init(&store);
     assert(!d2k_shadow_run(&r,&options,&store,&j,&count_net,log,&report));
     assert(!references && report.outcome==D2KM_FORM_NOT_REPRODUCED && !report.runs && !store.knowledge.count);
-    assert(d2k_shadow_snapshot_read(queue,&r,(d2k_shadow_snapshot[1]){{0}})<0);
+    assert(d2k_shadow_snapshot_read(queue,&r,&absent)<0);
     f=fopen(log,"r");assert(f);marked=0;while(fgets(line,sizeof line,f))
         if(strstr(line,"outcome=FORM_NOT_REPRODUCED") && strstr(line,"form=not-client"))marked++;
     fclose(f);assert(marked>=1);
@@ -391,7 +392,8 @@ int main(void)
     strcpy(report.reason,"phase=send\nerrno=1 \"denied\"\\");
     assert(!d2k_shadow_log(log,&r,r.time,&report));
     f=fopen(log,"r");assert(f);char last[4096]="";
-    while(fgets(line,sizeof line,f))strcpy(last,line);fclose(f);
+    while(fgets(line,sizeof line,f))strcpy(last,line);
+    fclose(f);
     assert(strstr(last,"reason=\"phase=send\\u000aerrno=1 \\\"denied\\\"\\\\\"") && strchr(last,'\n')==last+strlen(last)-1);
     unlink(log);unlink(why);rmdir(dir);
     puts("shadow task/dedup: ok");return 0;

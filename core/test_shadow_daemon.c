@@ -13,7 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
-static char queue[512],store[512],journal[512],logfile[512],diagnostic[512],seen[520],lockfile[520];
+static char queue[512],store[512],journal[512],logfile[512],diagnostic[512];
+static char seen[sizeof queue+sizeof ".seen"],lockfile[sizeof queue+sizeof ".consumer"];
 static void pause_briefly(void) { struct timespec ts={.tv_nsec=20000000};nanosleep(&ts,NULL); }
 static pid_t launch(void)
 {
