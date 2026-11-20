@@ -341,6 +341,11 @@ int main(void) {
         CHECK(d2k_routemark_gate(&pol, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE &&
               d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == 0,
               "policy: the mode survives a rule refresh");
+        d2k_routemark_set_policy(&pol, 0, 0x10000, 0xff0000);
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0x10040, 0x2e, 0x2d, 1, 5) == 0,
+              "OpenWrt group: unrelated bits do not exclude a selected client");
+        CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0x20040, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE,
+              "OpenWrt group: other groups stay outside");
         d2k_routemark_set_policy(&pol, 1, 0, 0);
         CHECK(d2k_routemark_gate(&pol, 4, 1, 1, 0xffffaaa, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE &&
               d2k_routemark_gate(&pol, 4, 1, 0, 0, 0x2e, 0x2d, 1, 5) == D2K_ROUTE_OUTSIDE,

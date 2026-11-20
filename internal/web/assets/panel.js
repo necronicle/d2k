@@ -448,7 +448,7 @@
     var self = this, watch = typeof requestedId === "string";
     if (!this.$("policy-form") || this.policyLoading) return Promise.resolve();
     this.policyLoading = true;
-    if (!watch) { this.policyBusy = true; this.$("policy-status").textContent = "Получаем политики Keenetic…"; }
+    if (!watch) { this.policyBusy = true; this.$("policy-status").textContent = "Получаем политики роутера…"; }
     this.renderPolicyControls();
     return this.updateRequest("/api/policies", false).then(function (reply) {
       if (!reply.ok || !Array.isArray(reply.data.policies)) throw Error(reply.data.message || "Не удалось прочитать политики. Обновите список.");

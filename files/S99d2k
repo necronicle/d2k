@@ -563,6 +563,10 @@ watch_validate() {
     done
     if [ -n "${KEENETIC_POLICY:-}" ]; then
         wp=$(policy_mark "$KEENETIC_POLICY")
+        if [ -z "$wp" ] && [ -f "$OPENWRT_RELEASE" ]; then
+            TCP_WATCH=0; LATE_WATCH=0
+            return 0
+        fi
         case "$wp" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
         [ "$((0x$wp & 0x60000000))" = 0 ] || {
             say "TCP_WATCH: метка политики использует служебные биты"; return 1;
@@ -788,6 +792,10 @@ preflight_validate() {
     done
     if [ -n "${KEENETIC_POLICY:-}" ]; then
         pm=$(policy_mark "$KEENETIC_POLICY")
+        if [ -z "$pm" ] && [ -f "$OPENWRT_RELEASE" ]; then
+            D2K_PREFLIGHT=0
+            return 0 # missing selector: policy_args restricts all client traffic
+        fi
         case "$pm" in ''|*[!0-9a-fA-F]*) return 1 ;; esac
         pm=$((0x$pm))
         if [ "$((pm & PF_CONN_BIT))" != 0 ] || [ "$pm" = "$((PF_MARK))" ] ||
@@ -1970,7 +1978,78 @@ fastnat_restore() {
 # ключом --only-mark и обслуживает только устройства с этой меткой, прочие и
 # трафик самого роутера идут ядром. Политики нет — «none»: устройств D2K не
 # трогает и говорит об этом, а не обрабатывает молча всех.
+# OpenWrt PBR assigns one mark/mask to each routing table. Different LuCI
+# rules targeting the same table are deliberately one choice in the panel.
+# A native firewall MARK rule can group clients even on routers without PBR.
+# Use the mark as identity: several rules may deliberately mark the same group.
+openwrt_mark_number() {
+    local word
+    case "$1" in
+        0x*) word=${1#0x}; case "$word" in ''|*[!a-fA-F0-9]*) return 1 ;; esac
+             [ "${#word}" -le 8 ] || return 1 ;;
+        0|[1-9]*) case "$1" in *[!0-9]*) return 1 ;; esac
+             [ "${#1}" -le 10 ] && [ "$1" -le 4294967295 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%x' "$1"
+}
+openwrt_firewall_policy() {
+    local section="$1" target value mask enabled mark
+    config_get_bool enabled "$section" enabled 1
+    [ "$enabled" = 1 ] || return 0
+    config_get target "$section" target
+    [ "$target" = MARK ] || [ "$target" = mark ] || return 0
+    config_get value "$section" set_mark
+    [ -n "$value" ] || config_get value "$section" set_xmark
+    case "$value" in */*) mask=${value#*/}; value=${value%%/*} ;; *) mask=0xffffffff ;; esac
+    mark=$(openwrt_mark_number "$value") && mask=$(openwrt_mark_number "$mask") || return 0
+    [ "$mark" != 0 ] && [ "$mask" != 0 ] && [ "$((0x$mark & 0x$mask))" = "$((0x$mark))" ] || return 0
+    printf 'mark.%s.%s\t0x%s/0x%s\t%s/0x%s\n' "$mark" "$mask" "$mark" "$mask" "$mark" "$mask"
+}
+openwrt_policies() (
+    # Some minimal OpenWrt installations only provide firewall MARK rules.
+    v4=$(ip -4 rule show 2>/dev/null) || v4=
+    v6=
+    if [ -e /proc/net/if_inet6 ]; then v6=$(ip -6 rule show 2>/dev/null) || v6=; fi
+    printf '%s\n%s\n' "$v4" "$v6" | awk '
+        function hex(s) {
+            return s ~ /^0x[[:xdigit:]]+$/ && length(s)<=10
+        }
+        # Include only rules selected solely by a nonzero firewall mark.
+        NF==7 && $2=="from" && $3=="all" && $4=="fwmark" && ($6=="lookup" || $6=="table") {
+            table=$7
+            if (table !~ /^[A-Za-z0-9_.-]+$/ || length(table)>56 ||
+                table ~ /^(main|default|local|253|254|255)$/) next
+            n=split(tolower($5),part,"/")
+            mask=n==1 ? "0xffffffff" : part[2]
+            if (n>2 || !hex(part[1]) || !hex(mask) ||
+                part[1] ~ /^0x0+$/ || mask ~ /^0x0+$/) next
+            selector=substr(part[1],3) "/" mask
+            if (!(table in seen)) { order[++count]=table; seen[table]=selector }
+            else if (seen[table]!=selector) ambiguous[table]=1
+            if ((selector in owner) && owner[selector]!=table) {
+                ambiguous[owner[selector]]=1; ambiguous[table]=1
+            }
+            owner[selector]=table
+        }
+        END { for (i=1;i<=count;i++) {
+            t=order[i]; if (!ambiguous[t]) print "route." t "\t" t "\t" seen[t]
+        } }'
+    # shellcheck disable=SC1091
+    . /lib/functions.sh
+    config_load firewall || exit 1
+    config_foreach openwrt_firewall_policy rule | sort -u
+)
+
+openwrt_selector() {
+    openwrt_policies | awk -F '\t' -v id="$1" '$1==id {print $3}'
+}
 policy_mark() {
+    if [ -f "$OPENWRT_RELEASE" ]; then
+        selector=$(openwrt_selector "$1")
+        printf '%s\n' "${selector%%/*}"
+        return
+    fi
     command -v ndmc >/dev/null 2>&1 || return 0
     policy_list=$(ndmc -c "show ip policy" 2>/dev/null) || return 0
     printf '%s\n' "$policy_list" | tr -d '\033' | awk -v want="$1" '
@@ -2000,6 +2079,15 @@ policy_mark() {
 }
 policy_args() {
     [ -n "${KEENETIC_POLICY:-}" ] || return 0
+    if [ -f "$OPENWRT_RELEASE" ]; then
+        selector=$(openwrt_selector "$KEENETIC_POLICY")
+        if [ -n "$selector" ]; then
+            printf '%s\n' "--only-mark 0x$selector"
+        else
+            echo "--only-mark none"
+        fi
+        return
+    fi
     pm=$(policy_mark "$KEENETIC_POLICY")
     case "$pm" in
         ''|*[!0-9a-fA-F]*)
@@ -2624,8 +2712,8 @@ status() {
     fi
     if [ -n "${KEENETIC_POLICY:-}" ]; then
         pm=$(policy_mark "$KEENETIC_POLICY")
-        if [ -n "$pm" ]; then echo "  политика Keenetic: «${KEENETIC_POLICY}» (метка 0x$pm) — остальные устройства идут как без D2K"
-        else echo "  политика Keenetic: «${KEENETIC_POLICY}» НЕ НАЙДЕНА — устройства не обрабатываются"; fi
+        if [ -n "$pm" ]; then echo "  политика: «${KEENETIC_POLICY}» (метка 0x$pm) — остальные устройства идут как без D2K"
+        else echo "  политика: «${KEENETIC_POLICY}» НЕ НАЙДЕНА — устройства не обрабатываются"; fi
     fi
     [ ! -f "$FW_V4ONLY" ] || echo "  IPv6: не обслуживается — нет ip6tables mangle, работа только по IPv4"
     if [ "$FW_BACKEND" = iptables ] && command -v d2k_ppe_status >/dev/null 2>&1; then
@@ -2694,6 +2782,7 @@ clear_found() {
 }
 
 case "$1" in
+    openwrt-policies) openwrt_policies ;;
     start)   locked; start ;;
     recover) engine_lock 0 || exit 0; recover ;;
     heal) locked; if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi

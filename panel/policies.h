@@ -41,7 +41,29 @@ static int policy_parse(char *text, policy_item *items, size_t *count) {
     }
     return 0;
 }
+static int policy_openwrt_parse(char *text,policy_item *items,size_t *count) {
+    char *save=NULL;
+    *count=0;
+    for(char *line=strtok_r(text,"\n",&save);line;line=strtok_r(NULL,"\n",&save)){
+        char *name=strchr(line,'\t');
+        if(!name)return -1;
+        *name++=0;
+        char *mark=strchr(name,'\t');
+        if(!mark)return -1;
+        *mark++=0;
+        char *mask=strstr(mark,"/0x");
+        if(!policy_id(line)||!*name||strlen(name)>=sizeof items[0].name||
+           (strncmp(line,"route.",6)&&strncmp(line,"mark.",5))||
+           !mask||mask==mark||mask-mark>8||strspn(mark,"0123456789abcdef")!=(size_t)(mask-mark)||
+           !mask[3]||strlen(mask+3)>8||strspn(mask+3,"0123456789abcdef")!=strlen(mask+3)||
+           *count>=POLICY_MAX)return -1;
+        policy_item *item=&items[(*count)++];
+        strcpy(item->id,line);strcpy(item->name,name);strcpy(item->mark,mark);
+    }
+    return 0;
+}
 static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items,size_t *count) {
+    int openwrt=access("/etc/openwrt_release",F_OK)==0;
     int pipes[2];if(pipe(pipes))return -1;
     pid_t pid=fork();if(pid<0){close(pipes[0]);close(pipes[1]);return -1;}
     if(!pid){
@@ -50,6 +72,11 @@ static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items
         int nullfd=open("/dev/null",O_WRONLY);if(nullfd>=0){dup2(nullfd,STDERR_FILENO);close(nullfd);}
         if(client>2)close(client);
         if(cfg&&cfg->listener_fd>2)close(cfg->listener_fd);
+        if(openwrt){
+            if(cfg && cfg->service_path)
+                execl(cfg->service_path,cfg->service_path,"openwrt-policies",(char*)NULL);
+            _exit(127);
+        }
         execlp("ndmc","ndmc","-c","show ip policy",(char*)NULL);_exit(127);
     }
     (void)setpgid(pid,pid);
@@ -76,7 +103,9 @@ static int policy_list(const d2k_panel_config *cfg,int client,policy_item *items
     /* The private group may outlive its already reaped leader. */
     (void)kill(-pid,SIGKILL);
     if(!ok||!WIFEXITED(status)||WEXITSTATUS(status))return -1;
-    text[used]=0;return policy_parse(text,items,count);
+    text[used]=0;
+    if(openwrt)return policy_openwrt_parse(text,items,count);
+    return policy_parse(text,items,count);
 }
 static int policy_key(const char *line,size_t n,size_t *offset) {
     size_t i=0;while(i<n&&(line[i]==' '||line[i]=='\t'))i++;
@@ -181,7 +210,7 @@ static int policy_argv_matches(const char *args,size_t len,const char *mark) {
             if(found++)return 0;
             at+=n+1;if(at>=len)return 0;n=strnlen(args+at,len-at);if(n==len-at)return 0;
             if(!mark||!*mark)return 0;
-            char expected[64];snprintf(expected,sizeof expected,"0x%s/0xffffffff",mark);
+            char expected[64];snprintf(expected,sizeof expected,"0x%s%s",mark,strchr(mark,'/')?"":"/0xffffffff");
             if(strcmp(args+at,expected))return 0;
         }
         at+=n+1;
@@ -211,7 +240,7 @@ static int api_policies(int fd,const d2k_panel_config *cfg,const char *req,const
     if(!cfg||!cfg->config_path)return policy_reply(fd,503,"Конфигурация недоступна");
     char selected[256];if(policy_config_read(cfg->config_path,selected,sizeof selected))return policy_reply(fd,503,"Не удалось прочитать выбранную политику");
     policy_item items[POLICY_MAX];size_t count=0;
-    if(policy_list(cfg,fd,items,&count))return policy_reply(fd,503,"Не удалось получить политики Keenetic. Обновите список и повторите попытку.");
+    if(policy_list(cfg,fd,items,&count))return policy_reply(fd,503,"Не удалось получить политики роутера. Обновите список и повторите попытку.");
     d2k_panel_control_tick();
     if(post){
         const char *value=NULL,*length=NULL;size_t len=0,length_len=0;

@@ -35,6 +35,15 @@ int main(void){
  policy_item items[64];size_t count=0;
  char list[]="policy, name = Policy7, description = Work <devices>:\n mark: 00ab\npolicy, name = Policy8:\n mark: ff\n";
  assert(policy_parse(list,items,&count)==0&&count==2);assert(!strcmp(items[0].name,"Work <devices>"));assert(!strcmp(items[0].id,"Policy7"));
+ char owrt[]="route.203\t203\t20000/0xff0000\nmark.10000.ff0000\t0x10000/0xff0000\t10000/0xff0000\n";
+ assert(!policy_openwrt_parse(owrt,items,&count)&&count==2);
+ assert(!strcmp(items[1].id,"mark.10000.ff0000"));
+ const char masked[]="d2kd\0--only-mark\0" "0x10000/0xff0000\0";
+ assert(policy_argv_matches(masked,sizeof masked-1,items[1].mark));
+ assert(!policy_argv_matches(masked,sizeof masked-1,items[0].mark));
+ assert(!policy_argv_matches(masked,sizeof masked-1,"10000/0xffffffff"));
+ char bad_mask[]="route.203\t203\t20000/0xffffffffff";
+ assert(policy_openwrt_parse(bad_mask,items,&count)<0);
  put(path,"KEENETIC_POLICY='broken\n");assert(policy_config_read(path,selected,sizeof selected)<0);
  put(path,"MODE=apply\nTG_RELAY_SECRET='private fixture'\nKEENETIC_POLICY=''\n");
  char ndmc[512],service[512];snprintf(ndmc,sizeof ndmc,"%s/ndmc",dir);snprintf(service,sizeof service,"%s/service",dir);
