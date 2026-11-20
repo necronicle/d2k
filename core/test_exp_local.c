@@ -210,7 +210,9 @@ int main(void) {
     x.context.transport=D2KM_TCP;x.context.protocol=D2KM_P_TLS13;x.context.family=D2KM_IPV4;
     spec.context=&x.context;
     CHECK(!run_arm(&x,&spec,&obs,&res));d2km_journal_close(&journal);
-    FILE *f=fopen(path,"r");assert(f);char log[8192]={0};fread(log,1,sizeof log-1,f);fclose(f);
+    FILE *f=fopen(path,"r");assert(f);char log[8192]={0};
+    size_t log_len=fread(log,1,sizeof log-1,f);fclose(f);
+    CHECK(log_len>0);
     CHECK(strstr(log,"install: errno=55; test executor full") && !x.arm.last_reason[0]);
     unlink(path);rmdir(dir);
     if(failures)return 1;
