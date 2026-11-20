@@ -2594,11 +2594,13 @@ d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const
     int family=ip&&strchr(ip,':')?6:4;
     if(!ip||!host||!*host||!port||timeout<=0||(tls12!=0&&tls12!=1)||
         inet_pton(family==6?AF_INET6:AF_INET,ip,address)!=1) {
-        if(fd>=0)close(fd);r.local_refusal=1;
+        if(fd>=0)close(fd);
+        r.local_refusal=1;
         snprintf(r.reason,sizeof r.reason,"invalid preflight endpoint");return r;
     }
     if(!doh_tls_open) {
-        if(fd>=0)close(fd);r.unsupported=1;
+        if(fd>=0)close(fd);
+        r.unsupported=1;
         snprintf(r.reason,sizeof r.reason,"authenticated preflight TLS backend unavailable");return r;
     }
     int contact=verify_contact(fd,ip,port,0,family,r.local_addr,&r.local_port,&r.fd);
