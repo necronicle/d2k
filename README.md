@@ -101,12 +101,26 @@ ssh root@192.168.1.1 -p 222
 ### 4) Пакеты Entware
 
 ```sh
-p=http://85.192.60.175:9444; pk="curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util"
+p=http://85.192.60.175:9444; pk="libcurl curl ca-bundle iptables ipset kmod_ndms xtables-addons_legacy openssl-util"
 { http_proxy=$p opkg update && http_proxy=$p opkg install $pk; } || { opkg update && opkg install $pk; }
 ```
 
 Команда сначала скачивает пакеты через VPS проекта, а если он не отвечает —
 напрямую с сервера Entware.
+
+Перед скачиванием установщика проверьте, что `curl` запускается вместе с библиотекой Entware.
+
+```sh
+LD_BIND_NOW=1 curl --version
+```
+
+Если появляется `undefined symbol: curl_multi_get_offt`, загрузчик нашёл библиотеку `libcurl`, в которой нет нужной функции. Даже если OPKG пишет, что `curl` уже обновлён, переустановите оба пакета из актуального индекса Entware и повторите проверку.
+
+```sh
+opkg update && opkg --force-reinstall install libcurl curl && LD_BIND_NOW=1 curl --version
+```
+
+Продолжайте установку, когда команда выведет версии `curl` и `libcurl`. Если ошибка сохранилась, для диагностики пришлите вывод `command -v curl`, `opkg list-installed | grep -E '^(libcurl|curl) '` и, если доступна команда `ldd`, вывод `ldd "$(command -v curl)" | grep libcurl`.
 
 ### 5) Остановите z2k и Zapret
 
