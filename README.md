@@ -345,6 +345,32 @@ D2K не трогает трафик, который работает. Медл�
 
 Эта команда останавливает D2K и снимает его правила.
 
+### Если D2K пропал во время копирования через Samba на OpenWrt
+
+Во время передачи выполните в SSH команды ниже. Повторите после сбоя до
+перезагрузки роутера. Для разбора приложите оба вывода, модель роутера,
+тип файловой системы, направление передачи и размер файла.
+
+```sh
+cat /opt/d2k/release-id /proc/uptime
+grep -E '^(MemAvailable|Cached|Dirty|Writeback|SwapFree):' /proc/meminfo
+for name in smbd d2kd d2kc; do
+  for pid in $(pidof "$name"); do
+    echo "$name PID $pid"
+    grep -E '^(VmRSS|RssAnon):' "/proc/$pid/status"
+  done
+done
+dmesg | grep -Ei 'out of memory|oom-kill|killed process|I/O error|filesystem error|EXT4-fs error|read-only|USB disconnect|reset .*USB'
+test ! -f /opt/d2k/log/service.log || tail -30 /opt/d2k/log/service.log
+```
+
+`MemAvailable` показывает оценку доступной ОЗУ. При записи часть памяти
+занимают данные, ожидающие записи на диск (`Dirty`) или уже записываемые
+ядром (`Writeback`). Строка `Killed process` в сообщении OOM указывает,
+кого завершило ядро. Журнал D2K показывает попытки восстановления служб.
+Если рядом есть ошибки накопителя, приложите соседние строки `dmesg` с
+отметками времени.
+
 ---
 
 ## Панель
