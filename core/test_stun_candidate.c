@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sched.c"
+#include "test_task_slots.h"
 #include <poll.h>
 static int fails;
 #define CHECK(c,m) do {if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;}}while(0)
@@ -15,7 +16,7 @@ static void catalog(d2k_catalog *c,int family) {
     bd->shape=D2K_LINK_SHAPE_VOICE;bd->level=3;bd->enabled=1;bd->confirmed=100;bd->verified_by=D2K_VERBY_STUN;
 }
 static task *baseline(d2k_sched *s,int family,d2k_stun_probe_status status){
-    task *t=&s->tasks[0];t->state=T_STUN_MEASURE;t->stun_target=1;t->by_addr=1;
+    task *t=test_task_at(s, 0);t->state=T_STUN_MEASURE;t->stun_target=1;t->by_addr=1;
     t->family=(uint8_t)family;t->transport=17;t->port=39478;
     strcpy(t->ip,family==4?"127.0.0.1":"::1");snprintf(t->name,sizeof t->name,"stun/[%s]:%u",t->ip,t->port);
     t->stun_res.status=status;t->stun_res.sent=status!=D2K_STUN_LOCAL_ERROR;

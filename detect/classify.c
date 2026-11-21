@@ -1291,7 +1291,9 @@ void d2k_classify_run(const char *addr, const d2k_trigger *tr,
     d2k_opts_defaults(opt);
     bind_run_cache(addr, tr, opt);
     start = d2k_now_ms();
-    memset(res, 0, sizeof(*res));
+    /* d2k_trace_add initializes each entry as it becomes visible. */
+    memset(res, 0, offsetof(d2k_result, trace));
+    res->ntrace = 0;
     /* Отложенные снятия правил подавления RST — перед пачкой зондов, а не
      * только перед следующей вставкой: прогон без сырого слоя или простой
      * d2kc иначе держал бы неснятое правило часами (ревью detect, I2). */

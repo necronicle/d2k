@@ -1,6 +1,7 @@
 /* Offline forced admission and continuation policy: no sockets or workers. */
 #define pthread_create force_thread_create
 #include "sched.c"
+#include "test_task_slots.h"
 #undef pthread_create
 int force_thread_create(pthread_t *t,const pthread_attr_t *a,void *(*f)(void *),void *v) {
     (void)t;(void)a;(void)f;(void)v;return EAGAIN;
@@ -45,7 +46,7 @@ int main(void) {
         strcpy(s->cooldowns[1].name,"ordinary.example");s->cooldowns[1]=s->cooldowns[0];
         strcpy(s->cooldowns[1].name,"ordinary.example");
         CHECK(cooldown_blocks(s,"ordinary.example",6,4,0,NULL));
-        task *q=&s->tasks[1];task_reset(s,q);strcpy(q->name,"ordinary.example");
+        task *q=test_task_at(s, 1);task_reset(s,q);strcpy(q->name,"ordinary.example");
         q->transport=6;q->family=4;q->state=T_QUEUED;q->queued_ms=1;
         CHECK(queued_pick(s)==t);
         t->state=T_RESTING;t->rest_until_ms=999999;
@@ -83,18 +84,18 @@ int main(void) {
     e=event("tenant.gateway.example.test");
     inet_pton(AF_INET,"162.159.36.5",e.low_ip);d2k_sched_event(s,&e);
     unsigned endpoints=0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)
-        if(s->tasks[i].state==T_QUEUED && force_name(s,s->tasks[i].name))endpoints++;
+    for(size_t i=0;i<s->task_count;i++)
+        if(s->tasks[i]->state==T_QUEUED && force_name(s,s->tasks[i]->name))endpoints++;
     CHECK(endpoints==2);
     task *first=task_of(s,"tenant.gateway.example.test",6,4);
     if(first) { first->state=T_WATCHING;strcpy(first->doh_path,"/dns-query"); }
     e.kind=D2K_EV_SUSPECT;e.code=D2K_SUSPECT_SILENT;e.planned=D2K_LINK_PLANNED_YES;
     on_suspect_as(s,&e,e.name,0);
     endpoints=0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)
-        if(s->tasks[i].state!=T_FREE && force_name(s,s->tasks[i].name))endpoints++;
+    for(size_t i=0;i<s->task_count;i++)
+        if(s->tasks[i]->state!=T_FREE && force_name(s,s->tasks[i]->name))endpoints++;
     CHECK(endpoints==2 && first && first->state==T_WATCHING);
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)task_reset(s,&s->tasks[i]);
+    for(size_t i=0;i<s->task_count;i++)task_reset(s,s->tasks[i]);
     /* A cold watcher remains idle until the Keenetic journal reports failure. */
     const char *host="tenant.gateway.example.test";
     CHECK(!bind_confirmed(&c,"force-box","force-plan","tcp split pos=1","tls",

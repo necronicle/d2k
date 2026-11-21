@@ -24,8 +24,9 @@ int tg_ws_decode_server_frame(const uint8_t *src, size_t len, size_t max_payload
                               size_t *payload_len, size_t *consumed);
 int tg_ws_upgrade(SSL *ssl, const char *host_header, const char *path);
 int tg_ws_write_binary(SSL *ssl, const uint8_t *payload, size_t payload_len);
-/* Returns 0 for one binary message, -2 for a clean peer close, -1 on protocol/I/O error. */
-int tg_ws_read_binary(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len);
+/* Consume one complete binary message. Copy at most cap bytes and return the
+ * full length. Returns -2 on peer close and -1 on protocol or I/O errors. */
+int tg_ws_read_binary_prefix(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len);
 
 typedef struct tg_ws_tx_frame tg_ws_tx_frame;
 typedef struct {

@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "tg_tls.h"
+#include "tg_session.h"
 #include "tg_ws.h"
 #include "tg_identity.h"
 #include "tg_register.h"
@@ -187,6 +188,23 @@ static void *serve_ws(void *opaque) {
     int response_len = snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept);
     assert(response_len > 0 && ssl_write_exact(ssl, (uint8_t *)response, (size_t)response_len) == 0);
+    /* Optional INFO text can fill the maximum WebSocket message. */
+    const uint8_t ping_auth[] = {0x89,1,'a'};
+    assert(ssl_write_exact(ssl,ping_auth,sizeof(ping_auth))==0);
+    uint8_t pong[7];
+    assert(ssl_read_exact(ssl,pong,sizeof(pong))==0);
+    assert(pong[0]==0x8a && pong[1]==0x81 && (pong[6]^pong[2])=='a');
+    uint8_t header[10]={0x82,127};
+    for(size_t i=0;i<8;i++) header[2+i]=(uint8_t)((uint64_t)TG_WS_MAX_MESSAGE>>(56-8*i));
+    assert(ssl_write_exact(ssl,header,sizeof(header))==0);
+    const uint8_t info[]={0,0,TG_MUX_INFO,TG_INFO_AUTH_OK,0,0,0,0};
+    assert(ssl_write_exact(ssl,info,sizeof(info))==0);
+    uint8_t padding[4096]={0};
+    for(size_t remaining=TG_WS_MAX_MESSAGE-sizeof(info);remaining;) {
+        size_t chunk=remaining<sizeof(padding)?remaining:sizeof(padding);
+        assert(ssl_write_exact(ssl,padding,chunk)==0);
+        remaining-=chunk;
+    }
     uint8_t frame[128];
     assert(ssl_read_exact(ssl, frame, 2) == 0);
     assert(frame[0] == 0x82 && (frame[1] & 0x80) && (frame[1] & 0x7f) == 5);
@@ -372,6 +390,9 @@ static void test_websocket_upgrade_binary_and_ping(void) {
     client_ctx=tg_tls_client_context(cert_path); assert(client_ctx);
     ssl=tg_tls_connect_fd(client_ctx,connect_loopback(args.listener),"relay.test"); assert(ssl);
     assert(tg_ws_upgrade(ssl,"relay.test:443","/ws")==0);
+    uint8_t prefix[TG_MUX_HEADER_LEN+TG_INFO_FIXED_LEN]; size_t message_len;
+    assert(tg_ws_read_binary_prefix(ssl,prefix,sizeof(prefix),&message_len)==0);
+    assert(message_len==TG_WS_MAX_MESSAGE && prefix[2]==TG_MUX_INFO && prefix[3]==TG_INFO_AUTH_OK);
     assert(tg_ws_pump_init(&pump,ssl)==0);
     /* Буфер приёма не занимает предел сообщения заранее. */
     assert(pump.rx_cap==TG_WS_RX_BASE);

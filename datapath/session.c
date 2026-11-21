@@ -22,6 +22,7 @@
 #include "d2k_plans.h"
 #include "d2k_packet.h"
 #include "d2k_quic.h"
+#include "quic_flow.h"
 #include "d2k_quicsnap.h" /* core/ — разбор QUIC линкуется исходниками, см. Makefile */
 #include "d2k_nat.h"
 #include "d2k_session.h"
@@ -1152,6 +1153,10 @@ static d2k_stun_request_slot *stun_observe_request(d2k_flow *fl, const uint8_t *
                                               uint64_t now_ns, int *fresh) {
     d2k_stun_request_slot *slot=NULL;
     *fresh=0;
+    if (!fl->stun_requests) {
+        fl->stun_requests = calloc(D2K_STUN_REQUEST_SLOTS, sizeof *fl->stun_requests);
+        if (!fl->stun_requests) return NULL;
+    }
     for (size_t i=0;i<D2K_STUN_REQUEST_SLOTS;i++) {
         d2k_stun_request_slot *r=&fl->stun_requests[i];
         if (r->valid && !memcmp(r->txid,txid,12)) {
@@ -1757,6 +1762,8 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "таблица потоков полна";
         return;
     }
+    if (fl->fwd_pkts >= D2K_HELLO_WINDOW && (fl->saw_initial || fl->saw_hello) &&
+        (fl->quic_assembly || fl->quic_replay)) d2k_flow_forget_quic(fl);
     if (controller_probe) { fl->controller_probe = 1; }
 
     /* Направление — из ПОРТА, а не из содержимого (ревью задачи 4, круг 3).
@@ -1849,7 +1856,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
                                 D2K_UDP_PROOF_VOICE_DISCOVERY, (uint32_t)payload_len,
                                 &fl->voice_request_context);
             }
-            if (!fl->controller_probe) {
+            if (!fl->controller_probe && fl->stun_requests) {
                 for(size_t i=0;i<D2K_STUN_REQUEST_SLOTS;i++) {
                     d2k_stun_request_slot *r=&fl->stun_requests[i];
                     if(!r->valid || r->answered)continue;
@@ -2146,15 +2153,16 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
      * более. */
     char name[256];
     int named = 1;
+    int quic_complete = 0;
     if (discord_class) {
         snprintf(name, sizeof name, "%s", D2K_VOICE_CLASS);
     } else if (voice) {
         named = 0;          /* STUN без класса: только адресный путь */
         name[0] = '\0';
     } else {
-        int assembled = d2k_quic_assembly_feed(&fl->quic_assembly,
-                                                pkt + payload_off,
-                                                payload_len, name, sizeof name);
+        int assembled = flow_quic_feed(fl, pkt + payload_off, payload_len, name, &quic_complete);
+        if (fl->fwd_pkts >= D2K_HELLO_WINDOW && !fl->udp_hold_active)
+            d2k_flow_forget_quic(fl);
         if (assembled != 1) {
             named = 0;
             name[0] = '\0';
@@ -2235,7 +2243,7 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
        пришедший после снимка, снова снимком не становится — кольцо уже
        очищено, и уходила бы одиночная датаграмма-обрывок. */
     if (named && !voice && !fl->controller_probe && !fl->qsnap_done &&
-        d2k_quic_assembly_complete(&fl->quic_assembly)) {
+        quic_complete) {
         fl->qsnap_done = 1;
         size_t k = shape_slot(17, key.family);
         /* ВЕСЬ ПОЛЁТ, А НЕ ПОСЛЕДНЯЯ ДАТАГРАММА (задача 66): приветствие с
@@ -4429,7 +4437,7 @@ static void sweep_udp_one(void *ctx, d2k_flow *f) {
         return;
     }
     if(f->stun_txid_valid) {
-        if(f->controller_probe ||
+        if(!f->stun_requests || f->controller_probe ||
            (!c->s->rev_seen[shape_slot(17,f->key.family)] && !c->s->udp_reverse_hook))return;
         for(size_t i=0;i<D2K_STUN_REQUEST_SLOTS;i++) {
             const d2k_stun_request_slot *r=&f->stun_requests[i];

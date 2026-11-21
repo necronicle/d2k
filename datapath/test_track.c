@@ -6,6 +6,7 @@
  * отслеживаться сам собой».
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "d2k_track.h"
 #include "d2k_addr.h"
@@ -40,6 +41,10 @@ static void count_expired(void *ctx, const d2k_flow *f) {
 }
 
 int main(void) {
+    CHECK(sizeof(((d2k_flow *)0)->quic_assembly) <= sizeof(void *),
+          "unused QUIC assembly must not occupy every flow slot");
+    CHECK(sizeof(((d2k_flow *)0)->stun_requests) <= sizeof(void *),
+          "unused STUN history must not occupy every flow slot");
     {
         d2k_addr s = {6, {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1}};
         d2k_addr d = {6, {0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,2}};
@@ -267,11 +272,24 @@ int main(void) {
                     fails++;
                     break;
                 }
+                CHECK(fl->stun_requests && fl->stun_requests[0].started_ns == (uint64_t)idx,
+                      "collision repair moved a flow without its history");
+                CHECK(fl->quic_assembly && fl->quic_assembly->largest_pn == (uint64_t)idx,
+                      "collision repair moved a flow without its QUIC assembly");
                 d2k_track_remove(s, &k);
                 alive[idx] = 0;
                 live--;
             } else {
-                if (d2k_track_get(s, &k, 100) != NULL) {
+                d2k_flow *fl = d2k_track_get(s, &k, 100);
+                if (fl) {
+                    CHECK(!fl->stun_requests, "new flow inherited another history");
+                    fl->stun_requests = calloc(D2K_STUN_REQUEST_SLOTS, sizeof *fl->stun_requests);
+                    if (!fl->stun_requests) abort();
+                    fl->stun_requests[0].started_ns = (uint64_t)idx;
+                    CHECK(!fl->quic_assembly && !fl->quic_replay, "new flow inherited QUIC state");
+                    fl->quic_assembly = calloc(1, sizeof *fl->quic_assembly);
+                    if (!fl->quic_assembly) abort();
+                    fl->quic_assembly->largest_pn = (uint64_t)idx;
                     alive[idx] = 1;
                     live++;
                 }

@@ -28,32 +28,26 @@ static int send_mux(const tg_session_io *io,uint8_t type,const uint8_t *payload,
     free(frame); return rc;
 }
 
-static int read_mux(const tg_session_io *io,tg_frame *frame,uint8_t **storage) {
-    *storage=malloc(TG_WS_MAX_MESSAGE);
-    if(!*storage)return -1;
-    size_t n=0;
-    if(!io||!io->read_binary||io->read_binary(io->ctx,*storage,TG_WS_MAX_MESSAGE,&n)!=0 ||
-       tg_mux_decode(*storage,n,frame)!=0) { free(*storage); *storage=NULL; return -1; }
-    return 0;
-}
-
 int tg_session_authenticate_v2(const tg_session_io *io,const tg_identity *id,
                                const char *build,int64_t local_unix,
                                tg_session_state *state) {
     uint8_t hello[261],auth_payload[TG_AUTH_V2_LEN],signed_data[40];
     uint8_t signature[64],id_bytes[16]; size_t hello_len=0;
-    tg_frame frame; uint8_t *message=NULL; tg_hello_ack ack;
-    if(!io||!io->send_binary||!io->read_binary||!id||!id->private_key||!state||
+    tg_frame frame;
+    tg_hello_ack ack;
+    uint8_t ack_message[TG_MUX_HEADER_LEN + TG_HELLO_ACK_FIXED_LEN + UINT8_MAX];
+    uint8_t info_prefix[TG_MUX_HEADER_LEN + TG_INFO_FIXED_LEN];
+    size_t message_len;
+    if(!io||!io->send_binary||!io->read_binary_prefix||!id||!id->private_key||!state||
        tg_hello_encode(hello,sizeof(hello),build,0,&hello_len)!=0 ||
        decode_id(id->install_id_hex,id_bytes)!=0)return TG_SESSION_ERROR;
     memset(state,0,sizeof(*state));
     if(send_mux(io,TG_MUX_HELLO,hello,hello_len)!=0)return TG_SESSION_ERROR;
-    if(read_mux(io,&frame,&message)!=0)return TG_SESSION_ERROR;
-    if(frame.stream_id!=0 || frame.type!=TG_MUX_HELLO_ACK ||
-       tg_hello_ack_decode(frame.payload,frame.payload_len,&ack)!=0) {
-        free(message); return TG_SESSION_ERROR;
-    }
-    free(message); message=NULL;
+    if (io->read_binary_prefix(io->ctx,ack_message,sizeof(ack_message),&message_len)!=0 ||
+        message_len>sizeof(ack_message) || tg_mux_decode(ack_message,message_len,&frame)!=0 ||
+        frame.stream_id!=0 || frame.type!=TG_MUX_HELLO_ACK ||
+        tg_hello_ack_decode(frame.payload,frame.payload_len,&ack)!=0)
+        return TG_SESSION_ERROR;
     if(ack.version!=2)return TG_SESSION_FALLBACK_V1;
     state->clock_offset=ack.server_unix-local_unix;
     state->window=ack.window;
@@ -63,12 +57,15 @@ int tg_session_authenticate_v2(const tg_session_io *io,const tg_identity *id,
     if(tg_identity_sign(id,signed_data,sizeof(signed_data),signature)!=0 ||
        tg_auth_v2_encode(auth_payload,id_bytes,(uint64_t)corrected,ack.nonce,signature)!=0 ||
        send_mux(io,TG_MUX_AUTHID,auth_payload,sizeof(auth_payload))!=0) return TG_SESSION_ERROR;
-    if(read_mux(io,&frame,&message)!=0)return TG_SESSION_ERROR;
-    if(frame.stream_id!=0 || frame.type!=TG_MUX_INFO) { free(message); return TG_SESSION_ERROR; }
+    /* INFO can carry arbitrary trailing text. Authentication only consumes kind and arg. */
+    if (io->read_binary_prefix(io->ctx,info_prefix,sizeof(info_prefix),&message_len)!=0 ||
+        message_len<sizeof(info_prefix) || message_len>TG_WS_MAX_MESSAGE ||
+        tg_mux_decode(info_prefix,sizeof(info_prefix),&frame)!=0 ||
+        frame.stream_id!=0 || frame.type!=TG_MUX_INFO)
+        return TG_SESSION_ERROR;
     uint8_t kind; uint32_t arg; const uint8_t *text; size_t text_len;
-    int rc=tg_info_decode(frame.payload,frame.payload_len,&kind,&arg,&text,&text_len);
-    (void)text; (void)text_len; free(message);
-    if(rc!=0)return TG_SESSION_ERROR;
+    if(tg_info_decode(frame.payload,frame.payload_len,&kind,&arg,&text,&text_len)!=0)
+        return TG_SESSION_ERROR;
     if(kind==TG_INFO_AUTH_OK)return TG_SESSION_V2_OK;
     if(kind==TG_INFO_GOODBYE && arg==TG_REASON_PROTOCOL)return TG_SESSION_FALLBACK_V1;
     if(kind==1)state->retry_after=arg>TG_MAX_RETRY_AFTER_SEC?TG_MAX_RETRY_AFTER_SEC:arg;

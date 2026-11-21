@@ -21,6 +21,7 @@
 
 #define REQUEST_MAX (32u * 1024u)
 #define BODY_MAX (1024u * 1024u)
+#define STATUS_OVERHEAD 16384u
 #ifndef D2K_PANEL_HEADER_TIMEOUT_MS
 #define D2K_PANEL_HEADER_TIMEOUT_MS 5000
 #endif
@@ -254,9 +255,31 @@ static int write_all(int fd, const void *buf, size_t len, long long deadline) {
     return 0;
 }
 
-/* extra — дополнительные строки заголовка, каждая с завершающим \r\n. */
-static int response_ex(int fd, int code, const char *reason, const char *type,
-                       const char *extra, const char *body, size_t len) {
+typedef struct {
+    const char *data;
+    size_t len;
+} response_part;
+
+static int write_file_body(int fd, int in, size_t len, long long deadline) {
+    char chunk[4096];
+    while (len) {
+        size_t want = len < sizeof chunk ? len : sizeof chunk;
+        ssize_t n = read(in, chunk, want);
+        if (n < 0 && errno == EINTR) { continue; }
+        if (n == 0) { errno = EIO; return -1; }
+        if (n < 0 || write_all(fd, chunk, (size_t)n, deadline) != 0) { return -1; }
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* A response has either memory parts or a regular file opened by static_file.
+   The length of a file comes from fstat on that same descriptor. */
+static int send_response(int fd, int code, const char *reason, const char *type,
+                         const char *extra, const response_part *parts, size_t count,
+                         int in, size_t file_len) {
+    size_t len = file_len;
+    for (size_t i = 0; i < count; i++) { len += parts[i].len; }
     char hdr[1024];
     int n = snprintf(hdr, sizeof hdr,
         "HTTP/1.1 %d %s\r\n"
@@ -274,11 +297,20 @@ static int response_ex(int fd, int code, const char *reason, const char *type,
     /* One deadline covers headers and body, including repeated partial writes. */
     const long long deadline = monotonic_ms() + D2K_PANEL_RESPONSE_TIMEOUT_MS;
     int rc = write_all(fd, hdr, (size_t)n, deadline);
-    if (rc == 0 && len) { rc = write_all(fd, body, len, deadline); }
+    for (size_t i = 0; rc == 0 && i < count; i++) {
+        rc = write_all(fd, parts[i].data, parts[i].len, deadline);
+    }
+    if (rc == 0 && in >= 0) { rc = write_file_body(fd, in, file_len, deadline); }
     int saved_errno = errno;
     int restored = fcntl(fd, F_SETFL, flags);
     if (rc != 0) { errno = saved_errno; return rc; }
     return restored == 0 ? 0 : -1;
+}
+
+static int response_ex(int fd, int code, const char *reason, const char *type,
+                       const char *extra, const char *body, size_t len) {
+    const response_part part = { body, len };
+    return send_response(fd, code, reason, type, extra, &part, 1, -1, 0);
 }
 
 static int response(int fd, int code, const char *reason, const char *type,
@@ -528,9 +560,7 @@ static int api_update(int fd, const d2k_panel_config *cfg) {
     return response(fd, 200, "OK", json, body, n);
 }
 
-static int read_request(int fd, char *buf, size_t cap, size_t *used) {
-    *used = 0;
-    const long long deadline = monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS;
+static int read_request(int fd, char *buf, size_t cap, size_t *used, long long deadline) {
     while (*used + 1 < cap) {
         long long remaining = deadline - monotonic_ms();
         if (remaining <= 0) { return -2; }
@@ -550,7 +580,7 @@ static int read_request(int fd, char *buf, size_t cap, size_t *used) {
     return *used + 1 >= cap ? 1 : -1;
 }
 
-static int json_object_file(const char *path, char **out, size_t *out_len) {
+static int read_status_object(const char *path, char **out, size_t *out_len) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) { return -1; }
     struct stat st;
@@ -560,7 +590,7 @@ static int json_object_file(const char *path, char **out, size_t *out_len) {
         return -1;
     }
     size_t cap = (size_t)st.st_size;
-    char *buf = malloc(cap + 1);
+    char *buf = malloc(cap + STATUS_OVERHEAD);
     if (!buf) { close(fd); return -1; }
     size_t nread = 0;
     while (nread < cap) {
@@ -649,8 +679,10 @@ static int catalog_revision(const char *json, char out[17]) {
     return found;
 }
 
-static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
-                               int effective_linked, int slim) {
+/* The read buffer includes STATUS_OVERHEAD spare bytes. At most three
+   replacements can grow, each by at most four bytes. Apply from the right so
+   the offsets recorded against the validated JSON remain valid. */
+static size_t update_live_knowledge(char *json, size_t len, int effective_linked, int slim) {
     struct replacement { size_t offset, len; const char *text; } parts[3];
     const char *keys[] = { "linked", "boxes", "groups" };
     size_t count = 0;
@@ -666,13 +698,17 @@ static void buf_live_knowledge(panel_buf *b, const char *json, size_t len,
         while (i && parts[i - 1].offset > part.offset) { parts[i] = parts[i - 1]; --i; }
         parts[i] = part;
     }
-    size_t offset = 0;
-    for (size_t i = 0; i < count; ++i) {
-        buf_add(b, json + offset, parts[i].offset - offset);
-        buf_puts(b, parts[i].text);
-        offset = parts[i].offset + parts[i].len;
+    while (count) {
+        struct replacement part = parts[--count];
+        size_t text_len = strlen(part.text);
+        char *value = json + part.offset;
+        if (text_len != part.len) {
+            memmove(value + text_len, value + part.len, len - part.offset - part.len);
+            len = len - part.len + text_len;
+        }
+        memcpy(value, part.text, text_len);
     }
-    buf_add(b, json + offset, len - offset);
+    return len;
 }
 
 static void append_stage(panel_buf *b, const char *key, const char *title,
@@ -768,12 +804,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
 static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     char *live = NULL;
     size_t live_len = 0;
-    if (cfg && cfg->live_path && json_object_file(cfg->live_path, &live, &live_len) == 0) {
-        size_t cap = live_len + 16384;
-        char *body = malloc(cap);
-        if (!body) { free(live); return -1; }
-        panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
-        buf_puts(&b, "{\"snapshot\":");
+    if (cfg && cfg->live_path && read_status_object(cfg->live_path, &live, &live_len) == 0) {
         time_t now = time(NULL);
         struct stat live_stat;
         time_t engine_started_at = 0;
@@ -787,24 +818,29 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
         int linked = json_top_true(live, "linked") && live_fresh &&
                      engine_running && controller_running;
         int have_catalog = json_top_nonempty_string(live, "catalog_at");
-        append_snapshot(&b, cfg, linked, have_catalog, live_fresh,
-                        engine_running, controller_running);
-        buf_puts(&b, ",\"knowledge\":");
         char revision[17];
         int have_revision = catalog_revision(live, revision);
         int unchanged = have_revision && query &&
             strncmp(query, "catalog_revision=", 17) == 0 &&
             strcmp(query + 17, revision) == 0;
-        buf_live_knowledge(&b, live, live_len, linked, unchanged);
+        size_t knowledge_len = update_live_knowledge(live, live_len, linked, unchanged);
+        panel_buf b = { .p = live + knowledge_len,
+                        .cap = live_len + STATUS_OVERHEAD - knowledge_len };
+        buf_puts(&b, "{\"snapshot\":");
+        append_snapshot(&b, cfg, linked, have_catalog, live_fresh,
+                        engine_running, controller_running);
+        buf_puts(&b, ",\"knowledge\":");
+        size_t prefix_len = b.len;
         if (have_revision) {
             buf_printf(&b, ",\"catalog_revision\":\"%s\",\"catalog_unchanged\":%s",
                        revision, unchanged ? "true" : "false");
         }
         buf_puts(&b, "}");
-        if (b.failed) { free(body); free(live); return -1; }
-        int rc = response(fd, 200, "OK", "application/json; charset=utf-8",
-                          body, b.len);
-        free(body);
+        const response_part parts[] = {
+            { b.p, prefix_len }, { live, knowledge_len }, { b.p + prefix_len, b.len - prefix_len }
+        };
+        int rc = b.failed ? -1 : send_response(fd, 200, "OK", "application/json; charset=utf-8",
+                                                NULL, parts, 3, -1, 0);
         free(live);
         return rc;
     }
@@ -812,7 +848,7 @@ static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
         "{\"linked\":false,\"link_note\":\"движок не отдаёт состояние\","
         "\"catalog_at\":\"\",\"boxes\":[],\"searches\":[],\"targets\":0,"
         "\"confirms\":0,\"probes_used\":0,\"client_unfit\":0}";
-    size_t cap = 16384;
+    size_t cap = STATUS_OVERHEAD;
     char *body = malloc(cap);
     if (!body) { return -1; }
     panel_buf b = { .p = body, .len = 0, .cap = cap, .failed = 0 };
@@ -861,19 +897,10 @@ static int static_file(int fd, const d2k_panel_config *cfg, const char *req,
         close(in);
         return response_ex(fd, 304, "Not Modified", type, extra, NULL, 0);
     }
-    size_t cap = (size_t)st.st_size;
-    char *body = malloc(cap ? cap : 1);
-    if (!body) { close(in); return -1; }
-    size_t got = 0;
-    while (got < cap) {
-        ssize_t nr = read(in, body + got, cap - got);
-        if (nr < 0 && errno == EINTR) { continue; }
-        if (nr <= 0) { free(body); close(in); return -1; }
-        got += (size_t)nr;
-    }
+    int rc = send_response(fd, 200, "OK", type, extra, NULL, 0, in, (size_t)st.st_size);
+    int saved_errno = errno;
     close(in);
-    int rc = response_ex(fd, 200, "OK", type, extra, body, cap);
-    free(body);
+    errno = saved_errno;
     return rc;
 }
 
@@ -1011,24 +1038,7 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     free(body);return rc;
 }
 
-int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
-    char req[REQUEST_MAX + 1];
-    size_t used = 0;
-    int rr = read_request(fd, req, sizeof req, &used);
-    if (rr != 0) {
-        if (rr == -2) {
-            static const char timed_out[] = "request timeout\n";
-            return response(fd, 408, "Request Timeout", "text/plain; charset=utf-8",
-                            timed_out, sizeof timed_out - 1);
-        }
-        static const char too_large[] = "request too large\n";
-        static const char bad_request[] = "bad request\n";
-        return response(fd, rr > 0 ? 431 : 400,
-                        rr > 0 ? "Request Header Fields Too Large" : "Bad Request",
-                        "text/plain; charset=utf-8",
-                        rr > 0 ? too_large : bad_request,
-                        rr > 0 ? sizeof too_large - 1 : sizeof bad_request - 1);
-    }
+static int dispatch_request(int fd, const d2k_panel_config *cfg, const char *req) {
     char method[8], path[256], version[16];
     if (sscanf(req, "%7s %255s %15s", method, path, version) != 3 ||
         (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0)) {
@@ -1080,6 +1090,37 @@ int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
     if (strcmp(path, "/assets/jbmono.woff2") == 0) {
         return static_file(fd, cfg, req, "fonts/jbmono.woff2", "font/woff2");
     }
-    (void)used;
     return response(fd, 404, "Not Found", "text/plain; charset=utf-8", "not found\n", 10);
+}
+
+int d2k_panel_handle_fd(int fd, const d2k_panel_config *cfg) {
+    char small[2048];
+    char *req = small;
+    size_t used = 0;
+    const long long deadline = monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS;
+    int rr = read_request(fd, req, sizeof small, &used, deadline);
+    if (rr == 1) {
+        req = malloc(REQUEST_MAX + 1);
+        if (!req) { return -1; }
+        memcpy(req, small, used + 1);
+        rr = read_request(fd, req, REQUEST_MAX + 1, &used, deadline);
+    }
+    if (rr == 0) {
+        int rc = dispatch_request(fd, cfg, req);
+        if (req != small) { free(req); }
+        return rc;
+    }
+    if (req != small) { free(req); }
+    if (rr == -2) {
+        static const char timed_out[] = "request timeout\n";
+        return response(fd, 408, "Request Timeout", "text/plain; charset=utf-8",
+                        timed_out, sizeof timed_out - 1);
+    }
+    static const char too_large[] = "request too large\n";
+    static const char bad_request[] = "bad request\n";
+    return response(fd, rr > 0 ? 431 : 400,
+                    rr > 0 ? "Request Header Fields Too Large" : "Bad Request",
+                    "text/plain; charset=utf-8",
+                    rr > 0 ? too_large : bad_request,
+                    rr > 0 ? sizeof too_large - 1 : sizeof bad_request - 1);
 }

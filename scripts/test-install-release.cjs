@@ -107,7 +107,15 @@ exit 0`));
   }
   fixture('builds/d2kc-linux-amd64', engineFixture('d2kc'));
   fixture('builds/d2kfetch-linux-amd64', sh('echo d2kfetch ${D2K_RELEASE_ID:-dev}'));
-  fixture('files/S99d2k', sh('printf "service-%s\\n" "$1" >> "$CALLS"\n[ "$1" != status ] || echo "датапат: работает"\nexit 0'));
+  fixture('files/S99d2k', sh(`printf 'service-%s\\n' "$1" >> "$CALLS"
+if [ "$1" = start ]; then
+  if [ -n "\${UPDATE_STAGE:-}" ] && [ -e "$UPDATE_STAGE" ]; then echo update-work-at-start >> "$CALLS"; fi
+  for w in "$HOME"/runtime-install.*; do
+    [ ! -d "$w" ] || echo installer-work-at-start >> "$CALLS"
+  done
+fi
+[ "$1" != status ] || echo "датапат: работает"
+exit 0`));
   fixture('files/config', 'PANEL_LISTEN=192.168.1.1:8090\nTG_ENABLED=0\nTG_RELAY_URL=wss://example.test/ws\n');
   fixture('files/d2k-ppe-deoffload.sh', sh('d2k_ppe_remove() { :; }'));
   for (const name of ['d2k-fw-heal.sh', '001-d2k.sh', 'd2k-tg-firewall.sh', 'd2k-tg-watchdog.sh',
@@ -184,6 +192,7 @@ exit 0`));
   // 1. Чистая 25.12 без curl и openssl: пакеты, затем подписанный выпуск.
   reset();
   const fresh = ok(run());
+  assert(!read(calls).includes('installer-work-at-start'), 'signed installer must release downloaded and unpacked copies before service startup');
   assert.match(read(log('apk')), /^add kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle curl openssl-util$/m,
     'пакеты ставятся до проверки подписи: без openssl её нечем делать');
   // Два скрипта определения арки — wget из образа (curl ещё нет), всё
@@ -212,6 +221,80 @@ exit 0`));
   assert.equal(read(calls).match(/^arch /gm).length, 2,
     'установщик из архива определяет арку сам');
   assert(read(calls).includes('service-start'), 'служба должна запуститься');
+
+  // The updater registered this installer PID against its verified, disposable release.
+  const work = path.join(tmp, 'runtime-update');
+  const stage = path.join(work, 'release');
+  const claim = path.join(work, `lock.${process.pid}`);
+  fs.mkdirSync(stage, { recursive: true });
+  fs.mkdirSync(claim, { mode: 0o700 });
+  fs.symlinkSync(path.basename(claim), path.join(work, 'lock'));
+  put(path.join(claim, 'pid'), String(process.pid));
+  put(path.join(work, 'previous.tar'), 'rollback copy');
+  execFileSync('tar', ['-xzf', path.join(src, rid, 'd2k-amd64.tar.gz'), '-C', stage]);
+  function applyUpdate(register) {
+    return spawnSync('/bin/sh', ['-c',
+      `echo "${register ? '$$' : '1'}" > "$1/installer"; exec sh "$D2K_LOCAL/scripts/install.sh" --verified-update "$PPID"`,
+      'sh', claim], { env: { ...env, D2K_LOCAL: stage, D2K_UPDATING: '1', D2K_RELEASE_ID: rid, UPDATE_STAGE: stage },
+      encoding: 'utf8', timeout: 30000 });
+  }
+  assert.notEqual(applyUpdate(false).status, 0, 'refuse to consume a caller bundle without the registered installer PID');
+  assert(fs.existsSync(path.join(stage, 'builds/d2kd-linux-amd64')), 'unclaimed local source must remain intact');
+  reset();
+  const copy = path.join(bin, 'cp');
+  put(copy, sh('case "$1" in "$UPDATE_STAGE"/builds/*) exit 1 ;; esac\nexec /bin/cp "$@"'));
+  ok(applyUpdate(true));
+  fs.unlinkSync(copy);
+  assert(!read(calls).includes('update-work-at-start'), 'dispose of the updater release before service start');
+  assert(!fs.existsSync(stage));
+  assert.equal(read(path.join(work, 'previous.tar')), 'rollback copy');
+  assert(fs.existsSync(path.join(work, 'lock')), 'the updater retains its lock');
+
+  // Installed releases before the workspace handoff used a directory lock and
+  // kept both archives beside the extracted tree. Unknown parents still own their inputs.
+  const legacyLock = path.join(work, 'lock');
+  fs.unlinkSync(legacyLock);
+  fs.mkdirSync(legacyLock);
+  put(path.join(legacyLock, 'pid'), String(process.pid), 0o600);
+  fs.mkdirSync(stage);
+  const tarball = path.join(work, 'release.tar.gz');
+  fs.copyFileSync(path.join(src, rid, 'd2k-amd64.tar.gz'), tarball);
+  execFileSync('tar', ['-xzf', tarball, '-C', stage]);
+  const legacyProc = path.join(tmp, 'proc', String(process.pid), 'cmdline');
+  const oldUpdater = path.join(tmp, 'opt/d2k/d2k-update.sh');
+  const runLegacy = () => spawnSync('/bin/sh', [path.join(stage, 'scripts/install.sh')], {
+    env: { ...env, D2K_LOCAL: stage, D2K_UPDATING: '1', D2K_RELEASE_ID: rid, UPDATE_STAGE: stage },
+    encoding: 'utf8', timeout: 30000,
+  });
+  put(legacyProc, ['/bin/sh', oldUpdater, 'check', ''].join('\0'), 0o600);
+  ok(runLegacy());
+  assert(fs.existsSync(path.join(stage, 'builds/d2kd-linux-amd64')) && fs.existsSync(tarball),
+    'an unrelated caller must retain its inputs and installation must still succeed');
+  put(legacyProc, ['/bin/sh', oldUpdater, 'install', 'manual', ''].join('\0'), 0o600);
+  reset();
+  ok(runLegacy());
+  assert(!read(calls).includes('update-work-at-start'), 'reclaim the legacy updater release before service start');
+  assert(!fs.existsSync(tarball) && !fs.existsSync(stage), 'drop both verified legacy copies');
+  assert.equal(read(path.join(work, 'previous.tar')), 'rollback copy');
+  assert.equal(read(path.join(legacyLock, 'pid')), String(process.pid));
+
+  // A failed legacy install must clean its moved tree even if a retry creates
+  // a fresh release/ under the old name before the first child returns.
+  fs.mkdirSync(stage);
+  fs.copyFileSync(path.join(src, rid, 'd2k-amd64.tar.gz'), tarball);
+  execFileSync('tar', ['-xzf', tarball, '-C', stage]);
+  fs.rmSync(path.join(stage, 'builds/d2kd-linux-amd64'));
+  const move = path.join(bin, 'mv');
+  put(move, sh(`if [ "$1" = "$UPDATE_STAGE" ]; then
+    /bin/mv "$@" && mkdir "$UPDATE_STAGE" && echo retry > "$UPDATE_STAGE/owner"
+    exit $?
+  fi
+  exec /bin/mv "$@"`));
+  assert.notEqual(runLegacy().status, 0);
+  fs.unlinkSync(move);
+  assert.equal(read(path.join(stage, 'owner')), 'retry\n');
+  assert(!fs.readdirSync(work).some(n => n.startsWith('.d2k-install.')), 'failed installer must remove its private stage');
+  assert.equal(read(path.join(work, 'previous.tar')), 'rollback copy');
 
   // 2. Подпись не сошлась: прежняя версия остаётся как была.
   // A mismatched tool must fail before stopping the installed service.
@@ -338,6 +421,12 @@ exit 0`));
   assert.match(read(log('apk')), /^add kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink ca-bundle/m,
     'после отказа проводника пакеты ставятся напрямую');
   assert.equal(read(releaseId).trim(), rid);
+
+  // Older signed installers expect a caller-owned D2K_LOCAL and return their own status.
+  fixture('scripts/install.sh', sh('[ -s "$D2K_LOCAL/builds/d2kd-linux-amd64" ] || exit 1\nexit 37'));
+  publish();
+  assert.equal(run().status, 37, 'bootstrap must propagate an older installer failure');
+  assert(!fs.readdirSync(tmp).some(n => n.startsWith('runtime-install.')), 'bootstrap must reclaim older release staging');
 
   console.log('install: signed release, bad signature, bad hash, missing arch, /tmp room, Keenetic, ref, VPS gate: PASS');
 } finally {

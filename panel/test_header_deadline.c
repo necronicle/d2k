@@ -6,10 +6,10 @@
 
 int main(void) {
     const char *header = "GET / HTTP/1.0\r\n\r\n";
-    char buf[REQUEST_MAX + 1]; size_t used;
+    char buf[REQUEST_MAX + 1]; size_t used = 0;
     int fds[2]; assert(pipe(fds) == 0);
     assert(write(fds[1], header, strlen(header)) == (ssize_t)strlen(header));
-    assert(read_request(fds[0], buf, sizeof buf, &used) == 0);
+    assert(read_request(fds[0], buf, sizeof buf, &used, monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS) == 0);
     close(fds[0]); close(fds[1]);
     assert(pipe(fds) == 0);
     pid_t pid = fork(); assert(pid >= 0);
@@ -23,8 +23,9 @@ int main(void) {
         close(fds[1]); _exit(0);
     }
     close(fds[1]);
+    used = 0;
     long long start = monotonic_ms();
-    assert(read_request(fds[0], buf, sizeof buf, &used) == -2);
+    assert(read_request(fds[0], buf, sizeof buf, &used, monotonic_ms() + D2K_PANEL_HEADER_TIMEOUT_MS) == -2);
     assert(monotonic_ms() - start < 1000);
     close(fds[0]); assert(waitpid(pid, NULL, 0) == pid);
     int sv[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);

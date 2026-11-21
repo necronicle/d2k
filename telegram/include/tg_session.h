@@ -24,7 +24,8 @@
 typedef struct {
     void *ctx;
     int (*send_binary)(void *ctx, const uint8_t *data, size_t len);
-    int (*read_binary)(void *ctx, uint8_t *dst, size_t cap, size_t *len);
+    /* Consume one complete message, copying at most cap bytes and returning its full length. */
+    int (*read_binary_prefix)(void *ctx, uint8_t *dst, size_t cap, size_t *len);
 } tg_session_io;
 
 typedef struct {

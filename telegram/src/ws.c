@@ -44,35 +44,35 @@ int tg_ws_encode_client_frame(uint8_t *dst, size_t cap, uint8_t opcode,
     return 0;
 }
 
+static size_t server_header_size(const uint8_t *src) {
+    if ((src[0] & 0xf0) != 0x80 || (src[1] & 0x80) || !valid_opcode(src[0] & 15))
+        return 0;
+    if (src[1] < 126) return 2;
+    return src[1] == 126 ? 4 : 10;
+}
+
+/* header is the complete validated header size returned by server_header_size. */
+static int server_payload_size(const uint8_t *src, size_t header, size_t *size) {
+    uint64_t n = src[1];
+    if (header > 2) {
+        n = 0;
+        for (size_t i = 2; i < header; ++i) n = (n << 8) | src[i];
+        if (n < 126 || (header == 10 && n <= UINT16_MAX)) return -1;
+    }
+    if (n > TG_WS_MAX_MESSAGE || ((src[0] & 15) >= 8 && n > 125)) return -1;
+    *size = (size_t)n;
+    return 0;
+}
+
 int tg_ws_decode_server_frame(const uint8_t *src, size_t len, size_t max_payload,
                               uint8_t *opcode, const uint8_t **payload,
                               size_t *payload_len, size_t *consumed) {
-    uint64_t n;
-    size_t header;
-    uint8_t op;
     if (!src || !opcode || !payload || !payload_len || !consumed || len < 2)
         return -1;
-    if ((src[0] & 0x70) != 0 || (src[0] & 0x80) == 0 || (src[1] & 0x80) != 0)
-        return -1;
-    op = src[0] & 0x0f;
-    if (!valid_opcode(op)) return -1;
-    if ((src[1] & 0x7f) < 126) { n = src[1] & 0x7f; header = 2; }
-    else if ((src[1] & 0x7f) == 126) {
-        if (len < 4) return -1;
-        n = ((uint64_t)src[2] << 8) | src[3];
-        if (n < 126) return -1;
-        header = 4;
-    } else {
-        if (len < 10 || (src[2] & 0x80) != 0) return -1;
-        n = 0;
-        for (size_t i = 0; i < 8; ++i) n = (n << 8) | src[2 + i];
-        if (n <= UINT16_MAX || n > SIZE_MAX) return -1;
-        header = 10;
-    }
-    if (n > max_payload || n > TG_WS_MAX_MESSAGE ||
-        (op >= 8 && (n > 125 || (src[0] & 0x80) == 0)) ||
-        n > SIZE_MAX - header || len < header + (size_t)n) return -1;
-    *opcode = op;
+    size_t header = server_header_size(src), n;
+    if (!header || len < header || server_payload_size(src, header, &n) != 0 ||
+        n > max_payload || n > len - header) return -1;
+    *opcode = src[0] & 15;
     *payload = src + header;
     *payload_len = (size_t)n;
     *consumed = header + (size_t)n;
@@ -194,55 +194,34 @@ int tg_ws_write_binary(SSL *ssl, const uint8_t *payload, size_t payload_len) {
     return write_frame(ssl, TG_WS_BINARY, payload, payload_len);
 }
 
-int tg_ws_read_binary(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len) {
-    uint8_t first[10], *frame = NULL;
+int tg_ws_read_binary_prefix(SSL *ssl, uint8_t *dst, size_t cap, size_t *payload_len) {
+    uint8_t header[10], scratch[1024];
     if (!ssl || !dst || !payload_len) return -1;
     for (;;) {
-        uint64_t n;
-        size_t hlen;
-        if (ssl_read_all(ssl, first, 2) != 0) return -1;
-        if ((first[0] & 0x70) != 0 || (first[0] & 0x80) == 0 || (first[1] & 0x80) != 0)
-            return -1;
-        uint8_t op = first[0] & 15;
-        if ((first[1] & 127) < 126) { n = first[1] & 127; hlen = 2; }
-        else if ((first[1] & 127) == 126) {
-            if (ssl_read_all(ssl, first + 2, 2) != 0) return -1;
-            n = ((uint64_t)first[2] << 8) | first[3];
-            if (n < 126) return -1;
-            hlen = 4;
-        } else {
-            if (ssl_read_all(ssl, first + 2, 8) != 0 || (first[2] & 0x80) != 0) return -1;
-            n = 0; for (size_t i = 0; i < 8; ++i) n = (n << 8) | first[2+i];
-            if (n <= UINT16_MAX || n > TG_WS_MAX_MESSAGE) return -1;
-            hlen = 10;
+        size_t n;
+        if (ssl_read_all(ssl, header, 2) != 0) return -1;
+        size_t hlen = server_header_size(header);
+        if (!hlen || ssl_read_all(ssl, header + 2, hlen - 2) != 0 ||
+            server_payload_size(header, hlen, &n) != 0) return -1;
+        uint8_t opcode = header[0] & 15;
+        if (opcode == TG_WS_BINARY) {
+            size_t kept = n < cap ? n : cap;
+            if (ssl_read_all(ssl, dst, kept) != 0) return -1;
+            for (size_t remaining = n - kept; remaining; ) {
+                size_t chunk = remaining < sizeof(scratch) ? remaining : sizeof(scratch);
+                if (ssl_read_all(ssl, scratch, chunk) != 0) return -1;
+                remaining -= chunk;
+            }
+            *payload_len = n;
+            return 0;
         }
-        if (n > TG_WS_MAX_MESSAGE || n > SIZE_MAX - hlen ||
-            (op >= 8 && (n > 125 || (first[0] & 0x80) == 0))) return -1;
-        frame = OPENSSL_malloc(hlen + (size_t)n);
-        if (!frame) return -1;
-        memcpy(frame, first, hlen);
-        if (n && ssl_read_all(ssl, frame + hlen, (size_t)n) != 0) goto fail;
-        uint8_t opcode; const uint8_t *body; size_t body_len, consumed;
-        if (tg_ws_decode_server_frame(frame, hlen + (size_t)n, TG_WS_MAX_MESSAGE,
-                                      &opcode, &body, &body_len, &consumed) != 0 ||
-            consumed != hlen + (size_t)n) goto fail;
-        if (opcode == TG_WS_PING) {
-            int rc = write_frame(ssl, TG_WS_PONG, body, body_len);
-            OPENSSL_clear_free(frame, hlen + (size_t)n); frame = NULL;
-            if (rc != 0) return -1;
-            continue;
-        }
-        if (opcode == TG_WS_PONG) { OPENSSL_clear_free(frame, hlen + (size_t)n); frame=NULL; continue; }
+        /* Valid control frames contain at most 125 bytes. */
+        if (ssl_read_all(ssl, scratch, n) != 0) return -1;
         if (opcode == TG_WS_CLOSE) {
-            (void)write_frame(ssl, TG_WS_CLOSE, body, body_len);
-            OPENSSL_clear_free(frame, hlen + (size_t)n); return -2;
+            (void)write_frame(ssl, TG_WS_CLOSE, scratch, n);
+            return -2;
         }
-        if (opcode != TG_WS_BINARY || body_len > cap) goto fail;
-        memcpy(dst, body, body_len); *payload_len = body_len;
-        OPENSSL_clear_free(frame, hlen + (size_t)n);
-        return 0;
-fail:
-        OPENSSL_clear_free(frame, hlen + (size_t)n);
-        return -1;
+        if (opcode == TG_WS_PING && write_frame(ssl, TG_WS_PONG, scratch, n) != 0)
+            return -1;
     }
 }

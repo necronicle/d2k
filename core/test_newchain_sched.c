@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 #define pthread_create newchain_thread_create
 #include "sched.c"
+#include "test_task_slots.h"
 #undef pthread_create
 #include <assert.h>
 #include <sys/socket.h>
@@ -68,7 +69,7 @@ int main(void) {
     assert(d2k_binding_equal(&r.binding,&entry->binding));assert(!task_of(s,"blocked.example",6,4));
     e.execution_binding.generation++;d2k_sched_event(s,&e);assert(!d2k_shadow_queue_next(queue,&r,&reader));
     /* Delayed old results cannot confirm, delete, start a worker or mutate catalog. */
-    task *t=&s->tasks[0];strcpy(t->name,"blocked.example");t->transport=6;t->family=4;t->trigger_shape=1;t->state=T_PLANNING;
+    task *t=test_task_at(s, 0);strcpy(t->name,"blocked.example");t->transport=6;t->family=4;t->trigger_shape=1;t->state=T_PLANNING;
     forget_clear_target_bindings(s,t,2000);assert(!bd->recheck_since);
     assert(start_worker(s,t,JOB_CLASSIFY)<0);assert(!start_search(s,t));
     verify_confirm(s,t,2000);assert(t->state==T_FREE);assert(b->n_binds==1);no_command(sv[1]);

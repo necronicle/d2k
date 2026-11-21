@@ -38,6 +38,7 @@ WORK=$DIR/.update
 if [ -f "${D2K_OPENWRT_RELEASE:-/etc/openwrt_release}" ] &&
    [ "$(df -P "$DIR" 2>/dev/null | awk 'NR == 2 { print $6 }')" = / ]; then
     WORK=${D2K_UPDATE_RAM:-/tmp/d2k-update}
+    while [ "${WORK%/}" != "$WORK" ]; do WORK=${WORK%/}; done
 fi
 LOG=$DIR/log/update.log
 HEALTH_WAIT=${D2K_UPDATE_HEALTH_WAIT:-60}
@@ -94,7 +95,6 @@ fetch() {
 
 # Скачивает и проверяет latest.json в $WORK. Ноль — подпись сошлась.
 check() {
-    mkdir -p "$WORK" || return 1
     rm -f "$WORK/latest.json.new" "$WORK/latest.json.sig"
     if ! fetch "$LATEST/latest.json" "$WORK/latest.json.new" ||
        ! fetch "$LATEST/latest.json.sig" "$WORK/latest.json.sig"; then
@@ -107,7 +107,7 @@ check() {
         rm -f "$WORK/latest.json.new"
         check_error="подпись выпуска не сошлась"; return 1
     fi
-    mv -f "$WORK/latest.json.new" "$WORK/latest.json"
+    mv -f "$WORK/latest.json.new" "$WORK/latest.json" || { check_error="не удалось сохранить сведения о выпуске"; return 1; }
     check_error=
 }
 latest_id() { sed -n 's/.*"release_id":"\([A-Za-z0-9][A-Za-z0-9._-]*\)".*/\1/p' "$WORK/latest.json" 2>/dev/null; }
@@ -116,11 +116,12 @@ latest_sum() { sed -n "s/.*\"$1\":{\"sha256\":\"\([0-9a-f]\{64\}\)\".*/\1/p" "$W
 do_check() {
     defaults
     write_state checking
-    if check; then
+    if check && cleanup_staging; then
         S_CHECKED=$(now) S_CHECK_OK=true S_CHECK_ERROR='' write_state ""
         log "проверка: последний выпуск $(latest_id), установлен ${current:-$(current_id)}"
         return 0
     fi
+    check_error=${check_error:-не удалось очистить временные файлы проверки}
     S_CHECKED=$(now) S_CHECK_OK=false S_CHECK_ERROR=$check_error write_state ""
     log "проверка не удалась: $check_error"
     return 1
@@ -128,7 +129,7 @@ do_check() {
 
 # Файлы, которые меняет установщик. Состояние, журнал и каталог знаний — нет.
 installed_paths() {
-    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$INIT" "$NDM_HOOK" \
+    for p in "$SBIN/d2kd" "$SBIN/d2kc" "$SBIN/d2kfetch" "$SBIN/d2kshadow" "$SBIN/d2khttp" "$SBIN/d2kpanel" "$SBIN/d2ktg" "$INIT" "$NDM_HOOK" \
              "$DIR/config" "$DIR/release-id" "$DIR/release-arch" "$DIR/panel" "$DIR/files"; do
         [ ! -e "$ROOT$p" ] || printf '%s\n' "${p#/}"
     done
@@ -190,27 +191,111 @@ healthy() {
          END {exit bad || seen!=count || seen<2}' "$WORK/health.before" "$WORK/health.after"
 }
 
-# $1 — manual (ставить даже выпуск, однажды не прошедший проверку).
-do_install() {
-    mkdir -p "$WORK" || return 1
-    if ! mkdir "$WORK/lock" 2>/dev/null; then
-        old=$(cat "$WORK/lock/pid" 2>/dev/null || true)
-        if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-            log "установка уже идёт (pid $old)"; return 1
+# Publish a PID-specific claim before inspecting a stale legacy lock. Two
+# simultaneous retries cannot both remove the lock and enter the workspace.
+claim=$WORK/lock.$$
+prepare_work() {
+    # /tmp is shared. A configured path alone does not establish ownership
+    # of the directory in which privileged cleanup will run.
+    case "$WORK" in ''|.|..|*/.|*/..) return 1 ;; esac
+    [ ! -L "$WORK" ] || return 1
+    [ -d "$WORK" ] || mkdir -m 700 "$WORK" 2>/dev/null || [ -d "$WORK" ] || return 1
+    [ ! -L "$WORK" ] || return 1
+    work_uid=$(id -u) || return 1
+    # Stock OpenWrt provides ls -n even on images without the stat applet.
+    # shellcheck disable=SC2012  # Read only permissions and numeric uid of one directory.
+    LC_ALL=C ls -ldn "$WORK" | awk -v uid="$work_uid" '
+        NR==1 && $3==uid && substr($1,1,1)=="d" &&
+            substr($1,6,1)!="w" && substr($1,9,1)!="w" {ok=1}
+        END {exit !ok}'
+}
+cleanup_staging() {
+    rm -rf "$WORK/release" &&
+        rm -f "$WORK/release.tar.gz" "$WORK/previous.tar.new" "$WORK/previous.tar.retired" "$WORK/health.before" \
+            "$WORK/health.after" "$WORK/key.pem" "$WORK/latest.json.sig" "$WORK/latest.json.new"
+}
+cleanup_failed() {
+    defaults
+    case "$action" in
+        install) finish false "$(current_id)" "$1" ;;
+        check) S_CHECKED=$(now) S_CHECK_OK=false S_CHECK_ERROR=$1 write_state ""; log "$1" ;;
+        *) log "$1" ;;
+    esac
+}
+release_lock() {
+    exit_status=$1
+    trap - EXIT
+    trap '' HUP INT TERM
+    if [ "$(readlink "$WORK/lock" 2>/dev/null)" = "lock.$$" ]; then
+        if ! cleanup_staging || ! rm -f "$STATE.new.$$" "$CONF.new.$$"; then
+            if [ "$exit_status" = 0 ]; then cleanup_failed "не удалось очистить временные файлы"; fi
+            exit_status=1
         fi
-        rm -rf "$WORK/lock"; mkdir "$WORK/lock" || return 1
+        if ! rm -f "$WORK/lock" "$claim/installer" "$claim/pid" || ! rmdir "$claim"; then
+            cleanup_failed "не удалось очистить блокировку обновления"
+            exit_status=1
+        fi
+    else
+        rm -f "$claim/pid" && rmdir "$claim" || exit_status=1
     fi
-    echo $$ > "$WORK/lock/pid"
+    exit "$exit_status"
+}
+with_lock() {
+    prepare_work && mkdir -m 700 "$claim" || return 1
+    trap 'release_lock $?' EXIT
+    trap 'exit 1' HUP INT TERM
+    echo $$ > "$claim/pid" || return 1
+    for other in "$WORK"/lock.*; do
+        [ "$other" != "$claim" ] && [ -d "$other" ] && [ ! -L "$other" ] || continue
+        owner=${other##*.}
+        case "$owner" in ''|0|*[!0-9]*) continue ;; esac
+        if kill -0 "$owner" 2>/dev/null; then
+            log "обновление уже выполняется (pid $owner)"; return 1
+        fi
+        [ ! -L "$other/pid" ] && [ -f "$other/pid" ] &&
+            [ "$(cat "$other/pid" 2>/dev/null)" = "$owner" ] || continue
+        # install.sh may outlive an updater killed during file replacement.
+        installer=$(cat "$other/installer" 2>/dev/null)
+        case "$installer" in
+            ''|*[!0-9]*) ;;
+            *) ! kill -0 "$installer" 2>/dev/null || return 1
+               rm -f "$other/installer" || return 1 ;;
+        esac
+        rm -f "$other/pid" || return 1
+        rmdir "$other" 2>/dev/null || true
+    done
+    if [ -L "$WORK/lock" ]; then
+        link=$(readlink "$WORK/lock") || return 1
+        old=${link#lock.}
+        case "$old" in ''|0|*[!0-9]*) return 1 ;; esac
+        [ "$link" = "lock.$old" ] && ! kill -0 "$old" 2>/dev/null || return 1
+        rm -f "$WORK/lock" || return 1
+    elif [ -d "$WORK/lock" ]; then
+        # The previous updater used a directory and a pid file.
+        old=$(cat "$WORK/lock/pid" 2>/dev/null)
+        case "$old" in ''|0|*[!0-9]*) return 1 ;; esac
+        ! kill -0 "$old" 2>/dev/null || return 1
+        rm -f "$WORK/lock/pid" && rmdir "$WORK/lock" || return 1
+    fi
+    ln -s "lock.$$" "$WORK/lock" || return 1
+    cleanup_staging || { cleanup_failed "не удалось очистить рабочий каталог обновления"; return 1; }
+    "$@"
+}
+
+do_install() {
     defaults
     write_state installing
-    rc=0; install_release "${1:-}" || rc=$?
-    rm -rf "$WORK/lock" "$WORK/release" "$WORK/release.tar.gz"
-    return $rc
+    install_release "${1:-}"
 }
 finish() {
     # $1 ok, $2 выпуск, $3 сообщение, $4 плохой выпуск (или пусто).
     S_LAST_UTC=$(now) S_LAST_OK=$1 S_LAST_RELEASE=$2 S_LAST_MESSAGE=$3 S_BAD=${4-$(field bad_release)} write_state ""
     log "$3"
+}
+# Once install health or rollback restart is confirmed, atomically separate
+# the retired archive from a backup that is still needed for recovery.
+retire_backup() {
+    mv -f "$WORK/previous.tar" "$WORK/previous.tar.retired" && cleanup_staging
 }
 install_release() {
     check || { S_CHECKED=$(now) S_CHECK_OK=false S_CHECK_ERROR=$check_error write_state installing
@@ -220,8 +305,14 @@ install_release() {
     if [ -z "$rid" ] || [ -z "$a" ]; then
         finish false "$rid" "установка не начата: неизвестен выпуск или арка роутера"; return 1
     fi
-    [ "$rid" != "$(current_id)" ] || { finish true "$rid" "выпуск $rid уже установлен"; return 0; }
-    if [ "$1" != manual ] && [ "$rid" = "$(field bad_release)" ]; then
+    if [ "$rid" = "$(current_id)" ]; then
+        if [ ! -f "$WORK/previous.tar" ]; then
+            cleanup_staging || { cleanup_failed "выпуск $rid установлен, очистка не завершена"; return 1; }
+            finish true "$rid" "выпуск $rid уже установлен"; return 0
+        fi
+        # release-id is written before install.sh finishes. Complete the
+        # signed installation and check its health before retiring the backup.
+    elif [ "$1" != manual ] && [ "$rid" = "$(field bad_release)" ]; then
         finish false "$rid" "выпуск $rid однажды не прошёл проверку — ночью не ставится, только вручную"; return 1
     fi
     sum=$(latest_sum "$a")
@@ -231,20 +322,51 @@ install_release() {
     got=$(openssl dgst -sha256 -r "$WORK/release.tar.gz" | cut -d' ' -f1)
     [ "$got" = "$sum" ] || { finish false "$rid" "архив выпуска $rid не совпал с подписанным хешем"; return 1; }
     rm -rf "$WORK/release"
-    if ! mkdir "$WORK/release" || ! tar -xzf "$WORK/release.tar.gz" -C "$WORK/release"; then
+    if ! mkdir -m 700 "$WORK/release" || ! tar -xzf "$WORK/release.tar.gz" -C "$WORK/release" ||
+       ! chmod 700 "$WORK/release"; then
         finish false "$rid" "архив выпуска $rid не распаковался"; return 1
     fi
 
+    rm -f "$WORK/release.tar.gz" || {
+        finish false "$rid" "не удалось удалить распакованный архив выпуска"; return 1
+    }
+
     # Копия того, что заменит установщик, — до первой замены.
-    rm -f "$WORK/previous.tar"
-    # shellcheck disable=SC2046  # список путей без пробелов, нарочно словами
-    tar -cf "$WORK/previous.tar" -C "${ROOT:-/}" $(installed_paths) ||
-        { finish false "$rid" "не удалось сохранить текущую версию — установка не начата"; return 1; }
+    if [ ! -f "$WORK/previous.tar" ]; then
+        # shellcheck disable=SC2046  # список путей без пробелов, нарочно словами
+        if ! (umask 077; tar -cf "$WORK/previous.tar.new" -C "${ROOT:-/}" $(installed_paths)) ||
+           ! mv -f "$WORK/previous.tar.new" "$WORK/previous.tar"; then
+            finish false "$rid" "не удалось сохранить текущую версию — установка не начата"; return 1
+        fi
+    fi
     prev=$(current_id)
     log "ставлю выпуск $rid (был ${prev:-неизвестен})"
-    if D2K_LOCAL="$WORK/release" D2K_RELEASE_ID="$rid" D2K_UPDATING=1 \
-           sh "$WORK/release/scripts/install.sh" >> "$LOG" 2>&1 && healthy; then
-        rm -f "$WORK/previous.tar"
+    installed=0
+    D2K_LOCAL="$WORK/release" D2K_RELEASE_ID="$rid" D2K_UPDATING=1 \
+           sh -c '
+               echo $$ > "$1/installer" &&
+                   kill -0 "$2" 2>/dev/null &&
+                   [ "$(readlink "$3/lock")" = "lock.$2" ] || exit 1
+               script=$D2K_LOCAL/scripts/install.sh
+               if grep -Fqx "# D2K verified update workspace v1" "$script"; then
+                   exec sh "$script" --verified-update "$2"
+               fi
+               exec sh "$script"
+           ' sh "$claim" "$$" "$WORK" >> "$LOG" 2>&1 && installed=1
+    # Older installers leave the full extracted release on tmpfs. Drop it
+    # before waiting for the live services or starting rollback.
+    if ! rm -rf "$WORK/release"; then
+        log "не удалось удалить распакованный выпуск $rid"
+        if [ "$installed" = 1 ]; then
+            finish false "$rid" "установщик завершился, очистка не удалась; проверка служб отложена"
+            return 1
+        fi
+    fi
+    if [ "$installed" = 1 ] && healthy; then
+        if ! retire_backup; then
+            finish false "$rid" "выпуск $rid прошёл проверку, очистка не завершена" ""
+            return 1
+        fi
         finish true "$rid" "установлен выпуск $rid" ""
         return 0
     fi
@@ -254,8 +376,11 @@ install_release() {
         return 1
     fi
     if tar -xf "$WORK/previous.tar" -C "${ROOT:-/}" && "$INIT" start >> "$LOG" 2>&1; then
-        rm -f "$WORK/previous.tar"
-        finish false "$rid" "выпуск $rid не прошёл проверку; возвращена прежняя версия" "$rid"
+        if retire_backup; then
+            finish false "$rid" "выпуск $rid не прошёл проверку; возвращена прежняя версия" "$rid"
+        else
+            finish false "$rid" "возвращена прежняя версия, очистка не завершена" "$rid"
+        fi
     else
         finish false "$rid" "выпуск $rid не прошёл проверку, и прежняя версия не вернулась; копия: $WORK/previous.tar" "$rid"
     fi
@@ -265,11 +390,17 @@ install_release() {
 # Ночной цикл: один раз за сутки в окне 03:00–04:59.
 run() {
     trap 'exit 0' INT TERM HUP
+    pending_cleanup=1
     while :; do
+        # The released updater can still be doing its health check when the
+        # new service starts. Retry local cleanup on the existing tick.
+        if [ "$pending_cleanup" = 1 ] && "$0" cleanup; then pending_cleanup=0; fi
         hour=$(date +%H); day=$(date +%Y%m%d)
         if [ "$hour" = 03 ] || [ "$hour" = 04 ]; then
+            prepare_work && [ ! -L "$WORK/night" ] || return 1
+            [ ! -e "$WORK/night" ] || [ -f "$WORK/night" ] || return 1
             if [ "$(cat "$WORK/night" 2>/dev/null)" != "$day" ]; then
-                mkdir -p "$WORK"; echo "$day" > "$WORK/night"
+                echo "$day" > "$WORK/night" || return 1
                 # Тумблер меняет config, а цикл живёт с запуска службы:
                 # значение при старте могло устареть (поле 10.10.2026).
                 # shellcheck disable=SC1090
@@ -280,7 +411,7 @@ run() {
                     # а с ней и этот цикл.
                     start-stop-daemon -S -b -x "$0" -- install
                 else
-                    do_check || true
+                    "$0" check || true
                 fi
             fi
         fi
@@ -299,10 +430,12 @@ set_auto() {
     log "ночная установка: $([ "$v" = 1 ] && echo включена || echo выключена)"
 }
 
-case "${1:-}" in
-    check) do_check ;;
-    install) do_install "${2:-}" ;;
+action=${1:-}
+case "$action" in
+    cleanup) with_lock : ;;
+    check) with_lock do_check ;;
+    install) with_lock do_install "${2:-}" ;;
     run) run ;;
-    auto) case "${2:-}" in on) set_auto 1 ;; off) set_auto 0 ;; *) exit 2 ;; esac ;;
+    auto) case "${2:-}" in on) with_lock set_auto 1 ;; off) with_lock set_auto 0 ;; *) exit 2 ;; esac ;;
     *) echo "usage: $0 {check|install [manual]|run|auto on|off}" >&2; exit 2 ;;
 esac

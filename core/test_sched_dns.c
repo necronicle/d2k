@@ -713,8 +713,8 @@ int main(void) {
     assert(d2k_sched_doh_discover(s,automatic,addresses)==3);
     before=started;doh_health_tick(s);assert(started==before+2);
     unsigned paths=0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *q=s->tasks+i;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *q=s->tasks[i];
         if(q->state!=T_FREE && !strcmp(q->name,"shared.example.test")) {
             assert(q->family==6 && !strcmp(q->ip,"2001:db8::53"));
             if(!strcmp(q->doh_path,"/first"))paths|=1;
@@ -726,7 +726,7 @@ int main(void) {
     char resource[sizeof t->doh_path];snprintf(resource,sizeof resource,"%s",t->doh_path);
     task *other=task_free_slot(s);assert(other);task_reset(s,other);
     strcpy(other->name,"ordinary.example.test");other->state=T_PLANNING;other->transport=6;other->family=4;
-    task *waiting=other+1;assert(waiting<s->tasks+SCHED_MAX_TASKS);task_reset(s,waiting);
+    task *waiting=task_free_slot(s);assert(waiting);task_reset(s,waiting);
     strcpy(waiting->name,"waiting-work.example.test");waiting->state=T_QUEUED;waiting->queued_event=0;
     t->state=T_DOH_HEALTH;t->res_ready=1;
     t->ver=(d2k_ver_result){.fd=-1,.level=D2K_VER_HANDSHAKE,.peer_authenticated=1,

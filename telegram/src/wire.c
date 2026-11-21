@@ -111,11 +111,11 @@ int tg_window_decode(const uint8_t *src, size_t len, uint32_t *credit) {
 
 int tg_info_decode(const uint8_t *src, size_t len, uint8_t *kind,
                    uint32_t *arg, const uint8_t **text, size_t *text_len) {
-    if (!src || !kind || !arg || !text || !text_len || len < 5) return -1;
+    if (!src || !kind || !arg || !text || !text_len || len < TG_INFO_FIXED_LEN) return -1;
     *kind = src[0];
     *arg = get_u32(src + 1);
-    *text = src + 5;
-    *text_len = len - 5;
+    *text = src + TG_INFO_FIXED_LEN;
+    *text_len = len - TG_INFO_FIXED_LEN;
     return 0;
 }
 

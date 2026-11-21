@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define D2K_SCHED_DNS_TEST 1
 #include "sched.c"
+#include "test_task_slots.h"
 #include <poll.h>
 static int fails;
 #define CHECK(c,m) do {if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;}}while(0)
@@ -17,7 +18,7 @@ static int mark_refuse(int fd,uint32_t m){mark_ok(fd,m);return -1;}
 static d2k_box_props gate_props(void){d2k_box_props p={0};p.response_gate=p.gate_carry=p.gate_hello_own=D2K_PROP_YES;p.gate_window=7;p.gate_pieces=9;p.gate_rtt_ms=231;return p;}
 typedef struct {int sv[2];d2k_catalog c;d2k_sched *s;task *t;} fixture;
 static fixture setup(void){fixture f={0};CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,f.sv),"socketpair");f.s=d2k_sched_new(&f.c,f.sv[0],0);return f;}
-static void init(fixture *f){f->s->cat=&f->c;f->t=&f->s->tasks[0];task *t=f->t;task_reset(f->s,t);t->state=T_ASKING;t->family=4;t->transport=6;t->port=443;strcpy(t->ip,"192.0.2.8");strcpy(t->name,"video.example");t->trigger_code=D2K_SUSPECT_SILENT;t->trigger_shape=D2K_SHAPE_MODERN;t->trigger_planned=D2K_LINK_PLANNED_NO;t->started_ms=1000;
+static void init(fixture *f){f->s->cat=&f->c;f->t=test_task_at(f->s, 0);task *t=f->t;task_reset(f->s,t);t->state=T_ASKING;t->family=4;t->transport=6;t->port=443;strcpy(t->ip,"192.0.2.8");strcpy(t->name,"video.example");t->trigger_code=D2K_SUSPECT_SILENT;t->trigger_shape=D2K_SHAPE_MODERN;t->trigger_planned=D2K_LINK_PLANNED_NO;t->started_ms=1000;
     CHECK(!d2k_hello_from_profile(D2K_SHAPE_MODERN,t->name,t->trig,sizeof t->trig,&t->trig_len),"hello fixture");t->trig_snapped=1;t->res.verdict=D2K_V_RESPONSE_GATE;t->res.box_props=gate_props();t->res_ready=1;wirelen=0;logbuf[0]=0;d2k_sched_set_say(f->s,logger,NULL);}
 static void finish(fixture *f){d2k_sched_free(f->s);d2k_catalog_free(&f->c);close(f->sv[0]);close(f->sv[1]);}
 static void step(fixture *f,int64_t ms){d2k_sched_tick(f->s,ms);drain_gate(f->sv[1]);}
@@ -270,26 +271,26 @@ static void test_response_candidate_admitted_to_full_queue(void) {
     f.s->clock_seen=1;
     f.s->now_ms=1200;
     f.s->event_sequence=SCHED_MAX_QUEUED_MEASUREMENTS+1;
-    f.s->tasks[1].state=T_ASKING;
+    test_task_at(f.s, 1)->state=T_ASKING;
     for (unsigned i=0;i<SCHED_MAX_QUEUED_MEASUREMENTS;i++) {
-        task *q=&f.s->tasks[i+2];
+        task *q=test_task_at(f.s, i+2);
         q->state=T_QUEUED;
         q->transport=6;q->family=4;q->trigger_code=D2K_SUSPECT_RST;
         q->queued_ms=1100;q->queued_event=i+1;
         snprintf(q->name,sizeof q->name,"waiting-%u.example",i);
     }
-    f.s->tasks[2].hot_event=1;
-    task *last=&f.s->tasks[SCHED_MAX_QUEUED_MEASUREMENTS+1];
+    test_task_at(f.s, 2)->hot_event=1;
+    task *last=test_task_at(f.s, SCHED_MAX_QUEUED_MEASUREMENTS+1);
     last->hot_event=2;
     task *victim=last-1;
     f.t->state=T_FREE;
     launch_or_queue(f.s,f.t);
     CHECK(f.t->state==T_QUEUED,"response candidate was dropped with a full queue");
     CHECK(queued_measurements(f.s)==SCHED_MAX_QUEUED_MEASUREMENTS,"admission changed the queue cap");
-    CHECK(f.s->tasks[1].state==T_ASKING && last->state==T_QUEUED && victim->state==T_FREE,
+    CHECK(test_task_at(f.s, 1)->state==T_ASKING && last->state==T_QUEUED && victim->state==T_FREE,
           "admission must only replace a waiting, uncorroborated suspicion");
     CHECK(queued_pick(f.s)==f.t,"response candidate did not get the next measurement slot");
-    f.s->tasks[1].state=T_FREE;
+    test_task_at(f.s, 1)->state=T_FREE;
     classify_calls=0;
     classify_gate=1;
     CHECK(queued_release(f.s,1300)==1,"newly admitted measurement was not released");

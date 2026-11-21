@@ -4,6 +4,7 @@
 #define d2k_link_del_name_family dns_remove_name
 #define d2k_link_del_endpoint dns_remove_endpoint
 #include "sched.c"
+#include "test_task_slots.h"
 #include <assert.h>
 static unsigned installs,deletes,endpoint_deletes;
 static uint8_t installed[2][16];
@@ -23,7 +24,7 @@ int dns_remove_endpoint(int fd,const uint8_t *ip,uint8_t family,uint16_t port,ui
     endpoint_deletes++;return 0;
 }
 static task *prepare(d2k_sched *s,unsigned slot,const char *ip,unsigned byte) {
-    task *t=s->tasks+slot;task_reset(s,t);t->state=T_VERIFY_WAIT;
+    task *t=test_task_at(s, slot);task_reset(s,t);t->state=T_VERIFY_WAIT;
     strcpy(t->name,"resolver.test");strcpy(t->ip,ip);t->family=4;t->transport=6;t->port=8443;
     strcpy(t->doh_path,"/private-query?account=fixture");strcpy(t->measure_path,t->doh_path);
     snprintf(t->plans[0],sizeof t->plans[0],"d2k-plan 1 1\nid 00000000000000000000000000000000\nproto tcp tls\npayload 1 %02x\npoison 1 badsum\nfake payload=1 poison=1 repeats=1 gap_us=0 place=before\norder forward\n",byte);
@@ -49,9 +50,9 @@ static void colliding_service_routes(void) {
     assert(newer_target_binding(&c,c.boxes[0].binds));
     assert(!dns_saved_route(s,s->doh) && dns_saved_route(s,s->doh+1));
     char plan[40];
-    assert(!own_first_plans(s,s->tasks,0) && own_first_plans(s,s->tasks+1,0)==1);
-    assert(!bound_plan_here(s,s->tasks,D2K_SHAPE_MODERN,plan));
-    assert(bound_plan_here(s,s->tasks+1,D2K_SHAPE_MODERN,plan));
+    assert(!own_first_plans(s,test_task_at(s, 0),0) && own_first_plans(s,test_task_at(s, 1),0)==1);
+    assert(!bound_plan_here(s,test_task_at(s, 0),D2K_SHAPE_MODERN,plan));
+    assert(bound_plan_here(s,test_task_at(s, 1),D2K_SHAPE_MODERN,plan));
     char file[]="/tmp/d2k-dns-collision-XXXXXX";int fd=mkstemp(file);assert(fd>=0);close(fd);
     assert(!d2k_sched_dns_routes(s,file));unlink(file);
     d2k_sched_free(s);d2k_catalog_free(&c);

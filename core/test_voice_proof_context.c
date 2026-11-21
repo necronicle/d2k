@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sched.c"
+#include "test_task_slots.h"
 static int failures;
 #define CHECK(c,m) do{if(!(c)){fprintf(stderr,"FAIL case=%d code=%u: %s\n",which,code,m);failures++;}}while(0)
 static void run(int which,unsigned code){
@@ -8,7 +9,7 @@ static void run(int which,unsigned code){
     /* Настоящий конструктор: mutex/cond/wake-пара инициализированы, link_fd=-1 —
        случайная запись в канал падает с EBADF, а не уходит в stdin. */
     d2k_sched *s=d2k_sched_new(&catalog,-1,0);if(!s){failures++;return;}
-    task *t=&s->tasks[0];strcpy(t->name,D2K_LINK_VOICE_CLASS);t->state=T_VOICE_TRIAL;t->family=4;t->transport=17;
+    task *t=test_task_at(s, 0);strcpy(t->name,D2K_LINK_VOICE_CLASS);t->state=T_VOICE_TRIAL;t->family=4;t->transport=17;
     t->ver_plan_id[0]=0x51;t->addr_probe_identity_valid=1;
     t->addr_probe_trial_id[0]=0x72;t->addr_probe_dst_port_be=htons(3478);
     t->addr_probe_src_ip[0]=1;t->addr_probe_dst_ip[0]=2;

@@ -129,3 +129,14 @@ clean-policies:
 	$(RM) test_policies test_policy_review
 
 d2kpanel test_server test_server_san test_header_deadline test_response_deadline test_config_values test_status_cache test_diagnostics: policies.h
+
+.PHONY: test-response-memory clean-response-memory
+test: test-response-memory
+test-response-memory: test_response_memory
+	./test_response_memory status
+	./test_response_memory static
+test_response_memory: test_response_memory.c server.c server.h policies.h ../runtime/d2k_diagnostics_files.h
+	$(CC) $(CFLAGS) -o $@ test_response_memory.c
+clean: clean-response-memory
+clean-response-memory:
+	$(RM) test_response_memory

@@ -2,6 +2,7 @@
 #define _DARWIN_C_SOURCE
 #define pthread_create shadow_thread_create
 #include "sched.c"
+#include "test_task_slots.h"
 #undef pthread_create
 #include <assert.h>
 #include "d2k_shadow.h"
@@ -161,7 +162,7 @@ static void synthesis_only(void)
     d2k_shadow_snapshot_remove(path,&r);
     e.kind=D2K_EV_SUSPECT;e.code=D2K_SUSPECT_SILENT;e.client_shape=D2K_SHAPE_MODERN;
     d2k_sched_event(s,&e);assert(!task_of(s,e.name,6,4));
-    task *t=&s->tasks[0];strcpy(t->name,"old.example");t->transport=6;t->family=4;t->state=T_PLANNING;
+    task *t=test_task_at(s, 0);strcpy(t->name,"old.example");t->transport=6;t->family=4;t->state=T_PLANNING;
     assert(start_worker(s,t,JOB_CLASSIFY)<0);assert(!start_search(s,t));task_done(s,t);
     /* Owner DNS admission does not depend on force-targets or a suspicion. */
     s->n_doh=1;strcpy(s->doh[0].host,"tenant.gateway.example.test");
@@ -441,7 +442,10 @@ int main(int argc,char **argv)
     d2k_ev e=wire_event(D2K_EV_FLOW,50000,443);d2k_sched_event(s,&e);
     e=wire_event(D2K_EV_HELLO,50000,443);strcpy(e.name,"blocked.example.com");d2k_sched_event(s,&e);
     e=wire_event(D2K_EV_SUSPECT,50000,443);d2k_sched_event(s,&e);assert(access(path,F_OK)!=0);
+    assert(sizeof s->shadow_flows == sizeof(void *));
+    assert(!s->shadow_flows);
     assert(!d2k_sched_shadow_dropped(s));assert(!d2k_sched_set_shadow(s,path));
+    assert(s->shadow_flows);
     e=wire_event(D2K_EV_FLOW,50000,443);d2k_sched_event(s,&e);
     e=wire_event(D2K_EV_HELLO,50000,443);strcpy(e.name,"blocked.example.com");d2k_sched_event(s,&e);
     e=wire_event(D2K_EV_SUSPECT,50000,443);d2k_sched_event(s,&e);
@@ -484,7 +488,7 @@ int main(int argc,char **argv)
     e.client_shape=D2K_LINK_SHAPE_HTTP;d2k_sched_event(s,&e);assert(!d2k_shadow_queue_next(path,&record,&rd));
     e.client_shape=D2K_SHAPE_MODERN;e.transport=17;d2k_sched_event(s,&e);assert(!d2k_shadow_queue_next(path,&record,&rd));
     e=wire_event(D2K_EV_SUSPECT,50999,443);d2k_sched_event(s,&e);assert(!d2k_shadow_queue_next(path,&record,&rd));
-    assert(!d2k_sched_set_shadow(s,NULL));d2k_sched_free(s);d2k_catalog_free(&catalog);
+    assert(!d2k_sched_set_shadow(s,NULL));assert(!s->shadow_flows);d2k_sched_free(s);d2k_catalog_free(&catalog);
     char recent[600];snprintf(recent,sizeof recent,"%s.recent",path);unlink(recent);unlink(path);assert(!rmdir(dir));
     puts("shadow scheduler: ok");return 0;
 }

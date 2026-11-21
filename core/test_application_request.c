@@ -1,5 +1,6 @@
 #define d2k_verify_doh_on routing_doh_verify
 #include "sched.c"
+#include "test_task_slots.h"
 #include <assert.h>
 static d2k_vol_result counted_volume(const char *ip, uint16_t port, const char *name,
                                     int plain, int legacy, size_t wire, uint32_t mark) {
@@ -77,7 +78,7 @@ int main(void) {
         d2k_sched *sched = d2k_sched_new(&catalog, sockets[0], 0x2d);
         assert(sched);
         for (size_t i = 0; i < 2; i++) {
-            task *target = &sched->tasks[i];
+            task *target = test_task_at(sched, i);
             target->transport = 6; target->family = 4; target->port = 443;
             target->rx_volume_only = 1;
             snprintf(target->name, sizeof target->name, "snapshot-%zu.example", i);
@@ -87,27 +88,27 @@ int main(void) {
         }
         d2k_ev ack = {.kind=D2K_EV_ACK, .code=D2K_CMD_ARM_SHAPE, .num=256};
         d2k_sched_event(sched, &ack);
-        assert(sched->tasks[0].shape_request_pending && sched->tasks[1].shape_request_pending);
-        memcpy(ack.trial_id, sched->tasks[1].shape_request_id, 16);
+        assert(test_task_at(sched, 0)->shape_request_pending && test_task_at(sched, 1)->shape_request_pending);
+        memcpy(ack.trial_id, test_task_at(sched, 1)->shape_request_id, 16);
         d2k_sched_event(sched, &ack);
-        assert(sched->tasks[0].shape_request_pending && !sched->tasks[1].shape_request_pending);
-        sched->tasks[1].shape_armed = 0;
-        assert(launch_task(sched, &sched->tasks[1]));
+        assert(test_task_at(sched, 0)->shape_request_pending && !test_task_at(sched, 1)->shape_request_pending);
+        test_task_at(sched, 1)->shape_armed = 0;
+        assert(launch_task(sched, test_task_at(sched, 1)));
         d2k_sched_event(sched, &ack);
-        assert(sched->tasks[1].shape_request_pending);
+        assert(test_task_at(sched, 1)->shape_request_pending);
         d2k_sched_vol_fn saved_volume = d2k_sched_vol_hook;
         d2k_sched_vol_hook = counted_volume;
-        memcpy(ack.trial_id, sched->tasks[1].shape_request_id, 16);
+        memcpy(ack.trial_id, test_task_at(sched, 1)->shape_request_id, 16);
         d2k_sched_event(sched, &ack);
         d2k_sched_tick(sched, 1);
-        assert(sched->tasks[0].state == T_SHAPE_WAIT && !sched->tasks[0].th_live);
-        assert(sched->tasks[1].th_live);
-        sched->tasks[2].state = T_ASKING;
-        sched->tasks[3].state = T_ASKING;
+        assert(test_task_at(sched, 0)->state == T_SHAPE_WAIT && !test_task_at(sched, 0)->th_live);
+        assert(test_task_at(sched, 1)->th_live);
+        test_task_at(sched, 2)->state = T_ASKING;
+        test_task_at(sched, 3)->state = T_ASKING;
         d2k_sched_tick(sched, 2001);
-        assert(sched->tasks[0].state == T_QUEUED && !sched->tasks[0].th_live);
-        sched->tasks[2].state = T_FREE;
-        sched->tasks[3].state = T_FREE;
+        assert(test_task_at(sched, 0)->state == T_QUEUED && !test_task_at(sched, 0)->th_live);
+        test_task_at(sched, 2)->state = T_FREE;
+        test_task_at(sched, 3)->state = T_FREE;
         d2k_sched_free(sched);
         d2k_sched_vol_hook = saved_volume;
         d2k_catalog_free(&catalog);

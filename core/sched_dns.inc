@@ -273,8 +273,8 @@ static doh_target *dns_target_of(d2k_sched *s,const task *t) {
 }
 static int dns_task_registered(d2k_sched *s,const task *t) {return dns_target_of(s,t)!=NULL;}
 static task *dns_task_of(d2k_sched *s,const doh_target *d) {
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=s->tasks+i;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state!=T_FREE && t->transport==(d->plain ? d->plain : 6) &&
            t->dns_plain==d->plain && t->dns_dot==d->dot && t->port==d->port &&
            !strcasecmp(t->name,d->host) && !strcmp(t->ip,d->ip) && !strcmp(t->doh_path,d->path))return t;
@@ -382,8 +382,8 @@ int d2k_sched_doh_discover(d2k_sched *s,const char *configuration,const char *ad
         }
     }
     memcpy(s->doh,pending,sizeof pending);s->n_doh=used;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=s->tasks+i;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state==T_FREE || (!encrypted_dns_task(t) && !t->dns_plain) || dns_task_registered(s,t))continue;
         if(t->th_live)t->stop=1;
         else task_done(s,t);

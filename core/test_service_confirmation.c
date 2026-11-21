@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sched.c"
+#include "test_task_slots.h"
 #include <poll.h>
 static int fails;
 #define CHECK(c,m) do {if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;}}while(0)
@@ -21,7 +22,7 @@ static void installed(int fd,int family,uint16_t port,const uint8_t token[16]){
     CHECK(n>=38 && !memcmp(body+n-2-16,token,16),"installation carries its own request token");
 }
 static task *prepare(d2k_sched *s,int family,uint16_t port,int discovery){
-    task *t=&s->tasks[0];task_reset(s,t);t->state=T_VOICE_WATCH;
+    task *t=test_task_at(s, 0);task_reset(s,t);t->state=T_VOICE_WATCH;
     t->family=(uint8_t)family;t->transport=17;t->port=port;
     strcpy(t->ip,family==6?"::1":"127.0.0.1");strcpy(t->name,D2K_LINK_VOICE_CLASS);
     t->voice_proof_code=discovery?D2K_UDP_PROOF_VOICE_DISCOVERY:D2K_UDP_PROOF_STUN;

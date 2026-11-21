@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ОСТАНОВКА СЛУЖБЫ НЕ ЖДЁТ ОКОНЧАНИЯ ЗАМЕРА.
@@ -453,7 +454,6 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     d2k_vres out;
     d2k_opts opt;
     d2k_trigger tr;
-    d2k_result res;
     char addr[96];
 
     if (bridge_input(ip, port, trigger, control, white, mark, repeats, gap_us, wait_ms, stop,
@@ -521,9 +521,16 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     memset(&refused, 0, sizeof refused);
     opt.accept = plannable_hit;
     opt.accept_ctx = &refused;
-    d2k_classify_run(addr, &tr, &opt, &res);
+    d2k_result *res = malloc(sizeof *res);
+    if (!res) {
+        out.probes = synthesis_probes;
+        out.verdict = D2K_V_FLAKY;
+        snprintf(out.reason, sizeof out.reason, "недостаточно памяти для результата замера");
+        return out;
+    }
+    d2k_classify_run(addr, &tr, &opt, res);
 
-    if (res.stopped) {
+    if (res->stopped) {
         /* БРОШЕННЫЙ ЗАМЕР НЕ ВЫДАЁТСЯ ЗА ИЗМЕРЕННЫЙ. Дерево пройдено не до
          * конца, и любой его вердикт утверждал бы больше, чем известно:
          * «чисто» сняло бы рабочий план, «режут адрес» закрыло бы цель.
@@ -533,39 +540,39 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
         out.verdict = D2K_V_INCONCLUSIVE;
         snprintf(out.reason, sizeof(out.reason),
                  "замер брошен по требованию остановки на %d-м зонде — о цели не сказано ничего",
-                 res.probes);
-        out.probes = res.probes>INT_MAX-synthesis_probes?INT_MAX:res.probes+synthesis_probes;
+                 res->probes);
+        out.probes = res->probes>INT_MAX-synthesis_probes?INT_MAX:res->probes+synthesis_probes;
         out.repeats = opt.repeats;
-        trace_questions(&res, opt.repeats, &out);
-        return out;
+        trace_questions(res, opt.repeats, &out);
+        goto done;
     }
-    out.verdict = map_verdict(res.verdict);
+    out.verdict = map_verdict(res->verdict);
     out.repeats = opt.repeats;
-    out.dial_deadline = res.dial_deadline;
-    trace_questions(&res, opt.repeats, &out);
-    box_props_of(&res, &out.box_props);
-    out.gate_candidate=res.preflight.candidate;
-    if (res.verdict == D2K_DV_RESPONSE_GATE) {
-        snprintf(out.gate_probe_name, sizeof out.gate_probe_name, "%s", res.preflight.white_name);
-        out.gate_probe_wscale = res.preflight.window_scale;
+    out.dial_deadline = res->dial_deadline;
+    trace_questions(res, opt.repeats, &out);
+    box_props_of(res, &out.box_props);
+    out.gate_candidate=res->preflight.candidate;
+    if (res->verdict == D2K_DV_RESPONSE_GATE) {
+        snprintf(out.gate_probe_name, sizeof out.gate_probe_name, "%s", res->preflight.white_name);
+        out.gate_probe_wscale = res->preflight.window_scale;
     }
     out.split_gap_us = (uint32_t)opt.write_gap_ms * 1000u;
-    snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res.reason);
-    out.split_pos = res.split_pos;
-    out.probes = res.probes>INT_MAX-synthesis_probes?INT_MAX:res.probes+synthesis_probes;
+    snprintf(out.reason, sizeof(out.reason), "%.*s", (int)sizeof(out.reason) - 1, res->reason);
+    out.split_pos = res->split_pos;
+    out.probes = res->probes>INT_MAX-synthesis_probes?INT_MAX:res->probes+synthesis_probes;
     /* Socket-only split diagnostics remain useful on unsupported hosts, but
        cannot arm a packet program that the measurement never executed. */
-    if ((res.verdict == D2K_DV_PREFIX || res.verdict == D2K_DV_WHOLE_PACKET) &&
-        d2k_raw_dial_count() == res.raw_dial_base) {
+    if ((res->verdict == D2K_DV_PREFIX || res->verdict == D2K_DV_WHOLE_PACKET) &&
+        d2k_raw_dial_count() == res->raw_dial_base) {
         out.verdict = D2K_V_FLAKY;
         out.split_pos = 0;
         snprintf(out.reason, sizeof out.reason,
                  "разрез проверен только записями сокета — общий пакетный исполнитель не участвовал");
-        return out;
+        goto done;
     }
     if (refused.first[0]) {
         size_t n;
-        if (!res.has_hit) {
+        if (!res->has_hit) {
             /* Ни одной выразимой находки после невыразимой: взятая отрава
              * всё равно доказала, что решает содержимое, — тот же вердикт и
              * та же строка, что прежде давала она сама; молчание контроля
@@ -586,7 +593,7 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
      * свойство DPI). Владеть поиском, которого не было, нельзя: иначе
      * планировщик снимает цель как «обойти нечем», хотя вопросы о свойствах
      * через датапат задать ещё можно. */
-    if (res.raw_selftest_failed && !res.has_hit) {
+    if (res->raw_selftest_failed && !res->has_hit) {
         out.owns_search = 0;
     }
     /* ЯДЕРНЫЙ RST НЕ ПОДАВЛЕН — ПУСТОЙ ПОИСК НИЧЕГО НЕ ДОКАЗАЛ. Роутер без
@@ -598,19 +605,19 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
     /* Счётчики — потока этого прогона (ревью detect, I1): отказ вставки в
      * соседнем рабочем потоке сюда не попадает, а пометка ставится, только
      * если прогон сам ходил сырым слоем. */
-    if (d2k_raw_rst_fail_count() != res.rst_fail_base &&
-        d2k_raw_dial_count() != res.raw_dial_base && !res.has_hit) {
+    if (d2k_raw_rst_fail_count() != res->rst_fail_base &&
+        d2k_raw_dial_count() != res->raw_dial_base && !res->has_hit) {
         /* Пометка — В НАЧАЛО: причина вердикта ограничена D2K_REASON_MAX, и
          * приписка в хвост срезалась бы первой, а она здесь главное. */
         static const char note[] =
             "ядерный RST не подавлен (нет правила iptables) — пустой поиск "
             "недостоверен, локальное ограничение; ";
         size_t room = sizeof(out.reason) - (sizeof(note) - 1) - 1;
-        size_t keep = strlen(res.reason);
+        size_t keep = strlen(res->reason);
         if (keep > room) { keep = room; }
         out.owns_search = 0;
         memcpy(out.reason, note, sizeof(note) - 1);
-        memcpy(out.reason + sizeof(note) - 1, res.reason, keep);
+        memcpy(out.reason + sizeof(note) - 1, res->reason, keep);
         out.reason[sizeof(note) - 1 + keep] = '\0';
     }
     /* Метку измеритель ставит всегда и на всех сокетах, но ПОДТВЕРЖДЕНИЯ, что
@@ -618,11 +625,11 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
      * «подтверждена» нельзя: на непомеченном зонде «обходить нечего» было бы
      * самоподтверждающимся (см. d2k_verdict.h). */
     out.marked = 0;
-    if (res.has_hit) {
+    if (res->has_hit) {
         char why[160];
-        int converted = d2k_arm_from_poison(&res.hit, &out.arm, why, sizeof(why));
-        if (converted == 0 && (res.hit.decoy_len > sizeof out.arm_input.decoy ||
-                              (res.hit.decoy_len && !res.hit.decoy))) {
+        int converted = d2k_arm_from_poison(&res->hit, &out.arm, why, sizeof(why));
+        if (converted == 0 && (res->hit.decoy_len > sizeof out.arm_input.decoy ||
+                              (res->hit.decoy_len && !res->hit.decoy))) {
             snprintf(why, sizeof why, "приманку найденного приёма нельзя сохранить целиком");
             converted = -1;
         }
@@ -630,21 +637,23 @@ static d2k_vres sched_tcp(const char *ip, uint16_t port,
             out.arm_input.trigger_len = tr.len;
             out.arm_input.sni_off = (size_t)tr.sni_off;
             out.arm_input.sni_len = (size_t)tr.sni_len;
-            out.arm_input.decoy_len = res.hit.decoy_len;
-            if (res.hit.decoy_len) {
-                memcpy(out.arm_input.decoy, res.hit.decoy, res.hit.decoy_len);
+            out.arm_input.decoy_len = res->hit.decoy_len;
+            if (res->hit.decoy_len) {
+                memcpy(out.arm_input.decoy, res->hit.decoy, res->hit.decoy_len);
             }
-            snprintf(out.arm_name, sizeof(out.arm_name), "%s", res.hit.name);
-            snprintf(out.arm_path, sizeof(out.arm_path), "%s", res.path);
+            snprintf(out.arm_name, sizeof(out.arm_name), "%s", res->hit.name);
+            snprintf(out.arm_path, sizeof(out.arm_path), "%s", res->path);
             out.have_arm = 1;
         } else {
             /* Молчать об этом нельзя: иначе «плана нет» читается как «коробку
              * не взяли», а коробку как раз взяли — не выразили. */
             size_t n = strlen(out.reason);
             snprintf(out.reason + n, sizeof(out.reason) - n,
-                     "; приём «%s» сработал, но планом не задаётся: %s", res.hit.name, why);
+                     "; приём «%s» сработал, но планом не задаётся: %s", res->hit.name, why);
         }
     }
+done:
+    free(res);
     return out;
 }
 
@@ -746,7 +755,6 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
     d2k_vres out;
     d2k_opts opt;
     d2k_trigger tr;
-    d2k_result res;
     char addr[96];
     base_ctx bc;
     d2k_hello none = {0};
@@ -763,44 +771,51 @@ d2k_vres d2k_detect_sched_tcp_base(const char *ip, uint16_t port,
     opt.cancel.ctx = &bc;
     opt.on_obs = base_seen;
     opt.on_obs_ctx = &bc;
-    d2k_classify_run(addr, &tr, &opt, &res);
+    d2k_result *res = malloc(sizeof *res);
+    if (!res) {
+        out.verdict = D2K_V_FLAKY;
+        snprintf(out.reason, sizeof out.reason, "недостаточно памяти для результата замера");
+        return out;
+    }
+    d2k_classify_run(addr, &tr, &opt, res);
 
-    const d2k_obs *b = res.ntrace > 0 && strcmp(res.trace[0].probe, "whole") == 0
-                       ? &res.trace[0] : NULL;
+    const d2k_obs *b = res->ntrace > 0 && strcmp(res->trace[0].probe, "whole") == 0
+                       ? &res->trace[0] : NULL;
     int asked = b ? b->pass + b->fail : 0;
     out.probes = asked;
-    if (b && res.repeats > 0 && asked >= res.repeats && !retry_base_timeout(b->err)) {
+    if (b && res->repeats > 0 && asked >= res->repeats && !retry_base_timeout(b->err)) {
         /* Вопрос задан целиком — его ответ годится полному прогону. */
         out.base.valid = 1;
-        out.base.repeats = res.repeats;
+        out.base.repeats = res->repeats;
         out.base.pass = b->pass;
         out.base.fail = b->fail;
         snprintf(out.base.err, sizeof(out.base.err), "%s", b->err);
     }
     if (!b) {
         /* До зонда не дошло: цель не разобрана (вердикт дерева тот же). */
-        out.verdict = map_verdict(res.verdict);
-        snprintf(out.reason, sizeof(out.reason), "%.300s", res.reason);
-    } else if (asked < res.repeats || res.repeats <= 0) {
+        out.verdict = map_verdict(res->verdict);
+        snprintf(out.reason, sizeof(out.reason), "%.300s", res->reason);
+    } else if (asked < res->repeats || res->repeats <= 0) {
         out.verdict = D2K_V_INCONCLUSIVE;
         snprintf(out.reason, sizeof(out.reason),
                  "базовый вопрос брошен по требованию остановки — о цели не сказано ничего");
     } else if (b->err[0] && b->pass == 0) {
         out.verdict = D2K_V_UNREACHABLE;
         snprintf(out.reason, sizeof(out.reason), "нет TCP до цели: %.300s", b->err);
-    } else if (b->pass == res.repeats) {
+    } else if (b->pass == res->repeats) {
         out.verdict = D2K_V_CLEAR;
         snprintf(out.reason, sizeof(out.reason),
-                 "база проходит: %d из %d (только базовый вопрос)", b->pass, res.repeats);
+                 "база проходит: %d из %d (только базовый вопрос)", b->pass, res->repeats);
     } else if (b->pass > 0) {
         out.verdict = D2K_V_FLAKY;
         snprintf(out.reason, sizeof(out.reason),
-                 "база не воспроизводится: %d прошло из %d", b->pass, res.repeats);
+                 "база не воспроизводится: %d прошло из %d", b->pass, res->repeats);
     } else {
         out.verdict = D2K_V_INCONCLUSIVE;
         out.base_blocked = 1;
         snprintf(out.reason, sizeof(out.reason),
-                 "база не проходит: 0 из %d — триггер целиком режется", res.repeats);
+                 "база не проходит: 0 из %d — триггер целиком режется", res->repeats);
     }
+    free(res);
     return out;
 }

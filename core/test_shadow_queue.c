@@ -203,6 +203,16 @@ int main(void)
     assert(r.form_key); /* a queued snapshot carries its context identity */
     assert(r.snapshot && !d2k_shadow_snapshot_read(path,&r,&snap));
     assert(snap.hello_len==sizeof hello && snap.options_len==2 && !memcmp(snap.hello,hello,sizeof hello));
+    /* A crash may leave the old staging name linked to the published form. */
+    char published[600],staging[600];
+    snprintf(published,sizeof published,"%s.snap-%016llx",path,(unsigned long long)r.snapshot);
+    snprintf(staging,sizeof staging,"%s.snap-tmp",path);
+    assert(!link(published,staging));
+    d2k_shadow_record next=r;
+    assert(!d2k_shadow_snapshot_write(path,&next,opts,sizeof opts,NULL,0,100));
+    assert(!d2k_shadow_snapshot_read(path,&r,&snap) && !memcmp(snap.hello,hello,sizeof hello));
+    d2k_shadow_snapshot_remove(path,&next);
+    unlink(staging);
     r.priority=2;
     assert(d2k_shadow_queue_append(&w,&r)==1);
     d2k_shadow_record later=r;later.time++;
@@ -230,7 +240,9 @@ int main(void)
     snprintf(foreign,sizeof foreign,"%s.snap-someone-else",path);
     fd=open(tmp,O_WRONLY|O_CREAT,0600);assert(fd>=0);struct timespec old[2]={{100,0},{100,0}};
     assert(!futimens(fd,old));close(fd);fd=open(foreign,O_WRONLY|O_CREAT,0600);assert(fd>=0);close(fd);
-    assert(d2k_shadow_snapshot_cleanup(path,3701)==1 && !access(foreign,F_OK));unlink(foreign);
+    char orphan[600];snprintf(orphan,sizeof orphan,"%s.snap-tmp-AbC123",path);
+    fd=open(orphan,O_WRONLY|O_CREAT,0600);assert(fd>=0);assert(!futimens(fd,old));close(fd);
+    assert(d2k_shadow_snapshot_cleanup(path,3701)==2 && !access(foreign,F_OK));unlink(foreign);
     r=target();strcpy(r.history_name,"inject\nline");r.history_time=100;
     assert(d2k_shadow_queue_append(&w,&r)==-1);
 

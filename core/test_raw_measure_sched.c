@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "sched.c"
+#include "test_task_slots.h"
 #include <poll.h>
 static int fails;
 #define CHECK(c,m) do {if(!(c)){fprintf(stderr,"FAIL: %s\n",m);fails++;}}while(0)
@@ -190,7 +191,7 @@ static void raw_parallel_scope_test(void) {
         e.client_shape=D2K_LINK_SHAPE_RAW;e.client_side=D2K_CLIENT_SIDE_HIGH;
         e.low_ip[0]=1;e.high_ip[0]=192;e.low_port=7777;e.high_port=49001;
         e.flow_epoch[0]=1;e.flow_incarnation=1;
-        if(variant==5)for(size_t i=0;i<SCHED_MAX_TASKS;i++)s->tasks[i].state=T_WATCHING;
+        if(variant==5)for(size_t i=0;i<SCHED_MAX_TASKS;i++)test_task_at(s, i)->state=T_WATCHING;
         raw_suspect(s,&e);struct d2k_rawmeasure_request first={0},second={0};
         CHECK(!read_request(sv[1],&first),"first parallel measurement absent");
         task *old=task_of(s,"1.0.0.0",6,4);CHECK(old!=NULL,"parallel first task absent");
@@ -283,8 +284,8 @@ static void raw_concurrent_completion_test(void) {
             result.raw_measure.client_data=2;result.raw_measure.exact_repeats=1;result.raw_measure.sample_digest[0]=1;
             if(tr==17)result.raw_measure.flags=D2K_RM_PRIOR_REPLY;
             d2k_sched_event(s,&result);
-            for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(s->tasks[i].state==T_RAW_MEASURED&&
-                !memcmp(s->tasks[i].raw_measure_request.token,r.token,16))owned[k]=&s->tasks[i];
+            for(size_t i=0;i<s->task_count;i++)if(s->tasks[i]->state==T_RAW_MEASURED&&
+                !memcmp(s->tasks[i]->raw_measure_request.token,r.token,16))owned[k]=s->tasks[i];
             CHECK(owned[k]!=NULL,"parallel measurement owner absent");
             if(!owned[k])continue;
             raw_measured_try(s,owned[k]);CHECK(next_frame(sv[1],frame,sizeof frame)>0,"parallel candidate missing");

@@ -41,6 +41,7 @@ struct d2k_tls_path_session {
     d2k_vres *application_program;
     d2k_ordered_stream *application_stream;
     d2k_stream_action *actions;
+    size_t action_capacity;
     d2k_experiment *application_experiment;
     rejected_prefix *rejections;
     size_t rejection_count;
@@ -293,7 +294,8 @@ d2k_tls_path_session *d2k_tls_path_session_new_application(const d2k_tls_stream 
     if(!w->application_program || !w->application_stream || !w->application_experiment) {
         d2k_tls_path_session_free(w);return NULL;
     }
-    w->actions=calloc(w->stream.chunks,sizeof *w->actions);
+    w->action_capacity=w->stream.chunks;
+    w->actions=calloc(w->action_capacity,sizeof *w->actions);
     if(!w->actions){d2k_tls_path_session_free(w);return NULL;}
     for(size_t i=0;i<w->stream.chunks;i++)w->actions[i]=(d2k_stream_action){.bytes=w->chunks[i]};
     *w->application_stream=(d2k_ordered_stream){&w->trigger,w->actions,w->stream.chunks,w->stream.read_timeout_ms,w->stream.read_minimum};
@@ -369,23 +371,34 @@ static int append_action(d2k_tls_path_session *w,size_t bytes,int reverse,d2k_st
         if(old->bytes!=bytes || old->reverse!=reverse || !!old->prefix!=!!prefix)continue;
         if(!prefix || !strcmp(d2k_stream_prefix_program(old->prefix),d2k_stream_prefix_program(prefix)))return 0;
     }
-    if(w->stream.chunks>=SIZE_MAX/sizeof(size_t)-1 ||
-       w->stream.chunks>=SIZE_MAX/sizeof(d2k_stream_action)-1)return -1;
-    size_t *chunks=malloc((w->stream.chunks+1)*sizeof *chunks);
+    size_t count=w->stream.chunks,capacity=w->action_capacity;
+    size_t *chunks=w->chunks;
+    d2k_stream_action *actions=w->actions;
+    size_t limit=SIZE_MAX/sizeof *actions;
+    if(SIZE_MAX/sizeof *chunks<limit)limit=SIZE_MAX/sizeof *chunks;
+    if(count>=limit)return -1;
     d2k_ordered_stream *stream=malloc(sizeof *stream);
-    d2k_stream_action *actions=malloc((w->stream.chunks+1)*sizeof *actions);
     d2k_experiment *experiment=malloc(sizeof *experiment);
-    if(!chunks || !stream || !experiment || !actions)goto failed;
-    memcpy(chunks,w->chunks,w->stream.chunks*sizeof *chunks);
-    chunks[w->stream.chunks]=bytes;
-    memcpy(actions,w->actions,w->stream.chunks*sizeof *actions);
-    actions[w->stream.chunks]=(d2k_stream_action){.bytes=bytes,.reverse=reverse,.prefix=prefix};
+    if(!stream || !experiment)goto failed;
+    if(count==capacity) {
+        capacity=capacity>limit/2?limit:capacity*2;
+        chunks=malloc(capacity*sizeof *chunks);
+        actions=malloc(capacity*sizeof *actions);
+        if(!chunks || !actions)goto failed;
+        memcpy(chunks,w->chunks,count*sizeof *chunks);
+        memcpy(actions,w->actions,count*sizeof *actions);
+    }
+    chunks[count]=bytes;
+    actions[count]=(d2k_stream_action){.bytes=bytes,.reverse=reverse,.prefix=prefix};
     *stream=*w->application_stream;stream->count++;stream->actions=actions;
     *experiment=*w->application_experiment;
     experiment->operation_count=stream->count+1;experiment->operation_context=stream;
     d2k_path_run *path=d2k_path_run_extend(w->path,experiment);
     if(!path)goto failed;
-    d2k_path_run_free(w->path);free(w->application_experiment);free(w->application_stream);free(w->chunks);free(w->actions);
+    d2k_path_run_free(w->path);free(w->application_experiment);free(w->application_stream);
+    if(chunks!=w->chunks)free(w->chunks);
+    if(actions!=w->actions)free(w->actions);
+    w->action_capacity=capacity;
     w->path=path;w->application_experiment=experiment;w->application_stream=stream;
     w->chunks=chunks;w->actions=actions;w->stream.chunks=stream->count;w->stream.chunk_bytes=chunks;
     size_t position=w->domain.initial;
@@ -394,7 +407,9 @@ static int append_action(d2k_tls_path_session *w,size_t bytes,int reverse,d2k_st
     w->ready=0;w->program_len=0;w->program[0]=0;w->reason[0]=0;w->direct=0;
     return 1;
 failed:
-    free(chunks);free(stream);free(experiment);free(actions);return -1;
+    if(chunks!=w->chunks)free(chunks);
+    if(actions!=w->actions)free(actions);
+    free(stream);free(experiment);return -1;
 }
 int d2k_tls_path_session_add_action(d2k_tls_path_session *w,size_t bytes,int reverse)
 {return append_action(w,bytes,reverse,NULL);}

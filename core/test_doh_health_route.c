@@ -1,5 +1,6 @@
 #define d2k_verify_doh_on observe_doh_query
 #include "sched.c"
+#include "test_task_slots.h"
 #undef d2k_verify_doh_on
 
 static unsigned calls;
@@ -25,7 +26,7 @@ int main(void) {
     d2k_catalog catalog = {0};
     d2k_sched *scheduler = d2k_sched_new(&catalog, -1, 0x2d);
     if (!scheduler) return 1;
-    task *target = &scheduler->tasks[0];
+    task *target = test_task_at(scheduler, 0);
     strcpy(target->name, resolver);
     strcpy(target->ip, "192.0.2.53");
     strcpy(target->doh_path, path);

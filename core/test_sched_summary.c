@@ -3,6 +3,7 @@
 #define d2k_verify_probe_ech_origin_on summary_ech_probe
 #define d2k_verify_doh_on summary_doh_probe
 #include "sched.c"
+#include "test_task_slots.h"
 #undef d2k_verify_doh_on
 #undef d2k_verify_probe_ech_origin_on
 #undef pthread_create
@@ -13,7 +14,7 @@ static int capture_spawn;
 int summary_thread_create(pthread_t *thread, const pthread_attr_t *attr,
                           void *(*start)(void *), void *arg) {
     (void)thread; (void)attr; (void)start; (void)arg;
-    /* Аргумент — слот планировщика (d2k_sched.wargs): не освобождается. */
+    /* Аргумент — слот задачи (task_slot.worker): не освобождается. */
     if (capture_spawn) { (void)arg; return 0; }
     return EAGAIN;
 }
@@ -85,7 +86,7 @@ static d2k_vol_result stub_vol_root(const char *ip, uint16_t port, const char *s
 }
 
 static task *fixture(d2k_sched *s) {
-    task *t = &s->tasks[0];
+    task *t = test_task_at(s, 0);
     memset(t, 0, sizeof *t);
     t->prop_fd = t->prop_q = t->probe_fd = t->ver.fd = t->c_fd = -1;
     strcpy(t->name, "summary.example");
@@ -349,7 +350,7 @@ static void tx_ladder_requires_volume_proof(int passed) {
     memcpy(t->ver_early[0].a_ip, t->ver.local_ip4, 4);
     inet_pton(AF_INET, t->ip, t->ver_early[0].b_ip);
     t->ver_early[0].a_port = t->ver.local_port; t->ver_early[0].b_port = t->port;
-    task *direct = &s->tasks[1];
+    task *direct = test_task_at(s, 1);
     if (passed) {
         memset(direct, 0, sizeof *direct);
         direct->prop_fd = direct->prop_q = direct->probe_fd = direct->ver.fd = direct->c_fd = -1;
@@ -813,7 +814,7 @@ t->n_plans=t->next_plan=1;
     d2k_catalog other_catalog={0};
     d2k_sched *other=d2k_sched_new(&other_catalog,-1,0x2d);CHECK(other!=NULL);
     if(other) {
-        g_progress_sink=(progress_sink){other,&other->tasks[0]};
+        g_progress_sink=(progress_sink){other,test_task_at(other, 0)};
         CHECK(d2k_sched_synthesis_retain(9,&released,retained_release,NULL)==1);
         g_progress_sink=saved;
         d2k_sched_free(other);CHECK(released==2);
@@ -1038,12 +1039,12 @@ static void retry_keeps_client_context(int completed_retry) {
         d2k_sched_tcp_base_hook=d2k_sched_tcp_hook;
         capture_spawn=1;
         if(completed_retry) {
-            task *watch=&s->tasks[1];task_reset(s,watch);
+            task *watch=test_task_at(s, 1);task_reset(s,watch);
             watch->state=T_WATCHING;watch->plan_retry=1;
             strcpy(watch->name,"already-confirmed.example");
             s->plan_news=1;s->plan_gen=1;
             plan_news_tick(s,1000);
-            CHECK(s->tasks[0].state==T_ASKING);
+            CHECK(test_task_at(s, 0)->state==T_ASKING);
         } else CHECK(plan_news_recheck(s,c,1000)==1);
         capture_spawn=0;
         t=task_of(s,"summary.example",6,4);

@@ -725,7 +725,7 @@ clean-preflight-control:
 clean: clean-preflight-control
 
 plan_parse.o: include/d2k_preflight_plan.h include/d2k_capture.h
-session.o: plan_internal.h
+session.o: plan_internal.h quic_flow.h
 
 # Session wiring: use the same product objects as test_session, no listeners.
 TESTS += test_preflight_wiring

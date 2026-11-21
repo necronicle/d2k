@@ -1298,7 +1298,7 @@ typedef struct {
    Раньше главный поток выделял его malloc, а рабочий освобождал free: память
    по 8 КиБ на каждый замер переходила между потоками, и распределитель libc
    волен держать такие куски у себя (так d2o объяснял рост RSS статической
-   musl-сборки). Слот выделен один раз вместе с планировщиком, по одному на
+   musl-сборки). Слот выделяется один раз вместе с ячейкой задачи, по одному на
    задачу: выделений на замер нет, наибольший расход известен заранее
    (SCHED_MAX_TASKS * sizeof(worker_arg)), и расти ему некуда.
    Владение: главный поток пишет слот только в start_worker, и только когда
@@ -1315,6 +1315,12 @@ typedef struct {
     int split_unfit; /* решено главным потоком (quic_split_unfit) */
     unsigned budget; /* бюджет потока испытания (JOB_VERIFY), 0 — без проверки */
 } worker_arg;
+
+/* Both addresses must stay stable while the worker runs. */
+typedef struct {
+    task value;
+    worker_arg worker;
+} task_slot;
 
 /* ПРОТОКОЛ КЛИЕНТА — НЕ HTTP (задача 37, F3). Снимок TLS 1.3 целиком, и в
    его ALPN явно назван протокол не HTTP (MQTT, XMPP…), без http/1.1 и h2: тогда
@@ -1719,9 +1725,10 @@ struct d2k_sched {
     int64_t      stun_cleanup_ms;
     int          stun_cleanup_seen;
 
-    task         tasks[SCHED_MAX_TASKS];
-    worker_arg   wargs[SCHED_MAX_TASKS]; /* слот аргумента рабочего потока задачи */
-    shadow_flow_state shadow_flows[SCHED_SEEN];
+    task        *tasks[SCHED_MAX_TASKS];
+    size_t       task_count; /* Allocated slots, including reusable idle slots. */
+    shadow_flow_state *shadow_flows;
+    size_t shadow_count;
     size_t shadow_next;
     seen_name    seen[SCHED_SEEN];
     size_t       seen_next;   /* кольцо: старое вытесняется, а не отказывает */
@@ -2227,8 +2234,18 @@ int d2k_sched_set_synthesis_only(d2k_sched *s,int enabled) {
 static void shadow_forget(d2k_sched *,shadow_flow_state *);
 int d2k_sched_set_shadow(d2k_sched *s,const char *path) {
     if(!s || (path && strlen(path)>=sizeof s->shadow.path))return -1;
-    for(size_t i=0;i<SCHED_SEEN;i++)shadow_forget(s,&s->shadow_flows[i]);
-    memset(&s->shadow_recent,0,sizeof s->shadow_recent);
+    if(path && *path && !s->shadow_flows) {
+        s->shadow_flows=malloc(SCHED_SEEN*sizeof *s->shadow_flows);
+        if(!s->shadow_flows)return -1;
+    }
+    for(size_t i=0;i<s->shadow_count;i++)shadow_forget(s,&s->shadow_flows[i]);
+    s->shadow_count=0;
+    s->shadow_next=0;
+    if(!path || !*path) {
+        free(s->shadow_flows);
+        s->shadow_flows=NULL;
+    }
+    s->shadow_recent.count=0;
     int rc=d2k_shadow_writer_set(&s->shadow,path);
     if(!rc && s->shadow.path[0])
         (void)d2k_shadow_recent_load(s->shadow.path,"recent",&s->shadow_recent,(uint64_t)time(NULL));
@@ -2434,7 +2451,7 @@ static int same_flow(const seen_name *s, const d2k_ev *ev) {
 static void server_of(const d2k_ev *, char *, size_t, uint16_t *);
 static shadow_flow_state *shadow_tuple(d2k_sched *s,const d2k_ev *ev)
 {
-    for(size_t i=0;i<SCHED_SEEN;i++) {
+    for(size_t i=0;i<s->shadow_count;i++) {
         shadow_flow_state *w=&s->shadow_flows[i];
         if(w->used && ev_matches_flow(ev,&w->tuple))return w;
     }
@@ -2467,8 +2484,16 @@ static void shadow_begin(d2k_sched *s,const d2k_ev *ev)
         side=w->client_side;memcpy(epoch,w->epoch,16);incarnation=w->incarnation;
         options_len=w->options_len;options_known=w->options_known;memcpy(options,w->options,sizeof options);
     }
-    if(!w)w=&s->shadow_flows[s->shadow_next++%SCHED_SEEN];
-    shadow_forget(s,w);w->used=1;
+    if(!w) {
+        w=&s->shadow_flows[s->shadow_next];
+        s->shadow_next=(s->shadow_next+1)%SCHED_SEEN;
+        if(s->shadow_count<SCHED_SEEN) {
+            /* First use of this slot. It has no prior snapshot owner. */
+            memset(w,0,sizeof *w);
+            s->shadow_count++;
+        } else shadow_forget(s,w);
+    } else shadow_forget(s,w);
+    w->used=1;
     memcpy(w->tuple.a_ip,ev->low_ip,16);memcpy(w->tuple.b_ip,ev->high_ip,16);
     w->tuple.a_port=ev->low_port;w->tuple.b_port=ev->high_port;
     w->tuple.transport=ev->transport;w->tuple.family=ev->family?ev->family:4;
@@ -2858,8 +2883,8 @@ static void flowwatch_tick(d2k_sched *s, int64_t now_ms) {
         w->samples++;
         w->sampled_ms = now_ms;
         int raw_observing=0;
-        if(w->obs_asked_ms)for(size_t ti=0;ti<SCHED_MAX_TASKS;ti++) {
-            const task *rt=&s->tasks[ti];
+        if(w->obs_asked_ms)for(size_t ti=0;ti<s->task_count;ti++) {
+            const task *rt=s->tasks[ti];
             if((rt->state==T_RAW_MEASURE_ACK || rt->state==T_RAW_MEASURE_OBSERVE || rt->state==T_RAW_MEASURED) &&
                rt->raw_measure_request.generation==w->flow_incarnation &&
                !memcmp(rt->raw_measure_request.epoch,w->flow_epoch,16) &&
@@ -3351,21 +3376,29 @@ static void stall_budgets_push(d2k_sched *s) {
 }
 
 static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t family) {
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state != T_FREE && s->tasks[i].transport == transport &&
-            s->tasks[i].family == (family ? family : 4) &&
-            strcmp(s->tasks[i].name, name) == 0) {
-            return &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        if (s->tasks[i]->state != T_FREE && s->tasks[i]->transport == transport &&
+            s->tasks[i]->family == (family ? family : 4) &&
+            strcmp(s->tasks[i]->name, name) == 0) {
+            return s->tasks[i];
         }
     }
     return NULL;
 }
 
+static task *task_append_slot(d2k_sched *s) {
+    if (s->task_count == SCHED_MAX_TASKS) return NULL;
+    task_slot *slot = calloc(1, sizeof *slot);
+    if (!slot) return NULL;
+    s->tasks[s->task_count++] = &slot->value;
+    return &slot->value;
+}
+
 static task *task_free_slot(d2k_sched *s) {
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state == T_FREE) { return &s->tasks[i]; }
+    for (size_t i = 0; i < s->task_count; i++) {
+        if (s->tasks[i]->state == T_FREE) { return s->tasks[i]; }
     }
-    return NULL;
+    return task_append_slot(s);
 }
 
 /* Задача, которая своё уже отдала: подтверждена и только смотрит на живой
@@ -3375,8 +3408,8 @@ static task *task_free_slot(d2k_sched *s) {
    стоит целого поиска. До 12.09 этого выбора не было: подтверждённая задача
    освобождала место сразу. */
 static task *task_watching_slot(d2k_sched *s) {
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state == T_WATCHING) { return &s->tasks[i]; }
+    for (size_t i = 0; i < s->task_count; i++) {
+        if (s->tasks[i]->state == T_WATCHING) { return s->tasks[i]; }
     }
     return NULL;
 }
@@ -3651,7 +3684,7 @@ static int fill_hellos(d2k_sched *s, task *t) {
  * Рабочий поток: сетевой оракул.
  * -------------------------------------------------------------------- */
 
-/* Аргумент рабочего потока — worker_arg, слот задачи в d2k_sched.wargs. */
+/* Аргумент рабочего потока — worker_arg, постоянный слот аргумента в task_slot. */
 
 d2k_vres d2k_sched_ech_baseline_result(const d2k_ver_result *baseline,
     d2k_vol_result *volume, const char *origin) {
@@ -4946,7 +4979,7 @@ static int start_worker(d2k_sched *s, task *t, task_job job) {
         pthread_mutex_unlock(&s->mu);
         join_worker(t);
     }
-    worker_arg *a = &s->wargs[t - s->tasks];
+    worker_arg *a = &((task_slot *)t)->worker;
     if (job==JOB_DOH_HEALTH && !t->plain_first_timeout_bytes)
         dns_pick_question(s,t,s->now_ms);
     pthread_mutex_lock(&s->mu);
@@ -7887,8 +7920,8 @@ void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
     }
     if(s->cat->groups)c->observations=s->cat->groups->n_observations;
     c->active=measurements_in_flight(s);c->queued=queued_measurements(s);
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        const task *t=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        const task *t=s->tasks[i];
         if(t->state!=T_FREE){c->tasks++;if(t->trig_len||t->snap_len)c->snapshots++;}
     }
 }
@@ -7961,8 +7994,8 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
     write_live_groups(f, s);
     fputs("  \"searches\": [", f);
     int first = 1;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        const task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        const task *t = s->tasks[i];
         if (t->state == T_FREE || t->state == T_WATCHING || t->state == T_RESTING) {
             continue; /* Passive monitoring/backoff is not an active search. */
         }
@@ -8135,30 +8168,32 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
 void d2k_sched_free(d2k_sched *s) {
     if(s)d2k_newchain_set(&s->newchain,NULL);
     if (!s) { return; }
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+    for (size_t i = 0; i < s->task_count; i++) {
         char err[160];
-        if (s->tasks[i].state==T_DNS_PLAIN_TRIAL)join_worker(&s->tasks[i]);
-        if (s->tasks[i].addr_probe_identity_valid) {
-            (void)addr_probe_remove(s, &s->tasks[i], err, sizeof err);
+        if (s->tasks[i]->state==T_DNS_PLAIN_TRIAL)join_worker(s->tasks[i]);
+        if (s->tasks[i]->addr_probe_identity_valid) {
+            (void)addr_probe_remove(s, s->tasks[i], err, sizeof err);
         }
-        join_worker(&s->tasks[i]);
-        gate_retire(s,&s->tasks[i]);
-        if(s->tasks[i].synthesis_release)s->tasks[i].synthesis_release(s->tasks[i].synthesis_context);
-        d2k_verification_free(s->tasks[i].synthesis_owner);
-        d2k_run_cache_clear(&s->tasks[i].run_cache);
-        stun_retire(s, &s->tasks[i]);
-        search_report(s, &s->tasks[i], s->now_ms, "shutdown", NULL, "служба останавливается, поиск не доведён");
+        join_worker(s->tasks[i]);
+        gate_retire(s,s->tasks[i]);
+        if(s->tasks[i]->synthesis_release)s->tasks[i]->synthesis_release(s->tasks[i]->synthesis_context);
+        d2k_verification_free(s->tasks[i]->synthesis_owner);
+        d2k_run_cache_clear(&s->tasks[i]->run_cache);
+        stun_retire(s, s->tasks[i]);
+        search_report(s, s->tasks[i], s->now_ms, "shutdown", NULL, "служба останавливается, поиск не доведён");
         /* Сокеты обращений закрываем сами: поток к этому моменту уже вернулся,
            а дескриптор принадлежит задаче, а не ему. */
-        contact_close(&s->tasks[i]);
-        prop_close(&s->tasks[i]);
-        ver_close(&s->tasks[i]);
+        contact_close(s->tasks[i]);
+        prop_close(s->tasks[i]);
+        ver_close(s->tasks[i]);
     }
+    for (size_t i = 0; i < s->task_count; i++) free(s->tasks[i]);
     pthread_cond_destroy(&s->question_cv);
     pthread_mutex_destroy(&s->mu);
     if (s->wake[0] >= 0) { close(s->wake[0]); }
     if (s->wake[1] >= 0) { close(s->wake[1]); }
-    for(size_t i=0;i<SCHED_SEEN;i++)shadow_forget(s,&s->shadow_flows[i]);
+    for(size_t i=0;i<s->shadow_count;i++)shadow_forget(s,&s->shadow_flows[i]);
+    free(s->shadow_flows);
     free(s->areas);
     free(s);
 }
@@ -8176,8 +8211,8 @@ int d2k_sched_wake_fd(const d2k_sched *s) { return s ? s->wake[0] : -1; }
 size_t d2k_sched_active(const d2k_sched *s) {
     if (!s) { return 0; }
     size_t n = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task_state st = s->tasks[i].state;
+    for (size_t i = 0; i < s->task_count; i++) {
+        task_state st = s->tasks[i]->state;
         if (st == T_GATE_INSTALL || st == T_GATE_VERIFY || st == T_GATE_COMMIT ||
             st == T_QUEUED || st == T_SHAPE_WAIT || st == T_ASKING || st == T_PLANNING ||
             st == T_VERIFY || st == T_VERIFY_WAIT || st == T_WATCHING ||
@@ -8556,7 +8591,7 @@ static int sync_area_send(d2k_sched *s, const installed_area *a, int remove) {
     uint16_t cmd;
     if (a->kind == 1 && !remove) {
         const d2k_cat_plan *p = area_plan(s, a);
-        char wire[sizeof s->tasks[0].plans[0]];
+        char wire[sizeof s->tasks[0]->plans[0]];
         uint8_t id[D2K_PLAN_ID_LEN] = {0};
         size_t n = strlen(a->plan_id); if (n > sizeof id) n = sizeof id;
         memcpy(id, a->plan_id, n);
@@ -8763,7 +8798,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
            картинки умирали. Защита дописывается в ПРОВОДНУЮ копию: текст
            плана в каталоге не меняется, его личность (plan_ident) считается
            из текста. Повод — измеренная примета «rst» у этой коробки. */
-        static char guarded[sizeof ((d2k_sched *)0)->tasks[0].plans[0]];
+        static char guarded[sizeof ((d2k_sched *)0)->tasks[0]->plans[0]];
         const char *text = p->text;
         if(preflight_text(text) && !preflight_family_enabled(bd->family ? bd->family : 4))continue;
         if ((bd->transport ? bd->transport : 6) == 6 && box_injects_rst(b) &&
@@ -8778,7 +8813,7 @@ int d2k_sched_sync_step(d2k_sched *s) {
            В проводную копию ставится идентификатор плана каталога (как у
            областей, sync_area_send); текст в каталоге не меняется. Текст без
            строки id ставится как прежде — без идентичности. */
-        static char stamped[sizeof ((d2k_sched *)0)->tasks[0].plans[0]];
+        static char stamped[sizeof ((d2k_sched *)0)->tasks[0]->plans[0]];
         if (strlen(text) < sizeof stamped) {
             uint8_t wid[D2K_PLAN_ID_LEN] = {0};
             size_t idn = strlen(p->id);
@@ -9484,9 +9519,9 @@ static int plan_news_recheck(d2k_sched *s, target_cooldown *c, int64_t now_ms) {
 /* Один заказ — одна проверка за тик, и только пока есть что проверять. */
 static void plan_news_tick(d2k_sched *s, int64_t now_ms) {
     if (!s->plan_news) { return; }
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].plan_retry && s->tasks[i].state != T_FREE &&
-            s->tasks[i].state != T_RESTING && s->tasks[i].state != T_WATCHING) {
+    for (size_t i = 0; i < s->task_count; i++) {
+        if (s->tasks[i]->plan_retry && s->tasks[i]->state != T_FREE &&
+            s->tasks[i]->state != T_RESTING && s->tasks[i]->state != T_WATCHING) {
             return;                      /* проверка уже идёт — по одной */
         }
     }
@@ -10092,15 +10127,15 @@ static int meas_state(task_state st);
 
 static size_t measurements_in_flight(const d2k_sched *s) {
     size_t n = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
-        if (meas_state(s->tasks[i].state) && !s->tasks[i].quic_parked) n++;
+    for (size_t i = 0; i < s->task_count; i++)
+        if (meas_state(s->tasks[i]->state) && !s->tasks[i]->quic_parked) n++;
     return n;
 }
 
 static size_t queued_measurements(const d2k_sched *s) {
     size_t n = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        if (s->tasks[i].state == T_QUEUED || s->tasks[i].quic_parked) { n++; }
+    for (size_t i = 0; i < s->task_count; i++) {
+        if (s->tasks[i]->state == T_QUEUED || s->tasks[i]->quic_parked) { n++; }
     }
     return n;
 }
@@ -10206,9 +10241,9 @@ static int meas_state(task_state st) {
    где цель наблюдается или отдыхает, замер не займёт), и не больше
    пробных слотов датапата. */
 static size_t measure_slots(const d2k_sched *s) {
-    size_t n = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task_state st = s->tasks[i].state;
+    size_t n = SCHED_MAX_TASKS - s->task_count;
+    for (size_t i = 0; i < s->task_count; i++) {
+        task_state st = s->tasks[i]->state;
         if (st == T_FREE || st == T_QUEUED || meas_state(st)) n++;
     }
     return n < SCHED_MEASURE_SLOTS ? n : SCHED_MEASURE_SLOTS;
@@ -10493,8 +10528,8 @@ static int make_response_queue_room(d2k_sched *s, task *incoming) {
        a response program. Preserve the resource cap and work already done. */
     if (!preflight_family_enabled(incoming->family) || !can_measure_silent_tls(incoming)) return 0;
     task *victim=NULL;
-    for (size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *waiting=&s->tasks[i];
+    for (size_t i=0;i<s->task_count;i++) {
+        task *waiting=s->tasks[i];
         if (waiting==incoming || waiting->state!=T_QUEUED ||
             waiting->search_started || waiting->probes || waiting->hot_event ||
             can_measure_silent_tls(waiting) || dns_task_registered(s,waiting) ||
@@ -10744,7 +10779,7 @@ static const d2k_cat_plan *raw_own_plan(const d2k_sched *s, const char *ip, uint
             for (size_t i = 0; i < b->n_plans; i++) {
                 const d2k_cat_plan *p = &b->plans[i];
                 if (!p->enabled || !p->text || strcmp(p->id, bd->plan_id) ||
-                    strlen(p->text) >= sizeof s->tasks[0].plans[0]) continue;
+                    strlen(p->text) >= sizeof s->tasks[0]->plans[0]) continue;
                 if (!best || bd->confirmed > newest) { best = p; newest = bd->confirmed; *owner = b; }
             }
         }
@@ -10772,8 +10807,8 @@ static int raw_measure_start(d2k_sched *s,const d2k_ev *ev,const char *ip,uint16
     r.tuple.dport_be[0]=(uint8_t)(sp>>8);r.tuple.dport_be[1]=(uint8_t)sp;
     r.generation=ev->flow_incarnation;memcpy(r.epoch,ev->flow_epoch,16);
     r.seconds=SCHED_LATE_OBS_S;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *old=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        task *old=s->tasks[i];
         int active=raw_measure_state(old) || (old->raw &&
                    (old->state==T_RAW_TRIAL || old->state==T_RAW_WATCH));
         if(!active && !(old->raw && old->state==T_WATCHING))continue;
@@ -10812,8 +10847,8 @@ static int raw_late_observe(d2k_sched *s,flow_watch *w) {
     ev.low_port=w->low_port;ev.high_port=w->high_port;
     memcpy(ev.flow_epoch,w->flow_epoch,16);ev.flow_incarnation=w->flow_incarnation;
     if(!raw_measure_start(s,&ev,w->target,w->port))return 0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];const struct d2k_rawmeasure_request *r=&t->raw_measure_request;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];const struct d2k_rawmeasure_request *r=&t->raw_measure_request;
         if(!raw_measure_state(t) || r->generation!=w->flow_incarnation ||
            memcmp(r->epoch,w->flow_epoch,16) || memcmp(&r->tuple,&w->tuple,sizeof w->tuple))continue;
         memcpy(w->obs_token,r->token,16);w->obs_asked_ms=s->now_ms?s->now_ms:1;return 1;
@@ -10841,8 +10876,8 @@ static void raw_measure_cancel(d2k_sched *s,const task *t) {
     /* A broken link is bounded by daemon peer-close cleanup or its lease. */
 }
 static void raw_measure_ack(d2k_sched *s,const d2k_ev *ev) {
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];if((t->state!=T_RAW_MEASURE_ACK && t->state!=T_RAW_MEASURE_OBSERVE)||memcmp(t->raw_measure_request.token,ev->trial_id,16))continue;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];if((t->state!=T_RAW_MEASURE_ACK && t->state!=T_RAW_MEASURE_OBSERVE)||memcmp(t->raw_measure_request.token,ev->trial_id,16))continue;
         if(((ev->num>>8)&255)!=1) {
             unknown_note(s,"addr",t->ip,t->transport,t->family,t->port,"measurement-unavailable","наблюдение недоступно или поколение соединения сменилось");
             raw_measure_watch_done(s,t,-1);task_done(s,t);return;
@@ -10990,8 +11025,8 @@ static void raw_trial_renew(d2k_sched *s,task *t,int64_t now_ms) {
 static void raw_measure_result(d2k_sched *s,const d2k_ev *ev) {
     const struct d2k_rawmeasure_report *r=&ev->raw_measure;
     if(!d2k_rawmeasure_report_valid(r))return;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];if(t->state!=T_RAW_MEASURE_OBSERVE)continue;
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];if(t->state!=T_RAW_MEASURE_OBSERVE)continue;
         const struct d2k_rawmeasure_request *q=&t->raw_measure_request;
         if(memcmp(q->token,r->request.token,16)||memcmp(q->epoch,r->request.epoch,16)||
            q->generation!=r->request.generation||q->seconds!=r->request.seconds||
@@ -11181,8 +11216,8 @@ static int force_doh_suspect(d2k_sched *s,const d2k_ev *ev,const char *name) {
             d->ip[0] && !strcmp(ip,d->ip)))return 1;
     }
     if(!s->n_force)return 0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state==T_FREE || t->transport!=6 || !force_name(s,t->name) ||
            t->family!=(ev->family?ev->family:4) || t->port!=port || strcmp(t->ip,ip) ||
            (name && name[0] && strcasecmp(name,t->name)))continue;
@@ -11377,8 +11412,8 @@ static int on_suspect_as(d2k_sched *s, const d2k_ev *ev, const char *found, int 
     if(force_name(s,name)) {
         char ip[INET6_ADDRSTRLEN];uint16_t port;server_of(ev,ip,sizeof ip,&port);
         t=NULL;
-        for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-            task *candidate=&s->tasks[i];
+        for(size_t i=0;i<s->task_count;i++) {
+            task *candidate=s->tasks[i];
             if(candidate->state!=T_FREE && candidate->transport==ev->transport &&
                candidate->family==(ev->family?ev->family:4) && candidate->port==port &&
                !strcasecmp(candidate->name,name) && !strcmp(candidate->ip,ip)) {t=candidate;break;}
@@ -11943,7 +11978,7 @@ static void quic_note_multi(d2k_sched *s, const char *name, uint8_t family) {
 }
 
 static void on_shape(d2k_sched *s, const d2k_ev *ev) {
-    if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0].trig) { return; }
+    if (ev->shape_len == 0 || ev->shape_len > sizeof s->tasks[0]->trig) { return; }
     if (ev->transport == 6 && !d2k_hello_complete(ev->shape, ev->shape_len)) {
         say(s, "снимок TCP (%zu байт) не содержит целого ClientHello — "
                "не заменяю им вход измерителя", ev->shape_len);
@@ -12110,8 +12145,8 @@ static void on_shape(d2k_sched *s, const d2k_ev *ev) {
     /* Кладём ТОЛЬКО задачам своего транспорта: у TCP и QUIC приветствия
        разные, и снимок одного для другого — не «лучше, чем ничего», а чужие
        байты, которыми задача пойдёт мерить. */
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->family != (ev->family ? ev->family : 4)) { continue; }
         if (ev->transport == 17 && t->transport == 17 && t->state != T_FREE &&
             t->state != T_WATCHING && t->state != T_SHAPE_WAIT &&
@@ -12560,8 +12595,9 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
        испытан) — чужое по транспорту подтверждение (QUIC при TCP-замере, поле
        28.10.2026) лишь перепроверяло бы старых кандидатов и теряло дерево. */
     size_t own_before[SCHED_MAX_TASKS];
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *ot = &s->tasks[i];
+    memset(own_before, 0xff, sizeof own_before);
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *ot = s->tasks[i];
         own_before[i] = (ot != t && ot->state == T_ASKING && ot->th_live && !ot->yield_to_own_plan)
                         ? own_first_plans(s, ot, 0) : (size_t)-1;
     }
@@ -13011,8 +13047,8 @@ static void verify_confirm(d2k_sched *s, task *t, int64_t now_ms) {
     /* Кооперативный выход из долгой классификации: если соседняя задача в T_ASKING
        всё ещё крутит классификатор, а подтверждённый план совместим с её формой,
        просим её уступить место проверке готового решения (§3.4, §5). */
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *ot = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *ot = s->tasks[i];
         if (ot == t || ot->state != T_ASKING || !ot->th_live || ot->yield_to_own_plan)
             continue;
         pthread_mutex_lock(&s->mu);
@@ -13146,8 +13182,8 @@ static int applied_of_candidate(const task *t, const d2k_ev *ev) {
 static void on_exchange(d2k_sched *s, const d2k_ev *ev);
 
 static void on_applied(d2k_sched *s, const d2k_ev *ev) {
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->state == T_RAW_TRIAL) {
             /* Опыт применился к повтору ИМЕННО этого клиентского потока и
                ИМЕННО нашим планом — дальше ждём ответа сервера на него. */
@@ -13465,8 +13501,8 @@ static void on_refused_unfit(d2k_sched *s, const d2k_ev *ev) {
 
 static void on_refused(d2k_sched *s, const d2k_ev *ev) {
     if (ev->code == 0) { return; }
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if((t->state==T_RAW_TRIAL || t->state==T_RAW_WATCH) &&
            ev_matches_flow(ev,&t->trigger_flow) && plan_id_is_ours(t,ev) && applied_trial_is_ours(t,ev)) {
             if(t->state==T_RAW_WATCH && (!ev->execution_id || ev->execution_id!=t->raw_execution_id))continue;
@@ -13702,8 +13738,8 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
     }
     /* Ответ сервера на продолжение клиента под опытом без протокола (этап 12):
        только тот поток, только план применён (planned), только уровень пути. */
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if(raw_path_proven && t->state==T_RAW_TRIAL && ev->transport==t->transport && ev->execution_id &&
            ev->planned==D2K_LINK_PLANNED_YES && ev_matches_flow(ev,&t->trigger_flow) &&
            plan_id_is_ours(t,ev) && applied_trial_is_ours(t,ev)) {
@@ -13722,8 +13758,8 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
     /* Наблюдение UDP-ответа по потоку с применённым приёмом. Раньше
        всех прочих разборов: у UDP нет типов записей TLS, и проверка на
        прикладные данные ниже отбросила бы его. */
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->state == T_VOICE_WATCH && ev_matches_flow(ev, &t->voice_flow)) {
             if (ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY ||
                 ev->code == D2K_UDP_PROOF_STUN) {
@@ -13741,8 +13777,8 @@ static void on_exchange(d2k_sched *s, const d2k_ev *ev) {
        чужое, решает КЛЮЧ ПОТОКА: событие обмена не адресовано команде, и без
        фильтра чужой обмен засчитался бы за наш зонд (ревью 11.09, находка 1
        в compose.c — воспроизводилось 5/5 на стенде). */
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->state == T_PROPS_CONTACT && ev->server_hello && ev->transport == 6 &&
             t->prop_sport_be != 0 &&
             (ev->family ? ev->family : 4) == (t->family ? t->family : 4) &&
@@ -14161,8 +14197,8 @@ static void force_retry(d2k_sched *s,task *t) {
     (void)launch_or_queue(s,t);
 }
 static task *force_task_of(d2k_sched *s,const force_target *f) {
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state!=T_FREE && t->transport==f->transport && t->family==f->family &&
            t->port==f->port && !strcasecmp(t->name,f->name) && !strcmp(t->ip,f->ip))return t;
     }
@@ -14270,8 +14306,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     }
     s->event_sequence++;
     (void)d2k_stun_trial_reap(ev);
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t=&s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t=s->tasks[i];
         if(plain_trial_event(t,ev)){wake_loop(s);return 0;}
         if(gate_event(s,t,ev)){wake_loop(s);return 0;}
         if(t->state==T_VOICE_INSTALL && ev->kind==D2K_EV_ACK &&
@@ -14285,8 +14321,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
             else t->voice_install_refused=1;
             wake_loop(s);return 0;
         }
-        if (stun_client_event(&s->tasks[i], ev)) { wake_loop(s); return 0; }
-        if (stun_candidate_event(&s->tasks[i], ev)) { wake_loop(s); return 0; }
+        if (stun_client_event(s->tasks[i], ev)) { wake_loop(s); return 0; }
+        if (stun_candidate_event(s->tasks[i], ev)) { wake_loop(s); return 0; }
     }
     switch (ev->kind) {
     case D2K_EV_HELLO:
@@ -14300,8 +14336,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         raw_measure_result(s,ev);return 0;
     case D2K_EV_ACK:
         if (ev->code == D2K_CMD_ARM_SHAPE) {
-            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-                task *t = &s->tasks[i];
+            for (size_t i = 0; i < s->task_count; i++) {
+                task *t = s->tasks[i];
                 if (t->state == T_SHAPE_WAIT && t->shape_request_pending &&
                     !memcmp(t->shape_request_id, ev->trial_id, 16))
                     t->shape_request_pending = 0;
@@ -14310,8 +14346,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
         }
         if(ev->code==D2K_CMD_RAW_MEASURE){raw_measure_ack(s,ev);return 0;}
         if(ev->code==D2K_CMD_SET_RAW_PROBE) {
-            for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-                task *t=&s->tasks[i];
+            for(size_t i=0;i<s->task_count;i++) {
+                task *t=s->tasks[i];
                 if((t->state!=T_RAW_TRIAL && t->state!=T_RAW_WATCH) ||
                    !candidate_trial_matches(t,ev->code,ev->trial_id))continue;
                 if(((ev->num>>8)&255)!=1) {
@@ -14398,8 +14434,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
             if (!any) { return 0; }
             int ok = ((ev->num >> 8) & 0xffu) == 1u;
             unsigned code = ev->num & 0xffu;
-            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-                task *t = &s->tasks[i];
+            for (size_t i = 0; i < s->task_count; i++) {
+                task *t = s->tasks[i];
                 if (!candidate_trial_matches(t, ev->code, ev->trial_id)) { continue; }
                 if (t->state == T_TRIAL_SETTLE) {
                     if (ok) { t->trial_acked = 1; wake_loop(s); }
@@ -14416,8 +14452,8 @@ int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
                    ((ev->num >> 8) & 0xffu) != 1u) {
             /* ДАТАПАТ ОТВЕРГ ГОЛОСОВОЙ ОПЫТ (нет места, план не принят) —
                это местный отказ: опыта не было, кандидат не судим. */
-            for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-                task *t = &s->tasks[i];
+            for (size_t i = 0; i < s->task_count; i++) {
+                task *t = s->tasks[i];
                 if ((t->state == T_VOICE_TRIAL || t->state == T_VOICE_WATCH) &&
                     voice_trial_owned(t) &&
                     memcmp(ev->trial_id, t->addr_probe_trial_id, D2K_TRIAL_ID_LEN) == 0) {
@@ -14738,14 +14774,14 @@ static int queued_before(const task *a, const task *b) {
  * no task state, trial or classification result changes on a pause. */
 static void quic_yield_tick(d2k_sched *s,int64_t now_ms) {
     int tcp_waiting=0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)
-        if(s->tasks[i].state==T_QUEUED && s->tasks[i].transport==6)tcp_waiting=1;
+    for(size_t i=0;i<s->task_count;i++)
+        if(s->tasks[i]->state==T_QUEUED && s->tasks[i]->transport==6)tcp_waiting=1;
     int need_slot=tcp_waiting && measurements_in_flight(s)>=s->meas_limit;
     task *resume=NULL;
     int parked_log[SCHED_MAX_TASKS]={0};
     pthread_mutex_lock(&s->mu);
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state!=T_ASKING || t->transport!=17 || t->job!=JOB_CLASSIFY)continue;
         t->quic_clock_ms=now_ms;
         t->quic_yield_request=need_slot;
@@ -14767,37 +14803,37 @@ static void quic_yield_tick(d2k_sched *s,int64_t now_ms) {
         pthread_cond_broadcast(&s->question_cv);
     }
     pthread_mutex_unlock(&s->mu);
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(parked_log[i])
-        say(s,"по %s (QUIC) вопрос завершён: уступаю слот ожидающему TCP, ответы сохранены",s->tasks[i].name);
+    for(size_t i=0;i<s->task_count;i++)if(parked_log[i])
+        say(s,"по %s (QUIC) вопрос завершён: уступаю слот ожидающему TCP, ответы сохранены",s->tasks[i]->name);
     if(resumed_wait>=0)
         say(s,"по %s (QUIC) продолжаю со следующего вопроса после очереди (%lld мс)",resume->name,(long long)resumed_wait);
 }
 
 static task *queued_pick(d2k_sched *s) {
     task *forced=NULL;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++) {
-        task *t=&s->tasks[i];
+    for(size_t i=0;i<s->task_count;i++) {
+        task *t=s->tasks[i];
         if(t->state==T_QUEUED && force_name(s,t->name) &&
            (!forced || queued_before(t,forced)))forced=t;
     }
     if(forced)return forced;
     int tcp_first=0;
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(s->tasks[i].quic_parked)tcp_first=1;
+    for(size_t i=0;i<s->task_count;i++)if(s->tasks[i]->quic_parked)tcp_first=1;
     if(tcp_first){
         task *best=NULL;
-        for(size_t i=0;i<SCHED_MAX_TASKS;i++){
-            task *t=&s->tasks[i];
+        for(size_t i=0;i<s->task_count;i++){
+            task *t=s->tasks[i];
             if(t->state==T_QUEUED && t->transport==6 && (!best || queued_before(t,best)))best=t;
         }
         if(best)return best;
     }
     int recovery = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++)
-        if (s->tasks[i].state == T_QUEUED && family_recovery_eligible(s, &s->tasks[i]))
+    for (size_t i = 0; i < s->task_count; i++)
+        if (s->tasks[i]->state == T_QUEUED && family_recovery_eligible(s, s->tasks[i]))
             recovery = 1;
     task *best = NULL;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->state != T_QUEUED) continue;
         if (recovery && !family_recovery_eligible(s, t)) continue;
         if (!best || queued_before(t, best)) best = t;
@@ -15174,8 +15210,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
         s->clock_seen = 1;
         s->mono_base_ms = now_ms;
         s->wall_base_s = (int64_t)time(NULL);
-        for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-            task *t = &s->tasks[i];
+        for (size_t i = 0; i < s->task_count; i++) {
+            task *t = s->tasks[i];
             if (t->report_id && !t->report_closed && t->report_admitted_ms < 0)
                 t->report_admitted_ms = now_ms;
         }
@@ -15189,8 +15225,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     (void)d2k_newchain_poll(&s->newchain,s->link_fd,now_ms,newchain_log,s);
     /* Retire already running old workers before consuming their results.
        Their cleanup owns only temporary trials, never the imported binding. */
-    for(size_t i=0;i<SCHED_MAX_TASKS;i++)if(s->tasks[i].state!=T_FREE && newchain_task(s,&s->tasks[i])) {
-        s->tasks[i].stop=1;task_done(s,&s->tasks[i]);
+    for(size_t i=0;i<s->task_count;i++)if(s->tasks[i]->state!=T_FREE && newchain_task(s,s->tasks[i])) {
+        s->tasks[i]->stop=1;task_done(s,s->tasks[i]);
     }
     if(s->synthesis_only)return 0;
     /* Retry exact cleanup separately from measurement tasks. A lost ACK or
@@ -15234,8 +15270,8 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
     }
 
     int moved = 0;
-    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
-        task *t = &s->tasks[i];
+    for (size_t i = 0; i < s->task_count; i++) {
+        task *t = s->tasks[i];
         if (t->state == T_FREE) { continue; }
 
         if(t->state==T_GATE_INSTALL || t->state==T_GATE_VERIFY || t->state==T_GATE_COMMIT) {

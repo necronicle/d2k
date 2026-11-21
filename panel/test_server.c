@@ -51,7 +51,11 @@ static size_t request(const d2k_panel_config *cfg, const char *req,
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     server_call call = { .fd = sv[1], .cfg = cfg };
     pthread_t thread;
-    assert(pthread_create(&thread, NULL, serve_thread, &call) == 0);
+    pthread_attr_t attr;
+    assert(pthread_attr_init(&attr) == 0);
+    assert(pthread_attr_setstacksize(&attr, 64 * 1024) == 0);
+    assert(pthread_create(&thread, &attr, serve_thread, &call) == 0);
+    assert(pthread_attr_destroy(&attr) == 0);
     send_request(sv[0], req);
     (void)shutdown(sv[0], SHUT_WR);
     size_t used = 0;
@@ -425,6 +429,9 @@ static void test_oversized_request_header_gets_431(void) {
     char response[4096];
     (void)request(&cfg, req, response, sizeof response);
     assert(strstr(response, "HTTP/1.1 431 Request Header Fields Too Large") != NULL);
+    memcpy(req + 32 * 1024 - 4, "\r\n\r\n", 5);
+    (void)request(&cfg, req, response, sizeof response);
+    assert(strstr(response, "HTTP/1.1 404 Not Found") != NULL);
     free(req);
 }
 

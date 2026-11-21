@@ -148,9 +148,27 @@ d2k_table *d2k_track_new(size_t capacity) {
     return t;
 }
 
+void d2k_flow_forget_quic(d2k_flow *f) {
+    free(f->quic_assembly);
+    free(f->quic_replay);
+    f->quic_assembly = NULL;
+    f->quic_replay = NULL;
+}
+
+static void free_flow_state(d2k_flow *f) {
+    free(f->stun_requests);
+    f->stun_requests = NULL;
+    d2k_flow_forget_quic(f);
+}
+
 void d2k_track_free(d2k_table *t) {
     if (!t) {
         return;
+    }
+    if (t->used) {
+        for (size_t i = 0; i < t->cap; i++) {
+            if (t->state[i] == SLOT_USED) free_flow_state(&t->slots[i]);
+        }
     }
     free(t->slots);
     free(t->state);
@@ -180,6 +198,7 @@ d2k_flow *d2k_track_find(d2k_table *t, const d2k_key *k) {
  * сохраняется без надгробий. */
 static void remove_at(d2k_table *t, size_t hole) {
     size_t mask = t->cap - 1;
+    free_flow_state(&t->slots[hole]);
     t->state[hole] = SLOT_FREE;
     t->slots[hole].in_use = 0;
     t->used--;
@@ -199,6 +218,9 @@ static void remove_at(d2k_table *t, size_t hole) {
         if (movable) {
             t->slots[hole] = t->slots[j];
             t->state[hole] = SLOT_USED;
+            t->slots[j].stun_requests = NULL;
+            t->slots[j].quic_assembly = NULL;
+            t->slots[j].quic_replay = NULL;
             t->state[j] = SLOT_FREE;
             t->slots[j].in_use = 0;
             hole = j;
@@ -250,6 +272,7 @@ void d2k_track_new_connection(d2k_flow *f) {
     if (!f) {
         return;
     }
+    free_flow_state(f);
     d2k_flow keep = *f;
     memset(f, 0, sizeof *f);
     f->key = keep.key;

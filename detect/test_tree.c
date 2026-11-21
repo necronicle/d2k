@@ -716,7 +716,15 @@ static void test_loopback_guard_rejects_misresolved_target(void)
     memset(&opt, 0, sizeof(opt));
     opt.repeats = 1;
     trig(&t);
+    res.ntrace = 7;
+    res.trace[D2K_TRACE_MAX - 1].pass = 17;
     d2k_classify_run("127.0.0.1:443", &t, &opt, &res);
+    if (res.ntrace != 0 || res.trace[D2K_TRACE_MAX - 1].pass != 17)
+        fail("empty result reset touched unused trace storage");
+    res.trace[0].fail = 9;
+    d2k_obs *first = d2k_trace_add(&res, "first");
+    if (res.ntrace != 1 || first->fail != 0 || strcmp(first->probe, "first"))
+        fail("first active trace inherited stale data");
     if (res.verdict != D2K_DV_FLAKY) {
         fail("вердикт = %s (%s), ждали flaky", d2k_verdict_name(res.verdict), res.reason);
     }

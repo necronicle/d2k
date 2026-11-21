@@ -92,7 +92,47 @@ exit 1
   assert.equal(fs.readFileSync(path.join(tmp, 'opt/sbin/d2khttp'), 'utf8'), beforeStop);
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2kd')), 'failed stop must not install binaries');
   fs.unlinkSync(existingInit);
+  // Fail the atomic copy after its first bytes reach the destination filesystem.
+  const cp = path.join(tmp, 'bin/cp');
+  fs.writeFileSync(cp, `#!/bin/sh
+case "$2" in "${tmp}"/opt/sbin/*)
+    printf partial > "$2"
+    case "$INTERRUPT_COPY" in error) exit 1 ;; *) kill -"$INTERRUPT_COPY" "$PPID"; exit 0 ;; esac ;;
+esac
+exec /bin/cp "$@"
+`, { mode: 0o755 });
+  const sbin = path.join(tmp, 'opt/sbin');
+  const onlyLegacyBinary = () => assert.deepEqual(fs.readdirSync(sbin), ['d2khttp'], 'partial executable must be discarded');
+  const workdirs = () => fs.readdirSync(tmp).filter(n => n.startsWith('runtime-install.'));
+  for (const interrupt of ['error', 'HUP', 'TERM', 'INT', 'KILL']) {
+    const r = spawnSync('/bin/sh', [path.join(tmp, 'install.sh')], {
+      env: { ...env, INTERRUPT_COPY: interrupt }, encoding: 'utf8', timeout: 10000,
+    });
+    if (interrupt === 'KILL') {
+      assert.equal(r.signal, 'SIGKILL');
+      assert.equal(workdirs().length, 1, 'SIGKILL must leave actual workspace for retry');
+      assert.equal(fs.readdirSync(sbin).length, 2, 'SIGKILL must leave an actual partial copy for retry');
+    } else {
+      assert.equal(r.status, { error: 1, HUP: 129, TERM: 143, INT: 130 }[interrupt], r.stderr);
+      onlyLegacyBinary();
+      assert.deepEqual(workdirs(), [], 'private installer workspace must be removed on error or signal');
+    }
+  }
+  fs.unlinkSync(cp);
+  const live = `runtime-install.${process.pid}.Ab1234`;
+  const unmarked = 'runtime-install.2147480001.Ab1234';
+  const link = 'runtime-install.2147480001.link01';
+  const liveFile = `.d2k-install.${process.pid}.Ab1234`;
+  fs.mkdirSync(path.join(tmp, live));
+  fs.writeFileSync(path.join(tmp, live, '.d2k-owner'), String(process.pid));
+  fs.mkdirSync(path.join(tmp, unmarked));
+  fs.symlinkSync(path.join(tmp, 'source'), path.join(tmp, link));
+  fs.writeFileSync(path.join(sbin, liveFile), 'active');
   const installOut = run('install');
+  assert.deepEqual(workdirs().sort(), [live, unmarked, link].sort(), 'retry must reclaim only its abandoned workspace');
+  assert.equal(fs.readFileSync(path.join(sbin, liveFile), 'utf8'), 'active', 'parallel installer stage stays intact');
+  fs.unlinkSync(path.join(sbin, liveFile));
+  assert.deepEqual(fs.readdirSync(sbin).sort(), ['d2kc', 'd2kd', 'd2kfetch', 'd2kpanel', 'd2kshadow', 'd2ktg'], 'retry must reclaim the abandoned per-file stage');
   assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kfetch')), 'diagnostic tool must be installed');
   assert(fs.existsSync(path.join(tmp, 'opt/sbin/d2kshadow')), 'shadow daemon must be installed');
   for (const profile of ['modern', 'legacy']) {
@@ -101,7 +141,7 @@ exit 1
   }
   fs.writeFileSync(path.join(tmp, 'opt/d2k/state/shadow.d2km'), 'shadow knowledge');
   assert(!fs.existsSync(path.join(tmp, 'opt/sbin/d2khttp')), 'upgrade must remove the old d2khttp proxy binary');
-  fs.writeFileSync(path.join(tmp, 'bin/mv'), '#!/bin/sh\ncase "$2" in *.migration.*) ls -l "$2" | cut -c1-10 >> "$CALLS.migration-mode";; esac\nexec /bin/mv "$@"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(tmp, 'bin/mv'), '#!/bin/sh\ncase "$3" in */d2k/config) ls -l "$2" | cut -c1-10 >> "$CALLS.migration-mode";; esac\nexec /bin/mv "$@"\n', { mode: 0o755 });
   const migrationConfig = path.join(tmp, 'opt/d2k/config');
   const identityPath = path.join(tmp, 'opt/d2k/state/tg.identity');
   fs.writeFileSync(identityPath, 'existing-private-identity');

@@ -80,7 +80,7 @@ prepare_openwrt_hook() {
     openwrt_check || return 0
     [ -r /etc/rc.common ] && [ -r /lib/functions/procd.sh ] || return 0
     # Stage on the host filesystem before stopping/replacing the runtime.
-    OPENWRT_STAGE=$(mktemp "$OPENWRT_INIT.XXXXXX") || die "не подготовить хук OpenWrt"
+    OPENWRT_STAGE=$(mktemp "${OPENWRT_INIT%/*}/.d2k-install.$$.XXXXXX") || die "не подготовить хук OpenWrt"
     fetch "files/d2k-openwrt-init" "$OPENWRT_STAGE"
     if ! grep -qx '# D2K-owned OpenWrt boot bridge v1' "$OPENWRT_STAGE" ||
        ! sh -n "$OPENWRT_STAGE" || ! chmod 0755 "$OPENWRT_STAGE"; then
@@ -96,15 +96,114 @@ install_openwrt_hook() (
     echo 'd2k: автозапуск OpenWrt включён (ожидание /opt, затем D2K)'
 )
 TMP=
+FILE_STAGE=
 
 say()  { echo "d2k: $*"; }
-die()  { echo "d2k: $*" >&2; cleanup; exit 1; }
+die()  { echo "d2k: $*" >&2; exit 1; }
 cleanup() {
+    [ -z "$FILE_STAGE" ] || rm -f "$FILE_STAGE"
     [ -z "$OPENWRT_STAGE" ] || rm -f "$OPENWRT_STAGE"
     [ -z "$TMP" ] || rm -rf "$TMP"
-    TMP=
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# PID plus a mktemp suffix identifies this run's work on each filesystem.
+# Only the download directory is recursive; it also carries an ownership marker.
+install_uid=$(id -u)
+owned_entry() {
+    # shellcheck disable=SC2012  # Only the numeric owner field of one entry is read.
+    [ -e "$1" ] && [ ! -L "$1" ] &&
+        [ "$(LC_ALL=C ls -dn "$1" | awk '{print $3}')" = "$install_uid" ]
+}
+remove_abandoned_stages() {
+    for leftover in "$1".[0-9]*.??????; do
+        owned_entry "$leftover" || continue
+        case "${leftover##*.}" in *[!A-Za-z0-9]*) continue ;; esac
+        owner=${leftover#"$1".}
+        owner=${owner%.*}
+        case "$owner" in ''|0*|*[!0-9]*) continue ;; esac
+        kill -0 "$owner" 2>/dev/null && continue
+        if [ "$2" = directory ]; then
+            [ -d "$leftover" ] && [ -f "$leftover/.d2k-owner" ] &&
+                [ "$(cat "$leftover/.d2k-owner")" = "$owner" ] || continue
+            rm -rf "$leftover"
+        elif [ -f "$leftover" ]; then
+            rm -f "$leftover"
+        fi
+    done
+}
+# The published updater verifies the archive and completes previous.tar before
+# invoking this installer. Recognize only its two shipped paths and directory lock.
+legacy_update_handoff() {
+    [ "${D2K_UPDATING:-}" = 1 ] && [ -n "${D2K_RELEASE_ID:-}" ] || return 1
+    case "${D2K_LOCAL:-}" in /tmp/d2k-update/release|"$DIR/.update/release") ;; *) return 1 ;; esac
+    [ "$0" = "$D2K_LOCAL/scripts/install.sh" ] || return 1
+    legacy_work=${D2K_LOCAL%/release}
+    [ -d "$legacy_work/lock" ] && [ -d "$D2K_LOCAL" ] || return 1
+    for file in "$DIR/d2k-update.sh" "$legacy_work/lock/pid" "$legacy_work/previous.tar" "$legacy_work/release.tar.gz"; do
+        [ -f "$file" ] && [ -s "$file" ] || return 1
+    done
+    for entry in "$DIR" "$DIR/d2k-update.sh" "$legacy_work" "$D2K_LOCAL" "$legacy_work/lock" \
+                 "$legacy_work/lock/pid" "$legacy_work/previous.tar" "$legacy_work/release.tar.gz"; do
+        [ ! -L "$entry" ] || return 1
+        # shellcheck disable=SC2012  # Numeric owner and permissions of one known path.
+        LC_ALL=C ls -dn "$entry" | awk -v uid="$install_uid" '
+            $3 == uid && substr($1,6,1) != "w" && substr($1,9,1) != "w" {ok=1}
+            END {exit !ok}' || return 1
+    done
+    [ "$(cat "$legacy_work/lock/pid")" = "$PPID" ] && kill -0 "$PPID" 2>/dev/null || return 1
+    [ -r "/proc/$PPID/cmdline" ] || return 1
+    # Preserve argv boundaries and reject an embedded newline in any argument.
+    tr '\000\n' '\n?' < "/proc/$PPID/cmdline" | awk -v script="$DIR/d2k-update.sh" '
+        NR == 1 {shell=($0 == "/bin/sh" || $0 == "sh" || $0 == "/bin/ash" || $0 == "ash")}
+        NR == 2 {path=($0 == script)}
+        NR == 3 {install=($0 == "install")}
+        NR == 4 {manual=($0 == "manual")}
+        END {exit !(shell && path && install && (NR == 3 || (NR == 4 && manual)))}'
+}
+# D2K verified installer workspace v1
+# exec keeps the PID across the signed bootstrap handoff. Only its own mktemp
+# workspace can be adopted; ordinary local bundles belong to their caller.
+if [ "${1:-}" = --verified-work ]; then
+    work=${0%/release/scripts/install.sh}
+    case "$work" in /tmp/d2k-install."$$".??????) ;; *) die "неверный каталог выпуска" ;; esac
+    case "${work##*.}" in *[!A-Za-z0-9]*) die "неверное имя каталога выпуска" ;; esac
+    owned_entry "$work" &&
+        [ "${D2K_LOCAL:-}" = "$work/release" ] &&
+        [ "$(cat "$work/.d2k-owner")" = "$$" ] || die "чужой каталог выпуска"
+    TMP=$work
+# D2K verified update workspace v1
+elif [ "${1:-}" = --verified-update ]; then
+    update_work=${D2K_LOCAL%/release}
+    claim=$update_work/lock.$PPID
+    [ "${2:-}" = "$PPID" ] && [ "${D2K_UPDATING:-}" = 1 ] &&
+        [ "$D2K_LOCAL" = "$update_work/release" ] && [ "$0" = "$D2K_LOCAL/scripts/install.sh" ] &&
+        owned_entry "$update_work" && owned_entry "$D2K_LOCAL" && owned_entry "$claim" &&
+        [ "$(readlink "$update_work/lock")" = "lock.$PPID" ] &&
+        [ "$(cat "$claim/pid")" = "$PPID" ] && [ "$(cat "$claim/installer")" = "$$" ] ||
+        die "обновление не передало владение каталогом выпуска"
+    # Only the extracted tree is ours. The backup and lock remain with the updater.
+    chmod 0700 "$D2K_LOCAL" || die "не защитить временный каталог выпуска"
+    TMP=$D2K_LOCAL
+elif [ "$#" = 0 ] && legacy_update_handoff; then
+    # If the old updater dies, its retry can reuse release/ while this child
+    # still runs. Give the child its own name on the same filesystem first.
+    TMP=$(mktemp -d "$legacy_work/.d2k-install.$$.XXXXXX") || TMP=
+    if [ -n "$TMP" ]; then
+        if printf '%s\n' "$$" > "$TMP/.d2k-owner" && mv "$D2K_LOCAL" "$TMP/release"; then
+            D2K_LOCAL=$TMP/release
+            if [ "$(cat "$legacy_work/lock/pid" 2>/dev/null)" = "$PPID" ]; then
+                rm -f "$legacy_work/release.tar.gz" || say "архив останется до завершения обновления"
+            fi
+        else
+            rm -rf "$TMP"
+            TMP=
+        fi
+    fi
+fi
 
 # --- арка ----------------------------------------------------------------
 #
@@ -289,7 +388,18 @@ fi
 # Сперва всё скачивается и проверяется, и только потом заменяется. Замена по
 # ходу загрузки оставляет систему в состоянии, которого не предусматривал
 # никто.
-TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать временный каталог"
+remove_abandoned_stages /tmp/d2k-install directory
+for parent in /tmp/d2k-update "$DIR/.update"; do
+    if owned_entry "$parent"; then remove_abandoned_stages "$parent/.d2k-install" directory; fi
+done
+for parent in "$SBIN" "$DIR" "$DIR/files" "$DIR/files/fake" "$DIR/panel" "$DIR/panel/fonts" \
+              "${INIT%/*}" "${OPENWRT_INIT%/*}" /opt/etc/ndm/netfilter.d; do
+    remove_abandoned_stages "$parent/.d2k-install" file
+done
+if [ -z "$TMP" ]; then
+    TMP=$(mktemp -d /tmp/d2k-install."$$".XXXXXX) || die "не создать временный каталог"
+    printf '%s\n' "$$" > "$TMP/.d2k-owner"
+fi
 
 # Место под саму загрузку — ДО неё. Комплект скачивается целиком в /tmp (на
 # роутере это tmpfs, то есть RAM) и только потом раскладывается: не хватило —
@@ -300,12 +410,15 @@ TMP=$(mktemp -d /tmp/d2k-install.XXXXXX) || die "не создать време�
 # Перед публикацией размеры всех
 # архитектур сверяются с этими лимитами в scripts/test-install-manifest.sh.
 TMP_NEED_KB=14336
-# При установке выпуска распакованное дерево и раскладка одновременно занимают /tmp.
+# В /tmp одновременно находятся архив и распакованное дерево. Старому
+# подписанному установщику может потребоваться и вторая копия для раскладки.
 TMP_RELEASE_NEED_KB=28672
 # Оба числа сторожит scripts/test-install-manifest.sh: он измеряет и
 # раскладку, и дерево выпуска и отвергает число ниже замера.
 need_kb=$TMP_NEED_KB
 [ "$SOURCE" != release ] || need_kb=$TMP_RELEASE_NEED_KB
+# При передаче владения файлы уже находятся на рабочей файловой системе.
+case "${D2K_LOCAL:-}" in "$TMP"|"$TMP/release") need_kb=0 ;; esac
 tmp_avail_kb=$(df -kP "$TMP" 2>/dev/null | awk 'NR == 2 { print $4 }')
 case "$tmp_avail_kb" in
     ''|*[!0-9]*) say "не узнать свободное место в $TMP — продолжаю" ;;
@@ -347,7 +460,11 @@ fetch() {
     # архива выпуска и проверка С ЧИСТОГО СОСТОЯНИЯ в лаборатории — обещать
     # рабочую установку, ни разу её не пройдя, нельзя (§9).
     if [ -n "${D2K_LOCAL:-}" ]; then
-        cp "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
+        if [ "$D2K_LOCAL" = "$TMP/release" ] || [ "$D2K_LOCAL" = "$TMP" ]; then
+            mv -f "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
+        else
+            cp "$D2K_LOCAL/$1" "$2" || die "нет $D2K_LOCAL/$1"
+        fi
         [ -s "$2" ] || die "$1 оказался пустым"
     else
         fetch_url "$BASE/$1" "$2"
@@ -480,8 +597,12 @@ if [ "$SOURCE" = release ]; then
     say "выпуск $rid: подпись сошлась, ставлю его установщиком"
     # Ставит установщик ИЗ архива: на роутер попадает только подписанное, и
     # комплект раскладывает тот же код, что при ночном обновлении.
-    D2K_LOCAL="$TMP/release" D2K_RELEASE_ID="$rid" D2K_SOURCE=local \
-        sh "$TMP/release/scripts/install.sh" || exit $?
+    export D2K_LOCAL="$TMP/release" D2K_RELEASE_ID="$rid" D2K_SOURCE=local
+    if grep -qx '# D2K verified installer workspace v1' "$D2K_LOCAL/scripts/install.sh"; then
+        exec sh "$D2K_LOCAL/scripts/install.sh" --verified-work
+    fi
+    # Older signed installers create a separate workspace; keep its caller's EXIT trap.
+    sh "$D2K_LOCAL/scripts/install.sh" || exit $?
     exit 0
 fi
 say "загрузка"
@@ -575,6 +696,11 @@ rc=0
 [ "$rc" = 2 ] || die "скачанный d2kshadow не запускается на этой системе (код $rc)"
 say "проверено: $("$TMP/d2kpanel" --version | head -1)"
 
+prepare_openwrt_hook
+if [ "${D2K_LOCAL:-}" = "$TMP/release" ]; then
+    rm -rf "$TMP/release"
+fi
+
 # --- OpenWrt на nftables: место, пакеты, ядро ----------------------------
 #
 # Всё до остановки прежней версии: отказ здесь оставляет работающую установку.
@@ -583,7 +709,7 @@ if [ "$FW" = nft ]; then
     # Место под свои файлы — ПОСЛЕ пакетов: без USB /opt — каталог той же
     # корневой ФС (флеш), и пакеты (~7 МБ) берут из того же места (ревью
     # 07.10). Нехватку на сами пакеты отвергает менеджер. Нужно: новое минус
-    # заменяемое старое плюс самый большой файл (он лежит дважды, пока .new не
+    # заменяемое старое плюс самый большой файл (он лежит дважды, пока временный файл не
     # встал на место).
     opt_fs=/opt; [ -d "$opt_fs" ] || opt_fs=/
     avail_kb=$(df -kP "$opt_fs" 2>/dev/null | awk 'NR == 2 { print $4 }')
@@ -617,7 +743,6 @@ if [ "$FW" = nft ]; then
     [ -e /proc/net/netfilter/nfnetlink_queue ] ||
         die "ядро без nfnetlink_queue — $(openwrt_add_cmd kmod-nfnetlink-queue)"
 fi
-prepare_openwrt_hook
 
 # --- остановка прежней версии --------------------------------------------
 if [ -x "$INIT" ]; then
@@ -632,14 +757,14 @@ fi
 mkdir -p "$DIR/state" "$DIR/run" "$DIR/log" "$DIR/panel" "$DIR/files/fake" "$SBIN" /opt/etc/init.d
 
 install_atomic() {
-    cp "$1" "$2.new" || die "не записать $2.new"
-    chmod +x "$2.new"
-    mv -f "$2.new" "$2" || die "не подменить $2"
+    FILE_STAGE=$(mktemp "${2%/*}/.d2k-install.$$.XXXXXX") || die "не подготовить $2"
+    cp "$1" "$FILE_STAGE" || die "не записать $2"
+    chmod "${3:-0755}" "$FILE_STAGE" || die "не установить права $2"
+    mv -f "$FILE_STAGE" "$2" || die "не подменить $2"
+    FILE_STAGE=
 }
 install_data_atomic() {
-    cp "$1" "$2.new" || die "не записать $2.new"
-    chmod 0644 "$2.new"
-    mv -f "$2.new" "$2" || die "не подменить $2"
+    install_atomic "$1" "$2" 0644
 }
 install_atomic "$TMP/d2kpanel" "$SBIN/d2kpanel"
 install_atomic "$TMP/d2kc"   "$SBIN/d2kc"
@@ -679,8 +804,10 @@ install_atomic "$TMP/d2k-log-maintenance.sh" "$DIR/d2k-log-maintenance.sh"
 install_atomic "$TMP/d2k-update.sh" "$DIR/d2k-update.sh"
 # Что стоит и под какую арку — для автообновления. Выпуск называет себя сам
 # (D2K_RELEASE_ID от d2k-update.sh); ручная установка из main выпуска не знает.
-printf '%s\n' "$ARCH" > "$DIR/release-arch.new" && mv -f "$DIR/release-arch.new" "$DIR/release-arch"
-printf '%s\n' "${D2K_RELEASE_ID:-}" > "$DIR/release-id.new" && mv -f "$DIR/release-id.new" "$DIR/release-id"
+printf '%s\n' "$ARCH" > "$TMP/release-arch"
+install_data_atomic "$TMP/release-arch" "$DIR/release-arch"
+printf '%s\n' "${D2K_RELEASE_ID:-}" > "$TMP/release-id"
+install_data_atomic "$TMP/release-id" "$DIR/release-id"
 install_atomic "$TMP/d2k-tg-firewall.sh" "$DIR/d2k-tg-firewall.sh"
 install_atomic "$TMP/d2k-tg-watchdog.sh" "$DIR/d2k-tg-watchdog.sh"
 install_atomic "$TMP/d2k-instagram-dns.sh" "$DIR/d2k-instagram-dns.sh"
@@ -701,7 +828,7 @@ fi
 
 # Конфигурация принадлежит человеку: существующую не трогаем.
 if [ ! -f "$DIR/config" ]; then
-    install_data_atomic "$TMP/config" "$DIR/config"
+    install_atomic "$TMP/config" "$DIR/config" 0600
     say "создана конфигурация $DIR/config"
 else
     say "конфигурация уже есть — не трогаю"
@@ -716,7 +843,7 @@ if [ "$PANEL_LISTEN_CURRENT" = "127.0.0.1:8090" ]; then
     [ -n "$PANEL_LAN_IP" ] || die "не найден приватный LAN IPv4-адрес; панель не будет выставлена в интернет"
     sed "s|^PANEL_LISTEN=.*|PANEL_LISTEN=$PANEL_LAN_IP:8090|" "$DIR/config" > "$TMP/config.lan" || \
         die "не настроить LAN-адрес панели"
-    install_data_atomic "$TMP/config.lan" "$DIR/config"
+    install_atomic "$TMP/config.lan" "$DIR/config" 0600
     say "панель доступна в LAN: http://$PANEL_LAN_IP:8090/"
 fi
 # В конфигурации хранится relay secret. Содержимое сохраняем, но ограничиваем
@@ -740,14 +867,9 @@ function endpoint(line, key, old, new, value) {
     print endpoint(line, "D2K_RELAY_URL", "https://213.176.74.63.nip.io:9443/resolve", "https://85.192.60.175.nip.io:9443/resolve")
 }' "$DIR/config" > "$TMP/config.endpoint" || die "не обновить адрес VPS"
 # A private sibling keeps credentials private before and after atomic rename.
-(
-    umask 077
-    endpoint_stage=$(mktemp "$DIR/config.migration.XXXXXX") || exit 1
-    trap 'rm -f "$endpoint_stage"' EXIT HUP INT TERM
-    cat "$TMP/config.endpoint" > "$endpoint_stage" || exit 1
-    chmod 0600 "$endpoint_stage" || exit 1
-    mv -f "$endpoint_stage" "$DIR/config"
-) || die "не сохранить адрес VPS"
+install_atomic "$TMP/config.endpoint" "$DIR/config" 0600
+rm -rf "$TMP"
+TMP=
 # Upgrade the old unconfigured Telegram template without changing a user's
 # enable/disable choice or custom relay. No fleet credential is installed.
 TG_INSTALL_URL=$(sed -n 's/^TG_RELAY_URL=//p' "$DIR/config" | tail -n 1)

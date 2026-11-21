@@ -233,7 +233,8 @@ static const policy_item *policy_resolve(const policy_item *items,size_t count,c
     for(size_t i=0;i<count;i++)if(!strcmp(items[i].name,selected)){if(match)return NULL;match=&items[i];}
     return match;
 }
-static int api_policies(int fd,const d2k_panel_config *cfg,const char *req,const char *method) {
+/* Keep the policy list and its reply buffers off the stack of every other route. */
+static __attribute__((noinline)) int api_policies(int fd,const d2k_panel_config *cfg,const char *req,const char *method) {
     int post=!strcmp(method,"POST");
     if(!post&&strcmp(method,"GET"))return response(fd,405,"Method Not Allowed","text/plain","method not allowed\n",19);
     if(post&&(!cfg||!cfg->control_enabled||!d2k_panel_same_origin(req)))return policy_reply(fd,403,"Управление разрешено только с этой панели");

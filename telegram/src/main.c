@@ -78,7 +78,7 @@ static int session_send(void *opaque,const uint8_t *data,size_t len) {
     session_transport *t=opaque;return tg_ws_write_binary(t->ssl,data,len);
 }
 static int session_read(void *opaque,uint8_t *dst,size_t cap,size_t *len) {
-    session_transport *t=opaque;int rc=tg_ws_read_binary(t->ssl,dst,cap,len);return rc==0?0:-1;
+    session_transport *t=opaque;int rc=tg_ws_read_binary_prefix(t->ssl,dst,cap,len);return rc==0?0:-1;
 }
 
 static int establish_ws(SSL_CTX *ctx,const tg_relay_url *url,SSL **out_ssl,int *out_fd) {
@@ -158,7 +158,7 @@ static int run_daemon(const char *config_path) {
         SSL *ssl=NULL;int relay_fd=-1;int protocol_v2=1;uint32_t window=TG_DEFAULT_WINDOW;
         if(establish_ws(ctx,&url,&ssl,&relay_fd)!=0){log_msg("verified relay WSS connection failed; will retry");failures++;
             interruptible_wait(tg_reconnect_delay_ms(failures,0,healthy,random_unit()));continue;}
-        session_transport transport={.ssl=ssl};tg_session_io io={.ctx=&transport,.send_binary=session_send,.read_binary=session_read};
+        session_transport transport={.ssl=ssl};tg_session_io io={.ctx=&transport,.send_binary=session_send,.read_binary_prefix=session_read};
         tg_session_state session={0};time_t began=time(NULL);
         int auth=tg_session_authenticate_v2(&io,&identity,TG_BUILD,(int64_t)began,&session);
         if(auth==TG_SESSION_FALLBACK_V1) {

@@ -1209,7 +1209,7 @@ SCHED_TEST_OBJ = dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) boxprops.o ../sy
     x25519.o verify.o tls12.o p256.o quicconn.o h3.o
 TESTS += test_sched_trial
 TESTS += test_application_request
-test_application_request: test_application_request.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_application_request: test_application_request.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 check: test-application-request
 .PHONY: test-application-request
@@ -1232,7 +1232,7 @@ test-sched-trial: test_sched_trial
 test_sched: test_sched.c $(SCHED_TEST_OBJ) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(SCHED_TEST_OBJ) $(TEST_LDFLAGS)
 
-test_sched_summary: test_sched_summary.c sched.c stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_summary: test_sched_summary.c sched.c test_task_slots.h stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: test-sched-summary
 test-sched-summary: test_sched_summary
@@ -1553,7 +1553,7 @@ cross-tls-rx12:
 	$(MIPSEL_CC) $(CFLAGS) -o /tmp/d2k-tls-rx12-mipsel test_tls_rx12.c suite.c p256.c tls13core.c crypto.c x25519.c -lpthread
 
 # A blocked QUIC question sequence must yield a measurement slot to TCP.
-test_sched_quic_yield: test_sched_quic_yield.c sched.c stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_quic_yield: test_sched_quic_yield.c sched.c test_task_slots.h stunprobe.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 .PHONY: test-sched-quic-yield
 test-sched-quic-yield: test_sched_quic_yield
@@ -1659,7 +1659,7 @@ check: test-stun-candidate
 .PHONY: test-stun-candidate
 test-stun-candidate: test_stun_candidate
 	./test_stun_candidate
-test_stun_candidate: test_stun_candidate.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_stun_candidate: test_stun_candidate.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 
 TESTS += test_service_confirmation
@@ -1667,7 +1667,7 @@ check: test-service-confirmation
 .PHONY: test-service-confirmation
 test-service-confirmation: test_service_confirmation
 	./test_service_confirmation
-test_service_confirmation: test_service_confirmation.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_service_confirmation: test_service_confirmation.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 
 TESTS += test_voice_proof_context
@@ -1675,7 +1675,7 @@ check: test-voice-proof-context
 .PHONY: test-voice-proof-context
 test-voice-proof-context: test_voice_proof_context
 	./test_voice_proof_context
-test_voice_proof_context: test_voice_proof_context.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_voice_proof_context: test_voice_proof_context.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 
 TESTS += test_raw_measure_sched
@@ -1683,7 +1683,7 @@ TESTS += test_raw_measure_sched
 TESTS += test_sched_gate
 
 .PHONY: test-raw-measure-sched
-test_raw_measure_sched: test_raw_measure_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+test_raw_measure_sched: test_raw_measure_sched.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 test-raw-measure-sched: test_raw_measure_sched
 	./test_raw_measure_sched
@@ -1750,7 +1750,7 @@ check: test-preflight-verify
 .PHONY: test-preflight-verify
 
 # Gate lifecycle, socketpair and existing verifier hooks; no listeners.
-test_sched_gate: test_sched_gate.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_gate: test_sched_gate.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 test-sched-gate: test_sched_gate
 	./test_sched_gate
@@ -1765,7 +1765,7 @@ san-sched-gate: hello_profiles.inc tcp1620_whitelist.inc
 TESTS += test_memory_accounting test_httpsearch_memory
 .PHONY: test-memory-accounting
 check: test-memory-accounting
-test_memory_accounting: test_memory_accounting.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_memory_accounting: test_memory_accounting.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 test_httpsearch_memory: test_httpsearch_memory.c httpsearch.c $(HTTP_READ_OBJ) httpup_logic.c plantlv.o quic.o quicwire.o crypto.o $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< httpup_logic.c plantlv.o quic.o quicwire.o crypto.o ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(HTTP_READ_OBJ) $(TEST_LDFLAGS)
@@ -1775,7 +1775,7 @@ test-memory-accounting: test_memory_accounting test_httpsearch_memory
 
 TESTS += test_sched_force
 .PHONY: test-sched-force
-test_sched_force: test_sched_force.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
+test_sched_force: test_sched_force.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 test-sched-force: test_sched_force
 	./test_sched_force
@@ -1813,7 +1813,7 @@ test_shadow_queue: test_shadow_queue.c shadow_queue.c include/d2k_shadow_queue.h
 	$(CC) $(CFLAGS) -o $@ test_shadow_queue.c shadow_queue.c
 test_shadow: test_shadow.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c $(SHADOW_HDR) $(HDR)
 	$(CC) $(CFLAGS) -I../model/include -o $@ test_shadow.c shadow.c shadow_queue.c domain.c $(D2KEXP_COMMON_SRC) ../model/sim.c -lpthread
-test_shadow_sched: test_shadow_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+test_shadow_sched: test_shadow_sched.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 TESTS += test_shadow_queue test_shadow test_shadow_sched
 .PHONY: test-shadow
@@ -1838,7 +1838,7 @@ test-newchain: test_newchain test_newchain_sched
 	./test_newchain
 	./test_newchain_sched
 
-test_newchain_sched: test_newchain_sched.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+test_newchain_sched: test_newchain_sched.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 TESTS += test_newchain_sched
 
@@ -1921,7 +1921,7 @@ check: test-dns-capture
 check: test-dns-service
 test-dns-service: test_dns_service
 	./test_dns_service
-test_dns_service: test_dns_service.c sched.c sched_dns.inc dns_question_wire.inc $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+test_dns_service: test_dns_service.c sched.c test_task_slots.h sched_dns.inc dns_question_wire.inc $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 
 TESTS += test_doh_health_route
@@ -1929,7 +1929,7 @@ TESTS += test_doh_health_route
 check: test-doh-health-route
 test-doh-health-route: test_doh_health_route
 	./test_doh_health_route
-test_doh_health_route: test_doh_health_route.c sched.c $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
+test_doh_health_route: test_doh_health_route.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR) libd2k_udp.a
 	$(CC) $(CFLAGS) -o $@ $< $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(TEST_LDFLAGS)
 
 # Keep this after every TESTS +=: the target list expands immediately.

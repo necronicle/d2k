@@ -24,6 +24,7 @@ builds/*
 /panel/test_config_values
 /panel/test_header_deadline
 /panel/test_response_deadline
+/panel/test_response_memory
 /panel/test_status_cache
 /panel/test_policies
 /panel/test_policy_review

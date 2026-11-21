@@ -29,6 +29,14 @@
 #include "d2k_quicsnap.h"
 #include "d2k_crypto.h"
 
+static int fail_quic_alloc;
+static void *quic_test_malloc(size_t size) {
+    return fail_quic_alloc ? NULL : malloc(size);
+}
+#define malloc quic_test_malloc
+#include "quic_flow.h"
+#undef malloc
+
 static int fails;
 #define CHECK(cond, msg)                                   \
     do {                                                   \
@@ -532,6 +540,51 @@ static void test_quic_cross_datagram_assembly(void) {
     CHECK(r.applied && r.n_out > 0,
           "после сборки имени план не применился к распознанной QUIC-цели");
     d2k_session_free(s);
+}
+
+static void test_quic_flow_storage(void) {
+    d2k_flow f = {0};
+    int complete;
+    char name[256];
+    uint8_t first[1500], second[1500], bad[1500];
+    size_t first_len, second_len;
+    if (d2k_test_pq_initials("example.com", first, &first_len, second, &second_len)) {
+        CHECK(0, "QUIC memory fixture");
+        return;
+    }
+    fail_quic_alloc = 1;
+    CHECK(flow_quic_feed(&f, v1_initial, sizeof v1_initial, name, &complete) == 1 &&
+          complete && !strcmp(name, "example.com") && !f.quic_assembly && !f.quic_replay,
+          "one complete datagram can be identified while allocations fail");
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) < 0 &&
+          !complete && !f.quic_assembly && !f.quic_replay, "allocation failure leaves no partial state");
+    fail_quic_alloc = 0;
+    memcpy(bad, first, first_len);
+    bad[first_len - 1] ^= 1;
+    CHECK(flow_quic_feed(&f, bad, first_len, name, &complete) < 0 && !f.quic_assembly,
+          "bad authentication does not leave an assembly behind");
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 0 &&
+          !complete && f.quic_assembly, "incomplete authenticated Initial keeps its CRYPTO bytes");
+    fail_quic_alloc = 1;
+    CHECK(flow_quic_feed(&f, second, second_len, name, &complete) == 1 &&
+          complete && !strcmp(name, "example.com"), "completion survives a failed compaction");
+    fail_quic_alloc = 0;
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 1 &&
+          complete && !strcmp(name, "example.com") && !f.quic_assembly && f.quic_replay,
+          "partial retransmit recovers the name and releases the full assembly");
+    CHECK(flow_quic_feed(&f, bad, first_len, name, &complete) < 0 && !complete,
+          "same DCID cannot reuse the completed name without authentication");
+    memcpy(bad, v1_initial, sizeof v1_initial);
+    bad[sizeof v1_initial - 1] ^= 1;
+    CHECK(flow_quic_feed(&f, bad, sizeof v1_initial, name, &complete) < 0 &&
+          !complete && !f.quic_assembly, "invalid new DCID does not displace a completed flight");
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 1 && complete &&
+          !strcmp(name, "example.com"), "completed flight survives an invalid new DCID");
+    d2k_track_new_connection(&f);
+    CHECK(!f.quic_assembly && !f.quic_replay, "new incarnation discarded the previous flight");
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 0 && !complete,
+          "an old head fragment alone cannot identify the next connection");
+    d2k_flow_forget_quic(&f);
 }
 
 /* СНИМОК QUIC — ВЕСЬ ПОЛЁТ КЛИЕНТА, А НЕ ПОСЛЕДНЯЯ ДАТАГРАММА (задача 66).
@@ -3436,6 +3489,7 @@ int main(void) {
     test_direction_by_hook();
     test_quic_non443_client_hold();
     test_quic_cross_datagram_assembly();
+    test_quic_flow_storage();
     test_quic_snapshot_is_every_initial();
     test_quic_snapshot_waits_for_whole_hello();
     test_quic_snapshot_skips_other_flow();

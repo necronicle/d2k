@@ -13,6 +13,7 @@ int accounting_madvise(void *,size_t,int);
 #define pthread_join accounting_join
 #define madvise accounting_madvise
 #include "sched.c"
+#include "test_task_slots.h"
 #undef pthread_create
 #undef pthread_join
 #undef madvise
@@ -53,17 +54,27 @@ static d2k_diag_counts counts(d2k_sched *s) {
 }
 int main(void) {
     d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0);assert(s);
+    assert(sizeof s->tasks <= SCHED_MAX_TASKS * sizeof(void *));
+    assert(s->task_count == 0 && measure_slots(s) == SCHED_MEASURE_SLOTS);
+    for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
+        task *t = task_free_slot(s);
+        assert(t && s->task_count == i + 1);
+        t->state = T_WATCHING;
+    }
+    assert(!task_free_slot(s) && !measure_slots(s));
+    s->tasks[3]->state = T_FREE;
+    assert(task_free_slot(s) == s->tasks[3] && measure_slots(s) == 1);
     d2k_sched_stun_hook=no_network;
     for(int batch=0;batch<3;batch++) {
         for(int i=0;i<SCHED_MAX_TASKS;i++) {
-            task *t=&s->tasks[i]; task_reset(s,t);
+            task *t=test_task_at(s, i); task_reset(s,t);
             strcpy(t->ip,"192.0.2.1");t->family=4;t->port=3478;
             assert(start_worker(s,t,JOB_STUN)==0);
             /* Аргумент — постоянный слот задачи, а не выделение на каждый
                поток: память не переходит между потоками через malloc/free. */
-            assert(last_arg==(void *)&s->wargs[i]);
+            assert(last_arg==(void *)&((task_slot *)t)->worker);
         }
-        for(int i=0;i<SCHED_MAX_TASKS;i++) join_worker(&s->tasks[i]);
+        for(int i=0;i<SCHED_MAX_TASKS;i++) join_worker(test_task_at(s, i));
         d2k_diag_counts c=counts(s);
         assert(c.memory.workers_started==(uint64_t)(batch+1)*SCHED_MAX_TASKS);
         assert(c.memory.workers_joined==c.memory.workers_started);
@@ -73,51 +84,51 @@ int main(void) {
     }
     /* Delay entry of one real pthread to measure an owned, not yet freed,
        argument deterministically. */
-    hold_arg=1;assert(!start_worker(s,&s->tasks[0],JOB_STUN));
+    hold_arg=1;assert(!start_worker(s,test_task_at(s, 0),JOB_STUN));
     d2k_diag_counts held=counts(s);
     assert(held.memory.worker_args_live==1);
     assert(held.memory.worker_args_live_bytes==sizeof(worker_arg));
     pthread_mutex_lock(&arg_mu);release_arg=1;pthread_cond_signal(&arg_cv);pthread_mutex_unlock(&arg_mu);
-    join_worker(&s->tasks[0]);hold_arg=0;
+    join_worker(test_task_at(s, 0));hold_arg=0;
     held=counts(s);assert(held.memory.worker_args_live==0 && held.memory.worker_args_live_bytes==0);
     /* Повторный запуск на задаче с живым (завершившимся, но не присоединённым)
        потоком сначала присоединяет прежний: иначе его стек и слот остаются
        навсегда, а аргумент нового потока затирает ещё не прочитанный. */
     release_arg=0;hold_arg=1;
-    assert(!start_worker(s,&s->tasks[1],JOB_STUN));
+    assert(!start_worker(s,test_task_at(s, 1),JOB_STUN));
     pthread_mutex_lock(&arg_mu);release_arg=1;pthread_cond_signal(&arg_cv);pthread_mutex_unlock(&arg_mu);
     hold_arg=0;
     d2k_diag_counts ov=counts(s);
-    assert(!start_worker(s,&s->tasks[1],JOB_STUN));
+    assert(!start_worker(s,test_task_at(s, 1),JOB_STUN));
     held=counts(s);
     assert(held.memory.workers_joined==ov.memory.workers_joined+1);
     assert(held.memory.worker_start_while_live==ov.memory.worker_start_while_live+1);
-    join_worker(&s->tasks[1]);
+    join_worker(test_task_at(s, 1));
     held=counts(s);
     assert(held.memory.workers_started==held.memory.workers_joined);
     assert(held.memory.worker_args_live==0);
     d2k_diag_counts before=counts(s);
     d2k_sched_spawn_hook=refuse_spawn;
-    assert(start_worker(s,&s->tasks[0],JOB_STUN)==-1);
+    assert(start_worker(s,test_task_at(s, 0),JOB_STUN)==-1);
     d2k_sched_spawn_hook=NULL;
     d2k_diag_counts after=counts(s);
     assert(after.memory.workers_started==before.memory.workers_started);
     assert(after.memory.worker_args_allocated==before.memory.worker_args_allocated+1);
     assert(after.memory.worker_args_freed==before.memory.worker_args_freed+1);
     assert(after.memory.worker_args_live==0);
-    assert(start_worker(s,&s->tasks[0],JOB_STUN)==0);
-    join_error=EINVAL; join_worker(&s->tasks[0]); join_error=0;
+    assert(start_worker(s,test_task_at(s, 0),JOB_STUN)==0);
+    join_error=EINVAL; join_worker(test_task_at(s, 0)); join_error=0;
     after=counts(s);
     assert(after.memory.worker_join_errors==1);
     assert(after.memory.workers_started==after.memory.workers_joined+1);
     /* The pre-existing behavior clears th_live even on join failure. */
-    assert(!s->tasks[0].th_live);
-    before=counts(s); task_reset(s,&s->tasks[0]); after=counts(s);
+    assert(!test_task_at(s, 0)->th_live);
+    before=counts(s); task_reset(s,test_task_at(s, 0)); after=counts(s);
     assert(after.memory.task_madvise_calls==before.memory.task_madvise_calls+1);
     assert(after.memory.task_madvise_successes==before.memory.task_madvise_successes+1);
     assert(after.memory.task_madvise_requested_bytes>before.memory.task_madvise_requested_bytes);
     assert(after.memory.task_madvise_last_errno==0);
-    before=after;page_error=ENOMEM;task_reset(s,&s->tasks[0]);after=counts(s);
+    before=after;page_error=ENOMEM;task_reset(s,test_task_at(s, 0));after=counts(s);
     assert(after.memory.task_madvise_calls==before.memory.task_madvise_calls+1);
     assert(after.memory.task_madvise_successes==before.memory.task_madvise_successes);
     assert(after.memory.task_madvise_requested_bytes>before.memory.task_madvise_requested_bytes);

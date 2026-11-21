@@ -6,6 +6,7 @@
 
 #define TG_MUX_HEADER_LEN 3u
 #define TG_HELLO_ACK_FIXED_LEN 34u
+#define TG_INFO_FIXED_LEN 5u
 #define TG_AUTH_V2_LEN 104u
 
 typedef struct {

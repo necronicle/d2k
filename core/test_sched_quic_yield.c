@@ -7,6 +7,7 @@
 int yield_spawn(pthread_t *,const pthread_attr_t *,void *(*)(void *),void *);
 #define pthread_create yield_spawn
 #include "sched.c"
+#include "test_task_slots.h"
 #undef pthread_create
 #include "d2k_quic_arms.h"
 
@@ -41,7 +42,7 @@ static d2k_quic_arm_data data(const d2k_quic_arm_question *q,void *u) {
 }
 static void pause_spent(void *u,uint32_t ms){(void)u;paused_total+=ms;}
 static void *questions(void *p) {
-    d2k_sched *s=p;g_progress_sink=(progress_sink){s,&s->tasks[0]};
+    d2k_sched *s=p;g_progress_sink=(progress_sink){s,test_task_at(s, 0)};
     const char pool[1][D2K_QUIC_ADDR_LEN]={"192.0.2.1"};
     d2k_quic_arm_context c={.pool=pool,.n_pool=1,.probe=probe,.marked=1,.data=mode==1?data:NULL,.spent=pause_spent};
     result=d2k_quic_strategy_arms(&c);
@@ -49,7 +50,7 @@ static void *questions(void *p) {
     return NULL;
 }
 static task *target(d2k_sched *s,int index,int transport,task_state state) {
-    task *t=&s->tasks[index];
+    task *t=test_task_at(s, index);
     snprintf(t->name,sizeof t->name,"yield%d.example",index);
     strcpy(t->ip,"192.0.2.1");t->port=443;t->family=4;t->transport=(uint8_t)transport;
     t->shape_armed=1;t->state=state;t->started_ms=100;t->queued_ms=100;
@@ -83,7 +84,7 @@ static void scenario(int selected) {
         }
         CHECK(waiting);
         if(mode==5){
-            s->tasks[1].queued_ms=s->tasks[2].started_ms=700000;
+            test_task_at(s, 1)->queued_ms=test_task_at(s, 2)->started_ms=700000;
             d2k_sched_tick(s,700000);
             CHECK(q->state==T_ASKING && q->quic_parked);
             CHECK(tcp_started==1);
@@ -93,7 +94,7 @@ static void scenario(int selected) {
         join_worker(q);
         CHECK(done);
         if(mode==3)CHECK(probes==1 && result.incomplete);
-        q->state=T_FREE;s->tasks[1].state=T_FREE;s->tasks[2].state=T_FREE;
+        q->state=T_FREE;test_task_at(s, 1)->state=T_FREE;test_task_at(s, 2)->state=T_FREE;
         d2k_sched_free(s);d2k_catalog_free(&cat);return;
     }
     int held_tcp=0;int64_t now_ms=1100;
@@ -123,22 +124,22 @@ static void scenario(int selected) {
             CHECK(q->quic_parked);
             if(mode==0){
                 now_ms+=SCHED_TASK_LIFE_MS+100;
-                s->tasks[1].started_ms=s->tasks[2].started_ms=now_ms;
+                test_task_at(s, 1)->started_ms=test_task_at(s, 2)->started_ms=now_ms;
                 d2k_sched_tick(s,now_ms);
                 CHECK(q->state==T_ASKING && q->quic_parked);
             }
             if(mode==4){
                 join_worker(q);CHECK(done && probes==1 && result.incomplete);
-                q->state=s->tasks[1].state=s->tasks[2].state=T_FREE;
+                q->state=test_task_at(s, 1)->state=test_task_at(s, 2)->state=T_FREE;
                 d2k_sched_free(s);d2k_catalog_free(&cat);return;
             }
-            s->tasks[1].state=T_FREE;
+            test_task_at(s, 1)->state=T_FREE;
             /* One TCP admission earns the suspended search its next turn,
                even if more TCP is queued. No starvation of saved work. */
             target(s,3,6,T_QUEUED);
             quic_yield_tick(s,now_ms+=SCHED_START_GAP_MS);
-            CHECK(!q->quic_parked && s->tasks[3].state==T_QUEUED);
-            s->tasks[3].state=T_FREE;
+            CHECK(!q->quic_parked && test_task_at(s, 3)->state==T_QUEUED);
+            test_task_at(s, 3)->state=T_FREE;
         }
         pthread_mutex_lock(&test_mu);int finished=done;pthread_mutex_unlock(&test_mu);
         if(finished)break;
@@ -152,7 +153,7 @@ static void scenario(int selected) {
     if(mode==0)paused_result=result;
     if(mode==2)CHECK(!memcmp(&paused_result,&result,sizeof result));
     CHECK(mode==2?paused_total==0:paused_total>0);
-    q->state=T_FREE;s->tasks[2].state=T_FREE;d2k_sched_free(s);d2k_catalog_free(&cat);
+    q->state=T_FREE;test_task_at(s, 2)->state=T_FREE;d2k_sched_free(s);d2k_catalog_free(&cat);
 }
 int main(void){
     /* ГЕРМЕТИЧНО: лимит слотов здесь обязан остаться 2. Планировщик на каждом

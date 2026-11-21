@@ -375,7 +375,13 @@ static int scan_snapshots(const char *queue,uint64_t now,int cleanup,unsigned *r
     while((e=readdir(d))) {
         size_t pn=strlen(prefix);
         if(strncmp(e->d_name,prefix,pn))continue;
-        int temporary=!strcmp(e->d_name+pn,"tmp");
+        const char *suffix=e->d_name+pn;
+        int temporary=!strcmp(suffix,"tmp");
+        if(!strncmp(suffix,"tmp-",4) && strlen(suffix+4)==6) {
+            temporary=1;
+            for(unsigned i=4;i<10;i++)
+                if(!isalnum((unsigned char)suffix[i]))temporary=0;
+        }
         if(!temporary && strlen(e->d_name)!=pn+16)continue;
         int valid=1;for(unsigned i=0;!temporary && i<16;i++)if(!isxdigit((unsigned char)e->d_name[pn+i]))valid=0;
         if(!valid)continue;
@@ -423,12 +429,11 @@ static int snapshot_write(const char *queue,d2k_shadow_record *r,const uint8_t *
     ssize_t got=read(random,&key,sizeof key);close(random);
     if(got!=(ssize_t)sizeof key || !key)return -1;
     char path[1024],tmp[1040];if(snap_path(queue,key,path))return -1;
-    /* The controller is the only snapshot producer. A fixed temporary file
-       bounds disk use even if it repeatedly dies before publication. */
-    snprintf(tmp,sizeof tmp,"%s.snap-tmp",queue);
-    int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC|O_NONBLOCK|O_NOFOLLOW,0600);if(fd<0)return -1;
-    struct stat temporary_stat;
-    if(fstat(fd,&temporary_stat) || !S_ISREG(temporary_stat.st_mode)) {close(fd);return -1;}
+    /* A crashed writer can leave its staging inode linked to a published
+       form. Start on a fresh inode every time. Orphans count towards the
+       same page budget as snapshots and expire in scan_snapshots. */
+    snprintf(tmp,sizeof tmp,"%s.snap-tmp-XXXXXX",queue);
+    int fd=mkstemp(tmp);if(fd<0)return -1;
     uint8_t header[24]={0};memcpy(header,"D2KSNAP1",8);
     uint64_t stamp=now;size_t a=hn,b=on;
     for(int i=7;i>=0;i--) { header[8+i]=(uint8_t)stamp;stamp>>=8; }
@@ -527,7 +532,7 @@ int d2k_shadow_recent_save(const char *queue,const char *producer,const d2k_shad
 int d2k_shadow_recent_load(const char *queue,const char *producer,d2k_shadow_recent *recent,uint64_t now)
 {
     if(!queue || !producer || !recent)return -1;
-    memset(recent,0,sizeof *recent);char path[1024];
+    recent->count=0;char path[1024];
     if(strcmp(producer,"recent") && strcmp(producer,"direct"))return -1;
     if(snprintf(path,sizeof path,"%s.%s",queue,producer)>=(int)sizeof path)return -1;
     int fd=open(path,O_RDONLY|O_NONBLOCK|O_NOFOLLOW);if(fd<0)return errno==ENOENT?0:-1;
@@ -557,6 +562,6 @@ int d2k_shadow_recent_load(const char *queue,const char *producer,d2k_shadow_rec
         d2k_shadow_recent_note(recent,&r,now);
     }
     if(ferror(f))bad=1;
-    fclose(f);if(bad)memset(recent,0,sizeof *recent);
+    fclose(f);if(bad)recent->count=0;
     return bad?-1:0;
 }

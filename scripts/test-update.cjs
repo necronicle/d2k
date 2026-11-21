@@ -30,9 +30,38 @@ while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; --proxy) proxy=$2; sh
 if [ -n "$proxy" ]; then echo "$proxy $url" >> "${feed}/../gate.log"; [ -z "\${GATE_DOWN:-}" ] || exit 7; fi
 f="${feed}/\${url#https://example.test/}"
 [ -f "$f" ] || exit 22
-cp "$f" "$out"
+if [ "\${HOLD_FETCH:-0}" = 1 ]; then
+    HOLD_FETCH=0 sh "${updater}" check > /dev/null 2>&1 && exit 90
+    HOLD_FETCH=0 sh "${updater}" install > /dev/null 2>&1 && exit 91
+    HOLD_FETCH=0 sh "${updater}" auto off > /dev/null 2>&1 && exit 92
+    echo locked > "${tmp}/concurrent"
+fi
+cp "$f" "$out" || exit 1
+if [ "\${INTERRUPT_FETCH:-0}" = 1 ]; then kill -TERM "$PPID"; fi
 `, { mode: 0o755 });
-fs.writeFileSync(init, `#!/bin/sh\necho "$1" >> "${initLog}"\n[ "$1" != stop ] || [ "\${FAIL_STOP:-0}" != 1 ]\n`, { mode: 0o755 });
+// Assert the ordering at the actual rollback archive creation.
+fs.writeFileSync(path.join(stub, 'tar'), `#!/bin/sh
+if [ "$1" = -cf ] && [ -f "$(dirname "$2")/release.tar.gz" ]; then
+    echo "download still present during backup" >&2
+    exit 1
+fi
+if [ "$1" = -cf ] && [ -n "\${BACKUP_FAULT:-}" ]; then
+    echo partial > "$2"
+    [ "$BACKUP_FAULT" != kill ] || kill -KILL "$(cat "$(dirname "$2")/lock/pid")"
+    exit 1
+fi
+exec /usr/bin/tar "$@"
+`, { mode: 0o755 });
+fs.writeFileSync(path.join(stub, 'rm'), `#!/bin/sh
+for item in "$@"; do
+    [ -e "$item" ] || continue
+    case "\${FAIL_CLEANUP:-}/\${item##*/}" in
+        backup/previous.tar|backup/previous.tar.retired|staging/health.after|unpacked/release) exit 1 ;;
+    esac
+done
+exec /bin/rm "$@"
+`, { mode: 0o755 });
+fs.writeFileSync(init, `#!/bin/sh\necho "$1" >> "${initLog}"\nif [ "$1" = stop ] && [ -f "${tmp}/installer-path" ]; then\n    stage=$(dirname "$(dirname "$(cat "${tmp}/installer-path")")")\n    [ ! -d "$stage" ] || echo "$stage" > "${tmp}/bad-rollback-footprint"\nfi\n[ "$1" != stop ] || [ "\${FAIL_STOP:-0}" != 1 ]\n`, { mode: 0o755 });
 
 const keyPem = path.join(tmp, 'key.pem');
 execFileSync(openssl, ['genpkey', '-algorithm', 'ED25519', '-out', keyPem]);
@@ -45,17 +74,27 @@ const liveController = spawnSync('/bin/sh', ['-c', 'sleep 300 >/dev/null 2>&1 & 
 const dead = '999999';
 
 // Выпуск: архив с «установщиком», который заменяет файлы и пишет pid-файлы.
-function release(id, { installOk = true, pid = live } = {}) {
+function release(id, { installOk = true, pid = live, verifiedWorkspace = false } = {}) {
   const src = path.join(tmp, 'src-' + id);
   fs.mkdirSync(path.join(src, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(src, 'scripts/install.sh'), `#!/bin/sh
+[ "$(LC_ALL=C ls -ldn "$D2K_LOCAL" | cut -c1-10)" = drwx------ ] || exit 1
+${verifiedWorkspace ? '# D2K verified update workspace v1\n[ "$1" = --verified-update ] && [ "$2" = "$PPID" ] || exit 1' : '[ "$#" -eq 0 ] || exit 1'}
 printf '%s\\n' "$0" > "${tmp}/installer-path"
 printf '%s\\n' "$D2K_RELEASE_ID" > "${dir}/release-id"
 printf 'binary ${id}\\n' > "${sbin}/d2kd"
 printf 'controller ${id}\\n' > "${sbin}/d2kc"
+printf 'shadow ${id}\\n' > "${sbin}/d2kshadow"
 printf 'fetch ${id}\\n' > "${sbin}/d2kfetch"
 printf 'panel ${id}\\n' > "${dir}/panel/index.html"
 echo ${pid} > "${dir}/run/d2kd.pid"; echo ${pid === dead ? dead : liveController} > "${dir}/run/d2k.pid"
+if [ "\${KILL_INSTALL:-0}" = 1 ]; then
+    kill -KILL "$PPID"
+    if [ "\${HOLD_ORPHAN:-0}" = 1 ]; then
+        sh "${updater}" check >/dev/null 2>&1 && exit 93
+        [ -d "$D2K_LOCAL/scripts" ] && echo protected > "${tmp}/orphan-result"
+    fi
+fi
 exit ${installOk ? 0 : 1}
 `);
   fs.mkdirSync(path.join(feed, id), { recursive: true });
@@ -77,6 +116,10 @@ const heartbeat = path.join(tmp, 'heartbeat.cjs');
 fs.writeFileSync(heartbeat, `
 const fs = require('node:fs'), path = require('node:path');
 const dir=${JSON.stringify(dir)}, proc=${JSON.stringify(proc)}, runtime=${JSON.stringify(runtime)}, sbin=${JSON.stringify(sbin)};
+const stage=path.dirname(path.dirname(fs.readFileSync(${JSON.stringify(path.join(tmp,'installer-path'))},'utf8').trim()));
+if (fs.existsSync(stage) || !fs.existsSync(path.join(path.dirname(stage),'previous.tar'))) {
+ fs.writeFileSync(${JSON.stringify(path.join(tmp, 'bad-health-footprint'))},stage);
+}
 const mode=process.env.HEALTH_FAULT || '';
 const release=fs.readFileSync(path.join(dir,'release-id'),'utf8').trim();
 for (const [name,pidfile] of [['d2kd','d2kd.pid'],['d2kc','d2k.pid']]) {
@@ -107,6 +150,12 @@ const env = {
   D2K_UPDATE_LATEST: 'https://example.test/latest', D2K_UPDATE_DOWNLOAD: 'https://example.test',
 };
 const run = (...args) => spawnSync('/bin/sh', [updater, ...args], { env, encoding: 'utf8' });
+const withEnv = (extra, ...args) => spawnSync('/bin/sh', [updater, ...args],
+  { env: { ...env, ...extra }, encoding: 'utf8' });
+const work = path.join(dir, '.update');
+function assertClean(root = work, keep = []) {
+  assert.deepEqual(fs.readdirSync(root).sort(), ['latest.json', ...keep].sort());
+}
 const state = () => JSON.parse(fs.readFileSync(path.join(dir, 'state/update.json'), 'utf8'));
 const read = p => fs.readFileSync(p, 'utf8');
 
@@ -123,19 +172,79 @@ try {
 
   // Проверка: подписанный выпуск виден, поддельный — нет.
   release('r2');
+  const otherWork = path.join(tmp, 'unrelated');
+  fs.mkdirSync(path.join(otherWork, 'release'), { recursive: true });
+  const sentinel = path.join(otherWork, 'release', 'retain');
+  fs.writeFileSync(sentinel, 'owner');
+  fs.symlinkSync(otherWork, work);
+  assert.notEqual(run('check').status, 0);
+  assert.notEqual(run('install').status, 0);
+  const guardStub = path.join(tmp, 'guard-stub');
+  fs.mkdirSync(guardStub);
+  fs.writeFileSync(path.join(guardStub, 'date'), '#!/bin/sh\n[ "$1" = +%H ] && echo 03 || exec /bin/date "$@"\n', { mode: 0o755 });
+  const runNight = () => spawnSync('/bin/sh', [updater, 'run'], {
+    env: { ...env, D2K_STUB_PATH: guardStub + ':' + stub }, timeout: 2000, encoding: 'utf8',
+  });
+  assert.equal(runNight().status, 1);
+  assert.deepEqual(fs.readdirSync(otherWork), ['release']);
+  assert.equal(read(sentinel), 'owner');
+  fs.unlinkSync(work);
+  fs.mkdirSync(work, { mode: 0o755 });
+  fs.symlinkSync(sentinel, path.join(work, 'night'));
+  assert.equal(runNight().status, 1);
+  assert.equal(read(sentinel), 'owner');
+  fs.unlinkSync(path.join(work, 'night'));
+  fs.chmodSync(work, 0o777);
+  assert.notEqual(run('check').status, 0);
+  fs.chmodSync(work, 0o755);
+  fs.writeFileSync(path.join(guardStub, 'ls'), '#!/bin/sh\necho "drwxr-xr-x 2 4294967294 0 64 Jan 1 00:00 work"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(stub, 'stat'), '#!/bin/sh\nexit 127\n', { mode: 0o755 });
+  assert.notEqual(withEnv({ D2K_STUB_PATH: guardStub + ':' + stub }, 'check').status, 0);
+  assert.deepEqual(fs.readdirSync(work), []);
+
+  // A numeric suffix alone does not identify a stale updater claim.
+  const unrelatedClaim = path.join(work, 'lock.' + dead);
+  fs.mkdirSync(unrelatedClaim);
+  fs.writeFileSync(path.join(unrelatedClaim, 'installer'), dead);
   assert.equal(run('check').status, 0);
+  assert.equal(read(path.join(unrelatedClaim, 'installer')), dead);
+  fs.rmSync(unrelatedClaim, { recursive: true });
+  fs.writeFileSync(path.join(work, 'owner-file'), 'keep');
+  assertClean(work, ['owner-file']);
+  assert.equal(withEnv({ HOLD_FETCH: '1' }, 'check').status, 0);
+  assert.equal(read(path.join(tmp, 'concurrent')), 'locked\n');
+  assert.notEqual(withEnv({ INTERRUPT_FETCH: '1' }, 'check').status, 0);
+  assertClean(work, ['owner-file']);
+  fs.unlinkSync(path.join(work, 'owner-file'));
+  const legacyLock = path.join(work, 'lock');
+  fs.mkdirSync(legacyLock);
+  fs.writeFileSync(path.join(legacyLock, 'pid'), live);
+  fs.mkdirSync(path.join(work, 'release'));
+  assert.notEqual(run('check').status, 0);
+  assert.notEqual(run('install').status, 0);
+  assert.equal(read(path.join(legacyLock, 'pid')), live);
+  assert(fs.existsSync(path.join(work, 'release')));
+  fs.writeFileSync(path.join(legacyLock, 'pid'), dead);
+  assert.equal(run('check').status, 0);
+  assertClean();
   let s = state();
   assert.equal(s.check_ok, true); assert.equal(s.current, 'r1'); assert.equal(s.latest.release_id, 'r2');
   assert.equal(s.latest.notes, 'Новое "в" выпуске');
   fs.appendFileSync(path.join(feed, 'latest/latest.json'), ' ');
   assert.notEqual(run('check').status, 0, 'подделанный latest.json принят');
   s = state();
+  assertClean();
   assert.equal(s.check_ok, false); assert.match(s.check_error, /подпись/);
   assert.equal(s.latest.release_id, 'r2', 'прежние проверенные сведения потеряны');
 
   // Успешная установка: стоит новая версия, копии прежней не остаётся.
   release('r2');
+  assert.notEqual(withEnv({ BACKUP_FAULT: 'error' }, 'install').status, 0);
+  assertClean();
+  assert.equal(withEnv({ BACKUP_FAULT: 'kill' }, 'install').signal, 'SIGKILL');
+  assert.equal(read(path.join(sbin, 'd2kd')), 'binary r1\n');
   assert.equal(run('install').status, 0, read(path.join(dir, 'log/update.log')));
+  assert(!fs.existsSync(path.join(tmp, 'bad-health-footprint')), 'health must run with only the rollback archive');
   s = state();
   assert.equal(s.last_ok, true); assert.equal(s.current, 'r2'); assert.equal(s.busy, '');
   assert.equal(read(path.join(sbin, 'd2kd')), 'binary r2\n');
@@ -145,6 +254,30 @@ try {
   assert.equal(run('install').status, 0, 'повтор того же выпуска не сводится к «уже установлен»');
   assert(read(path.join(tmp, 'installer-path')).startsWith(path.join(dir, '.update') + '/'), 'Keenetic: рабочий каталог — /opt/d2k/.update');
 
+
+  for (const failure of ['backup', 'staging', 'unpacked']) {
+    const id = 'clean-' + failure;
+    release(id);
+    const history = fs.existsSync(initLog) ? read(initLog) : '';
+    assert.notEqual(withEnv({ FAIL_CLEANUP: failure }, 'install').status, 0);
+    assert.equal(state().current, id);
+    assert.equal(state().last_ok, false);
+    assert.match(state().last_message, /очист/);
+    assert.equal(fs.existsSync(initLog) ? read(initLog) : '', history, 'cleanup failure triggered rollback');
+    assert.equal(run('install').status, 0);
+    assertClean();
+  }
+  release('r2-retry', { verifiedWorkspace: true });
+  assert.equal(withEnv({ KILL_INSTALL: '1', HOLD_ORPHAN: '1' }, 'install').signal, 'SIGKILL');
+  for (let i = 0; i < 50 && !fs.existsSync(path.join(tmp, 'orphan-result')); i++) {
+    spawnSync('/bin/sleep', ['0.05']);
+  }
+  assert.equal(read(path.join(tmp, 'orphan-result')), 'protected\n');
+  assert(fs.existsSync(path.join(work, 'previous.tar')));
+  assert.equal(run('install').status, 0);
+  assertClean();
+  release('r2');
+  assert.equal(run('install').status, 0);
 
   for (const fault of ['stale', 'stalled', 'incarnation', 'release', 'peer', 'exe', 'boot', 'wire', 'ready']) {
     release('bad-' + fault);
@@ -173,8 +306,16 @@ try {
   }).status, 0);
   assert.equal(read(path.join(sbin, 'd2kd')), 'binary bad-stop\n', 'failed rollback stop must not overwrite running files');
   assert(fs.existsSync(path.join(dir, '.update/previous.tar')), 'failed stop must retain rollback archive');
-  release('r2');
-  assert.equal(run('install').status, 0);
+  const backup = fs.readFileSync(path.join(work, 'previous.tar'));
+  assert.notEqual(withEnv({ HEALTH_FAULT: 'stale', FAIL_STOP: '1' }, 'install').status, 0,
+    'same release with pending rollback must pass health');
+  assert.deepEqual(fs.readFileSync(path.join(work, 'previous.tar')), backup);
+  release('bad-retry', { installOk: false });
+  assert.notEqual(withEnv({ FAIL_STOP: '1' }, 'install').status, 0);
+  assert.deepEqual(fs.readFileSync(path.join(work, 'previous.tar')), backup, 'last usable rollback replaced');
+  assert.notEqual(run('install', 'manual').status, 0);
+  assert.equal(read(path.join(sbin, 'd2kshadow')), 'shadow r2\n');
+  assertClean();
 
   // Отказ установщика: прежняя версия возвращается целиком.
   release('r3', { installOk: false });
@@ -223,10 +364,29 @@ try {
       `#!/bin/sh\necho "$*" >> "${ssd}"\n`, { mode: 0o755 });
     const nightEnv = { ...env, D2K_STUB_PATH: `${clock}:${stub}`, D2K_UPDATE_TICK: '1' };
     const wait = ms => spawnSync('/bin/sleep', [String(ms / 1000)]);
+    const stale = path.join(work, 'health.after');
+    const retained = path.join(work, 'previous.tar');
+    const nightPath = path.join(work, 'night');
+    const trustedLatest = read(path.join(work, 'latest.json'));
+    const gateBeforeCleanup = read(path.join(tmp, 'gate.log'));
+    fs.writeFileSync(stale, 'legacy health');
+    fs.writeFileSync(retained, 'needed rollback');
+    fs.writeFileSync(nightPath, 'yesterday');
+    fs.mkdirSync(legacyLock);
+    fs.writeFileSync(path.join(legacyLock, 'pid'), live);
     const loop = require('node:child_process').spawn('/bin/sh', [updater, 'run'], { env: nightEnv, stdio: 'ignore' });
     try {
-      fs.rmSync(path.join(dir, '.update/night'), { force: true });
-      wait(1500);
+      wait(1200);
+      assert.equal(read(stale), 'legacy health', 'legacy installer is still active');
+      fs.rmSync(legacyLock, { recursive: true });
+      for (let i = 0; i < 20 && fs.existsSync(stale); i++) wait(100);
+      assert(!fs.existsSync(stale), 'scheduler must clean legacy staging on the next tick');
+      assert.equal(read(retained), 'needed rollback');
+      assert.equal(read(nightPath), 'yesterday');
+      assert.equal(read(path.join(work, 'latest.json')), trustedLatest);
+      assert.equal(read(path.join(tmp, 'gate.log')), gateBeforeCleanup, 'startup cleanup downloaded a manifest');
+      fs.unlinkSync(retained);
+      fs.unlinkSync(nightPath);
       assert.equal(spawnSync('/bin/sh', [updater, 'auto', 'off'], { env: nightEnv }).status, 0);
       fs.writeFileSync(hour, '03\n');
       for (let i = 0; i < 40 && !fs.existsSync(path.join(dir, '.update/night')); i++) wait(250);
@@ -253,6 +413,7 @@ try {
     assert.equal(spawnSync('/bin/sh', [updater, 'install'], { env: owrt, encoding: 'utf8' }).status, 0);
     assert(read(path.join(tmp, 'installer-path')).startsWith(ram + '/'), 'OpenWrt без USB: выпуск должен распаковываться в RAM');
     assert(!fs.existsSync(path.join(ram, 'previous.tar')) && !fs.existsSync(path.join(ram, 'release')), 'в RAM не осталось копий');
+    assertClean(ram);
     df('/opt');
     release('r6');
     assert.equal(spawnSync('/bin/sh', [updater, 'install'], { env: owrt, encoding: 'utf8' }).status, 0);
@@ -273,6 +434,8 @@ try {
   assert.equal(spawnSync('/bin/sh', [updater, 'check'], { env: { ...env, D2K_GATE: '' }, encoding: 'utf8' }).status, 0);
   assert.equal(read(path.join(dir, 'state/catalog.json')), knowledge);
   assert.equal(read(path.join(dir, 'state/dns-cache')), 'preserve-dns');
+  assert(!fs.existsSync(path.join(tmp, 'bad-health-footprint')));
+  assert(!fs.existsSync(path.join(tmp, 'bad-rollback-footprint')));
   console.log('d2k-update: heartbeat identity/progress, stop failure, knowledge retention, signature, install, health rollback, bad release, toggle, VPS gate: PASS');
 } finally {
   try { process.kill(Number(live)); } catch (_) {}

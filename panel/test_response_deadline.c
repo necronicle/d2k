@@ -25,18 +25,8 @@
  * ловит по-прежнему. */
 #define SETTABLE_FLAGS (O_APPEND | O_NONBLOCK | O_ASYNC)
 
-int main(void) {
-    assert(d2k_panel_ignore_sigpipe() == 0);
-    int fds[2]; assert(pipe(fds) == 0);
-    int flags = fcntl(fds[1], F_GETFL); assert(flags >= 0);
-    assert(response(fds[1], 200, "OK", "text/plain", "complete\n", 9) == 0);
-    assert((fcntl(fds[1], F_GETFL) & SETTABLE_FLAGS) == (flags & SETTABLE_FLAGS));
-    close(fds[1]);
-    char small[2048]; ssize_t n = read(fds[0], small, sizeof small - 1);
-    assert(n > 0); small[n] = '\0';
-    assert(strstr(small, "HTTP/1.1 200 OK\r\n"));
-    assert(strstr(small, "\r\n\r\ncomplete\n")); close(fds[0]);
-
+static void slow_reader(const d2k_panel_config *assets) {
+    int fds[2];
     assert(pipe(fds) == 0);
     pid_t child = fork(); assert(child >= 0);
     if (!child) {
@@ -50,10 +40,11 @@ int main(void) {
         close(fds[0]); _exit(0);
     }
     close(fds[0]);
-    char *body = malloc(BODY_MAX); assert(body); memset(body, 'x', BODY_MAX);
-    flags = fcntl(fds[1], F_GETFL);
+    static char body[BODY_MAX];
+    int flags = fcntl(fds[1], F_GETFL);
     long long start = monotonic_ms();
-    int rc = response(fds[1], 200, "OK", "text/plain", body, BODY_MAX);
+    int rc = assets ? static_file(fds[1], assets, NULL, "asset", "text/plain")
+                    : response(fds[1], 200, "OK", "text/plain", body, sizeof body);
     int saved_errno = errno;
     long long elapsed = monotonic_ms() - start;
     assert(rc == -1 && saved_errno == ETIMEDOUT);
@@ -62,8 +53,31 @@ int main(void) {
        дескриптор в прежний режим, иначе следующий ответ уйдёт неблокирующим
        и оборвётся на первом же EAGAIN. */
     assert((fcntl(fds[1], F_GETFL) & SETTABLE_FLAGS) == (flags & SETTABLE_FLAGS));
-    free(body); close(fds[1]);
+    close(fds[1]);
     assert(kill(child, SIGTERM) == 0); assert(waitpid(child, NULL, 0) == child);
+}
+
+int main(void) {
+    assert(d2k_panel_ignore_sigpipe() == 0);
+    int fds[2]; assert(pipe(fds) == 0);
+    int flags = fcntl(fds[1], F_GETFL); assert(flags >= 0);
+    assert(response(fds[1], 200, "OK", "text/plain", "complete\n", 9) == 0);
+    assert((fcntl(fds[1], F_GETFL) & SETTABLE_FLAGS) == (flags & SETTABLE_FLAGS));
+    close(fds[1]);
+    char small[2048]; ssize_t n = read(fds[0], small, sizeof small - 1);
+    assert(n > 0); small[n] = '\0';
+    assert(strstr(small, "HTTP/1.1 200 OK\r\n"));
+    assert(strstr(small, "\r\n\r\ncomplete\n")); close(fds[0]);
+
+    slow_reader(NULL);
+    char dir[] = "/tmp/d2k-response-deadline-XXXXXX", path[256];
+    assert(mkdtemp(dir));
+    snprintf(path, sizeof path, "%s/asset", dir);
+    int asset = open(path, O_CREAT | O_RDWR, 0600);
+    assert(asset >= 0 && ftruncate(asset, BODY_MAX) == 0 && close(asset) == 0);
+    d2k_panel_config cfg = { .asset_dir = dir };
+    slow_reader(&cfg);
+    assert(unlink(path) == 0 && rmdir(dir) == 0);
     puts("HTTP responses: complete response accepted; slow reader total deadline enforced PASS");
     return 0;
 }
