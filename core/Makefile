@@ -729,7 +729,7 @@ test-measured: test_measured
 # Выпуск — тот же, что в CFLAGS: link.c сверяет приветствие датапата по
 # D2K_RELEASE_ID (задание 02, 28.10.2026), и санитайзерная сборка обязана его знать.
 SANFLAGS = -std=c99 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -DD2K_RELEASE_ID='"$(RELEASE_ID)"' \
-           -fno-omit-frame-pointer -Wall -Wextra -Werror -Wno-format-truncation -Iinclude -I../datapath/include
+           -fno-omit-frame-pointer -Wall -Wextra -Werror -Wno-format-truncation -Iinclude -I../datapath/include -I../model/include
 # ../datapath/ctlprobe и ../datapath/planlab — test_link и test_compose здесь
 # не просто собираются, а сразу ЗАПУСКАЮТСЯ (см. цикл ниже), значит нужны
 # свежие бинарники заранее, как и у test-link/test-compose выше. d2kask —

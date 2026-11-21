@@ -282,7 +282,7 @@ static void test_response_candidate_admitted_to_full_queue(void) {
     test_task_at(f.s, 2)->hot_event=1;
     task *last=test_task_at(f.s, SCHED_MAX_QUEUED_MEASUREMENTS+1);
     last->hot_event=2;
-    task *victim=last-1;
+    task *victim=test_task_at(f.s, SCHED_MAX_QUEUED_MEASUREMENTS);
     f.t->state=T_FREE;
     launch_or_queue(f.s,f.t);
     CHECK(f.t->state==T_QUEUED,"response candidate was dropped with a full queue");
