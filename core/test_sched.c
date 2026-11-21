@@ -17668,6 +17668,17 @@ own_first_test:
             own_rx_trials = own_rx_identity = own_rx_gzip = 0;
             memset(own_rx_ports, 0, sizeof own_rx_ports);
             own_rx_entered = own_rx_release = 0;
+            /* The client port must be occupied as it is in real traffic.
+               Otherwise the verifier can legitimately bind the same free
+               port and this fixture reports a false isolation failure. */
+            int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in client_addr = {0};
+            client_addr.sin_family = AF_INET;
+            client_addr.sin_port = htons(42151);
+            client_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            CHECK(client_fd >= 0 &&
+                  bind(client_fd, (struct sockaddr *)&client_addr, sizeof client_addr) == 0,
+                  "own-first RX: reserve client port");
             d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
             saidbuf[0] = '\0';
             d2k_sched_set_say(s, collect_say, NULL);
@@ -17782,6 +17793,7 @@ own_first_test:
                   "own-first RX: trials were not retired by their own scoped keys");
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
+            close(client_fd);
             d2k_sched_rx_ver_hook = saved_rx;
             d2k_sched_rx_gzip_ver_hook = saved_gzip;
         }
