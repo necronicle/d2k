@@ -580,7 +580,7 @@ static int read_request(int fd, char *buf, size_t cap, size_t *used, long long d
     return *used + 1 >= cap ? 1 : -1;
 }
 
-static int read_status_object(const char *path, char **out, size_t *out_len) {
+static int read_status_object(const char *path, char **out, size_t *out_len, time_t *modified) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) { return -1; }
     struct stat st;
@@ -606,6 +606,7 @@ static int read_status_object(const char *path, char **out, size_t *out_len) {
     if (!json_valid_object(p, end)) { free(buf); return -1; }
     *out = buf;
     *out_len = nread;
+    *modified = st.st_mtime;
     return 0;
 }
 
@@ -716,7 +717,7 @@ static void append_stage(panel_buf *b, const char *key, const char *title,
     if (comma) { buf_puts(b, ","); }
     buf_puts(b, "{\"key\":"); buf_json_string(b, key);
     buf_puts(b, ",\"title\":"); buf_json_string(b, title);
-    buf_printf(b, ",\"built\":%s,\"detail\":", built ? "true" : "false");
+    buf_printf(b, ",\"built\":%s,\"detail\":", built < 0 ? "null" : built ? "true" : "false");
     buf_json_string(b, detail);
     buf_puts(b, "}");
 }
@@ -776,14 +777,17 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
     append_stage(b, "config", "Конфигурация", 1,
                  cfg && cfg->config_exists ? "Прочитана из конфигурационного файла." :
                  "Файла конфигурации нет, действуют умолчания.", 0);
-    append_stage(b, "capture", "Чтение пакетов", linked,
-                 linked ? "Очередь ядра открыта, пакеты читаются: контроллер получает события датапата." :
+    int unknown = engine_running && controller_running && !live_fresh;
+    int stage = unknown ? -1 : linked;
+    const char *missing = "Нет свежего снимка контроллера.";
+    append_stage(b, "capture", "Чтение пакетов", stage,
+                 unknown ? missing : linked ? "Очередь ядра открыта, пакеты читаются: контроллер получает события датапата." :
                           "Контроллер не подключён к датапату — сказать, читаются ли пакеты, нечем.", 1);
-    append_stage(b, "flow", "Состояние потоков", linked,
-                 linked ? "Датапат ведёт учёт соединений и сообщает о подозрениях." :
+    append_stage(b, "flow", "Состояние потоков", stage,
+                 unknown ? missing : linked ? "Датапат ведёт учёт соединений и сообщает о подозрениях." :
                           "Контроллер не подключён к датапату.", 1);
-    append_stage(b, "plan", "Исполнение планов", linked,
-                 linked ? "Планы ставятся датапату и исполняются на живых соединениях." :
+    append_stage(b, "plan", "Исполнение планов", stage,
+                 unknown ? missing : linked ? "Планы ставятся датапату и исполняются на живых соединениях." :
                           "Контроллер не подключён к датапату: применяется ли обход, отсюда не видно.", 1);
     char boxes_detail[512];
     if (have_catalog) {
@@ -796,7 +800,7 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
                  "Нечем: сколько пакетов не дошло до очереди, снаружи не измеряется.", 0);
     if (!linked) {
         append_stage(b, "traffic", "Наблюдаемый трафик", 0,
-                     "Нечем: контроллер не подключён к датапату. Это не «ноль соединений», а отсутствие измерения.", 1);
+                     unknown ? missing : "Нечем: контроллер не подключён к датапату. Это не «ноль соединений», а отсутствие измерения.", 1);
     }
     buf_puts(b, "]}");
 }
@@ -804,17 +808,14 @@ static void append_snapshot(panel_buf *b, const d2k_panel_config *cfg,
 static int api_status(int fd, const d2k_panel_config *cfg, const char *query) {
     char *live = NULL;
     size_t live_len = 0;
-    if (cfg && cfg->live_path && read_status_object(cfg->live_path, &live, &live_len) == 0) {
+    time_t modified;
+    if (cfg && cfg->live_path && read_status_object(cfg->live_path, &live, &live_len, &modified) == 0) {
         time_t now = time(NULL);
-        struct stat live_stat;
         time_t engine_started_at = 0;
         int engine_running = engine_pid_running(cfg, &engine_started_at);
         int controller_running = controller_pid_running(cfg);
-        int live_fresh = cfg->live_path && stat(cfg->live_path, &live_stat) == 0 &&
-            S_ISREG(live_stat.st_mode) &&
-            (!engine_started_at || live_stat.st_mtime >= engine_started_at) &&
-            (live_stat.st_mtime > now ? live_stat.st_mtime - now <= 5 :
-                                         now - live_stat.st_mtime <= 15);
+        int live_fresh = (!engine_started_at || modified >= engine_started_at) &&
+            (modified > now ? modified - now <= 5 : now - modified <= 15);
         int linked = json_top_true(live, "linked") && live_fresh &&
                      engine_running && controller_running;
         int have_catalog = json_top_nonempty_string(live, "catalog_at");
@@ -926,15 +927,10 @@ static void diagnostic_queue(panel_buf *b, FILE *f, int queue) {
 
 /* Export known events only. Arbitrary relay messages and log lines can contain
  * network addresses or credentials. Scan at most the last 16 KiB. */
-static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
-    static const char *const events[]={
-        "d2k-tg-watchdog: probe failed", "d2k-tg-watchdog: probe recovered",
-        "d2k-tg-watchdog: restart requested", "d2k-tg-watchdog: restart command completed",
-        "d2k-tg-watchdog: restart command failed", "d2ktg: relay session authenticated",
-        "d2ktg: relay session ended", "d2ktg: relay authentication failed",
-        "d2ktg: verified relay WSS connection failed", "d2ktg: cannot bind",
-        "d2ktg: relay identity registration failed", "d2k-tg-watchdog: probe unavailable"
-    };
+struct diagnostic_pattern { const char *prefix; const char *label; };
+
+static void diagnostic_log_events(panel_buf *b, FILE *f,
+                                  const struct diagnostic_pattern *patterns, size_t n_patterns) {
     struct stat st;
     if(!f || fstat(fileno(f),&st) || !S_ISREG(st.st_mode)){buf_puts(b,"null");return;}
     char line[512];
@@ -948,12 +944,13 @@ static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
         size_t n=strlen(line);left-=(off_t)n;
         if(!n)break;
         if(n<21 || line[19]!=' ' || strspn(line,"0123456789- :")!=20)continue;
-        for(size_t i=0;i<sizeof events/sizeof events[0];i++){
-            if(strncmp(line+20,events[i],strlen(events[i])))continue;
+        for(size_t i=0;i<n_patterns;i++){
+            const char *prefix = patterns[i].prefix;
+            if(strncmp(line+20,prefix,strlen(prefix)))continue;
             char *record=records[count++%24];
-            snprintf(record,128,"%.19s %s",line,events[i]);
+            snprintf(record,128,"%.19s %s",line,patterns[i].label ? patterns[i].label : prefix);
             int rc;
-            if(sscanf(line+20+strlen(events[i]),": curl_rc=%d",&rc)==1){
+            if(!patterns[i].label && sscanf(line+20+strlen(prefix),": curl_rc=%d",&rc)==1){
                 size_t used=strlen(record);snprintf(record+used,128-used," curl_rc=%d",rc);
             }
             break;
@@ -965,13 +962,45 @@ static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
     buf_puts(b,"]");
 }
 
+static void diagnostic_tunnel_events(panel_buf *b, FILE *f) {
+    static const struct diagnostic_pattern events[]={
+        { "d2k-tg-watchdog: probe failed", NULL }, { "d2k-tg-watchdog: probe recovered", NULL },
+        { "d2k-tg-watchdog: restart requested", NULL }, { "d2k-tg-watchdog: restart command completed", NULL },
+        { "d2k-tg-watchdog: restart command failed", NULL }, { "d2ktg: relay session authenticated", NULL },
+        { "d2ktg: relay session ended", NULL }, { "d2ktg: relay authentication failed", NULL },
+        { "d2ktg: verified relay WSS connection failed", NULL }, { "d2ktg: cannot bind", NULL },
+        { "d2ktg: relay identity registration failed", NULL }, { "d2k-tg-watchdog: probe unavailable", NULL }
+    };
+    diagnostic_log_events(b, f, events, sizeof events / sizeof events[0]);
+}
+
+static void diagnostic_service_events(panel_buf *b, FILE *f) {
+    static const struct diagnostic_pattern events[] = {
+        { "датапат не работает (контроллер работает: нет)", "both_down" },
+        { "датапат не работает (контроллер работает: да)", "datapath_down" },
+        { "контроллер не работает при живом датапате", "controller_down" },
+        { "движок неполон (датапат: нет, контроллер: нет,", "both_down" },
+        { "движок неполон (датапат: нет, контроллер: да,", "datapath_down" },
+        { "движок неполон (датапат: да, контроллер: нет,", "controller_down" },
+        { "датапат не поднялся (код ", "datapath_restart_failed" },
+        { "контроллер не поднялся (код ", "controller_restart_failed" },
+        { "движок восстановлен:", "recovered" },
+        { "перезапуск движка для восстановления правил", "firewall_restart" },
+        { "получена команда engine-restart", "restart_requested" },
+        { "правила восстановлены сторожем", "firewall_recovered" }
+    };
+    diagnostic_log_events(b, f, events, sizeof events / sizeof events[0]);
+}
+
+#define DIAG_DOWNLOAD_EXTRA 8192
+
 static int download_diagnostics(int fd,const d2k_panel_config *cfg,char *body,size_t len) {
     if (!cfg || !json_valid_object(body,body+len))
         return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     while (len && body[len-1]!='}') len--;
     size_t end=len-1;
     while (end && strchr(" \r\n\t",body[end-1])) end--;
-    panel_buf b={.p=body,.len=len-1,.cap=len+4096};
+    panel_buf b={.p=body,.len=len-1,.cap=len+DIAG_DOWNLOAD_EXTRA};
     buf_puts(&b,body[end-1]=='{' ? "" : ",");
     buf_printf(&b,"\"router_at_download\":{\"epoch\":%lld,\"engine_running\":%s,\"controller_running\":%s,"
                "\"queue_id\":%d,\"nfqueue\":",(long long)time(NULL),
@@ -992,6 +1021,15 @@ static int download_diagnostics(int fd,const d2k_panel_config *cfg,char *body,si
     FILE *log=fopen("/opt/d2k/log/telegram.log","r");
     diagnostic_tunnel_events(&b,log);
     if(log)fclose(log);
+    buf_puts(&b,",\"engine_recovery_events\":");
+    log=fopen("/opt/d2k/log/service.log","r");
+    diagnostic_service_events(&b,log);
+    if(log)fclose(log);
+    struct stat live;
+    buf_puts(&b,",\"live_snapshot\":");
+    if(cfg->live_path && !stat(cfg->live_path,&live) && S_ISREG(live.st_mode))
+        buf_printf(&b,"{\"mtime\":%lld,\"bytes\":%lld}",(long long)live.st_mtime,(long long)live.st_size);
+    else buf_puts(&b,"null");
     buf_puts(&b,"}}");
     if(b.failed)return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     return response_ex(fd,200,"OK","application/json; charset=utf-8",
@@ -1019,7 +1057,7 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     int in=open(path,O_RDONLY|O_NOFOLLOW);
     if(in<0){
         if(errno==ENOENT && !strcmp(action,"download")){
-            char empty[4300]="{\"enabled\":true,\"pending\":true,\"events\":[],\"samples\":[]}";
+            char empty[DIAG_DOWNLOAD_EXTRA+128]="{\"enabled\":true,\"pending\":true,\"events\":[],\"samples\":[]}";
             return download_diagnostics(fd,cfg,empty,strlen(empty));
         }
         return diagnostic_response(fd,503,"Service Unavailable","application/json","{\"enabled\":true,\"pending\":true}",31);
@@ -1027,7 +1065,7 @@ static int api_diagnostics(int fd,const d2k_panel_config *cfg,const char *req,
     if(fstat(in,&st)||!S_ISREG(st.st_mode)||st.st_size<0||(uint64_t)st.st_size>D2K_DIAG_REPORT_MAX) {
         close(in);return diagnostic_response(fd,500,"Internal Server Error","text/plain","",0);
     }
-    size_t len=(size_t)st.st_size,off=0;char *body=malloc(len+4096);
+    size_t len=(size_t)st.st_size,off=0;char *body=malloc(len+DIAG_DOWNLOAD_EXTRA);
     if(!body){close(in);return diagnostic_response(fd,503,"Service Unavailable","text/plain","",0);}
     while(off<len){ssize_t n=read(in,body+off,len-off);if(n<0&&errno==EINTR)continue;if(n<=0)break;off+=(size_t)n;}
     close(in);

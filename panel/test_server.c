@@ -137,6 +137,10 @@ static void test_api_exposes_live_knowledge(void) {
     assert(strstr(response, "\"live_fresh\":false") != NULL);
     assert(strstr(response, "\"linked\":false") != NULL);
     assert(strstr(response, "\"linked\":true") == NULL);
+    cfg.controller_pid_path = NULL;
+    (void)request(&cfg, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n", response, sizeof response);
+    assert(!strstr(response, "Контроллер не подключён"));
+    assert(strstr(response, "Нет свежего снимка"));
     unlink(live);
 }
 

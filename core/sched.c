@@ -1695,6 +1695,7 @@ struct d2k_sched {
     force_target forced[SCHED_SEEN];
     size_t n_forced, force_next;
     d2k_diag_memory memory; /* argument counters protected by mu */
+    uint64_t discord_voice_hellos, discord_discovery_replies;
     doh_target doh[8];
     d2k_plain_prepare_fn plain_prepare;
     d2k_plain_run_fn plain_run;
@@ -7907,6 +7908,8 @@ void d2k_sched_synthesis_observer(d2k_sched *s,d2k_synthesis_observer fn,void *c
 void d2k_sched_diagnostic_counts(d2k_sched *s,d2k_diag_counts *c) {
     if(!s||!c)return;
     memset(c,0,sizeof *c);c->boxes=s->cat->n_boxes;
+    c->discord_voice_hellos=s->discord_voice_hellos;
+    c->discord_discovery_replies=s->discord_discovery_replies;
     pthread_mutex_lock(&s->mu);
     c->memory=s->memory;
     pthread_mutex_unlock(&s->mu);
@@ -14276,6 +14279,10 @@ static int plain_trial_event(task *t,const d2k_ev *event) {
 
 int d2k_sched_event(d2k_sched *s, const d2k_ev *ev) {
     if (!s || !ev) { return -1; }
+    if (ev->kind == D2K_EV_HELLO && is_voice_class(ev->name, ev->transport))
+        s->discord_voice_hellos++;
+    if (ev->kind == D2K_EV_EXCHANGE && ev->transport == 17 && ev->code == D2K_UDP_PROOF_VOICE_DISCOVERY)
+        s->discord_discovery_replies++;
     if(preflight_lease_event(s,ev)){wake_loop(s);return 0;}
     if(plain_dns_ack(s,ev)){wake_loop(s);return 0;}
     if(d2k_newchain_event(&s->newchain,ev,newchain_log,s)) {

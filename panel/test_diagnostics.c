@@ -10,6 +10,12 @@ int main(void) {
  char output[4096]={0};panel_buf b={.p=output,.cap=sizeof output};
  diagnostic_tunnel_events(&b,fixture);fclose(fixture);
  assert(strstr(output,"18:25:01")&&strstr(output,"curl_rc=28")&&!strstr(output,"secret-string"));
+ fixture=tmpfile();assert(fixture);
+ fputs("2026-11-21 18:27:01 движок неполон (датапат: нет, контроллер: да, правила ... private-address)\n",fixture);
+ fputs("2026-11-21 18:27:04 движок восстановлен: датапат pid 123 контроллер pid 456\n",fixture);
+ rewind(fixture);b.len=0;diagnostic_service_events(&b,fixture);fclose(fixture);
+ assert(strstr(output,"18:27:01 datapath_down") && strstr(output,"18:27:04 recovered"));
+ assert(!strstr(output,"private-address") && !strstr(output,"123"));
  fixture=tmpfile();assert(fixture);fputs("2000 52 3 2 65535 4 5 100 1\n",fixture);rewind(fixture);
  b.len=0;diagnostic_queue(&b,fixture,2000);fclose(fixture);
  assert(strstr(output,"\"bound\":true")&&strstr(output,"\"userspace_drops\":5"));

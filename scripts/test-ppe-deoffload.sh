@@ -384,12 +384,12 @@ HEAL_CALLS=$TMP/heal-calls; export HEAL_CALLS
 INIT_SCRIPT=$TMP/fake-init HEAL_LOCK=$TMP/heal.lock HEAL_LAST=$TMP/heal.last \
     sh "$ROOT/files/d2k-fw-heal.sh"
 check "сторож при целых правилах зовёт ppe-ensure" grep -qx 'ppe-ensure' "$HEAL_CALLS"
-check "сторож при целых правилах не переставляет очередь" sh -c "! grep -qx reapply '$HEAL_CALLS'"
+check "сторож при целых правилах не переставляет очередь" sh -c "! grep -q '^reapply' '$HEAL_CALLS'"
 check "сторож спрашивает состояние один раз" [ "$(grep -cx status "$HEAL_CALLS")" = 1 ]
 : > "$HEAL_CALLS"
 FAKE_RULES=0 INIT_SCRIPT=$TMP/fake-init HEAL_LOCK=$TMP/heal.lock HEAL_LAST=$TMP/heal.last \
     sh "$ROOT/files/d2k-fw-heal.sh" 2>/dev/null
-check "сторож при снесённой очереди делает reapply (он ставит и разгрузку)" grep -qx reapply "$HEAL_CALLS"
+check "сторож при снесённой очереди делает reapply (он ставит и разгрузку)" grep -qx "reapply auto" "$HEAL_CALLS"
 
 # An explicit owner restriction must still override broad default coverage.
 reset_rules

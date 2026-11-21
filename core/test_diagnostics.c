@@ -78,6 +78,7 @@ int main(void) {
     snprintf(path,sizeof path,"%s/self",dir);assert(!symlink("123",path));
     put(dir,"d2k.pid","999\n");
     put(dir,"123/stat","123 (d2kc) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 54321 0\n");
+    c.discord_voice_hellos=3;c.discord_discovery_replies=2;
     c.memory.workers_started=7;c.memory.workers_joined=6;
     c.memory.worker_args_allocated=8;c.memory.worker_args_freed=7;
     c.memory.worker_args_live=1;c.memory.worker_args_live_bytes=9000;
@@ -96,6 +97,7 @@ int main(void) {
     d2k_diag_sample(d,60000,&c,dir,dir);
     FILE *f=tmpfile();assert(f);assert(!d2k_diag_write(d,f));rewind(f);
     char json[16384];size_t n=fread(json,1,sizeof json-1,f);json[n]=0;
+    assert(strstr(json,"\"discord_voice_hellos\":3,\"discord_discovery_replies\":2"));
     assert(strstr(json,"\"rss_kib\":1024"));assert(strstr(json,"\"mem_available_kib\":8192"));
     const char *export_path=getenv("D2K_TEST_DIAG_JSON");
     if(export_path){FILE *out=fopen(export_path,"w");assert(out);assert(fwrite(json,1,n,out)==n);assert(!fclose(out));}

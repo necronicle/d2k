@@ -2739,15 +2739,20 @@ reapply() {
     # Мёртвый движок здесь не поднимается: после штатной остановки это было
     # бы воскрешением, а упавший демон поднимает recover по намерению.
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
+    # The earlier watchdog status was taken outside the service lock.
+    if [ "${1:-}" = auto ] && fw_installed; then return 0; fi
     if [ "${TCP_WATCH:-0}" = 1 ] || [ -f "$RUN/tcp-watch-active" ] ||
        [ "${D2K_PREFLIGHT:-0}" = 1 ] || [ -f "$RUN/preflight-active" ]; then
-        engine_stop && start_engine
-        return $?
+        svc_log "перезапуск движка для восстановления правил"
+        engine_stop && start_engine || return $?
+        if [ "${1:-}" = auto ]; then svc_log "правила восстановлены сторожем"; fi
+        return 0
     fi
     legacy_http_stop
     load_modules
     fw_up || { fw_down; die "не поставить полный набор правил"; }
-    say "правила поставлены заново"
+    if [ "${1:-}" = auto ]; then svc_log "правила восстановлены сторожем"
+    else say "правила поставлены заново"; fi
 }
 
 # ОЧИСТИТЬ ПОДОБРАННОЕ. Необратимо: это всё, что движок нашёл замером —
@@ -2807,6 +2812,7 @@ case "$1" in
     engine-restart)
         [ "$MODE" != "off" ] || die "MODE=off — перезапуск невозможен"
         locked
+        svc_log "получена команда engine-restart"
         engine_stop && start_engine
         ;;
     telegram-enable) telegram_enable ;;
@@ -2814,7 +2820,7 @@ case "$1" in
     telegram-restart) telegram_restart ;;
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
-    reapply) locked; reapply ;;
+    reapply) locked; reapply "${2:-}" ;;
     clear-found) locked; clear_found ;;
     ppe-ensure) ppe_ensure ;;
     dns-ensure) if running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;

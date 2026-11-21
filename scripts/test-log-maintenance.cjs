@@ -9,7 +9,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd2k-log-test.'));
 const log = path.join(tmp, 'log');
 const runtime = path.join(tmp, 'runtime');
 fs.mkdirSync(log);
-const owned = ['shadow.log', 'shadow-daemon.log', 'd2kd.log', 'd2kc.log', 'panel.log', 'telegram.log', 'instagram-dns.log', 'instagram-dns-scheduler.log', 'd2khttp.log'];
+const owned = ['service.log', 'shadow.log', 'shadow-daemon.log', 'd2kd.log', 'd2kc.log', 'panel.log', 'telegram.log', 'instagram-dns.log', 'instagram-dns-scheduler.log', 'd2khttp.log'];
 const payload = Buffer.concat([Buffer.alloc(3072, 'A'), Buffer.alloc(1024, 'Z')]);
 const env = { ...process.env, D2K_DIR: tmp, D2K_RUNTIME_DIR: runtime, LOGMAX: '3072', LOGKEEP: '1024' };
 function run(extra = {}) {

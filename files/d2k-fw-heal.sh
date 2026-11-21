@@ -90,11 +90,8 @@ if ! mkdir "$HEAL_LOCK" 2>/dev/null; then
 fi
 
 echo "$now" > "$HEAL_LAST"
-"$INIT_SCRIPT" reapply >/dev/null 2>&1
+"$INIT_SCRIPT" reapply auto >/dev/null 2>&1
 rc=$?
 rmdir "$HEAL_LOCK" 2>/dev/null
 
-if [ "$rc" = 0 ]; then
-    echo "d2k: правила снесены извне и восстановлены сторожем" >&2
-fi
 exit "$rc"

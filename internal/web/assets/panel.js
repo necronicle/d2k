@@ -149,14 +149,15 @@
   function model(status, received, now) {
     var snap = (status && status.snapshot) || {};
     var k = (status && status.knowledge) || {};
-    var linked = !!k.linked;
+    var fresh = snap.live_fresh !== false;
+    var linked = !!k.linked && fresh && !!snap.engine_running && snap.controller_running !== false;
     var engine = !!snap.engine_running;
     var searches = linked ? list(k.searches) : [];
     var QUEUED = "ожидает безопасного слота замера";
     var active = searches.filter(function (s) { return s.phase !== "подтверждено, смотрим живой трафик"; });
     var m = {
       snap: snap, k: k, linked: linked, engine: engine,
-      fresh: snap.live_fresh !== false,
+      fresh: fresh, linkUnknown: engine && snap.controller_running !== false && !fresh,
       searches: searches, hunting: active.length,
       running: searches.filter(function (s) { return s.phase !== QUEUED; }),
       queued: searches.filter(function (s) { return s.phase === QUEUED; }),
@@ -171,6 +172,16 @@
       m.lede = m.snap.mode === "off"
         ? "В конфигурации задан режим MODE=off. Трафик не читается и обходы не применяются."
         : "Трафик не читается, подбор не идёт, сохранённые обходы не применяются. Каталог ниже — последнее сохранённое состояние.";
+    } else if (snap.controller_running === false) {
+      m.tone = "bad"; m.lamp = "bad";
+      m.headline = ["Контроллер ", "остановлен"];
+      m.state = "Контроллер остановлен";
+      m.lede = "Панель видит процесс движка. Процесс контроллера не найден.";
+    } else if (m.linkUnknown) {
+      m.tone = "warn"; m.lamp = "warn";
+      m.headline = ["Нет свежего ", "снимка"];
+      m.state = "Нет свежего снимка движка";
+      m.lede = "Движок и контроллер запущены. Для проверки связи и текущих поисков нужен свежий снимок.";
     } else if (!linked) {
       m.tone = "bad"; m.lamp = "warn";
       m.headline = ["Нет связи ", "с датапатом"];
@@ -189,10 +200,6 @@
       m.headline = ["Поисков ", "нет"];
       m.state = "Движок работает";
       m.lede = "Подтверждённых блокировок без решения сейчас нет. Живой трафик под наблюдением: подбор начнётся, только если блокировка подтвердится измерением.";
-    }
-    if (engine && !m.fresh) {
-      m.lamp = "warn";
-      m.state = "Снимок движка устарел";
     }
     /* uptime_seconds — время работы процесса панели, а не движка. */
     m.panelUptime = num(snap.uptime_seconds);
@@ -907,8 +914,8 @@
       parts = [this.flash.what ? el(doc, "b", "", this.flash.what + ".") : null, " " + this.flash.text];
     } else if (this.m && this.m.snap.preview) {
       tone = "info"; parts = [el(doc, "b", "", "Демонстрационные данные."), " Это локальный стенд, а не роутер."];
-    } else if (this.m && this.m.engine && !this.m.fresh) {
-      tone = "warn"; parts = [el(doc, "b", "", "Снимок движка устарел."), " Движок давно не обновлял состояние; цифры ниже могут быть не текущими."];
+    } else if (this.m && this.m.linkUnknown) {
+      tone = "warn"; parts = [el(doc, "b", "", "Нет свежего снимка движка."), " Движок давно не обновлял состояние; цифры ниже могут быть не текущими."];
     }
     if (!parts) {
       if (n.hidden || n.__closing) return;
@@ -1043,9 +1050,9 @@
     var doc = this.doc, self = this;
     var listNode = this.$("searches");
     if (!m.linked || !m.engine) {
-      section(listNode, "absent:" + m.engine + ":" + m.linked, function () {
+      section(listNode, "absent:" + m.engine + ":" + m.linkUnknown, function () {
         var li = el(doc, "li", "quiet");
-        add(li, el(doc, "b", "", "Поиски не измеряются."), m.engine
+        add(li, el(doc, "b", "", "Поиски не измеряются."), m.linkUnknown ? " Нет свежего снимка контроллера." : m.engine
           ? " Контроллер не подключён к датапату, поэтому список поисков недоступен."
           : " Движок остановлен.");
         return [li];
@@ -2294,8 +2301,8 @@
       var ul = el(doc, "ul", "stages");
       list(snap.stages).forEach(function (s) {
         var li = el(doc, "li");
-        li.setAttribute("data-ok", String(!!s.built));
-        add(li, icon(doc, s.built ? "check" : "cross"), el(doc, "b", "", str(s.title)), el(doc, "p", "", str(s.detail)));
+        li.setAttribute(s.built === null ? "data-absent" : "data-ok", s.built === null ? "true" : String(!!s.built));
+        add(li, icon(doc, s.built === null ? "dash" : s.built ? "check" : "cross"), el(doc, "b", "", str(s.title)), el(doc, "p", "", str(s.detail)));
         ul.appendChild(li);
       });
       list(snap.absent).forEach(function (s) {
@@ -2324,7 +2331,7 @@
       var last = { idle: "", running: "выполняется", done: "выполнена", failed: "завершилась ошибкой", timeout: "не завершилась вовремя" }[str(snap.control_state)];
       if (last) fact("Последняя команда", last, snap.control_state === "failed" || snap.control_state === "timeout" ? "warn" : null);
       if (m.panelUptime) fact("Панель запущена", duration(m.panelUptime * 1000) + " назад");
-      fact("Связь с датапатом", m.linked ? "есть" : "нет", m.linked ? null : "bad");
+      fact("Связь с датапатом", m.linkUnknown ? "нет свежих данных" : m.linked ? "есть" : "нет", m.linkUnknown ? "warn" : m.linked ? null : "bad");
       fact("Снимок движка", snap.live_fresh ? "свежий" : "устарел или отсутствует", snap.live_fresh ? null : "warn");
       fact("Конфигурация", str(snap.config_path) + (snap.config_exists ? "" : " — файла нет, действуют умолчания"),
         snap.config_exists ? null : "warn", true);
@@ -2356,12 +2363,12 @@
       n.textContent = text;
       if (tone) n.setAttribute("data-tone", tone); else n.removeAttribute("data-tone");
     }.bind(this);
-    set("nav-now", !m.engine ? "стоп" : !m.linked ? "нет связи" : m.hunting ? String(m.hunting) : "", m.hunting ? "live" : null);
+    set("nav-now", !m.engine ? "стоп" : m.linkUnknown ? "нет данных" : !m.linked ? "нет связи" : m.hunting ? String(m.hunting) : "", m.hunting ? "live" : null);
     set("nav-families", m.groups.length ? String(m.groups.length) : "");
     set("nav-boxes", m.boxes.length ? String(m.boxes.length) : "");
     var tg = m.snap.telegram_status;
     set("nav-telegram", tg === "connected" ? "вкл" : tg === "connecting" ? "…" : "выкл");
-    var bad = list(m.snap.stages).filter(function (s) { return !s.built; }).length;
+    var bad = list(m.snap.stages).filter(function (s) { return s.built === false; }).length;
     set("nav-diagnostics", bad ? "!" + bad : "", bad ? "warn" : null);
   };
 

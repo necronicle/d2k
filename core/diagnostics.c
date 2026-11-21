@@ -262,6 +262,8 @@ int d2k_diag_write(const d2k_diag *d,FILE *f) {
         fprintf(f,"{\"at\":%lld,\"mono_ms\":%lld,\"mem_total_kib\":",(long long)s->at,(long long)s->mono);number(f,s->total);
         fputs(",\"mem_available_kib\":",f);number(f,s->available);
         fputs(",\"system_conntrack\":",f);number(f,s->conntrack);
+        fprintf(f,",\"discord_voice_hellos\":%llu,\"discord_discovery_replies\":%llu",
+                (unsigned long long)c->discord_voice_hellos,(unsigned long long)c->discord_discovery_replies);
         fprintf(f,",\"datapath_flows\":null,\"http_records\":%llu,\"http_queued\":%llu",(unsigned long long)c->http_records,(unsigned long long)c->http_queued);
         fprintf(f,",\"boxes\":%llu,\"bindings\":%llu,\"plans\":%llu,\"observations\":%llu,\"active\":%llu,\"queued\":%llu,\"tasks\":%llu,\"snapshots\":%llu,\"processes\":[",
           (unsigned long long)c->boxes,(unsigned long long)c->bindings,(unsigned long long)c->plans,(unsigned long long)c->observations,

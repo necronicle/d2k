@@ -62,7 +62,30 @@ static void run(int which,unsigned code){
     }
     d2k_sched_free(s);
 }
+static int check_voice_diagnostics(void) {
+    d2k_catalog catalog = {0};
+    d2k_sched *s = d2k_sched_new(&catalog, -1, 0);
+    if (!s) return 1;
+    d2k_ev ev = {.kind = D2K_EV_HELLO, .transport = 17, .family = 4};
+    strcpy(ev.name, D2K_LINK_VOICE_CLASS);
+    d2k_sched_event(s, &ev);
+    strcpy(ev.name, "other.example");
+    d2k_sched_event(s, &ev);
+    ev.kind = D2K_EV_EXCHANGE;
+    ev.code = D2K_UDP_PROOF_STUN;
+    d2k_sched_event(s, &ev);
+    ev.code = D2K_UDP_PROOF_VOICE_DISCOVERY;
+    d2k_sched_event(s, &ev);
+    ev.transport = 6;
+    d2k_sched_event(s, &ev);
+    d2k_diag_counts counts;
+    d2k_sched_diagnostic_counts(s, &counts);
+    d2k_sched_free(s);
+    d2k_catalog_free(&catalog);
+    return counts.discord_voice_hellos != 1 || counts.discord_discovery_replies != 1;
+}
 int main(void){
+    failures += check_voice_diagnostics();
     for(int i=0;i<16;i++){run(i,D2K_UDP_PROOF_STUN);run(i,D2K_UDP_PROOF_VOICE_DISCOVERY);}
     for(int i=0;i<12;i++)run(i,D2K_SUSPECT_SILENT+256);
     run(15,D2K_SUSPECT_SILENT+256);

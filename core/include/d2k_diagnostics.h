@@ -38,6 +38,7 @@ typedef struct {
 } d2k_diag_memory;
 typedef struct {
     d2k_diag_memory memory;
+    uint64_t discord_voice_hellos, discord_discovery_replies; /* cumulative for this controller PID */
     uint64_t boxes, bindings, plans, observations, active, queued, tasks, snapshots, http_records, http_queued;
 } d2k_diag_counts;
 typedef struct d2k_diag d2k_diag;

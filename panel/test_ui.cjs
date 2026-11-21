@@ -44,7 +44,13 @@ const snap = (over) => ({ engine_running: true, controller_running: true, live_f
 {
   const m = ui.model({ snapshot: snap({ live_fresh: false }), knowledge: { linked: true } });
   assert.equal(m.lamp, 'warn');
-  assert.match(m.state, /устарел/);
+  assert.match(m.state, /снимка/i);
+  assert.match(m.headline.join(''), /снимка/i);
+  assert.equal(m.linked, false);
+  assert.equal(m.linkUnknown, true);
+  const stopped = ui.model({ snapshot: snap({ controller_running: false, live_fresh: false }), knowledge: { linked: false } });
+  assert.match(stopped.headline.join(''), /контроллер/i);
+  assert.equal(stopped.linkUnknown, false);
 }
 // Мусор вместо массивов не роняет модель.
 {
