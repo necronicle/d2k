@@ -42,6 +42,7 @@ fw_installed() { return "$missing"; }
 engine_stop() { echo stop >> "$RUN/calls"; }
 start_engine() { echo start >> "$RUN/calls"; }
 svc_log() { :; }
+engine_evidence() { :; }
 D2K_PREFLIGHT=1
 missing=0
 : > "$RUN/calls"

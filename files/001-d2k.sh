@@ -23,7 +23,7 @@ HEAL="${HEAL:-/opt/d2k/d2k-fw-heal.sh}"
 # хук и на нём, а сброс к тому моменту уже случился (та же оговорка, что у
 # z2k в 000-zapret2.sh).
 if [ "$table" = "mangle" ] || [ "$table" = "nat" ]; then
-    [ ! -x "$HEAL" ] || "$HEAL"
+    [ ! -x "$HEAL" ] || D2K_HEAL_SOURCE=ndm "$HEAL"
 fi
 
 # Telegram owns independent nat redirects and IPv6 fast-fail rules. NDM's nat

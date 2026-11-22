@@ -101,7 +101,12 @@ static int client_tcp_ports(const uint8_t *pkt, size_t len,
 #define OUT_BUF    (D2K_RESULT_MAX * MAX_PKT)
 
 static volatile sig_atomic_t stop_flag;
-static void on_signal(int sig) { (void)sig; stop_flag = 1; }
+static volatile sig_atomic_t stop_sender;
+static void on_signal(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    stop_sender = info && info->si_code <= 0 ? info->si_pid : 0;
+    stop_flag = sig;
+}
 
 /* Собственная цена. Читается у ядра, а не оценивается: §10 требует CPU и RSS
    как метрики, а «на глаз не тормозит» метрикой не является.
@@ -2137,7 +2142,9 @@ int main(int argc, char **argv) {
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = on_signal;
+    sa.sa_flags = SA_SIGINFO;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
@@ -3254,6 +3261,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    fprintf(stderr, "d2kd: engine-exit time=%ld pid=%ld signal=%d sender_pid=%d duration_s=%u\n",
+            (long)time(NULL), (long)getpid(), (int)stop_flag, (int)stop_sender, duration_s);
     d2k_hold_flush(holding, now_ns(), 0, 1, release_original, &hc);
     (void)d2k_udp_path_expire(&udp_path, now_ns(), 0);
     if (udp_releases) {

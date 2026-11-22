@@ -222,8 +222,23 @@ xt_wait() {
     [ "${1:-}" != -w ] || shift
     command "$xt_tool" -w "$@"
     xt_rc=$?
-    [ "$xt_rc" = 2 ] || return "$xt_rc"
-    command "$xt_tool" "$@"
+    if [ "$xt_rc" = 2 ]; then
+        command "$xt_tool" "$@"
+        xt_rc=$?
+    fi
+    if [ "$xt_rc" != 0 ] && [ "${FW_DIAG:-0}" = 1 ] && [ "${3:-}" = -C ]; then
+        svc_log "fw-check tool=$xt_tool rc=$xt_rc $*" >/dev/null || :
+        case "$*" in
+            *" --mark $PF_CONN_BIT/$PF_CONN_BIT -j NFQUEUE "*)
+                # Independent listing before repair. Record counts, not addresses.
+                { command "$xt_tool" -w -t mangle -S "$4" 2>/dev/null; echo "list_rc=$?"; } |
+                    awk -v chain="$4" '$1=="-A" && $2==chain && / -m connmark --mark 0x0*8000000\/0x0*8000000 / &&
+                        / -j NFQUEUE / && !/ -m comment / { n++ }
+                        /^list_rc=/ { print "preflight-list",chain,$1,"marked_queue_rules=" n+0 }' >> "$SERVICE_LOG"
+                ;;
+        esac
+    fi
+    return "$xt_rc"
 }
 iptables() { xt_wait iptables "$@"; }
 ip6tables() { xt_wait ip6tables "$@"; }
@@ -271,6 +286,14 @@ ENGINE_LOCK=${ENGINE_LOCK:-/tmp/d2k-engine.lock}
 ENGINE_WANT=$RUNTIME_DIR/engine.want
 RECOVER_STATE=$RUNTIME_DIR/recover.state
 SERVICE_LOG=$LOG/service.log
+ENGINE_ACTION=${1:-unknown}
+if [ "$ENGINE_ACTION" = reapply ] && [ "${2:-}" = auto ]; then
+    case "${D2K_HEAL_SOURCE:-}" in
+        watchdog|ndm) ENGINE_ACTION=reapply-auto-$D2K_HEAL_SOURCE ;;
+        *) ENGINE_ACTION=reapply-auto ;;
+    esac
+fi
+FW_DIAG=0
 # Метка «IPv6 не обслуживается»: ip6tables mangle на этой прошивке нет
 # (без компонента IPv6 или без ip6table_mangle). fw_installed тогда не ждёт
 # IPv6-правил, а fw_down метку снимает.
@@ -2293,7 +2316,7 @@ start_engine() {
     WATCHLOOP="elapsed=${HEAL_EVERY:-60}
     while :; do
         if [ \$elapsed -ge ${HEAL_EVERY:-60} ]; then
-            \"$HEAL\" >/dev/null 2>&1
+            D2K_HEAL_SOURCE=watchdog \"$HEAL\" >/dev/null 2>&1
             elapsed=0
         elif [ \"$FW_BACKEND\" = iptables ] && [ -r \"$RUN/dns-routes\" ] &&
              ! cmp -s \"$RUN/dns-routes\" \"$RUN/dns-routes.reconciled\"; then
@@ -2426,6 +2449,42 @@ svc_log() {
     say "$*"
 }
 
+# Capture evidence before recover/stop can remove or replace the PID files.
+# Kernel ring timestamps are retained; an old line is never an inferred cause.
+engine_evidence() (
+    dp_pid=none; ct_pid=none
+    if [ -r "$DP_PID" ]; then read -r dp_pid < "$DP_PID" || :; fi
+    if [ -r "$CT_PID" ]; then read -r ct_pid < "$CT_PID" || :; fi
+    svc_log "engine-event=$1 action=$ENGINE_ACTION service_pid=$$ dp_pid=$dp_pid ct_pid=$ct_pid" >/dev/null
+    {
+        awk '/^(MemAvailable|SwapFree):/' "$PROC_DIR/meminfo"
+        for p in "$dp_pid" "$ct_pid"; do
+            case "$p" in ''|*[!0-9]*) continue ;; esac
+            if [ -r "$PROC_DIR/$p/status" ]; then
+                awk -v p="$p" '/^(Name|State|VmRSS|VmSwap):/ {print "pid=" p, $0}' "$PROC_DIR/$p/status"
+            fi
+        done
+        dmesg 2>/dev/null | awk -v dp="$dp_pid" -v ct="$ct_pid" '
+            index($0, "process " dp " (d2kd)") || index($0, "process " ct " (d2kc)") ||
+            index($0, "d2kd[" dp "]") || index($0, "d2kc[" ct "]")' | tail -4
+    } 2>/dev/null >> "$SERVICE_LOG"
+    exit 0
+)
+
+# Read after the event. Include only lifecycle diagnostics, even if the daemon
+# logs also contain browsing targets. Bound reads on small routers.
+stop_report() {
+    for report in "$SERVICE_LOG" "$LOG/d2kd.log" "$LOG/d2kc.log"; do
+        [ -r "$report" ] || continue
+        printf '%s\n' "--- ${report##*/} ---"
+        tail -c 65536 "$report" | awk '
+            /engine-event=|engine-signal=|engine-exit |fw-check tool=|^preflight-list |^MemAvailable:|^SwapFree:|^pid=[0-9]+ |Killed process [0-9]+ \(d2k[cd]\)|^.*d2k[cd]\[[0-9]+\].*(fault|segfault)/ {
+                gsub(/ -[sd] [^ ]+/, " [address]")
+                print
+            }' | tail -40
+    done
+}
+
 # Штатная остановка снимает намерение и счёт попыток: после неё движок
 # своей волей не поднимается — ни сторожем, ни хуком NDM.
 engine_unwant() {
@@ -2479,6 +2538,7 @@ recover() {
         return 0
     fi
     recover_backoff_ok || return 0
+    engine_evidence "missing:dp=$dp,ct=$ct"
     if [ ! -f "$RUN/tcp-watch-active" ] && [ ! -f "$RUN/preflight-active" ] && watch_contract_matches && fw_installed; then
         if [ "$dp" = нет ]; then
             svc_log "датапат не работает (контроллер работает: $ct) — восстанавливаю датапат и контроллер; правила, исключения и каталог не трогаю"
@@ -2537,6 +2597,9 @@ stop_pidfile() {
     # «номер из файла»: тот мог достаться чужому процессу.
     if running "$p"; then
         sp=$(cat "$p" 2>/dev/null)
+        if [ "$p" = "$DP_PID" ] || [ "$p" = "$CT_PID" ]; then
+            svc_log "engine-signal=TERM action=$ENGINE_ACTION service_pid=$$ target_pid=$sp" >/dev/null || :
+        fi
         kill "$sp" 2>/dev/null
         # d2kd: up to 2.5s post-NAT drain, one 2s filter-removal ACK and
         # a 2s late-worker stop. Ten seconds leaves bounded cleanup headroom;
@@ -2558,6 +2621,9 @@ stop_pidfile() {
             fi
         done
         if running "$p"; then
+            if [ "$p" = "$DP_PID" ] || [ "$p" = "$CT_PID" ]; then
+                svc_log "engine-signal=KILL action=$ENGINE_ACTION service_pid=$$ target_pid=$sp" >/dev/null || :
+            fi
             kill -9 "$sp" 2>/dev/null
         fi
     fi
@@ -2874,7 +2940,7 @@ reapply() {
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
     # The earlier watchdog status was taken outside the service lock.
     if [ "${1:-}" = auto ]; then
-        if fw_installed; then return 0; fi
+        if FW_DIAG=1 fw_installed; then return 0; fi
         if fw_recover_mangle; then
             svc_log "после сброса IPv4/IPv6 mangle правила восстановлены без перезапуска движка"
             return 0
@@ -2886,6 +2952,7 @@ reapply() {
     fi
     if [ "${TCP_WATCH:-0}" = 1 ] || [ -f "$RUN/tcp-watch-active" ] ||
        [ "${D2K_PREFLIGHT:-0}" = 1 ] || [ -f "$RUN/preflight-active" ]; then
+        engine_evidence "restart:firewall"
         svc_log "перезапуск движка для восстановления правил"
         engine_stop && start_engine || return $?
         if [ "${1:-}" = auto ]; then svc_log "правила восстановлены сторожем"; fi
@@ -2963,6 +3030,7 @@ case "$1" in
     telegram-restart) telegram_restart ;;
     telegram-reapply) telegram_reapply ;;
     status)  status ;;
+    stop-report) stop_report ;;
     reapply) locked; reapply "${2:-}" ;;
     clear-found) locked; clear_found ;;
     ppe-ensure) ppe_ensure ;;

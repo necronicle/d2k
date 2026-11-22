@@ -95,6 +95,9 @@ running "$DP_PID" || fail "unstamped d2kd whose binary was replaced by an update
 echo "S99 running(): unstamped engine pid — exe + control socket identity: PASS"
 
 # Actual stop loop, with signals/time intercepted: no host PID is signalled.
+svc_log() { printf '%s\n' "$*" >> "$TMP/events"; }
+# shellcheck disable=SC2034 # consumed by stop_pidfile
+ENGINE_ACTION=engine-stop
 kill() { printf '%s\n' "$*" >> "$TMP/signals"; }
 sleep() {
     [ "${stop_whole:-0}" != 1 ] || [ "$1" != 0.1 ] || return 1
@@ -113,6 +116,7 @@ stop_fixture 65
 stop_pidfile "$DP_PID"
 [ "$stop_ticks" -eq 65 ] || fail "datapath must get time for 2.5s drain + 2s filter cleanup + 2s worker stop"
 [ "$(cat "$TMP/signals")" = 201 ] || fail "completed datapath cleanup must not receive SIGKILL"
+grep -q 'engine-signal=TERM action=engine-stop .*target_pid=201' "$TMP/events" || fail "planned TERM missing from diagnostics"
 stop_fixture 0
 stop_pidfile "$DP_PID"
 [ "$stop_ticks" -eq 100 ] || fail "stuck datapath stop must remain bounded at 10s"

@@ -278,7 +278,12 @@ int d2k_detect_sched_tcp_ack(const char *ip, uint16_t port, uint32_t mark,
 #define LIVE_EVERY_MS 2000
 
 static volatile sig_atomic_t stop_asked;
-static void on_signal(int sig) { (void)sig; stop_asked = 1; }
+static volatile sig_atomic_t stop_sender;
+static void on_signal(int sig, siginfo_t *info, void *context) {
+    (void)context;
+    stop_sender = info && info->si_code <= 0 ? info->si_pid : 0;
+    stop_asked = sig;
+}
 typedef struct {
     int output;
     volatile sig_atomic_t halt;
@@ -778,8 +783,12 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    struct sigaction sa = {0};
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = on_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 #ifdef D2K_TRUSTED_DOH
     d2k_verify_doh_set_tls(d2k_doh_trusted_tls_open);
     d2k_verify_dot_set_probe(d2k_dot_trusted_probe);
@@ -1292,6 +1301,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    fprintf(stderr, "d2kc: engine-exit time=%ld pid=%ld signal=%d sender_pid=%d link_lost=%d protocol_mismatch=%d\n",
+            (long)time(NULL), (long)getpid(), (int)stop_asked, (int)stop_sender, link_lost, proto_bad);
     if (proto_bad) {
         printf("d2kc: остановлен из-за несовпадения версии протокола\n");
     }
