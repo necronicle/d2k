@@ -261,6 +261,18 @@ int main(void) {
     deliver(&lw, 2, 0, 12*S);
     CHECK(!d2k_lw_ipv4_repair_pending(&lw), "restored IPv4 rules did not acknowledge repair");
 
+    reset(&lw, D2K_LW_BACKEND_RULES);
+    d2k_lw_trial_add(&lw, &t, 0, 10*S);
+    deliver(&lw, 0, 0, 10*S);
+    d2k_lw_trial_add(&lw, &v6, 0, 10*S);
+    deliver(&lw, 1, 0, 10*S);
+    d2k_lw_family_mangle_reset(&lw, 6, 11*S);
+    CHECK(count_op(D2K_LWOP_INSTALL) == 3 && reqs[2].t.family == 6,
+          "IPv4 delivery changed or IPv6 tuple was not reinstalled during IPv6 repair");
+    CHECK(d2k_lw_family_repair_pending(&lw, 6), "IPv6 repair acknowledged before its new rule");
+    deliver(&lw, 2, 0, 12*S);
+    CHECK(!d2k_lw_family_repair_pending(&lw, 6), "restored IPv6 rules did not acknowledge repair");
+
     /* 1. Наблюдение: подтверждение и срок — от готовности установки; пакеты
           до неё не считаются; итог и снятие по сроку. */
     reset(&lw, D2K_LW_BACKEND_MARK);

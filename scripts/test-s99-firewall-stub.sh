@@ -70,8 +70,10 @@ case "$op" in
     -A) [ -e "$f" ] || exit 1; printf '%s\n' "$spec" >> "$f" ;;
     -I) [ -e "$f" ] || exit 1
         # «-I цепочка 1 …»: номер — позиция, не часть правила (как у iptables -S).
-        case "$spec" in [0-9]*' '*) spec=${spec#* } ;; esac
-        { printf '%s\n' "$spec"; cat "$f"; } > "$f.new"; mv "$f.new" "$f" ;;
+        pos=1
+        case "$spec" in [0-9]*' '*) pos=${spec%% *}; spec=${spec#* } ;; esac
+        awk -v n="$pos" -v rule="$spec" 'NR==n {print rule} {print} END {if (NR<n) print rule}' "$f" > "$f.new"
+        mv "$f.new" "$f" ;;
     -C) [ -e "$f" ] && grep -qxF -- "$spec" "$f" ;;
     -D) [ -e "$f" ] && grep -qxF -- "$spec" "$f" || exit 1
         awk -v s="$spec" '!d && $0==s {d=1; next} {print}' "$f" > "$f.new"; mv "$f.new" "$f" ;;
@@ -101,7 +103,7 @@ s99() {
     env FW_STATE="$TMP/fw" "$@" sh -c '
         . "$1/s99funcs.sh"
         PATH="$1/bin:$PATH"
-        STATE_DIR=$1/state; RUN=$1/run; FW_V4ONLY=$RUN/fw-ipv4-only; FW_LOCK=$1/fw.lock; PROC_DIR=$1/proc
+        STATE_DIR=$1/state; RUN=$1/run; FW_V4ONLY=$RUN/fw-ipv4-only; FW_V6_REBUILDING=$RUN/fw-ipv6-rebuilding; FW_LOCK=$1/fw.lock; PROC_DIR=$1/proc
         USER_RULES=$STATE_DIR/user-rules
         MODE=observe
         shift; eval "$1"' sh "$TMP" "$S99_SNIPPET"
@@ -117,16 +119,18 @@ python3 "$ROOT/scripts/test-preflight-firewall.py" "$TMP/fw" || fail "preflight 
 cat > "$TMP/bin/iptables-restore" <<'RESTORE'
 #!/bin/sh
 set -eu
+tool=${0##*/}; tool=${tool%-restore}
 [ "$1" = --noflush ]
 read -r table; [ "$table" = '*mangle' ]
 while read -r op chain pos jump target; do
     [ "$op" != COMMIT ] || exit 0
     [ "$op" = -I ] && [ "$pos" = 1 ] && [ "$jump" = -j ]
-    iptables -t mangle -I "$chain" 1 -j "$target"
+    "$tool" -t mangle -I "$chain" 1 -j "$target"
 done
 exit 1
 RESTORE
 chmod +x "$TMP/bin/iptables-restore"
+ln -s iptables-restore "$TMP/bin/ip6tables-restore"
 rules iptables nat > "$TMP/old-nat"
 rules ip6tables mangle > "$TMP/old-ip6"
 for cycle in 1 2; do
@@ -149,6 +153,26 @@ for cycle in 1 2; do
     rules ip6tables mangle | cmp -s - "$TMP/old-ip6" || fail "changed surviving IPv6 rules"
 done
 ok "two WAN renewals restore wiped IPv4 mangle and preserve both processes"
+# A single missing preflight queue rule is a partial IPv4 mangle loss. On a
+# small router the old preflight fallback restarted both daemons every minute.
+# Restore exactly that static rule in its original position while the engine
+# and the owner's rule stay live.
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -I D2K_OUT 1 -m comment --comment keep-owner -j RETURN
+rules iptables mangle > "$TMP/healthy-partial-v4"
+for chain in D2K_OUT D2K_IN; do
+    direction=ORIGINAL; [ "$chain" != D2K_IN ] || direction=REPLY
+    FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -D "$chain" -p tcp -m conntrack --ctdir "$direction" \
+        -m connmark --mark 0x08000000/0x08000000 -j NFQUEUE --queue-num 2000 --queue-bypass
+    S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+        RUNTIME_DIR=$RUN; CONF=$RUN/test-config; : > "$CONF"; sha256sum < "$CONF" > "$RUN/fw-config.sha256";
+        : > "$RUN/preflight-active";
+        running() { return 0; }; engine_stop() { return 1; }; svc_log() { :; };
+        reapply auto && fw_installed' s99 > "$TMP/partial.log" 2>&1 ||
+        { cat "$TMP/partial.log"; fail "partial IPv4 preflight rule restarted the engine or stayed missing: $chain"; }
+    rules iptables mangle | cmp -s - "$TMP/healthy-partial-v4" ||
+        fail "partial IPv4 repair changed rule order or owner's rule: $chain"
+done
+ok "partial IPv4 preflight loss restores exact rule order without restarting daemons"
 # Numeric aliases of the reserved marks are conflicts too.
 if S99_SNIPPET='D2K_PREFLIGHT=1; MARK=49; preflight_validate' s99 >/dev/null 2>&1; then fail "preflight numeric mark collision accepted"; fi
 S99_SNIPPET='D2K_PREFLIGHT=1; KEENETIC_POLICY=Policy7;
@@ -906,5 +930,65 @@ S99_SNIPPET="$LWS fw_up" s99 >/dev/null 2>&1 || fail "fw_up после паде�
 S99_SNIPPET='MODE=apply; fw_down' s99 >/dev/null 2>&1 || true
 rm -f "$TMP/run/d2kd.pid" "$TMP/run/d2kd.pid.start"
 ok "late delivery rules of a live d2kd survive reapply/rollback; removed after its stop; crash leftovers cleaned"
+
+# Full and partial IPv6 recovery uses the same live-engine contract as IPv4.
+# Keep a saved owner rule in both families and compare every rule and its order.
+: > "$TMP/state/user-rules"
+S99_SNIPPET='D2K_PREFLIGHT=1; D2K_PREFLIGHT_V6=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+    preflight_ipv6_available() { return 0; }; dns_excl_sync_unlocked() { :; }; fw_up' s99 >/dev/null 2>&1 || fail "IPv6 preflight setup"
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t mangle -I D2K_OUT 1 -m comment --comment keep-owner -j RETURN
+FW_STATE="$TMP/fw" "$TMP/bin/ip6tables" -t mangle -I D2K_OUT 1 -m comment --comment keep-owner -j RETURN
+printf '%s\n' 'iptables -A D2K_OUT -m comment --comment keep-owner -j RETURN' \
+    'ip6tables -A D2K_OUT -m comment --comment keep-owner -j RETURN' > "$TMP/state/user-rules"
+rules iptables mangle | grep -vE '^-[NA] FOREIGN' > "$TMP/healthy-both-v4"
+# NDM's full-table reset also erased the unrelated FOREIGN chain left by an
+# earlier fixture. Compare every D2K rule and hook; D2K cannot restore it.
+rules ip6tables mangle | grep -vE '^-[NA] FOREIGN' > "$TMP/healthy-both-v6"
+for lost in v6 both; do
+    mv "$TMP/fw/ip6tables/mangle" "$TMP/reset-$lost-v6"
+    if [ "$lost" = both ]; then mv "$TMP/fw/iptables/mangle" "$TMP/reset-$lost-v4"; fi
+    S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+        RUNTIME_DIR=$RUN; CONF=$RUN/test-config; : > "$CONF"; sha256sum < "$CONF" > "$RUN/fw-config.sha256";
+        : > "$RUN/preflight-active"; : > "$RUN/preflight-v6-active";
+        preflight_ipv6_available() { return 0; };
+        running() { return 0; }; engine_stop() { return 1; }; svc_log() { :; };
+        dns_excl_sync_unlocked() { :; };
+        (n=0; while [ ! -d "$RUN/d2kd.health.fw6" ] && [ "$n" -lt 150 ]; do n=$((n+1)); sleep .1; done;
+            [ -d "$RUN/d2kd.health.fw6" ] || exit 1; rmdir "$RUN/d2kd.health.fw6") & peer6=$!;
+        if [ "$LOST" = both ]; then
+            (n=0; while [ ! -d "$RUN/d2kd.health.fw4" ] && [ "$n" -lt 150 ]; do n=$((n+1)); sleep .1; done;
+                [ -d "$RUN/d2kd.health.fw4" ] || exit 1; rmdir "$RUN/d2kd.health.fw4") & peer4=$!;
+        fi;
+        reapply auto && wait "$peer6" && { [ "$LOST" != both ] || wait "$peer4"; } && fw_installed' s99 "LOST=$lost" > "$TMP/renew-$lost.log" 2>&1 ||
+        { cat "$TMP/renew-$lost.log"; fail "$lost full mangle loss restarted daemons or left rules incomplete"; }
+    rules iptables mangle | grep -vE '^-[NA] FOREIGN' > "$TMP/repaired-v4"
+    cmp -s "$TMP/repaired-v4" "$TMP/healthy-both-v4" ||
+        { diff -u "$TMP/healthy-both-v4" "$TMP/repaired-v4" || :; fail "$lost repair changed IPv4 rules"; }
+    rules ip6tables mangle | grep -vE '^-[NA] FOREIGN' > "$TMP/repaired-v6"
+    cmp -s "$TMP/repaired-v6" "$TMP/healthy-both-v6" ||
+        { diff -u "$TMP/healthy-both-v6" "$TMP/repaired-v6" || :; fail "$lost repair changed IPv6 rules"; }
+done
+ok "full IPv6 and simultaneous IPv4/IPv6 wipes preserve daemons and owner rules"
+for tool in ip6tables iptables; do
+    FW_STATE="$TMP/fw" "$TMP/bin/$tool" -t mangle -D D2K_OUT -p tcp -m conntrack --ctdir ORIGINAL \
+        -m connmark --mark 0x08000000/0x08000000 -j NFQUEUE --queue-num 2000 --queue-bypass
+    S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+        RUNTIME_DIR=$RUN; CONF=$RUN/test-config; : > "$CONF"; sha256sum < "$CONF" > "$RUN/fw-config.sha256";
+        : > "$RUN/preflight-active"; : > "$RUN/preflight-v6-active";
+        preflight_ipv6_available() { return 0; };
+        running() { return 0; }; engine_stop() { return 1; }; svc_log() { :; };
+        reapply auto && fw_installed' s99 > "$TMP/partial-v6.log" 2>&1 ||
+        { cat "$TMP/partial-v6.log"; fail "partial $tool preflight loss restarted the engine"; }
+    rules iptables mangle | grep -vE '^-[NA] FOREIGN' | cmp -s - "$TMP/healthy-both-v4" || fail "partial repair changed IPv4 order"
+    rules ip6tables mangle | grep -vE '^-[NA] FOREIGN' | cmp -s - "$TMP/healthy-both-v6" || fail "partial repair changed IPv6 order"
+done
+ok "partial preflight loss restores IPv4 and IPv6 rule order without restarting daemons"
+FW_STATE="$TMP/fw" "$TMP/bin/ip6tables" -t mangle -D D2K_OUT -m comment --comment keep-owner -j RETURN
+: > "$TMP/run/fw-ipv6-rebuilding"
+S99_SNIPPET='user_rules_save' s99 >/dev/null 2>&1 || fail "owner snapshot during IPv6 fallback"
+grep -qxF 'ip6tables -A D2K_OUT -m comment --comment keep-owner -j RETURN' "$TMP/state/user-rules" ||
+    fail "saved IPv6 owner rule was lost while its family was rebuilding"
+rm -f "$TMP/run/fw-ipv6-rebuilding"
+ok "IPv6 fallback retains saved owner rules during a partial rebuild"
 
 echo "S99d2k firewall (stub): all checks passed"

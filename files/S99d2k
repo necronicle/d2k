@@ -275,6 +275,7 @@ SERVICE_LOG=$LOG/service.log
 # (без компонента IPv6 или без ip6table_mangle). fw_installed тогда не ждёт
 # IPv6-правил, а fw_down метку снимает.
 FW_V4ONLY=$RUN/fw-ipv4-only
+FW_V6_REBUILDING=$RUN/fw-ipv6-rebuilding
 PROC_DIR=/proc
 
 # Разгрузка окна рукопожатия от аппаратного ускорителя Keenetic (-j PPE с
@@ -769,6 +770,9 @@ preflight_queue_rules() {
     local wt op
     wt=$1; op=$2
     preflight_family "$wt" || return 0
+    # A narrowly scoped live repair checks every other rule before restoring
+    # these two. The flag exists only in that repair's subshell.
+    [ "$op" != -C ] || [ "${D2K_SKIP_PREFLIGHT_QUEUE_CHECK:-0}" != 1 ] || return 0
     "$wt" -t mangle "$op" "$CHAIN_OUT" -p tcp -m conntrack --ctdir ORIGINAL -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
     "$wt" -t mangle "$op" "$CHAIN_IN" -p tcp -m conntrack --ctdir REPLY -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || return 1
 }
@@ -1004,8 +1008,10 @@ fw_family_up() (
     # неотличимы. Только UDP: для TCP то же правило не нужно, а проверять
     # непроверенное на живой линии нельзя.
     if [ "${2:-}" = detached ]; then
-        "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE 2>/dev/null ||
-            "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE || return 1
+        if [ "$fw_tool" = iptables ]; then
+            "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE 2>/dev/null ||
+                "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE || return 1
+        fi
         return 0
     fi
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
@@ -1150,6 +1156,7 @@ user_rules_save() {
         # read; a readable empty chain means the owner removed its rules.
         for _save_chain in "$CHAIN_OUT" "$CHAIN_IN"; do
             if { [ "$fw_tool" != iptables ] || [ -z "${RUN:-}" ] || [ ! -f "$RUN/fw-ipv4-rebuilding" ]; } &&
+               { [ "$fw_tool" != ip6tables ] || [ ! -f "$FW_V6_REBUILDING" ]; } &&
                command -v "$fw_tool" >/dev/null 2>&1 &&
                _saved_rules=$("$fw_tool" -t mangle -S "$_save_chain" 2>/dev/null); then
                 printf '%s\n' "$_saved_rules" |
@@ -2265,6 +2272,8 @@ start_engine() {
     fw_up || { engine_stop; die "не поставить правила"; }
     rm -f "$RUN/fw-ipv4-rebuilding"
     rmdir "$RUNTIME_DIR/d2kd.health.fw4" 2>/dev/null || :
+    rm -f "$FW_V6_REBUILDING"
+    rmdir "$RUNTIME_DIR/d2kd.health.fw6" 2>/dev/null || :
     sha256sum < "$CONF" > "$RUN/fw-config.sha256" || rm -f "$RUN/fw-config.sha256"
 
     # После правил, но до контроллера: к моменту первого приветствия таблица
@@ -2742,10 +2751,10 @@ status() {
     [ -x "$BIN" ] && "$BIN" version 2>/dev/null | sed 's/^/  /'
 }
 
-# NDM can replace the whole IPv4 mangle table on WAN DHCP renewal.
-# Rebuild only an absent family. Install all three hooks in one transaction
-# after the private chains, DNS exclusions and the owner's rules are ready.
-fw_recover_ipv4_mangle() (
+# NDM can replace either or both mangle tables. Rebuild only absent families.
+# Install each family's three hooks in one transaction after private chains,
+# DNS exclusions and the owner's rules are ready.
+fw_recover_mangle() (
     [ "$FW_BACKEND" = iptables ] && running "$CT_PID" && watch_contract_matches || exit 1
     active=0; [ ! -f "$RUN/preflight-active" ] || active=1
     [ "${D2K_PREFLIGHT:-0}" = "$active" ] || exit 1
@@ -2754,33 +2763,104 @@ fw_recover_ipv4_mangle() (
     if preflight_ipv6_available; then D2K_PREFLIGHT_V6=1; fi
     if [ -f "$RUN/preflight-v6-active" ]; then [ "$D2K_PREFLIGHT_V6" = 1 ] || exit 1
     else [ "$D2K_PREFLIGHT_V6" = 0 ] || exit 1; fi
-    command -v iptables-restore >/dev/null 2>&1 || exit 1
     fw_lock_acquire || exit 1
     trap 'fw_lock_release' EXIT
-    fw_rules=$(iptables -t mangle -S) || exit 1
-    if printf '%s\n' "$fw_rules" | grep -Eq '^-N D2K_| -j D2K_'; then exit 1; fi
-    [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables || exit 1
-    # While this marker exists the IPv4 chains are under construction.
-    # A fallback restart must retain the saved user rules for this family.
-    : > "$RUN/fw-ipv4-rebuilding" || exit 1
-    fw_family_up iptables detached || exit 1
+    rules4=$(iptables -t mangle -S) || exit 1
+    need4=0
+    printf '%s\n' "$rules4" | grep -Eq '^-N D2K_| -j D2K_' || need4=1
+    need6=0
+    if [ ! -f "$FW_V4ONLY" ]; then
+        rules6=$(ip6tables -t mangle -S) || exit 1
+        printf '%s\n' "$rules6" | grep -Eq '^-N D2K_| -j D2K_' || need6=1
+    fi
+    [ "$need4" = 1 ] || [ "$need6" = 1 ] || exit 1
+    if [ "$need4" = 1 ]; then command -v iptables-restore >/dev/null 2>&1 || exit 1
+    else fw_family_installed iptables || exit 1; fi
+    if [ "$need6" = 1 ]; then command -v ip6tables-restore >/dev/null 2>&1 || exit 1
+    else [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables || exit 1; fi
+    if [ "$need4" = 1 ]; then
+        : > "$RUN/fw-ipv4-rebuilding" || exit 1
+        fw_family_up iptables detached || exit 1
+    fi
+    if [ "$need6" = 1 ]; then
+        : > "$FW_V6_REBUILDING" || exit 1
+        fw_family_up ip6tables detached || exit 1
+    fi
     dns_excl_sync_unlocked fresh || exit 1
-    user_rules_restore iptables || exit 1
-    # The live daemon owns temporary per-tuple rules. Wake it through its
-    # runtime directory; an older binary cannot acknowledge this request.
-    repair="$RUNTIME_DIR/d2kd.health.fw4"
-    mkdir "$repair" || exit 1
-    retry=0
-    while [ -d "$repair" ] && [ "$retry" -lt 5 ]; do
-        retry=$((retry+1))
-        sleep 1
+    [ "$need4" != 1 ] || user_rules_restore iptables || exit 1
+    [ "$need6" != 1 ] || user_rules_restore ip6tables || exit 1
+    # The live daemon owns temporary per-tuple rules. It acknowledges each
+    # repaired family after replaying those rules; an older binary falls back.
+    for family in 4 6; do
+        [ "$family" != 4 ] || [ "$need4" = 1 ] || continue
+        [ "$family" != 6 ] || [ "$need6" = 1 ] || continue
+        repair="$RUNTIME_DIR/d2kd.health.fw$family"
+        mkdir "$repair" || exit 1
+        retry=0
+        while [ -d "$repair" ] && [ "$retry" -lt 5 ]; do
+            retry=$((retry+1))
+            sleep 1
+        done
+        [ ! -d "$repair" ] && running "$DP_PID" && running "$CT_PID" || exit 1
     done
-    [ ! -d "$repair" ] && running "$DP_PID" && running "$CT_PID" || exit 1
-    printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
-        iptables-restore --noflush || exit 1
+    if [ "$need4" = 1 ]; then
+        printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
+            iptables-restore --noflush || exit 1
+    fi
+    if [ "$need6" = 1 ]; then
+        printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
+            ip6tables-restore --noflush || exit 1
+    fi
     ppe_up
     fw_installed || exit 1
     rm -f "$RUN/fw-ipv4-rebuilding"
+    rm -f "$FW_V6_REBUILDING"
+)
+# A partial loss can remove one preflight queue rule while all other
+# static rules and both daemons remain healthy. Rebuild that exact rule at its
+# original position, after exclusions and before the other conntrack queues.
+# The old fallback restarted both daemons, which amplified memory pressure on
+# 128 MiB routers. No owner or live per-tuple rule is touched here.
+fw_recover_preflight_queue() (
+    [ "$FW_BACKEND" = iptables ] && [ "${D2K_PREFLIGHT:-0}" = 1 ] &&
+        running "$DP_PID" && running "$CT_PID" && watch_contract_matches || exit 1
+    [ -f "$RUN/preflight-active" ] || exit 1
+    fw_config=$(sha256sum < "$CONF") && [ "$fw_config" = "$(cat "$RUN/fw-config.sha256" 2>/dev/null)" ] || exit 1
+    D2K_PREFLIGHT_V6=0
+    if preflight_ipv6_available; then D2K_PREFLIGHT_V6=1; fi
+    if [ -f "$RUN/preflight-v6-active" ]; then [ "$D2K_PREFLIGHT_V6" = 1 ] || exit 1
+    else [ "$D2K_PREFLIGHT_V6" = 0 ] || exit 1; fi
+    fw_lock_acquire || exit 1
+    trap 'fw_lock_release' EXIT
+    D2K_SKIP_PREFLIGHT_QUEUE_CHECK=1
+    fw_family_installed iptables || exit 1
+    [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables || exit 1
+    D2K_SKIP_PREFLIGHT_QUEUE_CHECK=0
+    missing=0
+    set -- iptables
+    [ "$D2K_PREFLIGHT_V6" != 1 ] || set -- "$@" ip6tables
+    for fw_tool in "$@"; do
+        for chain in "$CHAIN_OUT" "$CHAIN_IN"; do
+            direction=ORIGINAL; [ "$chain" != "$CHAIN_IN" ] || direction=REPLY
+            if ! "$fw_tool" -t mangle -C "$chain" -p tcp -m conntrack --ctdir "$direction" \
+                -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass 2>/dev/null; then
+                missing=1
+                rules=$("$fw_tool" -t mangle -S "$chain") || exit 1
+                pos=$(printf '%s\n' "$rules" | awk -v chain="$chain" -v queue="$QUEUE_NUM" '
+                    $1 == "-A" && $2 == chain {
+                        n++
+                        if (index($0, "-m conntrack") && index($0, "-j NFQUEUE") &&
+                            index($0, "--queue-num " queue) && !index($0, " -m comment ")) {
+                            print n; exit
+                        }
+                    }')
+                [ -n "$pos" ] || exit 1
+                "$fw_tool" -t mangle -I "$chain" "$pos" -p tcp -m conntrack --ctdir "$direction" \
+                    -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || exit 1
+            fi
+        done
+    done
+    [ "$missing" = 1 ] && fw_installed
 )
 # NDM периодически сносит чужие правила. Сторож есть: событийный хук
 # /opt/etc/ndm/netfilter.d/001-d2k.sh и периодическая страховка
@@ -2795,8 +2875,12 @@ reapply() {
     # The earlier watchdog status was taken outside the service lock.
     if [ "${1:-}" = auto ]; then
         if fw_installed; then return 0; fi
-        if fw_recover_ipv4_mangle; then
-            svc_log "после сброса IPv4 mangle правила восстановлены без перезапуска движка"
+        if fw_recover_mangle; then
+            svc_log "после сброса IPv4/IPv6 mangle правила восстановлены без перезапуска движка"
+            return 0
+        fi
+        if fw_recover_preflight_queue; then
+            svc_log "частично снятые правила preflight IPv4/IPv6 восстановлены без перезапуска движка"
             return 0
         fi
     fi

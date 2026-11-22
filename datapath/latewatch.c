@@ -524,10 +524,10 @@ void d2k_lw_peer_closed(d2k_lw *lw, uint64_t now) {
     }
 }
 
-void d2k_lw_ipv4_mangle_reset(d2k_lw *lw, uint64_t now) {
+void d2k_lw_family_mangle_reset(d2k_lw *lw, uint8_t family, uint64_t now) {
     for (size_t i = 0; i < D2K_LW_SLOTS; i++) {
         d2k_lw_slot *w = &lw->slot[i];
-        if (!w->used || w->t.family != 4) continue;
+        if (!w->used || w->t.family != family) continue;
         if (lw->backend == D2K_LW_BACKEND_RULES) {
             /* The serial executor finishes old jobs before their replacements.
                Ignore their receipts: they refer to the previous chains. */
@@ -541,14 +541,22 @@ void d2k_lw_ipv4_mangle_reset(d2k_lw *lw, uint64_t now) {
     }
 }
 
-int d2k_lw_ipv4_repair_pending(const d2k_lw *lw) {
+int d2k_lw_family_repair_pending(const d2k_lw *lw, uint8_t family) {
     if (lw->backend != D2K_LW_BACKEND_RULES) return 0;
     for (size_t i = 0; i < D2K_LW_SLOTS; i++) {
         const d2k_lw_slot *w = &lw->slot[i];
-        if (w->used && w->t.family == 4 &&
+        if (w->used && w->t.family == family &&
             (w->busy || (wanted(w) && w->installed != D2K_LW_YES))) return 1;
     }
     return 0;
+}
+
+void d2k_lw_ipv4_mangle_reset(d2k_lw *lw, uint64_t now) {
+    d2k_lw_family_mangle_reset(lw, 4, now);
+}
+
+int d2k_lw_ipv4_repair_pending(const d2k_lw *lw) {
+    return d2k_lw_family_repair_pending(lw, 4);
 }
 
 void d2k_lw_tick(d2k_lw *lw, uint64_t now, int controller_gone) {
