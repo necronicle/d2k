@@ -1179,7 +1179,7 @@ user_rules_save() {
         # read; a readable empty chain means the owner removed its rules.
         for _save_chain in "$CHAIN_OUT" "$CHAIN_IN"; do
             if { [ "$fw_tool" != iptables ] || [ -z "${RUN:-}" ] || [ ! -f "$RUN/fw-ipv4-rebuilding" ]; } &&
-               { [ "$fw_tool" != ip6tables ] || [ ! -f "$FW_V6_REBUILDING" ]; } &&
+               { [ "$fw_tool" != ip6tables ] || [ ! -f "${FW_V6_REBUILDING:-}" ]; } &&
                command -v "$fw_tool" >/dev/null 2>&1 &&
                _saved_rules=$("$fw_tool" -t mangle -S "$_save_chain" 2>/dev/null); then
                 printf '%s\n' "$_saved_rules" |
