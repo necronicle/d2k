@@ -659,7 +659,7 @@ D2K вырос из «Поиска по домену» проекта z2k и р�
 > **TheGreatYogo** · **logistik77** · **b11d11** · **BloodKnife39** · **SIGogelon** · **yozh**<br>
 > **Altaec** · **DIDIQ Rawa** · **GregMSK** · **Кожевников** · **bootnet** · **ewgen911**<br>
 > **cmfifty** · **Ret80** · **Шулепов Александр** · **Андрюшка** · **Marshmalick** · **Mustang**<br>
-> **Роман Борисович** · **zelenewruan** · **Den** · **WanTBeeR**
+> **Роман Борисович** · **zelenewruan** · **Den** · **WanTBeeR** · **Kurdt_Kobain** · **Сергей**
 
 ## Лицензия
 
