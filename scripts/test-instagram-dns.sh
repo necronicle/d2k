@@ -115,13 +115,14 @@ env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$TMP/d2k" D2K_CONFIG="$TMP/d2k/config" \
 
 grep -q '^ip host instagram.com 157.240.9.174$' "$TMP/ndmc-state" || { cat "$TMP/refresh.log" >&2; cat "$TMP/ndmc-calls" >&2; fail "VPS Instagram address was not added"; }
 grep -q '^ip host instagram.com 157.240.9.176$' "$TMP/ndmc-state" || fail "second live Instagram edge was not added"
-! grep -Eq '^ip host instagram.com 157.240.9.177$|^ip host instagram.com 157.240.9.178$' "$TMP/ndmc-state" || fail "more than two live edges were pinned for one host"
+for ip in 157.240.9.177 157.240.9.178; do
+    grep -q "^ip host instagram.com $ip$" "$TMP/ndmc-state" || fail "working direct address was lost: $ip"
+done
 grep -q '^ip host instagram.com 203.0.113.10$' "$TMP/ndmc-state" || fail "pre-existing user mapping was changed"
 grep -q '^ip host www.instagram.com 157.240.9.175$' "$TMP/ndmc-state" || fail "identical pre-existing mapping was lost"
 ! grep -q '8.8.8.8\|not-instagram.example' "$TMP/ndmc-calls" || fail "untrusted or non-Instagram answer reached ndmc"
 grep -q '^instagram.com 157.240.9.174$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "ownership manifest omitted added address"
 grep -q '^instagram.com 157.240.9.176$' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "ownership manifest omitted second added address"
-[ "$(grep -c '^instagram.com ' "$TMP/d2k/state/instagram-ip-hosts.tsv")" = 2 ] || fail "manifest does not track both installed edges"
 ! grep -q '^www.instagram.com ' "$TMP/d2k/state/instagram-ip-hosts.tsv" || fail "pre-existing mapping was incorrectly claimed"
 ! grep -qi 'X-Z2K-Auth\|hmac\|test-secret\|old-secret' "$TMP/curl-calls" || fail "d2k resolver request still carries z2k HMAC authentication"
 [ ! -e "$TMP/openssl-key" ] || fail "refresh still computes an HMAC with openssl"
@@ -339,8 +340,8 @@ printf 'pps.whatsapp.net 57.144.249.32\n' > "$FAM/d2k/state/instagram-ip-hosts.t
 printf 'ip host pps.whatsapp.net 57.144.249.32\n' > "$FAM/ndmc-state"
 env D2K_STUB_PATH="$TMP/bin" D2K_DIR="$FAM/d2k" D2K_META_RANGES="$FAM/d2k/files/meta-ranges.txt" \
     D2K_RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE_ATTEMPTS=1 \
-    RESOLVE_BODY='{"results":{"instagram.com":["157.240.9.174"],"web.whatsapp.com":["57.144.245.32"],"static.whatsapp.net":["157.240.0.60"],"mmg.whatsapp.net":["157.240.0.61"],"pps.whatsapp.net":[],"static.xx.fbcdn.net":["157.240.0.62"],"graph.whatsapp.com":["8.8.4.4"]}}' \
-    PROBE_DEAD='157.240.0.60 157.240.0.61 157.240.0.62 mmg.whatsapp.net:57.144.245.32 mmg.whatsapp.net:57.144.249.32' \
+    RESOLVE_BODY='{"results":{"instagram.com":["157.240.9.174"],"web.whatsapp.com":["57.144.245.32"],"static.whatsapp.net":["157.240.0.60","157.240.0.63","57.144.247.32"],"mmg.whatsapp.net":["157.240.0.61"],"pps.whatsapp.net":[],"static.xx.fbcdn.net":["157.240.0.62"],"graph.whatsapp.com":["8.8.4.4"]}}' \
+    PROBE_DEAD='157.240.0.60 157.240.0.63 157.240.0.61 157.240.0.62 mmg.whatsapp.net:57.144.245.32 mmg.whatsapp.net:57.144.249.32 mmg.whatsapp.net:57.144.247.32' \
     NDMC_STATE="$FAM/ndmc-state" NDMC_CALLS="$FAM/ndmc-calls" CURL_CALLS="$FAM/curl-calls" \
     D2K_INSTAGRAM_LOG="$FAM/refresh.log" sh "$SCRIPT" refresh || { cat "$FAM/refresh.log" >&2; fail "family refresh failed"; }
 grep -q '^ip host static.whatsapp.net 57.144.245.32$' "$FAM/ndmc-state" || { cat "$FAM/refresh.log" >&2; fail "static.whatsapp.net did not get a verified sibling address"; }
@@ -359,7 +360,9 @@ grep -q '^ip host www.instagram.com 157.240.9.174$' "$FAM/ndmc-state" || fail "I
 # family address is still range-checked before use.
 grep -q '^ip host graph.whatsapp.com 57.144.245.32$' "$FAM/ndmc-state" || fail "graph.whatsapp.com did not use its family after a non-Meta answer"
 ! grep -q '8.8.4.4' "$FAM/ndmc-calls" || fail "non-Meta address reached ndmc"
-[ "$(grep -c '^ip host static.whatsapp.net ' "$FAM/ndmc-state")" -le 2 ] || fail "family fallback pinned more than two addresses"
+grep -q '^ip host static.whatsapp.net 57.144.247.32$' "$FAM/ndmc-state" || fail "working VPS address was lost"
+grep -q '^ip host static.whatsapp.net 57.144.249.32$' "$FAM/ndmc-state" || fail "second failed VPS address was not replaced"
+[ "$(grep -c '^ip host static.whatsapp.net ' "$FAM/ndmc-state")" -eq 3 ] || fail "expected one direct address and two replacements"
 ok "family fallback pins only same-family addresses verified for this very name"
 
 # Addresses outside Meta ranges do not use up the per-name probe tries: a Meta

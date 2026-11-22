@@ -98,6 +98,7 @@ record_exists() {
 # I3: every owned pin present in NDM is re-checked from the router itself,
 # independently of the VPS. Sets dead_pins ("host ip" lines) and alive_pins.
 dead_pins=
+verified_pins=
 alive_pins=0
 recheck_owned() {
     [ -s "$MANIFEST" ] || return 0
@@ -110,6 +111,7 @@ recheck_owned() {
         fi
         if edge_verified "$host" "$ip"; then
             alive_pins=$((alive_pins + 1))
+            verified_pins="${verified_pins}${host} ${ip}\n"
         else
             dead_pins="${dead_pins}${host} ${ip}
 "
@@ -234,30 +236,36 @@ refresh() {
     for host in $HOSTS; do
         tried=0
         kept=0
-        for ip in $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h{print $2}' | head -8); do
-            # Only Meta-range candidates spend one of the 4 probe tries, so junk
-            # answers cannot push the real edges out.
-            is_meta_ip "$ip" || { log "отброшен адрес вне диапазонов Meta: $host $ip"; continue; }
+        rejected=0
+        for ip in $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h && !seen[$2]++ {print $2}' | head -8); do
+            if ! is_meta_ip "$ip"; then
+                log "отброшен адрес вне диапазонов Meta: $host $ip"
+                rejected=$((rejected + 1))
+                continue
+            fi
             [ "$tried" -lt 4 ] || break
             tried=$((tried + 1))
             if edge_verified "$host" "$ip"; then
                 filtered="${filtered}${host} ${ip}\n"
                 kept=$((kept + 1))
-                [ "$kept" -lt 2 ] || break
             else
+                rejected=$((rejected + 1))
                 log "адрес не прошёл TLS-проверку доступности и сертификата Meta: $host $ip"
             fi
         done
-        [ "$kept" -gt 0 ] || missing="$missing $host"
+        if [ "$kept" -eq 0 ] && [ "$rejected" -eq 0 ]; then rejected=1; fi
+        [ "$rejected" -eq 0 ] || missing="${missing}${host} ${rejected}\n"
     done
-    # Meta GeoDNS may give the VPS only an edge that is dead from here. For a
-    # name left without a verified address, try addresses of the same family
-    # verified in this refresh, then ones currently owned in the manifest.
-    for host in $missing; do
+    # Freeze the direct results so a borrowed address cannot become a donor.
+    direct=$filtered
+    # Replace each rejected address with a distinct sibling address verified
+    # again for the target name. Keep the existing limit on fallback probes.
+    while read -r host rejected; do
+        [ -n "$host" ] || continue
         family=$(meta_family "$host")
         [ -n "$family" ] || continue
         answered=" $(printf '%s\n' "$parsed" | awk -v h="$host" '$1==h{print $2}' | tr '\n' ' ') "
-        candidates=$({ printf '%b' "$filtered"; cat "$MANIFEST" 2>/dev/null || true; } |
+        candidates=$(printf '%b' "$direct$verified_pins" |
             while read -r sibling ip _extra; do
                 { [ -n "${sibling:-}" ] && [ -n "${ip:-}" ]; } || continue
                 [ "$sibling" != "$host" ] || continue
@@ -267,7 +275,6 @@ refresh() {
                 printf '%s %s\n' "$ip" "$sibling"
             done | awk '!seen[$1]++')
         tried=0
-        kept=0
         while read -r ip sibling; do
             [ -n "${ip:-}" ] || continue
             case "$answered" in *" $ip "*) continue;; esac
@@ -276,16 +283,18 @@ refresh() {
             is_meta_ip "$ip" || { log "адрес семейства вне диапазонов Meta: $host $ip"; continue; }
             if edge_verified "$host" "$ip"; then
                 filtered="${filtered}${host} ${ip}\n"
-                kept=$((kept + 1))
+                rejected=$((rejected - 1))
                 log "адрес семейства: $host $ip (от $sibling), сертификат проверен для $host"
-                [ "$kept" -lt 2 ] || break
+                [ "$rejected" -gt 0 ] || break
             else
                 log "адрес семейства не прошёл TLS-проверку для $host: $ip (от $sibling)"
             fi
         done <<EOF_CANDIDATES
 $candidates
 EOF_CANDIDATES
-    done
+    done <<EOF_MISSING
+$(printf '%b' "$missing")
+EOF_MISSING
     # Each family stands on its own. The Instagram family is pinned only with
     # a verified instagram.com; WhatsApp and fbcdn never wait for it.
     if [ -n "$filtered" ] && ! printf '%b' "$filtered" | awk '$1=="instagram.com" {ok=1} END{exit !ok}'; then
