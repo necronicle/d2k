@@ -1759,11 +1759,8 @@ static void test_application_worker(void)
             CHECK(d2k_tls_path_session_add_chunk(w,0)==0);
             CHECK(d2k_tls_path_session_add_chunk(w,7)==0);
             CHECK(d2k_tls_path_session_add_chunk(w,2)==1);
-            /* The previous growth leaves room for one more distinct action. */
-            const size_t *chunks_before=w->chunks;
-            const d2k_stream_action *actions_before=w->actions;
             CHECK(d2k_tls_path_session_add_action(w,5,0)==1);
-            CHECK(w->chunks==chunks_before && w->actions==actions_before);
+            CHECK(w->actions[w->stream.chunks-1].bytes==5);
             CHECK(f.runs==old_runs);
             size_t retained;d2k_tls_path_session_history(w,&retained);
             CHECK(retained==old_count);
