@@ -1184,7 +1184,7 @@ user_rules_save() {
                _saved_rules=$("$fw_tool" -t mangle -S "$_save_chain" 2>/dev/null); then
                 printf '%s\n' "$_saved_rules" |
                     grep "^-A $_save_chain " | grep -F ' -m comment ' |
-                    grep -vE ' --comment (\"?d2k-dns-route\"?)( |$)' |
+                    grep -vE ' --comment ("?d2k-dns-route"?)( |$)' |
                     sed "s/^/$fw_tool /" >> "$_new" || :
             elif [ -r "$USER_RULES" ]; then
                 grep "^$fw_tool -A $_save_chain " "$USER_RULES" |

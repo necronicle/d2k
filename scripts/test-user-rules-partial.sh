@@ -24,7 +24,13 @@ awk '/^user_rules_save\(\)/ {copy=1} copy {print} copy && /^}/ {exit}' "$INIT" >
 . "$TMP/functions"
 printf '%s\n' '-A D2K_OUT -s 192.168.1.145/32 -m comment --comment d2k-nintendo-bypass -j RETURN' > "$TMP/fw/D2K_OUT"
 printf '%s\n' '-A D2K_IN -d 192.168.1.145/32 -m comment --comment d2k-nintendo-bypass -j RETURN' > "$TMP/fw/D2K_IN"
-user_rules_save
+printf '%s\n' '-A D2K_OUT -m comment --comment "d2k-dns-route" -j RETURN' \
+    '-A D2K_OUT -m comment --comment d2k-dns-route -j RETURN' \
+    '-A D2K_OUT -m comment --comment d2k-dns-route-owner -j RETURN' >> "$TMP/fw/D2K_OUT"
+user_rules_save 2>"$TMP/stderr"
+[ ! -s "$TMP/stderr" ] || { cat "$TMP/stderr" >&2; exit 1; }
+if grep -Eq ' --comment "?d2k-dns-route"? ' "$USER_RULES"; then echo 'FAIL: saved a service DNS rule'; exit 1; fi
+grep -q 'd2k-dns-route-owner' "$USER_RULES" || { echo 'FAIL: dropped similarly named owner rule'; exit 1; }
 cp "$USER_RULES" "$TMP/expected"
 rm "$TMP/fw/D2K_IN"
 user_rules_save
