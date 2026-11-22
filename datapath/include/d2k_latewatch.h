@@ -148,6 +148,8 @@ void d2k_lw_complete(d2k_lw *lw, const d2k_lw_done *done, uint64_t now);
 void d2k_lw_peer_closed(d2k_lw *lw, uint64_t now);
 
 /* Сроки и повторы; controller_gone — снять всех владельцев. */
+void d2k_lw_ipv4_mangle_reset(d2k_lw *lw, uint64_t now);
+int d2k_lw_ipv4_repair_pending(const d2k_lw *lw);
 void d2k_lw_tick(d2k_lw *lw, uint64_t now, int controller_gone);
 
 size_t d2k_lw_pending_clears(const d2k_lw *lw);

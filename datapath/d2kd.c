@@ -2350,6 +2350,10 @@ int main(int argc, char **argv) {
        о своей слепоте позже, чем успел бы выбросить рабочий план. */
     uint64_t next_ctl_stats = start + NS_PER_S;
 
+    char fw_repair_path[4096];
+    int repair_len = snprintf(fw_repair_path, sizeof fw_repair_path, "%s.fw4", health_path);
+    int fw_repair_enabled = repair_len > 0 && (size_t)repair_len < sizeof fw_repair_path;
+    int fw_repair_started = 0;
     while (!stop_flag) {
         (void)d2k_runtime_heartbeat(health_path, NULL, ctl && d2k_ctl_peer_fd(ctl) >= 0, 1, 1);
         uint64_t t = now_ns();
@@ -3208,6 +3212,12 @@ int main(int argc, char **argv) {
         }
 
         if (t >= next_expire) {
+            if (fw_repair_enabled && access(fw_repair_path, F_OK) == 0) {
+                if (!fw_repair_started && lwx) d2k_lw_ipv4_mangle_reset(&lwt, t);
+                fw_repair_started = 1;
+                if ((!lwx || !d2k_lw_ipv4_repair_pending(&lwt)) && rmdir(fw_repair_path) == 0)
+                    fw_repair_started = 0;
+            }
             /* Сперва заметить молчание, потом забывать. Обратный порядок
                означал бы, что о молчании узнаём только при забвении потока —
                через две минуты, когда человек уже ушёл со страницы. */

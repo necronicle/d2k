@@ -48,6 +48,14 @@ missing=0
 reapply auto
 [ ! -s "$RUN/calls" ] || { echo 'watchdog restarted a healthy engine using a stale status'; exit 1; }
 missing=1
+FW_BACKEND=iptables
+can_recover=1
+fw_recover_ipv4_mangle() { [ "$can_recover" = 1 ] && echo live-repair >> "$RUN/calls"; }
+reapply auto
+[ "$(cat "$RUN/calls")" = live-repair ] || { echo 'NDM mangle reset restarted live processes'; exit 1; }
+: > "$RUN/calls"
+can_recover=0
+missing=1
 reapply auto
 [ "$(cat "$RUN/calls")" = "$(printf 'stop\nstart')" ]
 : > "$RUN/calls"

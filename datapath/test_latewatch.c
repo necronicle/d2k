@@ -237,6 +237,30 @@ int main(void) {
     d2k_ct_tuple t = tup(1);
     uint8_t pkt[64];
 
+    reset(&lw, D2K_LW_BACKEND_RULES);
+    d2k_lw_trial_add(&lw, &t, 0, 10*S);
+    deliver(&lw, 0, 0, 11*S);
+    d2k_lw_observe(&lw, &t, 60, TOK, 12*S);
+    d2k_lw_ipv4_mangle_reset(&lw, 13*S);
+    CHECK(notes == 1 && last_note_code == D2K_LATEOBS_UNAVAILABLE,
+          "lost IPv4 rules must invalidate the interrupted observation");
+    CHECK(count_op(D2K_LWOP_INSTALL) == 2, "live IPv4 tuple was not submitted for reinstallation");
+    deliver(&lw, 1, 0, 14*S);
+
+    reset(&lw, D2K_LW_BACKEND_RULES);
+    d2k_ct_tuple v6 = t;
+    v6.family = 6;
+    d2k_lw_trial_add(&lw, &v6, 0, 10*S);
+    deliver(&lw, 0, 0, 10*S);
+    d2k_lw_trial_add(&lw, &t, 0, 10*S);
+    d2k_lw_ipv4_mangle_reset(&lw, 11*S);
+    CHECK(count_op(D2K_LWOP_INSTALL) == 3 && reqs[2].t.family == 4,
+          "IPv6 delivery changed during IPv4 repair");
+    deliver(&lw, 1, 0, 12*S);
+    CHECK(d2k_lw_ipv4_repair_pending(&lw), "old receipt acknowledged the new IPv4 rules");
+    deliver(&lw, 2, 0, 12*S);
+    CHECK(!d2k_lw_ipv4_repair_pending(&lw), "restored IPv4 rules did not acknowledge repair");
+
     /* 1. Наблюдение: подтверждение и срок — от готовности установки; пакеты
           до неё не считаются; итог и снятие по сроку. */
     reset(&lw, D2K_LW_BACKEND_MARK);

@@ -524,6 +524,33 @@ void d2k_lw_peer_closed(d2k_lw *lw, uint64_t now) {
     }
 }
 
+void d2k_lw_ipv4_mangle_reset(d2k_lw *lw, uint64_t now) {
+    for (size_t i = 0; i < D2K_LW_SLOTS; i++) {
+        d2k_lw_slot *w = &lw->slot[i];
+        if (!w->used || w->t.family != 4) continue;
+        if (lw->backend == D2K_LW_BACKEND_RULES) {
+            /* The serial executor finishes old jobs before their replacements.
+               Ignore their receipts: they refer to the previous chains. */
+            w->busy = 0;
+            w->installed = D2K_LW_UNKNOWN;
+            w->retry_ns = 0;
+        }
+        if (w->raw_active) raw_cancel(lw, w, 1);
+        if (w->observe) obs_finish(lw, w, D2K_LATEOBS_UNAVAILABLE, now);
+        else reconcile(lw, w, now);
+    }
+}
+
+int d2k_lw_ipv4_repair_pending(const d2k_lw *lw) {
+    if (lw->backend != D2K_LW_BACKEND_RULES) return 0;
+    for (size_t i = 0; i < D2K_LW_SLOTS; i++) {
+        const d2k_lw_slot *w = &lw->slot[i];
+        if (w->used && w->t.family == 4 &&
+            (w->busy || (wanted(w) && w->installed != D2K_LW_YES))) return 1;
+    }
+    return 0;
+}
+
 void d2k_lw_tick(d2k_lw *lw, uint64_t now, int controller_gone) {
     for (size_t i = 0; i < D2K_LW_SLOTS; i++) {
         d2k_lw_slot *w = &lw->slot[i];

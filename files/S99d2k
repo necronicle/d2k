@@ -977,7 +977,9 @@ fw_family_up() (
 
     fw_icmp_te_rule "$fw_tool" -A || return 1
 
-    preflight_nat_rule "$fw_tool" -A || return 1
+    if [ "${2:-}" != detached ] || ! preflight_nat_rule "$fw_tool" -C 2>/dev/null; then
+        preflight_nat_rule "$fw_tool" -A || return 1
+    fi
 
     # СВОИ ПОСЫЛКИ ПО UDP — ЧЕРЕЗ MASQUERADE, и это не симметрия ради
     # симметрии, а разница между TCP и QUIC, замеренная на живом роутере
@@ -1001,6 +1003,11 @@ fw_family_up() (
     # идущий следом тем же кортежем, попадает в неё же — на проводе они
     # неотличимы. Только UDP: для TCP то же правило не нужно, а проверять
     # непроверенное на живой линии нельзя.
+    if [ "${2:-}" = detached ]; then
+        "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE 2>/dev/null ||
+            "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" -j MASQUERADE || return 1
+        return 0
+    fi
     [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -A POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE || say "не поставить MASQUERADE для своих посылок — QUIC за роутером не пойдёт"
 
@@ -1142,7 +1149,8 @@ user_rules_save() {
         # failure. Preserve its saved rules only when that chain cannot be
         # read; a readable empty chain means the owner removed its rules.
         for _save_chain in "$CHAIN_OUT" "$CHAIN_IN"; do
-            if command -v "$fw_tool" >/dev/null 2>&1 &&
+            if { [ "$fw_tool" != iptables ] || [ ! -f "$RUN/fw-ipv4-rebuilding" ]; } &&
+               command -v "$fw_tool" >/dev/null 2>&1 &&
                _saved_rules=$("$fw_tool" -t mangle -S "$_save_chain" 2>/dev/null); then
                 printf '%s\n' "$_saved_rules" |
                     grep "^-A $_save_chain " | grep -F ' -m comment ' |
@@ -1162,15 +1170,17 @@ user_rules_save() {
 # принимает.
 # shellcheck disable=SC2120
 user_rules_restore() {
+    local family_filter="${1:-}"
     [ -s "$USER_RULES" ] || return 0
     _ok=0; _bad=0
     # Обратный порядок с вставкой в позицию 1 даёт исходный порядок сверху.
     sed '1!G;h;$!d' "$USER_RULES" | while IFS= read -r _line; do
         case "$_line" in *' --comment d2k-dns-route '*|*' --comment "d2k-dns-route" '*) continue ;; esac
         _tool=${_line%% *}; _rule=${_line#* }
+        [ -z "$family_filter" ] || [ "$family_filter" = "$_tool" ] || continue
         case "$_tool" in iptables|ip6tables) ;; *) continue ;; esac
-        command -v "$_tool" >/dev/null 2>&1 || continue
-        "$_tool" -t mangle -S "$CHAIN_OUT" >/dev/null 2>&1 || continue
+        command -v "$_tool" >/dev/null 2>&1 || { [ -z "$family_filter" ] || exit 1; continue; }
+        "$_tool" -t mangle -S "$CHAIN_OUT" >/dev/null 2>&1 || { [ -z "$family_filter" ] || exit 1; continue; }
         # Строка — вывод iptables -S. Ничего, кроме слов и кавычек: строка с
         # подстановкой или управляющим символом не исполняется.
         case "$_rule" in *[\`\$\;\&\|\<\>\(\)\\]*) say "исключение владельца не возвращено (недопустимые символы): $_rule"; continue ;; esac
@@ -1180,7 +1190,7 @@ user_rules_restore() {
         eval "set -- $_args" 2>/dev/null || { say "исключение владельца не разобралось: $_rule"; continue; }
         "$_tool" -t mangle -C "$_chain" "$@" 2>/dev/null && continue
         "$_tool" -t mangle -I "$_chain" 1 "$@" 2>/dev/null ||
-            say "исключение владельца не возвращено ($_tool): $_rule"
+            { say "исключение владельца не возвращено ($_tool): $_rule"; [ -z "$family_filter" ] || exit 1; }
     done
 }
 
@@ -2253,6 +2263,9 @@ start_engine() {
     esac
 
     fw_up || { engine_stop; die "не поставить правила"; }
+    rm -f "$RUN/fw-ipv4-rebuilding"
+    rmdir "$RUNTIME_DIR/d2kd.health.fw4" 2>/dev/null || :
+    sha256sum < "$CONF" > "$RUN/fw-config.sha256" || rm -f "$RUN/fw-config.sha256"
 
     # После правил, но до контроллера: к моменту первого приветствия таблица
     # соединений уже обязана вестись.
@@ -2729,6 +2742,46 @@ status() {
     [ -x "$BIN" ] && "$BIN" version 2>/dev/null | sed 's/^/  /'
 }
 
+# NDM can replace the whole IPv4 mangle table on WAN DHCP renewal.
+# Rebuild only an absent family. Install all three hooks in one transaction
+# after the private chains, DNS exclusions and the owner's rules are ready.
+fw_recover_ipv4_mangle() (
+    [ "$FW_BACKEND" = iptables ] && running "$CT_PID" && watch_contract_matches || exit 1
+    active=0; [ ! -f "$RUN/preflight-active" ] || active=1
+    [ "${D2K_PREFLIGHT:-0}" = "$active" ] || exit 1
+    fw_config=$(sha256sum < "$CONF") && [ "$fw_config" = "$(cat "$RUN/fw-config.sha256" 2>/dev/null)" ] || exit 1
+    D2K_PREFLIGHT_V6=0
+    if preflight_ipv6_available; then D2K_PREFLIGHT_V6=1; fi
+    if [ -f "$RUN/preflight-v6-active" ]; then [ "$D2K_PREFLIGHT_V6" = 1 ] || exit 1
+    else [ "$D2K_PREFLIGHT_V6" = 0 ] || exit 1; fi
+    command -v iptables-restore >/dev/null 2>&1 || exit 1
+    fw_lock_acquire || exit 1
+    trap 'fw_lock_release' EXIT
+    fw_rules=$(iptables -t mangle -S) || exit 1
+    if printf '%s\n' "$fw_rules" | grep -Eq '^-N D2K_| -j D2K_'; then exit 1; fi
+    [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables || exit 1
+    # While this marker exists the IPv4 chains are under construction.
+    # A fallback restart must retain the saved user rules for this family.
+    : > "$RUN/fw-ipv4-rebuilding" || exit 1
+    fw_family_up iptables detached || exit 1
+    dns_excl_sync_unlocked fresh || exit 1
+    user_rules_restore iptables || exit 1
+    # The live daemon owns temporary per-tuple rules. Wake it through its
+    # runtime directory; an older binary cannot acknowledge this request.
+    repair="$RUNTIME_DIR/d2kd.health.fw4"
+    mkdir "$repair" || exit 1
+    retry=0
+    while [ -d "$repair" ] && [ "$retry" -lt 5 ]; do
+        retry=$((retry+1))
+        sleep 1
+    done
+    [ ! -d "$repair" ] && running "$DP_PID" && running "$CT_PID" || exit 1
+    printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
+        iptables-restore --noflush || exit 1
+    ppe_up
+    fw_installed || exit 1
+    rm -f "$RUN/fw-ipv4-rebuilding"
+)
 # NDM периодически сносит чужие правила. Сторож есть: событийный хук
 # /opt/etc/ndm/netfilter.d/001-d2k.sh и периодическая страховка
 # d2k-fw-heal.sh — оба зовут ЭТУ команду, а не повторяют её содержимое.
@@ -2740,7 +2793,13 @@ reapply() {
     # бы воскрешением, а упавший демон поднимает recover по намерению.
     running "$DP_PID" || die "датапат не работает — ставить правила не для кого"
     # The earlier watchdog status was taken outside the service lock.
-    if [ "${1:-}" = auto ] && fw_installed; then return 0; fi
+    if [ "${1:-}" = auto ]; then
+        if fw_installed; then return 0; fi
+        if fw_recover_ipv4_mangle; then
+            svc_log "после сброса IPv4 mangle правила восстановлены без перезапуска движка"
+            return 0
+        fi
+    fi
     if [ "${TCP_WATCH:-0}" = 1 ] || [ -f "$RUN/tcp-watch-active" ] ||
        [ "${D2K_PREFLIGHT:-0}" = 1 ] || [ -f "$RUN/preflight-active" ]; then
         svc_log "перезапуск движка для восстановления правил"

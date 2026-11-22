@@ -112,6 +112,43 @@ rules() { FW_STATE="$TMP/fw" "$TMP/bin/$1" -t "$2" -S 2>/dev/null; }
 S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0; fw_up && fw_installed; nft_ruleset > "$RUN/nft.rules"' s99 >/dev/null 2>&1 || fail "preflight rules install"
 cp "$TMP/run/nft.rules" "$TMP/fw/nft.rules"
 python3 "$ROOT/scripts/test-preflight-firewall.py" "$TMP/fw" || fail "preflight packet contracts"
+# WAN DHCP renewal on Keenetic: NDM has already removed every IPv4
+# mangle chain while both D2K processes, IPv6 and NAT are still live.
+cat > "$TMP/bin/iptables-restore" <<'RESTORE'
+#!/bin/sh
+set -eu
+[ "$1" = --noflush ]
+read -r table; [ "$table" = '*mangle' ]
+while read -r op chain pos jump target; do
+    [ "$op" != COMMIT ] || exit 0
+    [ "$op" = -I ] && [ "$pos" = 1 ] && [ "$jump" = -j ]
+    iptables -t mangle -I "$chain" 1 -j "$target"
+done
+exit 1
+RESTORE
+chmod +x "$TMP/bin/iptables-restore"
+rules iptables nat > "$TMP/old-nat"
+rules ip6tables mangle > "$TMP/old-ip6"
+for cycle in 1 2; do
+    mv "$TMP/fw/iptables/mangle" "$TMP/reset-$cycle"
+    S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+        RUNTIME_DIR=$RUN; CONF=$RUN/test-config; : > "$CONF"; sha256sum < "$CONF" > "$RUN/fw-config.sha256";
+        mkdir -p "$STATE_DIR"; : > "$RUN/preflight-active";
+        echo "iptables -A D2K_OUT -m comment --comment keep-owner -j RETURN" > "$USER_RULES";
+        running() { return 0; }; engine_stop() { return 1; }; svc_log() { :; };
+        dns_excl_sync_unlocked() { iptables -t mangle -I D2K_OUT 1 -d 192.0.2.53 -j RETURN; };
+        (n=0; while [ ! -d "$RUN/d2kd.health.fw4" ] && [ "$n" -lt 150 ]; do n=$((n+1)); sleep .1; done;
+            [ -d "$RUN/d2kd.health.fw4" ] || exit 1;
+            iptables -t mangle -C D2K_OUT -m comment --comment keep-owner -j RETURN &&
+            iptables -t mangle -C D2K_OUT -d 192.0.2.53 -j RETURN &&
+            ! iptables -t mangle -C POSTROUTING -j D2K_OUT &&
+            rmdir "$RUN/d2kd.health.fw4") & peer=$!;
+        reapply auto && wait "$peer" && fw_installed' s99 > "$TMP/renew.log" 2>&1 ||
+        { cat "$TMP/renew.log"; fail "DHCP renewal restarted healthy processes or lost rules"; }
+    rules iptables nat | cmp -s - "$TMP/old-nat" || fail "duplicated surviving NAT rule"
+    rules ip6tables mangle | cmp -s - "$TMP/old-ip6" || fail "changed surviving IPv6 rules"
+done
+ok "two WAN renewals restore wiped IPv4 mangle and preserve both processes"
 # Numeric aliases of the reserved marks are conflicts too.
 if S99_SNIPPET='D2K_PREFLIGHT=1; MARK=49; preflight_validate' s99 >/dev/null 2>&1; then fail "preflight numeric mark collision accepted"; fi
 S99_SNIPPET='D2K_PREFLIGHT=1; KEENETIC_POLICY=Policy7;
