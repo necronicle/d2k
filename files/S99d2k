@@ -1883,7 +1883,7 @@ fw_family_installed() (
     local late_from
     preflight_control_rules "$fw_tool" -C || return 1
     preflight_queue_rules "$fw_tool" -C || return 1
-    preflight_nat_rule "$fw_tool" -C || return 1
+    [ "${2:-}" = mangle-only ] || preflight_nat_rule "$fw_tool" -C || return 1
     watch_rules "$fw_tool" -C || return 1
     watch_release_rules "$fw_tool" -C || return 1
     late_watch_rules "$fw_tool" -C || return 1
@@ -1957,7 +1957,7 @@ fw_family_installed() (
         -m connbytes --connbytes "$late_from": --connbytes-dir reply --connbytes-mode packets \
         -j NFQUEUE --queue-num "$QUEUE_NUM" \
         --queue-bypass 2>/dev/null || return 1
-    [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
+    [ "${2:-}" = mangle-only ] || [ "$fw_tool" != iptables ] || "$fw_tool" -t nat -C POSTROUTING -p udp -m mark --mark "$MARK" \
         -j MASQUERADE 2>/dev/null || return 1
     return 0
 )
@@ -2882,12 +2882,42 @@ fw_recover_mangle() (
     rm -f "$RUN/fw-ipv4-rebuilding"
     rm -f "$FW_V6_REBUILDING"
 )
-# A partial loss can remove one preflight queue rule while all other
-# static rules and both daemons remain healthy. Rebuild that exact rule at its
-# original position, after exclusions and before the other conntrack queues.
-# The old fallback restarted both daemons, which amplified memory pressure on
-# 128 MiB routers. No owner or live per-tuple rule is touched here.
-fw_recover_preflight_queue() (
+# The TCP preflight and raw UDP MASQUERADE rules are IPv4 only. NDM may
+# rewrite nat independently of mangle. Keep the two rules in installation
+# order and leave rules owned by the router in their existing order.
+fw_repair_ipv4_nat() (
+    for proto in tcp udp; do
+        mark=$MARK; other=$PF_MARK; peer=tcp
+        if [ "$proto" = tcp ]; then mark=$PF_MARK; other=$MARK; peer=udp; fi
+        set -- -p "$proto" -m mark --mark "$mark" -j MASQUERADE
+        if iptables -t nat -C POSTROUTING "$@" 2>/dev/null; then continue
+        else rc=$?; fi
+        [ "$rc" = 1 ] || exit 1
+        listed=$(iptables -t nat -S POSTROUTING) || exit 1
+        # Count only -A entries (-S may print the policy first). Detect a
+        # rule that reappeared between -C and -S instead of adding a copy.
+        pos=$(printf '%s\n' "$listed" | awk -v proto="$proto" -v peer="$peer" \
+            -v mark="$(printf '0x%x' "$mark")" -v other="$(printf '0x%x' "$other")" '
+            $1=="-A" && $2=="POSTROUTING" {
+                n++
+                if (NF!=10 || $3!="-p" || $5!="-m" || $6!="mark" || $7!="--mark" ||
+                    $9!="-j" || $10!="MASQUERADE") next
+                sub(/\/0xffffffff$/, "", $8)
+                if ($4==proto && $8==mark) found=1
+                if ($4==peer && $8==other && !anchor) anchor=n
+            }
+            END { if (found) print "present"; else if (anchor) print anchor+(proto=="udp"); else print "append" }')
+        case "$pos" in
+            present) ;;
+            append) iptables -t nat -A POSTROUTING "$@" || exit 1 ;;
+            *) iptables -t nat -I POSTROUTING "$pos" "$@" || exit 1 ;;
+        esac
+        iptables -t nat -C POSTROUTING "$@" || exit 1
+    done
+    exit 0
+)
+# Restore partial preflight queue and IPv4 NAT loss with both daemons live.
+fw_recover_partial() (
     [ "$FW_BACKEND" = iptables ] && [ "${D2K_PREFLIGHT:-0}" = 1 ] &&
         running "$DP_PID" && running "$CT_PID" && watch_contract_matches || exit 1
     [ -f "$RUN/preflight-active" ] || exit 1
@@ -2899,10 +2929,9 @@ fw_recover_preflight_queue() (
     fw_lock_acquire || exit 1
     trap 'fw_lock_release' EXIT
     D2K_SKIP_PREFLIGHT_QUEUE_CHECK=1
-    fw_family_installed iptables || exit 1
+    fw_family_installed iptables mangle-only || exit 1
     [ -f "$FW_V4ONLY" ] || fw_family_installed ip6tables || exit 1
     D2K_SKIP_PREFLIGHT_QUEUE_CHECK=0
-    missing=0
     set -- iptables
     [ "$D2K_PREFLIGHT_V6" != 1 ] || set -- "$@" ip6tables
     for fw_tool in "$@"; do
@@ -2910,7 +2939,6 @@ fw_recover_preflight_queue() (
             direction=ORIGINAL; [ "$chain" != "$CHAIN_IN" ] || direction=REPLY
             if ! "$fw_tool" -t mangle -C "$chain" -p tcp -m conntrack --ctdir "$direction" \
                 -m connmark --mark "$PF_CONN_BIT/$PF_CONN_BIT" -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass 2>/dev/null; then
-                missing=1
                 rules=$("$fw_tool" -t mangle -S "$chain") || exit 1
                 pos=$(printf '%s\n' "$rules" | awk -v chain="$chain" -v queue="$QUEUE_NUM" '
                     $1 == "-A" && $2 == chain {
@@ -2926,7 +2954,14 @@ fw_recover_preflight_queue() (
             fi
         done
     done
-    [ "$missing" = 1 ] && fw_installed
+    # At this point every other required rule has been checked or repaired.
+    # If NDM still owns/rebuilds nat, the next hook/watchdog can retry.
+    fw_repair_ipv4_nat || exit 2
+    if fw_installed; then exit 0; fi
+    # NDM may rewrite nat again during the final two-family verification.
+    preflight_nat_rule iptables -C && iptables -t nat -C POSTROUTING -p udp \
+        -m mark --mark "$MARK" -j MASQUERADE || exit 2
+    exit 1
 )
 # NDM периодически сносит чужие правила. Сторож есть: событийный хук
 # /opt/etc/ndm/netfilter.d/001-d2k.sh и периодическая страховка
@@ -2945,9 +2980,12 @@ reapply() {
             svc_log "после сброса IPv4/IPv6 mangle правила восстановлены без перезапуска движка"
             return 0
         fi
-        if fw_recover_preflight_queue; then
-            svc_log "частично снятые правила preflight IPv4/IPv6 восстановлены без перезапуска движка"
+        if fw_recover_partial; then
+            svc_log "правила preflight и NAT восстановлены без перезапуска движка"
             return 0
+        elif [ "$?" = 2 ]; then
+            svc_log "восстановление IPv4 NAT отложено до следующей проверки, движок работает"
+            return 1
         fi
     fi
     if [ "${TCP_WATCH:-0}" = 1 ] || [ -f "$RUN/tcp-watch-active" ] ||

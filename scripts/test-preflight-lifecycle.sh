@@ -53,7 +53,7 @@ FW_BACKEND=iptables
 can_recover=1
 fw_recover_mangle() { [ "$can_recover" = 1 ] && echo live-repair >> "$RUN/calls"; }
 can_partial=0
-fw_recover_preflight_queue() { [ "$can_partial" = 1 ] && echo partial-repair >> "$RUN/calls"; }
+fw_recover_partial() { [ "$can_partial" = 1 ] && echo partial-repair >> "$RUN/calls"; }
 reapply auto
 [ "$(cat "$RUN/calls")" = live-repair ] || { echo 'NDM mangle reset restarted live processes'; exit 1; }
 : > "$RUN/calls"

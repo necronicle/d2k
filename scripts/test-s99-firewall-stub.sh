@@ -61,6 +61,9 @@ if [ "$tool" = ip6tables ] && [ "$table" = mangle ] && [ "${STUB_V6_MANGLE_BROKE
     exit 3
 fi
 case " $spec " in *" ${STUB_FAIL_MATCH:-@none@} "*) [ "$tool" = "${STUB_FAIL_TOOL:-ip6tables}" ] && [ "$op" = -A ] && exit 1;; esac
+if [ "$tool:$table:${STUB_NAT_WRITE_FAIL:-0}" = iptables:nat:1 ]; then
+    case "$op" in -A|-I) exit 4 ;; esac
+fi
 dir=$FW_STATE/$tool/$table
 mkdir -p "$dir"
 for builtin in PREROUTING INPUT FORWARD OUTPUT POSTROUTING; do [ -e "$dir/$builtin" ] || : > "$dir/$builtin"; done
@@ -173,6 +176,27 @@ for chain in D2K_OUT D2K_IN; do
         fail "partial IPv4 repair changed rule order or owner's rule: $chain"
 done
 ok "partial IPv4 preflight loss restores exact rule order without restarting daemons"
+# Field report 99611: a NAT-only failure must not deliver TERM to either daemon.
+nat_auto='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
+    RUNTIME_DIR=$RUN; CONF=$RUN/test-config; running() { return 0; };
+    engine_stop() { echo stopped >> "$RUN/unexpected-stop"; return 1; };
+    svc_log() { :; }; reapply auto'
+for loss in tcp both; do
+    FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t nat -D POSTROUTING -p tcp -m mark --mark 0x31 -j MASQUERADE
+    if [ "$loss" = both ]; then
+        FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t nat -D POSTROUTING -p udp -m mark --mark 0x2d -j MASQUERADE
+    fi
+    S99_SNIPPET="$nat_auto" s99 >/dev/null 2>&1 || fail "NAT-only $loss recovery failed"
+    S99_SNIPPET="$nat_auto" s99 >/dev/null 2>&1 || fail "repeat NAT notification failed"
+    rules iptables nat | cmp -s - "$TMP/old-nat" || fail "NAT rules duplicated or reordered"
+    rules iptables mangle | cmp -s - "$TMP/healthy-partial-v4" || fail "NAT repair changed IPv4 mangle"
+    rules ip6tables mangle | cmp -s - "$TMP/old-ip6" || fail "NAT repair changed IPv6"
+done
+FW_STATE="$TMP/fw" "$TMP/bin/iptables" -t nat -D POSTROUTING -p udp -m mark --mark 0x2d -j MASQUERADE
+if S99_SNIPPET="$nat_auto" s99 STUB_NAT_WRITE_FAIL=1 >/dev/null 2>&1; then fail "failed NAT write looked healthy"; fi
+[ ! -f "$TMP/run/unexpected-stop" ] || fail "NAT failure stopped the engine"
+S99_SNIPPET="$nat_auto" s99 >/dev/null 2>&1 || fail "later NAT repair failed"
+ok "NDM NAT rewrite restores owned rules in place and retries write failure without restart"
 # Numeric aliases of the reserved marks are conflicts too.
 if S99_SNIPPET='D2K_PREFLIGHT=1; MARK=49; preflight_validate' s99 >/dev/null 2>&1; then fail "preflight numeric mark collision accepted"; fi
 S99_SNIPPET='D2K_PREFLIGHT=1; KEENETIC_POLICY=Policy7;
