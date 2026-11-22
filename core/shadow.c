@@ -291,19 +291,18 @@ static int load_history(const char *queue,const d2k_shadow_record *r,uint64_t no
                         d2k_shadow_record *chosen,char *name_reason,size_t name_cap,
                         char *history,size_t history_cap)
 {
-    d2k_shadow_recent *scratch=malloc(sizeof *scratch);
-    if(!scratch)return -1;
-    int recent_rc=d2k_shadow_recent_load(queue,"recent",scratch,now);
-    size_t recent_count=scratch->count;
-    const d2k_shadow_record *best=best_name(scratch,r,now,NULL);
+    d2k_shadow_recent scratch;
+    int recent_rc=d2k_shadow_recent_load(queue,"recent",&scratch,now);
+    size_t recent_count=scratch.count;
+    const d2k_shadow_record *best=best_name(&scratch,r,now,NULL);
     if(best) {
         *chosen=*best;
         best=chosen;
     }
-    int direct_rc=d2k_shadow_recent_load(queue,"direct",scratch,now);
+    int direct_rc=d2k_shadow_recent_load(queue,"direct",&scratch,now);
     fprintf(stderr,"d2kshadow: inputs host=%s recent=%zu(%d) direct=%zu(%d) queued_seconds=%llu\n",
-        r->host,recent_count,recent_rc,scratch->count,direct_rc,(unsigned long long)(now>=r->time?now-r->time:0));
-    best=best_name(scratch,r,now,best);
+        r->host,recent_count,recent_rc,scratch.count,direct_rc,(unsigned long long)(now>=r->time?now-r->time:0));
+    best=best_name(&scratch,r,now,best);
     int found=describe_name(best,r,name_reason,name_cap);
     if(found && best!=chosen)*chosen=*best;
     /* §4.3 п. 2 — обмен с тем же адресом и портом, ДОШЕДШИЙ ДО ДАННЫХ
@@ -313,8 +312,8 @@ static int load_history(const char *queue,const d2k_shadow_record *r,uint64_t no
        прямой успех самой тени (прикладная проверка §9) на этом адресе и
        порту за час; пассивные наблюдения остаются лишь кандидатами имени,
        пропуск которых доказывает контрольное плечо. */
-    for(size_t i=0;i<scratch->count;i++) {
-        const d2k_shadow_record *d=&scratch->entries[i];
+    for(size_t i=0;i<scratch.count;i++) {
+        const d2k_shadow_record *d=&scratch.entries[i];
         if(d->port!=r->port || strcmp(d->ip,r->ip) || !d->time || d->time>now ||
            now-d->time>D2K_SHADOW_HOUR) continue;
         time_t stamp=(time_t)d->time;struct tm tm;char clock[16]="?";
@@ -323,20 +322,16 @@ static int load_history(const char *queue,const d2k_shadow_record *r,uint64_t no
             d->host,r->ip,(unsigned)r->port,clock);
         break;
     }
-    free(scratch);
     return found;
 }
 
 static int note_direct_success(const char *queue,const d2k_shadow_record *r,uint64_t now)
 {
-    d2k_shadow_recent *direct=malloc(sizeof *direct);
-    if(!direct)return -1;
-    (void)d2k_shadow_recent_load(queue,"direct",direct,now);
+    d2k_shadow_recent direct;
+    (void)d2k_shadow_recent_load(queue,"direct",&direct,now);
     d2k_shadow_record success=*r;success.time=now;success.signal=1;
-    d2k_shadow_recent_note(direct,&success,now);
-    int rc=d2k_shadow_recent_save(queue,"direct",direct,now);
-    free(direct);
-    return rc;
+    d2k_shadow_recent_note(&direct,&success,now);
+    return d2k_shadow_recent_save(queue,"direct",&direct,now);
 }
 
 int d2k_shadow_run(const d2k_shadow_record *r,const d2k_exp_options *options,d2km_store *store,
@@ -346,7 +341,7 @@ int d2k_shadow_run(const d2k_shadow_record *r,const d2k_exp_options *options,d2k
     uint64_t now=(uint64_t)time(NULL);char err[300],history[700]="",name_reason[700]="";
     d2k_exp_options assembled=*options;const char *form="not-client";
     d2k_shadow_snapshot snapshot;d2k_shadow_record chosen;
-    int snapshot_error=r->snapshot_errno,history_error=0;
+    int snapshot_error=r->snapshot_errno;
     const char *form_error=NULL;
     if(options->shadow_queue) {
         assembled.pass_name=NULL;assembled.alive_history=NULL;
@@ -373,7 +368,6 @@ int d2k_shadow_run(const d2k_shadow_record *r,const d2k_exp_options *options,d2k
         d2k_shadow_snapshot_remove(options->shadow_queue,r);
         int picked=load_history(options->shadow_queue,r,now,&chosen,name_reason,sizeof name_reason,
                                 history,sizeof history);
-        history_error=picked<0;
         if(picked>0)assembled.pass_name=chosen.host;
         if(history[0])assembled.alive_history=history;
     }
@@ -394,14 +388,13 @@ int d2k_shadow_run(const d2k_shadow_record *r,const d2k_exp_options *options,d2k
         else if(snapshot_error)snprintf(err,sizeof err,"snapshot-write: errno=%d; форма клиента не сохранена",snapshot_error);
         else snprintf(err,sizeof err,"форма клиента для проверки той же привязки или новой задачи не воспроизведена (snapshot=%016" PRIx64 ")",r->snapshot);
     }
-    else if(history_error)snprintf(err,sizeof err,"недостаточно памяти для чтения истории");
     else task=d2k_exp_task_open(&assembled,store,journal,injected,err,sizeof err);
     if(task) {
         d2k_exp_task_run(task,report);d2k_exp_task_close(task);
     } else {
         memset(report,0,sizeof *report);report->outcome=options->shadow_queue && !assembled.client_hello?
             (snapshot_error?(snapshot_error==ENOSPC || snapshot_error==ENOMEM?D2KM_NO_RESOURCES:D2KM_LOCAL_FAIL):D2KM_FORM_NOT_REPRODUCED):
-            (history_error?D2KM_NO_RESOURCES:D2KM_LOCAL_FAIL);report->state=D2KM_T_WAIT;
+            D2KM_LOCAL_FAIL;report->state=D2KM_T_WAIT;
         snprintf(report->reason,sizeof report->reason,"%s",err);
         char reason[400];snprintf(reason,sizeof reason,"form=%s; %s",form,err);
         d2km_why why={.task=&ctx,.step=D2KM_STEP_DIRECT,.outcome=report->outcome,.reason=reason};

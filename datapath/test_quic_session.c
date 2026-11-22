@@ -29,11 +29,8 @@
 #include "d2k_quicsnap.h"
 #include "d2k_crypto.h"
 
-static int fail_quic_alloc;
-static void *quic_test_malloc(size_t size) {
-    return fail_quic_alloc ? NULL : malloc(size);
-}
-#define malloc quic_test_malloc
+/* The packet path must work with no heap allocation after flow admission. */
+#define malloc(size) ((void)(size), (void *)0)
 #include "quic_flow.h"
 #undef malloc
 
@@ -543,7 +540,8 @@ static void test_quic_cross_datagram_assembly(void) {
 }
 
 static void test_quic_flow_storage(void) {
-    d2k_flow f = {0};
+    d2k_flow_protocol_storage storage;
+    d2k_flow f = {.storage = &storage};
     int complete;
     char name[256];
     uint8_t first[1500], second[1500], bad[1500];
@@ -552,39 +550,35 @@ static void test_quic_flow_storage(void) {
         CHECK(0, "QUIC memory fixture");
         return;
     }
-    fail_quic_alloc = 1;
-    CHECK(flow_quic_feed(&f, v1_initial, sizeof v1_initial, name, &complete) == 1 &&
-          complete && !strcmp(name, "example.com") && !f.quic_assembly && !f.quic_replay,
-          "one complete datagram can be identified while allocations fail");
-    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) < 0 &&
-          !complete && !f.quic_assembly && !f.quic_replay, "allocation failure leaves no partial state");
-    fail_quic_alloc = 0;
+    CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 0 && !complete,
+          "split ClientHello keeps its first fragment after flow admission");
+    CHECK(flow_quic_feed(&f, second, second_len, name, &complete) == 1 &&
+          complete && !strcmp(name, "example.com"),
+          "split ClientHello must survive allocation pressure after flow admission");
+    d2k_track_new_connection(&f);
     memcpy(bad, first, first_len);
     bad[first_len - 1] ^= 1;
-    CHECK(flow_quic_feed(&f, bad, first_len, name, &complete) < 0 && !f.quic_assembly,
+    CHECK(flow_quic_feed(&f, bad, first_len, name, &complete) < 0 && !f.quic_assembly->active,
           "bad authentication does not leave an assembly behind");
     CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 0 &&
           !complete && f.quic_assembly, "incomplete authenticated Initial keeps its CRYPTO bytes");
-    fail_quic_alloc = 1;
     CHECK(flow_quic_feed(&f, second, second_len, name, &complete) == 1 &&
-          complete && !strcmp(name, "example.com"), "completion survives a failed compaction");
-    fail_quic_alloc = 0;
+          complete && !strcmp(name, "example.com"), "completion uses the reserved buffer");
     CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 1 &&
-          complete && !strcmp(name, "example.com") && !f.quic_assembly && f.quic_replay,
-          "partial retransmit recovers the name and releases the full assembly");
+          complete && !strcmp(name, "example.com"),
+          "partial retransmit recovers the name");
     CHECK(flow_quic_feed(&f, bad, first_len, name, &complete) < 0 && !complete,
           "same DCID cannot reuse the completed name without authentication");
     memcpy(bad, v1_initial, sizeof v1_initial);
     bad[sizeof v1_initial - 1] ^= 1;
     CHECK(flow_quic_feed(&f, bad, sizeof v1_initial, name, &complete) < 0 &&
-          !complete && !f.quic_assembly, "invalid new DCID does not displace a completed flight");
+          !complete, "invalid new DCID does not displace a completed flight");
     CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 1 && complete &&
           !strcmp(name, "example.com"), "completed flight survives an invalid new DCID");
     d2k_track_new_connection(&f);
-    CHECK(!f.quic_assembly && !f.quic_replay, "new incarnation discarded the previous flight");
+    CHECK(!f.quic_assembly, "new incarnation discarded the previous flight");
     CHECK(flow_quic_feed(&f, first, first_len, name, &complete) == 0 && !complete,
           "an old head fragment alone cannot identify the next connection");
-    d2k_flow_forget_quic(&f);
 }
 
 /* СНИМОК QUIC — ВЕСЬ ПОЛЁТ КЛИЕНТА, А НЕ ПОСЛЕДНЯЯ ДАТАГРАММА (задача 66).

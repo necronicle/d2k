@@ -1726,6 +1726,8 @@ struct d2k_sched {
     int64_t      stun_cleanup_ms;
     int          stun_cleanup_seen;
 
+    task_slot task_storage[SCHED_MAX_TASKS];
+    shadow_flow_state shadow_storage[SCHED_SEEN];
     task        *tasks[SCHED_MAX_TASKS];
     size_t       task_count; /* Allocated slots, including reusable idle slots. */
     shadow_flow_state *shadow_flows;
@@ -2236,14 +2238,12 @@ static void shadow_forget(d2k_sched *,shadow_flow_state *);
 int d2k_sched_set_shadow(d2k_sched *s,const char *path) {
     if(!s || (path && strlen(path)>=sizeof s->shadow.path))return -1;
     if(path && *path && !s->shadow_flows) {
-        s->shadow_flows=malloc(SCHED_SEEN*sizeof *s->shadow_flows);
-        if(!s->shadow_flows)return -1;
+        s->shadow_flows=s->shadow_storage;
     }
     for(size_t i=0;i<s->shadow_count;i++)shadow_forget(s,&s->shadow_flows[i]);
     s->shadow_count=0;
     s->shadow_next=0;
     if(!path || !*path) {
-        free(s->shadow_flows);
         s->shadow_flows=NULL;
     }
     s->shadow_recent.count=0;
@@ -3389,8 +3389,7 @@ static task *task_of(d2k_sched *s, const char *name, uint8_t transport, uint8_t 
 
 static task *task_append_slot(d2k_sched *s) {
     if (s->task_count == SCHED_MAX_TASKS) return NULL;
-    task_slot *slot = calloc(1, sizeof *slot);
-    if (!slot) return NULL;
+    task_slot *slot = &s->task_storage[s->task_count];
     s->tasks[s->task_count++] = &slot->value;
     return &slot->value;
 }
@@ -8190,13 +8189,11 @@ void d2k_sched_free(d2k_sched *s) {
         prop_close(s->tasks[i]);
         ver_close(s->tasks[i]);
     }
-    for (size_t i = 0; i < s->task_count; i++) free(s->tasks[i]);
     pthread_cond_destroy(&s->question_cv);
     pthread_mutex_destroy(&s->mu);
     if (s->wake[0] >= 0) { close(s->wake[0]); }
     if (s->wake[1] >= 0) { close(s->wake[1]); }
     for(size_t i=0;i<s->shadow_count;i++)shadow_forget(s,&s->shadow_flows[i]);
-    free(s->shadow_flows);
     free(s->areas);
     free(s);
 }

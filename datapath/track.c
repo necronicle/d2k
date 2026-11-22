@@ -85,6 +85,7 @@ int d2k_key_make_addr(d2k_key *k, uint8_t proto,
 struct d2k_table {
     uint8_t flow_epoch[16];
     d2k_flow *slots;
+    d2k_flow_protocol_storage *storage;
     uint8_t  *state;
     size_t    cap;  /* степень двойки */
     size_t    used;
@@ -141,35 +142,19 @@ d2k_table *d2k_track_new(size_t capacity) {
     t->cap = round_pow2(capacity);
     t->slots = calloc(t->cap, sizeof *t->slots);
     t->state = calloc(t->cap, sizeof *t->state);
-    if (!t->slots || !t->state) {
+    t->storage = calloc(t->cap, sizeof *t->storage);
+    if (!t->slots || !t->state || !t->storage) {
         d2k_track_free(t);
         return NULL;
     }
     return t;
 }
 
-void d2k_flow_forget_quic(d2k_flow *f) {
-    free(f->quic_assembly);
-    free(f->quic_replay);
-    f->quic_assembly = NULL;
-    f->quic_replay = NULL;
-}
-
-static void free_flow_state(d2k_flow *f) {
-    free(f->stun_requests);
-    f->stun_requests = NULL;
-    d2k_flow_forget_quic(f);
-}
-
 void d2k_track_free(d2k_table *t) {
     if (!t) {
         return;
     }
-    if (t->used) {
-        for (size_t i = 0; i < t->cap; i++) {
-            if (t->state[i] == SLOT_USED) free_flow_state(&t->slots[i]);
-        }
-    }
+    free(t->storage);
     free(t->slots);
     free(t->state);
     free(t);
@@ -198,7 +183,7 @@ d2k_flow *d2k_track_find(d2k_table *t, const d2k_key *k) {
  * сохраняется без надгробий. */
 static void remove_at(d2k_table *t, size_t hole) {
     size_t mask = t->cap - 1;
-    free_flow_state(&t->slots[hole]);
+
     t->state[hole] = SLOT_FREE;
     t->slots[hole].in_use = 0;
     t->used--;
@@ -216,11 +201,10 @@ static void remove_at(d2k_table *t, size_t hole) {
         int movable = (hole <= j) ? (home <= hole || home > j)
                                   : (home <= hole && home > j);
         if (movable) {
+            d2k_flow_protocol_storage *vacant = t->slots[hole].storage;
             t->slots[hole] = t->slots[j];
             t->state[hole] = SLOT_USED;
-            t->slots[j].stun_requests = NULL;
-            t->slots[j].quic_assembly = NULL;
-            t->slots[j].quic_replay = NULL;
+            t->slots[j].storage = vacant;
             t->state[j] = SLOT_FREE;
             t->slots[j].in_use = 0;
             hole = j;
@@ -255,7 +239,9 @@ d2k_flow *d2k_track_get(d2k_table *t, const d2k_key *k, uint64_t now_ns) {
         }
         t->state[s] = SLOT_USED;
         t->used++;
+        d2k_flow_protocol_storage *storage = t->slots[s].storage;
         memset(&t->slots[s], 0, sizeof t->slots[s]);
+        t->slots[s].storage = storage ? storage : &t->storage[s];
         t->slots[s].key = *k;
         memcpy(t->slots[s].flow_epoch, t->flow_epoch, sizeof t->flow_epoch);
         t->slots[s].incarnation = fresh_incarnation();
@@ -272,9 +258,9 @@ void d2k_track_new_connection(d2k_flow *f) {
     if (!f) {
         return;
     }
-    free_flow_state(f);
     d2k_flow keep = *f;
     memset(f, 0, sizeof *f);
+    f->storage = keep.storage;
     f->key = keep.key;
     memcpy(f->flow_epoch, keep.flow_epoch, sizeof f->flow_epoch);
     f->incarnation = fresh_incarnation();

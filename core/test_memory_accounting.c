@@ -4,6 +4,12 @@
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
+#include <stdlib.h>
+
+static int refuse_allocation;
+static void *test_calloc(size_t count, size_t size) {
+    return refuse_allocation ? NULL : calloc(count, size);
+}
 #include <sys/mman.h>
 int accounting_join(pthread_t, void **);
 int accounting_create(pthread_t *,const pthread_attr_t *,void *(*)(void *),void *);
@@ -12,7 +18,9 @@ int accounting_madvise(void *,size_t,int);
 #define pthread_create accounting_create
 #define pthread_join accounting_join
 #define madvise accounting_madvise
+#define calloc test_calloc
 #include "sched.c"
+#undef calloc
 #include "test_task_slots.h"
 #undef pthread_create
 #undef pthread_join
@@ -56,6 +64,7 @@ int main(void) {
     d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0);assert(s);
     assert(sizeof s->tasks <= SCHED_MAX_TASKS * sizeof(void *));
     assert(s->task_count == 0 && measure_slots(s) == SCHED_MEASURE_SLOTS);
+    refuse_allocation = 1;
     for (size_t i = 0; i < SCHED_MAX_TASKS; i++) {
         task *t = task_free_slot(s);
         assert(t && s->task_count == i + 1);
@@ -64,6 +73,7 @@ int main(void) {
     assert(!task_free_slot(s) && !measure_slots(s));
     s->tasks[3]->state = T_FREE;
     assert(task_free_slot(s) == s->tasks[3] && measure_slots(s) == 1);
+    refuse_allocation = 0;
     d2k_sched_stun_hook=no_network;
     for(int batch=0;batch<3;batch++) {
         for(int i=0;i<SCHED_MAX_TASKS;i++) {

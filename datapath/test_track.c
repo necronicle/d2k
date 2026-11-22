@@ -283,12 +283,10 @@ int main(void) {
                 d2k_flow *fl = d2k_track_get(s, &k, 100);
                 if (fl) {
                     CHECK(!fl->stun_requests, "new flow inherited another history");
-                    fl->stun_requests = calloc(D2K_STUN_REQUEST_SLOTS, sizeof *fl->stun_requests);
-                    if (!fl->stun_requests) abort();
+                    fl->stun_requests = fl->storage->stun;
                     fl->stun_requests[0].started_ns = (uint64_t)idx;
-                    CHECK(!fl->quic_assembly && !fl->quic_replay, "new flow inherited QUIC state");
-                    fl->quic_assembly = calloc(1, sizeof *fl->quic_assembly);
-                    if (!fl->quic_assembly) abort();
+                    CHECK(!fl->quic_assembly, "new flow inherited QUIC state");
+                    fl->quic_assembly = &fl->storage->quic;
                     fl->quic_assembly->largest_pn = (uint64_t)idx;
                     alive[idx] = 1;
                     live++;

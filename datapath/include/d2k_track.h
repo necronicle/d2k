@@ -120,6 +120,11 @@ typedef struct {
     d2k_udp_request_context context;
 } d2k_stun_request_slot;
 
+typedef struct {
+    d2k_quic_assembly quic;
+    d2k_stun_request_slot stun[D2K_STUN_REQUEST_SLOTS];
+} d2k_flow_protocol_storage;
+
 struct d2k_flow {
     d2k_key  key;
     int      in_use;
@@ -306,7 +311,7 @@ struct d2k_flow {
     uint8_t  stun_txid[12];
     uint8_t  stun_txid_valid;
     uint8_t  stun_proof_told;
-    d2k_stun_request_slot *stun_requests; /* Owned by this flow, allocated on its first STUN request. */
+    d2k_stun_request_slot *stun_requests; /* Set on the first STUN request. */
     d2k_udp_request_context voice_request_context;
     /* ПРИЗНАКА «ПРИКЛАДНОЕ ДОКАЗАТЕЛЬСТВО QUIC» ЗДЕСЬ НЕТ, И ЭТО ЗАМЕР.
        Короткий заголовок 1-RTT от сервера (RFC 9000 §17.3) доказательством
@@ -321,7 +326,7 @@ struct d2k_flow {
        означает успеха: пока префикс ClientHello не собран, пакет проходит
        без имени и без применения плана. */
     d2k_quic_assembly *quic_assembly;
-    struct d2k_quic_replay *quic_replay; /* Authenticated retransmits after completion. */
+    d2k_flow_protocol_storage *storage; /* Reserved with the table, follows the flow during rehash. */
     /* Полёт приветствия этого потока уже снят (задача 66): повторы Initial
        по PTO и подтверждения после рукопожатия в снимок не идут. */
     int      qsnap_done;
@@ -447,7 +452,6 @@ typedef struct d2k_table d2k_table;
 /* capacity округляется вверх до степени двойки. */
 d2k_table *d2k_track_new(size_t capacity);
 void       d2k_track_free(d2k_table *t);
-void       d2k_flow_forget_quic(d2k_flow *f);
 
 /* Находит поток или заводит новый. NULL означает, что таблица полна — это
  * нормальный исход, а не ошибка: вызывающий пропускает пакет без обработки. */

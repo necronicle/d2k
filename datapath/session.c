@@ -1154,8 +1154,8 @@ static d2k_stun_request_slot *stun_observe_request(d2k_flow *fl, const uint8_t *
     d2k_stun_request_slot *slot=NULL;
     *fresh=0;
     if (!fl->stun_requests) {
-        fl->stun_requests = calloc(D2K_STUN_REQUEST_SLOTS, sizeof *fl->stun_requests);
-        if (!fl->stun_requests) return NULL;
+        fl->stun_requests = fl->storage->stun;
+        memset(fl->stun_requests, 0, sizeof fl->storage->stun);
     }
     for (size_t i=0;i<D2K_STUN_REQUEST_SLOTS;i++) {
         d2k_stun_request_slot *r=&fl->stun_requests[i];
@@ -1762,8 +1762,6 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         out->skipped = "таблица потоков полна";
         return;
     }
-    if (fl->fwd_pkts >= D2K_HELLO_WINDOW && (fl->saw_initial || fl->saw_hello) &&
-        (fl->quic_assembly || fl->quic_replay)) d2k_flow_forget_quic(fl);
     if (controller_probe) { fl->controller_probe = 1; }
 
     /* Направление — из ПОРТА, а не из содержимого (ревью задачи 4, круг 3).
@@ -2161,8 +2159,6 @@ static void handle_udp(d2k_session *s, const uint8_t *pkt, size_t len,
         name[0] = '\0';
     } else {
         int assembled = flow_quic_feed(fl, pkt + payload_off, payload_len, name, &quic_complete);
-        if (fl->fwd_pkts >= D2K_HELLO_WINDOW && !fl->udp_hold_active)
-            d2k_flow_forget_quic(fl);
         if (assembled != 1) {
             named = 0;
             name[0] = '\0';
