@@ -1696,10 +1696,10 @@ TESTS += test_dns_journal
 check: test-dns-journal
 test-dns-journal: test_dns_journal
 	./test_dns_journal
-test_dns_journal: test_dns_journal.c dns_journal.inc domain.c include/d2k_domain.h profiles/psl_index.h
+test_dns_journal: test_dns_journal.c dns_journal.inc ../runtime/d2k_json_reader.h domain.c include/d2k_domain.h profiles/psl_index.h
 	$(CC) $(CFLAGS) -o $@ test_dns_journal.c domain.c
-d2kc: dns_journal.inc
-release: dns_journal.inc
+d2kc: dns_journal.inc ../runtime/d2k_json_reader.h
+release: dns_journal.inc ../runtime/d2k_json_reader.h
 .PHONY: test-verify-doh test-doh-h2
 check: test-verify-doh test-doh-h2
 test-verify-doh: test_verify_doh

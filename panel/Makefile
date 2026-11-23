@@ -140,3 +140,5 @@ test_response_memory: test_response_memory.c server.c server.h policies.h ../run
 clean: clean-response-memory
 clean-response-memory:
 	$(RM) test_response_memory
+
+d2kpanel release server.o test_server test_server_san test_config_values test_header_deadline test_response_deadline test_status_cache test_diagnostics test_policies test_policy_review test_response_memory: ../runtime/d2k_json_reader.h

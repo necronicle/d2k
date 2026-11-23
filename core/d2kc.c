@@ -289,21 +289,62 @@ typedef struct {
     volatile sig_atomic_t halt;
     dns_journal_cursor cursor;
 } dns_journal_reader;
+/* Local Keenetic RCI handles show/log without opening an ndmc CLI session.
+ * Ask for a small tail normally, the firmware ring on a burst. */
+static int journal_snapshot(unsigned lines,dns_journal_cursor *cursor,dns_journal_hits *hits) {
+    char command[256];
+    snprintf(command,sizeof command,
+        "curl -q -fs --noproxy '*' --max-time %u -H 'Content-Type: application/json' "
+        "-d '{\"once\":true,\"max-lines\":%u}' http://127.0.0.1:79/rci/show/log",lines>32 ? 12U : 3U,lines);
+    FILE *f=popen(command,"r");
+    if(!f)return -1;
+    char *data=NULL;
+    size_t used=0,cap=0;
+    int complete=0;
+    while(!feof(f) && !ferror(f)) {
+        if(used==cap) {
+            if(cap>=8*1024*1024)break;
+            size_t larger=cap ? cap*2 : 4096;
+            char *grown=realloc(data,larger);
+            if(!grown)break;
+            data=grown;cap=larger;
+        }
+        used+=fread(data+used,1,cap-used,f);
+    }
+    complete=feof(f) && !ferror(f);
+    int status=pclose(f);
+    int rc=complete && !status && used ? dns_journal_parse(data,used,cursor,hits) : -1;
+    free(data);
+    return rc;
+}
+
 static void *dns_journal_run(void *context) {
     dns_journal_reader *reader=context;
+    int unavailable=0;
     while(!reader->halt) {
-        FILE *f=popen("ndmc -c 'show log' 2>/dev/null","r");
-        if(f) {
-            dns_journal_cursor next=reader->cursor;
-            dns_journal_hits hits={0};
-            int valid=!dns_journal_scan(f,&next,&hits);
-            int status=pclose(f);
-            if(valid && status==0) {
-                reader->cursor=next;
-                for(size_t i=0;i<hits.count;i++)
-                    if(write(reader->output,hits.names[i],sizeof hits.names[i])!=
-                       (ssize_t)sizeof hits.names[i])break;
+        dns_journal_cursor next=reader->cursor;
+        dns_journal_hits hits={0};
+        int failed=journal_snapshot(next.ready ? 32 : 1,&next,&hits);
+        if(!failed && reader->cursor.ready && next.first!=UINT64_MAX &&
+           next.first>reader->cursor.last && next.first-reader->cursor.last>1) {
+            uint64_t gap=next.last-reader->cursor.last;
+            unsigned lines=gap>=3000-32 ? 3000 : (unsigned)gap+32;
+            next=reader->cursor;
+            failed=journal_snapshot(lines,&next,&hits);
+            /* If even the expanded tail moved past the cursor, read the ring. */
+            if(!failed && lines<3000 && next.first!=UINT64_MAX &&
+               next.first>reader->cursor.last && next.first-reader->cursor.last>1) {
+                next=reader->cursor;
+                failed=journal_snapshot(3000,&next,&hits);
             }
+        }
+        if(failed && !unavailable)fprintf(stderr,"d2kc: Keenetic DNS journal unavailable via local RCI\n");
+        unavailable=failed;
+        if(!failed) {
+            reader->cursor=next;
+            for(size_t i=0;i<hits.count;i++)
+                if(write(reader->output,hits.names[i],sizeof hits.names[i])!=
+                   (ssize_t)sizeof hits.names[i])break;
         }
         for(int i=0;i<50 && !reader->halt;i++) {
             struct timespec pause={0,100000000L};

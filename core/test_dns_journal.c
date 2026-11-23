@@ -1,34 +1,36 @@
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
-#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include "dns_journal.inc"
 
-static void scan_text(const char *text,dns_journal_cursor *cursor,dns_journal_hits *hits) {
-    FILE *f=tmpfile();assert(f);
-    assert(fputs(text,f)>=0 && !fflush(f) && !fseek(f,0,SEEK_SET));
-    assert(!dns_journal_scan(f,cursor,hits));
-    assert(!fclose(f));
-}
+#define ENTRY(id, source, level, text) "\"" #id "\":{\"ident\":\"" source "\",\"message\":{\"label\":\"" level "\",\"message\":\"" text "\"}}"
+#define SNAP(rows) "{\"log\":{" rows "}}"
 int main(void) {
-    const char *old="I [Nov 19 21:00:00] ndm: ready\n"
-        "W [Nov 19 21:00:01] https-dns-proxy: A001: \"https://old.example.com/dns-query\": curl error message: timeout\n";
-    dns_journal_cursor cursor={0};dns_journal_hits hits={0};
-    scan_text(old,&cursor,&hits);assert(cursor.ready && !hits.count);
-    const char *fresh="I [Nov 19 21:00:00] ndm: ready\n"
-        "W [Nov 19 21:00:01] https-dns-proxy: A001: \"https://old.example.com/dns-query\": curl error message: timeout\n"
-        "W [Nov 19 21:00:02] https-dns-proxy: A002: \"https://gw.cloudflare-\n"
-        "                    gateway.com/dns-query\": curl error message: Operation timed out\n"
-        "W [Nov 19 21:00:03] unrelated: \"https://ignore.example.com\": error\n"
-        "\033[K"
-        "W [Nov 19 21:00:04] https-dns-proxy: A003: \"https://gw.cloudflare-gateway.com/dns-query\": curl error message: timeout\n";
-    scan_text(fresh,&cursor,&hits);
-    assert(hits.count==1 && !strcmp(hits.names[0],"cloudflare-gateway.com"));
-    hits=(dns_journal_hits){0};scan_text(fresh,&cursor,&hits);assert(!hits.count);
-    hits=(dns_journal_hits){0};
-    scan_text("W [Nov 19 21:00:05] https-dns-proxy: A004: \"https://fresh.example.org/dns-query\": curl error message: timeout\n",
-        &cursor,&hits);
-    assert(!hits.count); /* Lost anchor after rotation: no old replay. */
+    const char *initial=SNAP(ENTRY(20,"https-dns-proxy","W","https://old.example.com error"));
+    const char *fresh=SNAP(
+        ENTRY(22,"tls-dns-proxy","E","tls://dns.example.net failed") ","
+        ENTRY(21,"https-dns-proxy","W","A001: \\\"https://gw.cloudflare-gateway.com/dns-query\\\": curl error") ","
+        ENTRY(23,"quic-dns-proxy","W","quic://dns.example.org timed out") ","
+        ENTRY(24,"kernel","W","https://ignored.invalid error") ","
+        ENTRY(25,"https-dns-proxy","I","https://ignored.invalid error") ","
+        ENTRY(26,"https-dns-proxy","W","https://gw.cloudflare-gateway.com failed"));
+    dns_journal_cursor cursor={0};
+    dns_journal_hits hits={0};
+    assert(!dns_journal_parse(initial,strlen(initial),&cursor,&hits) && !hits.count && cursor.last==20);
+    assert(dns_journal_parse(fresh,strlen(fresh)-1,&cursor,&hits)<0 && cursor.last==20 && !hits.count);
+    assert(!dns_journal_parse(fresh,strlen(fresh),&cursor,&hits) && cursor.last==26 && hits.count==3);
+    assert(!strcmp(hits.names[0],"example.net") && !strcmp(hits.names[1],"cloudflare-gateway.com"));
+    assert(!strcmp(hits.names[2],"example.org"));
+    assert(!dns_journal_parse(fresh,strlen(fresh),&cursor,&hits) && !hits.count);
+    assert(!dns_journal_parse(initial,strlen(initial),&cursor,&hits) && !hits.count && cursor.last==20);
+    const char *wrapped=SNAP(ENTRY(21,"ndm","W","quic-dns-proxy: quic://wrap.example.org failed"));
+    assert(dns_journal_parse("{}",2,&cursor,&hits)<0 && cursor.last==20);
+    assert(!dns_journal_parse(wrapped,strlen(wrapped),&cursor,&hits));
+    assert(hits.count==1 && !strcmp(hits.names[0],"example.org"));
+    const char *empty=SNAP("");
+    assert(!dns_journal_parse(empty,strlen(empty),&cursor,&hits) && cursor.ready && !hits.count);
+    const char *first=SNAP(ENTRY(1,"https-dns-proxy[42]","E","https://dns.example.net failed"));
+    assert(!dns_journal_parse(first,strlen(first),&cursor,&hits) && hits.count==1);
     return 0;
 }
