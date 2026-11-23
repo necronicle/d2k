@@ -1240,6 +1240,7 @@ static void ipv6_late_silence_checks_verified_ipv4(void) {
         } else CHECK(t->state!=T_FAMILY_PROBE);
         t->th_live=0;
         d2k_sched_free(s);
+        d2k_catalog_free(&cat);
     }
 }
 
