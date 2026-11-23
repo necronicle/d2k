@@ -405,6 +405,9 @@ d2k_ver_result d2k_verify_probe_ech_origin_on(int use_fd, const char *ip,
 d2k_ver_result d2k_verify_doh_on(int, const char *, uint16_t, const char *, int, size_t, int, uint32_t, const char *);
 /* Authenticated TLS1.2/1.3 + complete HTTP/1.1 or HTTP/2 GET for preflight. */
 d2k_ver_result d2k_verify_preflight_on(int,const char *,uint16_t,const char *,int,size_t,int);
+/* Same authenticated GET, using a separately configured HTTP/1.1-only TLS
+ * opener for route-family selection. DoH and preflight ALPN stay unchanged. */
+d2k_ver_result d2k_verify_family_page_on(int,const char *,uint16_t,const char *,int,size_t,int);
 d2k_ver_result d2k_verify_doh_question_on(int,const char *,uint16_t,const char *,int,
     size_t,int,uint32_t,const char *,const char *,uint16_t);
 /* Socket DoH must authenticate its peer. The process installs its TLS
@@ -422,7 +425,10 @@ typedef struct {
 typedef d2k_doh_tls_status (*d2k_doh_tls_open_fn)(int, const char *, uint16_t,
     int, d2k_doh_tls_session *);
 void d2k_verify_doh_set_tls(d2k_doh_tls_open_fn);
+void d2k_verify_page_set_tls(d2k_doh_tls_open_fn);
 d2k_doh_tls_status d2k_doh_trusted_tls_open(int, const char *, uint16_t, int,
+    d2k_doh_tls_session *);
+d2k_doh_tls_status d2k_http1_trusted_tls_open(int, const char *, uint16_t, int,
     d2k_doh_tls_session *);
 /* DoT shares the verifier's exact TCP connection and flow receipt. */
 typedef void (*d2k_dot_probe_fn)(int,const char *,uint16_t,int,const char *,uint16_t,d2k_ver_result *);

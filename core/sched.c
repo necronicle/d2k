@@ -543,7 +543,7 @@ static d2k_ver_result family_verify_default(int use_fd,const char *ip,uint16_t p
         snprintf(r.reason,sizeof r.reason,"IPv4 probe socket mark unavailable");
         return r;
     }
-    return d2k_verify_preflight_on(fd,ip,port,name,deadline_ms,hello_wire,tls12);
+    return d2k_verify_family_page_on(fd,ip,port,name,deadline_ms,hello_wire,tls12);
 }
 d2k_sched_family_probe_fn d2k_sched_family_probe_hook = family_verify_default;
 d2k_sched_ver_fn  d2k_sched_preflight_ver_hook = preflight_verify_default;

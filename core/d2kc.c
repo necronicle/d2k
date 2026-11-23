@@ -899,6 +899,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 #ifdef D2K_TRUSTED_DOH
     d2k_verify_doh_set_tls(d2k_doh_trusted_tls_open);
+    d2k_verify_page_set_tls(d2k_http1_trusted_tls_open);
     d2k_verify_dot_set_probe(d2k_dot_trusted_probe);
     d2k_verify_plain_dns_set_probe(d2k_plain_dns_probe);
 #endif

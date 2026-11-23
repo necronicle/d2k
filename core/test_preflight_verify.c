@@ -64,6 +64,14 @@ int main(void) {
         assert(r.level==D2K_VER_CHALLENGE && r.cloudflare_challenge &&
             r.body_complete && r.peer_authenticated && r.name_ok==1 &&
             strstr(r.reason,"challenge")!=NULL);
+        d2k_verify_page_set_tls(fake_open);
+        response_pos=0;
+        r=d2k_verify_family_page_on(-1,"192.0.2.8",443,"video.example",1000,0,0);
+        assert(r.level==D2K_VER_CHALLENGE && r.body_complete &&
+            r.peer_authenticated && r.http_version==1);
+        d2k_verify_page_set_tls(NULL);
+        r=d2k_verify_family_page_on(-1,"192.0.2.8",443,"video.example",1000,0,0);
+        assert(r.unsupported && !r.peer_authenticated);
     }
     tls_status=D2K_DOH_TLS_AUTH;
     d2k_ver_result r=d2k_verify_preflight_on(-1,"192.0.2.8",443,"video.example",1000,0,1);
@@ -71,7 +79,7 @@ int main(void) {
     d2k_verify_doh_set_tls(NULL);
     r=d2k_verify_preflight_on(-1,"192.0.2.8",443,"video.example",1000,0,0);
     assert(r.unsupported && !r.peer_authenticated && r.fd==-1);
-    assert(opens==6 && releases==5);
+    assert(opens==7 && releases==6);
     puts("authenticated preflight verifier: TLS12/13, HTTP1/2, auth failure and unsupported PASS");
     return 0;
 }
