@@ -822,7 +822,7 @@ san-loop: hello_profiles.inc tcp1620_whitelist.inc ../datapath/ctlprobe ../datap
 		if [ "$$t" = test_doh_contract ]; then srcs=""; fi; \
 		if [ "$$t" = test_appget ]; then srcs="../model/check.c"; fi; \
 		if [ "$$t" = test_d2kapplication ]; then srcs="../synthesis/verification.c ../synthesis/application_search.c ../synthesis/application_policy.c ../synthesis/application_late.c ../synthesis/token_content.c ../synthesis/lower.c ../synthesis/application_history.c plantlv.c"; fi; \
-		if [ "$$t" = test_application_provider ]; then srcs="$$(printf '%s\n' $(SYNTH_SRC) diagnostics.c $(SCHED_TEST_OBJ:.o=.c) $(DETECT_OBJ:.o=.c) $(UDP_ENGINE_SRC) $(D2KC_CT_SRC) provider_ips.c | sort -u | tr '\n' ' ')"; fi; \
+		if [ "$$t" = test_application_provider ]; then srcs="$$(printf '%s\n' $(SYNTH_SRC) diagnostics.c $(SCHED_TEST_SRC) $(DETECT_OBJ:.o=.c) $(UDP_ENGINE_SRC) $(D2KC_CT_SRC) provider_ips.c | sort -u | tr '\n' ' ')"; fi; \
 		if [ "$$t" = test_provider_ips ]; then srcs="provider_ips.c"; fi; \
 		if [ "$$t" = test_dns_capture ]; then srcs="dns_capture.c"; fi; \
 		if [ "$$t" = test_shadow_daemon ]; then srcs="shadow_queue.c"; fi; \
@@ -1211,6 +1211,7 @@ SCHED_TEST_OBJ = dns_family.o dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) box
     quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
     hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o \
     x25519.o verify.o tls12.o p256.o quicconn.o h3.o
+SCHED_TEST_SRC = $(filter-out dns_family.c,$(SCHED_TEST_OBJ:.o=.c)) ../datapath/dns_family.c
 TESTS += test_sched_trial
 TESTS += test_application_request
 test_application_request: test_application_request.c sched.c test_task_slots.h $(filter-out sched.o,$(SCHED_TEST_OBJ)) $(HDR)
@@ -1567,7 +1568,7 @@ TESTS += test_sched_quic_yield
 .PHONY: san-sched-quic-yield
 san: san-sched-quic-yield
 san-sched-quic-yield: hello_profiles.inc tcp1620_whitelist.inc
-	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
+	$(CC) $(SANFLAGS) -I../model/include -o /tmp/d2k-san-sched-quic-yield test_sched_quic_yield.c $(sort $(filter-out sched.c,$(SCHED_TEST_SRC)) $(UDP_ENGINE_SRC)) -lpthread
 	/tmp/d2k-san-sched-quic-yield
 
 # В САМОМ КОНЦЕ, И ЭТО ВАЖНО. LDFLAGS выше несёт libd2k_udp.a в каждую
@@ -1762,7 +1763,7 @@ check: test-sched-gate
 .PHONY: test-sched-gate
 .PHONY: san-sched-gate
 san-sched-gate: hello_profiles.inc tcp1620_whitelist.inc
-	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-gate test_sched_gate.c $(sort $(filter-out sched.c,$(SCHED_TEST_OBJ:.o=.c)) $(UDP_ENGINE_SRC)) -lpthread
+	$(CC) $(SANFLAGS) -o /tmp/d2k-san-sched-gate test_sched_gate.c $(sort $(filter-out sched.c,$(SCHED_TEST_SRC)) $(UDP_ENGINE_SRC)) -lpthread
 	/tmp/d2k-san-sched-gate
 
 # Offline memory ownership diagnostics: real lifecycle/storage, no network.

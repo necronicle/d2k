@@ -3184,7 +3184,9 @@ int main(int argc, char **argv) {
                            plan exists. Complete responses still need their
                            execution identity to become plan evidence. */
                         if(http_observation.response &&
-                           (http_observation.execution_id || http_observation.response == 3) &&
+                           (http_observation.execution_id || http_observation.response == 3 ||
+                            http_observation.response == D2K_HTTP80_RESET_BEFORE_RESPONSE ||
+                            http_observation.response == D2K_HTTP80_RETRY_BEFORE_RESPONSE) &&
                            http_observation.response!=D2K_HTTP80_CUT) /* обрыв уже сообщён */
                             d2k_ctlsrv_http80_event(ctl,&http_observation);
                     }

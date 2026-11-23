@@ -9566,6 +9566,9 @@ static int start_search(d2k_sched *s, task *t) {
     return 1;
 }
 
+static int installed_family_ready(const d2k_sched *s, const task *t,
+                                  uint64_t after_event, int include_exact);
+
 /* ПРОВЕРКА ПЛАНА, ПОЯВИВШЕГОСЯ ПОСЛЕ ОТДЫХА ЦЕЛИ (24.10.2026).
  *
  * ЧТО БЫЛО. Подтверждённый план коробки догонял только те цели, чей поиск
@@ -9619,6 +9622,12 @@ static int plan_news_recheck(d2k_sched *s, target_cooldown *c, int64_t now_ms) {
     t->plan_retry = 1;
     t->started_ms = now_ms;
     t->began_ms = now_ms;
+    /* A confirmed, installed family already covers the next client flow.
+       A cooldown from an earlier failure must not start a donor recheck. */
+    if (installed_family_ready(s, t, 0, 0)) {
+        task_reset(s, t);
+        return 0;
+    }
     if (fill_hellos(s, t) != 0) { task_reset(s, t); return 0; }
     /* A fresh offer needs its own RR decision; do not reuse GREASE from
        different bytes cached since the exhausted measurement. */
