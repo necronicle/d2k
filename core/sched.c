@@ -16190,6 +16190,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                              "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён");
                 }
             }
+            /* A retransmitting live IPv6 flow stalled, but our own volume
+               probe did not complete its HTTP response. This is no proof
+               for a content plan. Test authenticated IPv4 for this name
+               before treating the inconclusive result as a cooldown. */
+            if (r.verdict == D2K_V_INCONCLUSIVE && t->family == 6 &&
+                t->trigger_code == D2K_SUSPECT_LATE_SILENCE &&
+                !volume_proven && !t->vol.rx_direct_complete &&
+                family_probe_start(s, t, now_ms)) {
+                moved++;
+                continue;
+            }
             /* A measured synthesis candidate requests an isolated application
                trial; it does not assert a blocking class. CLEAR and other
                direct/unreachable verdicts still forbid candidate execution. */

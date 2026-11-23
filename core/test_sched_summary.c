@@ -1217,6 +1217,32 @@ static void installed_family_skips_plan_news(void) {
     free(groups);
 }
 
+static void ipv6_late_silence_checks_verified_ipv4(void) {
+    for(int complete=0;complete<2;complete++) {
+        d2k_catalog cat={0};
+        d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        CHECK(s!=NULL);
+        if(!s)continue;
+        d2k_sched_family_path(s,"/tmp/d2k-family-summary-test");
+        task *t=fixture(s);
+        strcpy(t->name,"ru.numista.com");
+        strcpy(t->ip,"2a06:98c1:3122:8000::");
+        t->family=6;t->state=T_ASKING;t->res_ready=1;
+        t->trigger_code=D2K_SUSPECT_LATE_SILENCE;
+        t->res.verdict=D2K_V_CLEAR;
+        t->vol.rx_direct_complete=complete;
+        capture_spawn=1;
+        d2k_sched_tick(s,1000);
+        capture_spawn=0;
+        if(!complete) {
+            CHECK(t->state==T_FAMILY_PROBE && t->job==JOB_FAMILY_PROBE);
+            CHECK(cooldown_find(s,t->name,6,6)==NULL);
+        } else CHECK(t->state!=T_FAMILY_PROBE);
+        t->th_live=0;
+        d2k_sched_free(s);
+    }
+}
+
 static void measurement_timeout_does_not_cooldown(void) {
     for(int typed=0;typed<2;typed++) {
         d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
@@ -1235,6 +1261,7 @@ int main(void) {
     synthesis_candidate_opens_rx_ladder();
     failed_synthesis_waits_for_new_own_plan();
     installed_family_skips_plan_news();
+    ipv6_late_silence_checks_verified_ipv4();
     retry_keeps_client_context(0);
     retry_keeps_client_context(1);
     measurement_timeout_does_not_cooldown();
