@@ -47,11 +47,15 @@ MIPS_BE_ZIG ?= -target mips-linux-musleabi -mcpu=mips32+soft_float
 MIPS_LE_ZIG ?= -target mipsel-linux-musleabi -mcpu=mips32+soft_float
 
 SRC     = ../synthesis/verification.c stun.c net4.c voice.c voice_discovery.c meas.c verdict.c crypto.c quicsnap.c quicsnap_reseal.c verify_quic_replay.c quicwire.c tls13core.c quicconn.c h3.c quic.c quicprobe.c quicarms.c ipfrag.c props.c hello.c catalog.c match.c compose.c measured.c link.c plantlv.c x25519.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c volume.c sched.c stunprobe.c stuntrial.c quichello.c verify.c
+SRC += ../datapath/dns_family.c
+dns_family.o: ../datapath/dns_family.c ../datapath/include/d2k_dns_family.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 HDR     = include/d2k_meas.h include/d2k_verdict.h include/d2k_crypto.h include/d2k_quic.h \
           include/d2k_quicsnap.h include/d2k_quicprobe.h include/d2k_quic_arms.h include/d2k_ipfrag.h include/d2k_hello.h include/d2k_catalog.h include/d2k_compose.h \
           include/d2k_compose_internal.h include/d2k_link.h include/d2k_plantlv.h include/d2k_tls13.h include/d2k_volume.h include/d2k_sched.h \
           include/d2k_verify.h include/d2k_arm.h include/d2k_stun.h include/d2k_net4.h include/d2k_voice.h ../datapath/include/d2k_plan.h ../datapath/include/d2k_ctl.h ../datapath/include/d2k_ctlsrv.h
 HDR += ../datapath/include/d2k_rawmeasure.h ../datapath/include/d2k_rawmeasure_wire.h
+HDR += ../datapath/include/d2k_dns_family.h
 HDR += ../datapath/include/d2k_http_response.h ../datapath/include/d2k_http_request_stream.h
 HDR += ../synthesis/verification_status.h
 HDR += include/d2k_boxprops.h include/d2k_shadow_queue.h include/d2k_doh_contract.h include/d2k_shadow_workers.h
@@ -1089,7 +1093,7 @@ router-openssl:
 release: fetch-release shadow-release hello_profiles.inc tcp1620_whitelist.inc router-openssl
 	@mkdir -p $(BUILDDIR)
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -I"$(ROUTER_OPENSSL)/include" -DD2K_TRUSTED_DOH -static -Wl,-S,--gc-sections \
-		-o $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH) $(D2KC_MAIN) $(DOH_TLS_SRC) dns_upstreams.c boxprops.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c \
+		-o $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH) $(D2KC_MAIN) $(DOH_TLS_SRC) ../datapath/dns_family.c dns_upstreams.c boxprops.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
 		volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) ../datapath/wire_udp.c udpplan.c udpruntime.c -L"$(ROUTER_SSL_LIBDIR)" -lssl -lcrypto -ldl -lpthread
 	@ls -l $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH)
@@ -1203,7 +1207,7 @@ test-sched-modes: test_sched sched.o stunprobe.o stuntrial.o quichello.o plantlv
 # verify.o tls12.o quicconn.o quicwire.o h3.o — с 12.09 планировщик испытывает кандидата САМ (d2k_sched_ver_hook,
 # умолчание verify_default зовёт d2k_verify_probe). Тест зонд подменяет, но
 # умолчание всё равно линкуется: крючок — точка подмены, а не условная сборка.
-SCHED_TEST_OBJ = dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) boxprops.o ../synthesis/verification.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o \
+SCHED_TEST_OBJ = dns_family.o dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) boxprops.o ../synthesis/verification.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o \
     quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o \
     hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o \
     x25519.o verify.o tls12.o p256.o quicconn.o h3.o
@@ -1351,10 +1355,10 @@ DETECT_OBJ = ../detect/bridge.o ../detect/classify.o ../detect/poison.o \
 $(DETECT_OBJ): FORCE
 	$(MAKE) -C ../detect $(notdir $@)
 
-d2kc: d2kc.c $(DOH_TLS_SRC) $(DOH_TLS_HDR) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o udpplan.o udpruntime.o \
+d2kc: d2kc.c $(DOH_TLS_SRC) $(DOH_TLS_HDR) dns_family.o dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o voice.o voice_discovery.o stun.o udpplan.o udpruntime.o \
       hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
       $(DETECT_OBJ) $(HDR) $(D2KC_CT_SRC) ../datapath/wire_udp.c
-	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -DD2K_TRUSTED_DOH -o $@ $< $(DOH_TLS_SRC) dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
+	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -DD2K_TRUSTED_DOH -o $@ $< $(DOH_TLS_SRC) dns_family.o dns_upstreams.o shadow_queue.o $(NEWCHAIN_OBJ) $(SYNTH_OBJ) boxprops.o ../synthesis/verification.o diagnostics.o httpsprobe.o httpsearch.o httpup_logic.o sched.o stunprobe.o stuntrial.o verify_quic_replay.o quichello.o plantlv.o verdict.o meas.o crypto.o quic.o quicwire.o quicprobe.o quicsnap.o quicsnap_reseal.o quicarms.o ipfrag.o net4.o props.o \
 		voice.o voice_discovery.o stun.o udpplan.o udpruntime.o hello.o catalog.o groups.o domain.o match.o compose.o measured.o link.o volume.o tls13.o suite.o mlkem.o keccak.o tls13core.o x25519.o verify.o tls12.o p256.o quicconn.o h3.o \
 		$(DETECT_OBJ) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c ../datapath/wire_udp.c \
 		$(D2KC_CT_SRC) $(OPENSSL_LIBS) $(TEST_LDFLAGS)

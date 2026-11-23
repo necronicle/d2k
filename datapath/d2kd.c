@@ -59,6 +59,7 @@
 #include "d2k_icmpguard.h"
 #include "d2k_postnat_own.h"
 #include "d2k_postnat_capture.h"
+#include "d2k_dns_family.h"
 
 /* Сколько решений по клиентскому QUIC пишется в журнал за запуск. */
 #define D2K_CLIENT_QUIC_LOG 300u
@@ -98,6 +99,93 @@ static int client_tcp_ports(const uint8_t *pkt, size_t len,
 
 #define RECV_BUF   65536
 #define MAX_PKT     1600
+enum { MODE_OBSERVE = 0, MODE_APPLY = 1 };
+
+/* The controller owns the decision. The datapath only executes a short
+ * exact-name/client lease on locally generated ordinary DNS replies. */
+static d2k_dns_family_rule dns_family_rules[64];
+static size_t dns_family_count;
+static time_t dns_family_loaded_at;
+static int dns_family_loaded;
+static struct {
+    d2k_dns_family_request request;
+    time_t expires_at;
+} dns_family_requests[128];
+
+static int dns_family_step(d2k_nfq *q,const d2k_nl_pkt *np,const char *path,int mode) {
+    if(!path || !np->have_payload || np->payload_len<28 || np->truncated ||
+       (np->hook!=D2K_HOOK_OUTPUT&&np->hook!=D2K_HOOK_INPUT))return 0;
+    const uint8_t *p=np->payload;
+    size_t ip_len=(p[0]>>4)==4 ? (size_t)(p[0]&15u)*4u :
+                  (p[0]>>4)==6 ? 40u : 0u;
+    if(!ip_len || np->payload_len<ip_len+8 ||
+       p[(p[0]>>4)==4?9:6]!=17 ||
+       (np->hook==D2K_HOOK_OUTPUT ? (p[ip_len]!=0||p[ip_len+1]!=53) :
+        (p[ip_len+2]!=0||p[ip_len+3]!=53)))return 0;
+    time_t now=time(NULL);
+    if(now<0)now=0;
+    if(!dns_family_loaded || !dns_family_count || now-dns_family_loaded_at>=2 ||
+       now<dns_family_loaded_at) {
+        dns_family_loaded=1;dns_family_loaded_at=now;
+        if(d2k_dns_family_load(path,dns_family_rules,
+            sizeof dns_family_rules/sizeof dns_family_rules[0],&dns_family_count,now))
+            dns_family_count=0;
+    }
+    char err[160];
+    if(mode==MODE_APPLY && dns_family_count && np->payload_len<=MAX_PKT) {
+        if(np->hook==D2K_HOOK_INPUT) {
+            for(size_t i=0;i<dns_family_count;i++) {
+                d2k_dns_family_request request;
+                if(d2k_dns_family_request_parse(p,np->payload_len,&dns_family_rules[i],&request)!=1)
+                    continue;
+                size_t slot=0;
+                int found=0;
+                for(size_t j=0;j<sizeof dns_family_requests/sizeof dns_family_requests[0];j++) {
+                    const d2k_dns_family_request *old=&dns_family_requests[j].request;
+                    if(dns_family_requests[j].expires_at>now && old->family==request.family &&
+                       old->id==request.id && old->client_port==request.client_port &&
+                       !strcmp(old->name,request.name) &&
+                       !memcmp(old->client,request.client,request.family==4?4:16) &&
+                       !memcmp(old->server,request.server,request.family==4?4:16)) {
+                        slot=j;found=1;break;
+                    }
+                    if(dns_family_requests[j].expires_at<=now && !found) {slot=j;found=1;}
+                    if(found)continue;
+                    if(dns_family_requests[j].expires_at<dns_family_requests[slot].expires_at)slot=j;
+                }
+                dns_family_requests[slot].request=request;
+                dns_family_requests[slot].expires_at=now+10;
+                break;
+            }
+        } else {
+            for(size_t i=0;i<sizeof dns_family_requests/sizeof dns_family_requests[0];i++) {
+                if(dns_family_requests[i].expires_at<=now ||
+                   !d2k_dns_family_response_matches(p,np->payload_len,
+                       &dns_family_requests[i].request))continue;
+                d2k_dns_family_request request=dns_family_requests[i].request;
+                dns_family_requests[i].expires_at=0;
+                if(request.dnssec)break;
+                uint8_t rewritten[MAX_PKT];
+                memcpy(rewritten,p,np->payload_len);
+                for(size_t j=0;j<dns_family_count;j++) {
+                    if(strcmp(dns_family_rules[j].name,request.name)||
+                       dns_family_rules[j].client_family!=request.family||
+                       memcmp(dns_family_rules[j].client,request.client,
+                           request.family==4?4:16))continue;
+                    size_t length=np->payload_len;
+                    if(d2k_dns_family_rewrite(rewritten,&length,sizeof rewritten,
+                        &dns_family_rules[j],now,1)==1 &&
+                       d2k_nfq_verdict_payload(q,np->id,D2K_NF_ACCEPT,rewritten,length,
+                           err,sizeof err)==0)return 1;
+                    break;
+                }
+                break;
+            }
+        }
+    }
+    (void)d2k_nfq_verdict(q,np->id,D2K_NF_ACCEPT,err,sizeof err);
+    return 1;
+}
 #define OUT_BUF    (D2K_RESULT_MAX * MAX_PKT)
 
 static volatile sig_atomic_t stop_flag;
@@ -1109,7 +1197,6 @@ static int http80_step(d2k_nfq *q, d2k_raw *raw, d2k_ctl *ctl, uint32_t id,
 }
 
 static const char *MODE_NAMES[] = {"observe", "apply"};
-enum { MODE_OBSERVE = 0, MODE_APPLY = 1 };
 
 static void usage(void) {
     fprintf(stderr,
@@ -1858,6 +1945,7 @@ int main(int argc, char **argv) {
     const char *ifname = NULL;
     const char *ctl_path = NULL;
     const char *provider_ips_path = NULL;
+    const char *dns_family_path = NULL;
     const char *exp_ctl_path = NULL;   /* второй управляющий: только опыты новой цепочки */
     int mode = MODE_OBSERVE;
     uint32_t mark = 0;
@@ -1892,6 +1980,7 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--control") == 0)     { NEEDV(); ctl_path = v; }
         else if (strcmp(a, "--exp-control") == 0) { NEEDV(); exp_ctl_path = v; }
         else if (strcmp(a, "--provider-ips") == 0) { NEEDV(); provider_ips_path = v; }
+        else if (strcmp(a, "--dns-family-file") == 0) { NEEDV(); dns_family_path = v; }
         else if (strcmp(a, "--mark") == 0)        { NEEDV(); if (arg_u32(v, &mark)) goto badval; }
         else if (strcmp(a, "--probe-mark") == 0)  { NEEDV(); if (arg_u32(v, &probe_mark)) goto badval; }
         else if (strcmp(a, "--only-mark") == 0) {
@@ -2578,6 +2667,7 @@ int main(int argc, char **argv) {
                         (void)preflight_repeat(q,&np);
                         continue;
                     }
+                    if(dns_family_step(q,&np,dns_family_path,mode))continue;
                     st.seen++;
                     st.bytes += np.payload_len;
                     /* ICMP идёт в очередь только как time-exceeded (S99d2k,

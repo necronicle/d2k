@@ -414,6 +414,11 @@ uint64_t d2k_sched_plain_dns_revision(const d2k_sched *);
 int d2k_sched_dns_save_pending(const d2k_sched *, uint64_t saved_catalog_revision);
 void d2k_sched_plain_dns_saved(d2k_sched *,uint64_t revision);
 d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark);
+/* Absolute state path; the controller publishes measured, expiring leases. */
+void d2k_sched_family_path(d2k_sched *,const char *);
+typedef d2k_ver_result (*d2k_sched_family_probe_fn)(int,const char *,uint16_t,
+    const char *,int,size_t,int,uint32_t,const char *);
+extern d2k_sched_family_probe_fn d2k_sched_family_probe_hook;
 
 /* Ставит датапату планы ВСЕХ подтверждённых привязок каталога.
  *

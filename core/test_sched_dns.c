@@ -656,7 +656,47 @@ static void journal_driven_dns(void) {
     unlink(config);unlink(addresses);
 }
 
+static void family_fallback_proof(void) {
+    char path[]="/tmp/d2k-family-proof-XXXXXX";
+    int fd=mkstemp(path);assert(fd>=0);close(fd);unlink(path);
+    d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);assert(s);
+    s->clock_seen=1;s->now_ms=1000;s->meas_limit=0;
+    d2k_sched_family_path(s,path);
+    d2k_dns_answer a={.family=4,.type=1,.count=1,.ttl=60,
+        .client={192,0,2,2},.addresses={{8,47,69,0}}};
+    snprintf(a.question,sizeof a.question,"ru.numista.com");
+    snprintf(a.name,sizeof a.name,"ru.numista.com");
+    d2k_sched_dns_observe_answer(s,&a,1000);
+    assert(s->family_a[0].expires_ms>61000);
+    task *t=task_free_slot(s);assert(t);
+    t->state=T_FAMILY_PROBE;t->job=JOB_FAMILY_PROBE;
+    t->family=6;t->transport=6;t->port=443;
+    t->started_ms=1000;t->res_ready=1;t->ver.fd=-1;
+    t->ver.level=D2K_VER_HANDSHAKE;t->ver.peer_authenticated=1;
+    t->family_ipv4_count=1;
+    snprintf(t->name,sizeof t->name,"ru.numista.com");
+    snprintf(t->family_ipv4[0],sizeof t->family_ipv4[0],"8.47.69.0");
+    d2k_sched_tick(s,2000);
+    assert(access(path,F_OK)!=0); /* TLS alone cannot trigger DNS policy. */
+    t=task_free_slot(s);assert(t);
+    t->state=T_FAMILY_PROBE;t->job=JOB_FAMILY_PROBE;
+    t->family=6;t->transport=6;t->port=443;
+    t->started_ms=3000;t->res_ready=1;t->ver.fd=-1;
+    t->ver.level=D2K_VER_APPLICATION;t->ver.peer_authenticated=1;
+    t->ver.name_ok=1;t->ver.body_complete=1;
+    t->family_ipv4_count=1;
+    snprintf(t->name,sizeof t->name,"ru.numista.com");
+    snprintf(t->family_ipv4[0],sizeof t->family_ipv4[0],"8.47.69.0");
+    d2k_sched_tick(s,4000);
+    d2k_dns_family_rule rules[4];size_t count=0;
+    assert(d2k_dns_family_load(path,rules,4,&count,time(NULL))==0 && count==1);
+    assert(!strcmp(rules[0].name,"ru.numista.com") && rules[0].client_family==4 &&
+           !memcmp(rules[0].client,a.client,4));
+    unlink(path);d2k_sched_free(s);d2k_catalog_free(&cat);
+}
+
 int main(void) {
+    family_fallback_proof();
     journal_driven_dns();
     named_flow_address_history();
     repeat_connection();

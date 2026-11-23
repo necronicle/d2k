@@ -136,6 +136,10 @@ chmod +x "$TMP/bin/iptables-restore"
 ln -s iptables-restore "$TMP/bin/ip6tables-restore"
 rules iptables nat > "$TMP/old-nat"
 rules ip6tables mangle > "$TMP/old-ip6"
+mkdir -p "$TMP/state"
+renew_family_until=$(($(date +%s)+600))
+printf '%s\n' "$renew_family_until 4 192.0.2.2 ru.numista.com" > "$TMP/state/ipv4-fallback"
+S99_SNIPPET='dns_family_sync_unlocked' s99 || fail "renewal family lease install"
 for cycle in 1 2; do
     mv "$TMP/fw/iptables/mangle" "$TMP/reset-$cycle"
     S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0;
@@ -154,7 +158,11 @@ for cycle in 1 2; do
         { cat "$TMP/renew.log"; fail "DHCP renewal restarted healthy processes or lost rules"; }
     rules iptables nat | cmp -s - "$TMP/old-nat" || fail "duplicated surviving NAT rule"
     rules ip6tables mangle | cmp -s - "$TMP/old-ip6" || fail "changed surviving IPv6 rules"
+    rules iptables mangle | grep -q -- '-A D2K_DNS_FAMILY -d 192.0.2.2 -p udp --sport 53 -j NFQUEUE' ||
+        fail "renewal lost the verified family lease"
 done
+: > "$TMP/state/ipv4-fallback"
+S99_SNIPPET='dns_family_sync_unlocked' s99 || fail "renewal family lease removal"
 ok "two WAN renewals restore wiped IPv4 mangle and preserve both processes"
 # A single missing preflight queue rule is a partial IPv4 mangle loss. On a
 # small router the old preflight fallback restarted both daemons every minute.
@@ -370,6 +378,26 @@ ok "отказ запуска печатает причину из журнал�
 # --- I4: ip6tables mangle unusable → IPv4-only, with a clear warning --------
 S99_SNIPPET='fw_up && fw_installed' s99 || fail "baseline fw_up failed"
 rules ip6tables mangle | grep -q -- '-N D2K_OUT' || fail "baseline did not set up IPv6"
+[ -z "$(rules iptables mangle | grep -- '-A D2K_DNS_FAMILY .*NFQUEUE' || :)" ] ||
+    fail "ordinary DNS entered NFQUEUE before a verified fallback"
+mkdir -p "$TMP/state"
+family_until=$(($(date +%s)+600))
+printf '%s\n' "$family_until 4 192.0.2.2 ru.numista.com" \
+    "$family_until 6 2001:db8::2 ru.numista.com" > "$TMP/state/ipv4-fallback"
+S99_SNIPPET='dns_family_sync_unlocked && fw_installed' s99 || fail "family DNS rule sync"
+rules iptables mangle | grep -q -- '-A D2K_DNS_FAMILY -d 192.0.2.2 -p udp --sport 53 -j NFQUEUE' ||
+    fail "verified IPv4 DNS client not queued"
+rules iptables mangle | grep -q -- '-A D2K_DNS_FAMILY -s 192.0.2.2 -p udp --dport 53 -j NFQUEUE' ||
+    fail "verified IPv4 DNS request not queued"
+rules ip6tables mangle | grep -q -- '-A D2K_DNS_FAMILY -d 2001:db8::2 -p udp --sport 53 -j NFQUEUE' ||
+    fail "verified IPv6 DNS client not queued"
+rules ip6tables mangle | grep -q -- '-A D2K_DNS_FAMILY -s 2001:db8::2 -p udp --dport 53 -j NFQUEUE' ||
+    fail "verified IPv6 DNS request not queued"
+rm -f "$TMP/state/ipv4-fallback"
+S99_SNIPPET='dns_family_sync_unlocked && fw_installed' s99 || fail "family DNS rule revocation"
+[ -z "$(rules iptables mangle | grep -- '-A D2K_DNS_FAMILY .*NFQUEUE' || :)" ] ||
+    fail "expired/removed family DNS rule remained in NFQUEUE"
+ok "DNS family queue is scoped to verified clients and removed with the lease"
 [ ! -e "$TMP/run/fw-ipv4-only" ] || fail "IPv4-only marker without a reason"
 S99_SNIPPET='fw_down' s99
 rm -rf "$TMP/fw"; mkdir -p "$TMP/fw"
