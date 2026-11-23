@@ -1561,8 +1561,52 @@ locked() {
 # разрешает восстановление точного апстрима. Остальные DNS и UDP сохраняют
 # защиту. Источник — фактическая конфигурация, без списка провайдеров.
 # Неразрешившееся имя сохраняет прежние собственные адресные наблюдения.
+# procd supplies the live command for each running DoH instance, including its
+# resolver URL and bootstrap addresses. Keep URL paths in the private snapshot.
+openwrt_dns_snapshot() (
+    command -v jsonfilter >/dev/null 2>&1 || return 1
+    instances=$(ubus call service list '{"name":"https-dns-proxy"}') || return 1
+    [ -n "$instances" ] || return 1
+    # jsonfilter returns 1 when a valid service list has no matching instance.
+    pids=$(printf '%s' "$instances" | jsonfilter -e '@["https-dns-proxy"].instances[@.running=true].pid') || :
+    for pid in $pids; do
+        case $pid in *[!0-9]*|'') return 1 ;; esac
+        args=$(tr '\000' '\n' < "/proc/$pid/cmdline") || return 1
+        url=$(printf '%s\n' "$args" | awk '$0=="-r"{getline;print;exit}')
+        case $url in https://*) ;; *) continue ;; esac
+        printf 'upstream %s\n' "$url"
+        host=${url#https://}; host=${host%%[/?]*}
+        case $host in *'@'*|'['*) continue ;; esac
+        host=${host%%:*}
+        case $host in ''|-*|*[!A-Za-z0-9.-]*) continue ;; *[!0-9.]*) ;; *) continue ;; esac
+        bootstrap=$(printf '%s\n' "$args" | awk '$0=="-b"{getline;gsub(/,/," ");print;exit}')
+        for server in ${bootstrap:-127.0.0.1}; do
+            case $server in *[!0-9a-fA-F.:\[\]]*) continue ;; esac
+            answer=$(nslookup -timeout=2 "$host" "$server" 2>/dev/null) || continue
+            printf '%s\n' "$answer" | awk -v host="$host" '
+                /^Name:/ {answer=1;next}
+                answer && /^Address/ {ip=$NF
+                    if(ip ~ /^[0-9.]+$/) print "static_a = " host,ip,0
+                    else if(ip ~ /^[0-9a-fA-F:]+$/ && index(ip,":")) print "static_aaaa = " host,ip,0
+                }'
+            break
+        done
+    done
+)
+
 dns_config_snapshot() (
-    command -v ndmc >/dev/null 2>&1 || return 0
+    if ! command -v ndmc >/dev/null 2>&1; then
+        [ -f "${OPENWRT_RELEASE:-/etc/openwrt_release}" ] || return 0
+        umask 077
+        native=$(mktemp "$RUN/.dns-upstreams.XXXXXX") || return 1
+        if openwrt_dns_snapshot > "$native"; then
+            mv -f "$native" "$RUN/dns-upstreams" || return 1
+        else
+            rm -f "$native"
+        fi
+        [ ! -r "$RUN/dns-upstreams" ] || cat "$RUN/dns-upstreams"
+        return
+    fi
     umask 077
     dns_raw=$(mktemp "$RUN/.dns-upstreams.raw.XXXXXX") || return 1
     dns_clean=
@@ -1579,7 +1623,7 @@ dns_config_snapshot() (
     [ ! -r "$RUN/dns-upstreams" ] || cat "$RUN/dns-upstreams"
 )
 dns_upstreams() {
-    command -v ndmc >/dev/null 2>&1 || return 0
+    command -v ndmc >/dev/null 2>&1 || [ -f "${OPENWRT_RELEASE:-/etc/openwrt_release}" ] || return 0
     [ -r "$RUN/dns-upstreams" ] || dns_config_snapshot >/dev/null || return 1
     [ -r "$RUN/dns-upstreams" ] || return 0
     awk '
@@ -1592,6 +1636,9 @@ dns_upstreams() {
                 sub(/:.*/, "", host); port = s; sub(/.*:/, "", port)
             }
             if (host != "" && port ~ /^[0-9]+$/) print host, port
+        }
+        $1 == "upstream" && $2 ~ /^https:\/\// {
+            c=$2; sub(/^https:\/\//,"",c); sub(/[\/?].*/,"",c); emit(c,443); next
         }
         $1 == "dns_server" && $2 == "=" {
             a = $3
@@ -1840,6 +1887,7 @@ fw_up() {
             rc=1
         elif fw_nft_up; then
             rc=0
+            [ ! -f "$OPENWRT_RELEASE" ] || dns_config_snapshot >/dev/null
         else
             say "nft не принял правила — см. $RUN/fw.nft"
             fw_down_unlocked

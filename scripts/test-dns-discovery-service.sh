@@ -28,6 +28,10 @@ printf '%s\n' 'partial failed configuration' > "$task_tmp/input"
 DNS_TEST_FAILURE=1;export DNS_TEST_FAILURE
 dns_config_snapshot >/dev/null
 cmp "$task_tmp/previous" "$RUN/dns-upstreams"
+# Native OpenWrt snapshots carry the resolver URI for the same firewall parser.
+printf '%s\n' 'upstream https://unlisted.example.test:8443/private/dns-query' \
+    'upstream https://[2001:db8::53]/dns-query' > "$RUN/dns-upstreams"
+[ "$(dns_upstreams)" = "$(printf '%s\n' 'unlisted.example.test 8443' '2001:db8::53 443')" ]
 awk '/^spawn_controller\(\)/,/^}/' files/S99d2k >> "$task_tmp/functions"
 . "$task_tmp/functions"
 spawn_daemon() { printf '%s\n' "$@" > "$RUN/controller-arguments"; }

@@ -36,6 +36,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "d2k_sched.h"
 #include "dns_journal.inc"
@@ -285,7 +286,7 @@ static void on_signal(int sig, siginfo_t *info, void *context) {
     stop_asked = sig;
 }
 typedef struct {
-    int output;
+    int output,openwrt;
     volatile sig_atomic_t halt;
     dns_journal_cursor cursor;
 } dns_journal_reader;
@@ -318,28 +319,94 @@ static int journal_snapshot(unsigned lines,dns_journal_cursor *cursor,dns_journa
     return rc;
 }
 
+static int journal_api_poll(dns_journal_cursor *next,dns_journal_hits *hits) {
+    dns_journal_cursor previous=*next;
+    int failed=journal_snapshot(next->ready ? 32 : 1,next,hits);
+    if(!failed && !previous.text_mode && previous.ready && next->first!=UINT64_MAX &&
+       next->first>previous.last && next->first-previous.last>1) {
+        uint64_t gap=next->last-previous.last;
+        unsigned lines=gap>=3000-32 ? 3000 : (unsigned)gap+32;
+        *next=previous;
+        failed=journal_snapshot(lines,next,hits);
+        /* If even the expanded tail moved past the cursor, read the ring. */
+        if(!failed && lines<3000 && next->first!=UINT64_MAX &&
+           next->first>previous.last && next->first-previous.last>1) {
+            *next=previous;
+            failed=journal_snapshot(3000,next,hits);
+        }
+    }
+    if(failed==1 && previous.text_mode) {
+        *next=previous;
+        failed=journal_snapshot(3000,next,hits);
+        if(failed==1) {
+            /* The CLI anchor has rolled out of the ring. Baseline as at startup. */
+            *next=(dns_journal_cursor){0};
+            failed=journal_snapshot(1,next,hits);
+        }
+    }
+    return failed;
+}
+
+/* Neither platform guarantees a timeout utility. Bound this child even if the
+ * logging service accepts its connection and then stops responding. */
+static int journal_text_snapshot(int openwrt,int tail,dns_journal_cursor *next,dns_journal_hits *hits) {
+    int output[2];
+    if(pipe(output))return -1;
+    pid_t child=fork();
+    if(child==0) {
+        close(output[0]);
+        if(dup2(output[1],STDOUT_FILENO)<0)_exit(127);
+        if(output[1]!=STDOUT_FILENO)close(output[1]);
+        int quiet=open("/dev/null",O_WRONLY);
+        if(quiet<0 || dup2(quiet,STDERR_FILENO)<0)_exit(127);
+        if(quiet!=STDERR_FILENO)close(quiet);
+        alarm(20);
+        if(!openwrt)execl("/bin/ndmc","ndmc","-c","show log",(char *)NULL);
+        else if(tail)execl("/sbin/logread","logread","-l","32",(char *)NULL);
+        else execl("/sbin/logread","logread",(char *)NULL);
+        _exit(127);
+    }
+    close(output[1]);
+    if(child<0){close(output[0]);return -1;}
+    FILE *f=fdopen(output[0],"r");
+    int rc=-1,status;
+    if(f){rc=journal_scan_text(f,openwrt,next,hits);fclose(f);}
+    else close(output[0]);
+    pid_t waited;
+    do {waited=waitpid(child,&status,0);} while(waited<0 && errno==EINTR);
+    return waited==child && WIFEXITED(status) && !WEXITSTATUS(status) ? rc : -1;
+}
+
+static int journal_cli_poll(int openwrt,dns_journal_cursor *next,dns_journal_hits *hits) {
+    if(openwrt) {
+        dns_journal_cursor previous=*next;
+        int rc=journal_text_snapshot(1,1,next,hits);
+        if(rc<=0)return rc;
+        /* Busy ring: the last read record may precede this tail. */
+        *next=previous;
+    }
+    return journal_text_snapshot(openwrt,0,next,hits)<0 ? -1 : 0;
+}
+
 static void *dns_journal_run(void *context) {
     dns_journal_reader *reader=context;
-    int unavailable=0;
+    int previous_mode=-1;
     while(!reader->halt) {
         dns_journal_cursor next=reader->cursor;
         dns_journal_hits hits={0};
-        int failed=journal_snapshot(next.ready ? 32 : 1,&next,&hits);
-        if(!failed && reader->cursor.ready && next.first!=UINT64_MAX &&
-           next.first>reader->cursor.last && next.first-reader->cursor.last>1) {
-            uint64_t gap=next.last-reader->cursor.last;
-            unsigned lines=gap>=3000-32 ? 3000 : (unsigned)gap+32;
+        int failed=reader->openwrt || journal_api_poll(&next,&hits);
+        int mode=0;
+        if(failed) {
             next=reader->cursor;
-            failed=journal_snapshot(lines,&next,&hits);
-            /* If even the expanded tail moved past the cursor, read the ring. */
-            if(!failed && lines<3000 && next.first!=UINT64_MAX &&
-               next.first>reader->cursor.last && next.first-reader->cursor.last>1) {
-                next=reader->cursor;
-                failed=journal_snapshot(3000,&next,&hits);
-            }
+            failed=journal_cli_poll(reader->openwrt,&next,&hits);
+            mode=failed ? 2 : 1;
         }
-        if(failed && !unavailable)fprintf(stderr,"d2kc: Keenetic DNS journal unavailable via local RCI\n");
-        unavailable=failed;
+        if(mode!=previous_mode) {
+            if(mode==2)fprintf(stderr,"d2kc: DNS journal temporarily unavailable\n");
+            else if(!reader->openwrt && mode==1)fprintf(stderr,"d2kc: DNS journal using ndmc fallback\n");
+            else if(previous_mode>=0)fprintf(stderr,"d2kc: DNS journal using %s\n",reader->openwrt?"logread":"RCI");
+            previous_mode=mode;
+        }
         if(!failed) {
             reader->cursor=next;
             for(size_t i=0;i<hits.count;i++)
@@ -1100,7 +1167,8 @@ int main(int argc, char **argv) {
     int64_t dns_reload_at=0;
     int journal_pipe[2]={-1,-1};pthread_t journal_thread;int journal_started=0;
     dns_journal_reader journal_reader={.output=-1};
-    if(dns_configuration && access("/bin/ndmc",X_OK)==0 && pipe(journal_pipe)>=0) {
+    journal_reader.openwrt=access("/etc/openwrt_release",F_OK)==0 && access("/bin/ndmc",X_OK)!=0;
+    if(dns_configuration && (journal_reader.openwrt || access("/bin/ndmc",X_OK)==0) && pipe(journal_pipe)>=0) {
         journal_reader.output=journal_pipe[1];
         int flags=fcntl(journal_pipe[0],F_GETFL,0);
         int output_flags=fcntl(journal_pipe[1],F_GETFL,0);
