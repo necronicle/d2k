@@ -19,7 +19,8 @@ static size_t answer(uint8_t *p,const char *name,int dnssec) {
         const char *dot=strchr(s,'.');
         size_t part=dot?(size_t)(dot-s):strlen(s);
         d[n++]=(uint8_t)part;memcpy(d+n,s,part);n+=part;
-        if(!dot)break;s=dot+1;
+        if(!dot)break;
+        s=dot+1;
     }
     d[n++]=0;d[n++]=0;d[n++]=28;d[n++]=0;d[n++]=1;
     d[n++]=0xc0;d[n++]=12;d[n++]=0;d[n++]=28;d[n++]=0;d[n++]=1;
@@ -55,7 +56,8 @@ static size_t question(uint8_t *p,const char *name,int dnssec,int cd) {
         const char *dot=strchr(s,'.');
         size_t part=dot?(size_t)(dot-s):strlen(s);
         d[n++]=(uint8_t)part;memcpy(d+n,s,part);n+=part;
-        if(!dot)break;s=dot+1;
+        if(!dot)break;
+        s=dot+1;
     }
     d[n++]=0;d[n++]=0;d[n++]=28;d[n++]=0;d[n++]=1;
     if(dnssec) {
