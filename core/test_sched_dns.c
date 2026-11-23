@@ -657,6 +657,18 @@ static void journal_driven_dns(void) {
 }
 
 static void family_fallback_proof(void) {
+    assert(d2k_sched_family_probe_hook==family_verify_default);
+    d2k_ver_result proof={.fd=-1,.level=D2K_VER_APPLICATION,.peer_authenticated=1,
+        .name_ok=1,.body_complete=1,.status=200};
+    assert(family_ipv4_usable(&proof));
+    proof.level=D2K_VER_CHALLENGE;proof.status=403;proof.cloudflare_challenge=1;
+    assert(family_ipv4_usable(&proof));
+    proof.body_complete=0;assert(!family_ipv4_usable(&proof));
+    proof.body_complete=1;proof.peer_authenticated=0;assert(!family_ipv4_usable(&proof));
+    proof.peer_authenticated=1;proof.level=D2K_VER_BLOCKPAGE;
+    assert(!family_ipv4_usable(&proof));
+    proof.level=D2K_VER_DENIED;proof.status=451;
+    assert(!family_ipv4_usable(&proof));
     char path[]="/tmp/d2k-family-proof-XXXXXX";
     int fd=mkstemp(path);assert(fd>=0);close(fd);unlink(path);
     d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);assert(s);
@@ -682,8 +694,9 @@ static void family_fallback_proof(void) {
     t->state=T_FAMILY_PROBE;t->job=JOB_FAMILY_PROBE;
     t->family=6;t->transport=6;t->port=443;
     t->started_ms=3000;t->res_ready=1;t->ver.fd=-1;
-    t->ver.level=D2K_VER_APPLICATION;t->ver.peer_authenticated=1;
+    t->ver.level=D2K_VER_CHALLENGE;t->ver.peer_authenticated=1;
     t->ver.name_ok=1;t->ver.body_complete=1;
+    t->ver.cloudflare_challenge=1;t->ver.status=403;
     t->family_ipv4_count=1;
     snprintf(t->name,sizeof t->name,"ru.numista.com");
     snprintf(t->family_ipv4[0],sizeof t->family_ipv4[0],"8.47.69.0");

@@ -54,13 +54,24 @@ int main(void) {
         assert(r.negotiated_tls==(shape?0x0303:0x0304) && opened_version==r.negotiated_tls);
         assert(r.local_port==41008 && r.family==4 && r.fd==-1);
     }
+    {
+        const char challenge[]="HTTP/1.1 403 Forbidden\r\nCf-Mitigated: challenge\r\n"
+            "Content-Length: 3\r\n\r\nabc";
+        memcpy(response,challenge,sizeof challenge-1);
+        response_len=sizeof challenge-1;response_pos=0;http_kind=1;
+        d2k_ver_result r=d2k_verify_preflight_on(-1,"192.0.2.8",443,
+            "video.example",1000,0,0);
+        assert(r.level==D2K_VER_CHALLENGE && r.cloudflare_challenge &&
+            r.body_complete && r.peer_authenticated && r.name_ok==1 &&
+            strstr(r.reason,"challenge")!=NULL);
+    }
     tls_status=D2K_DOH_TLS_AUTH;
     d2k_ver_result r=d2k_verify_preflight_on(-1,"192.0.2.8",443,"video.example",1000,0,1);
     assert(r.peer_auth_failed && !r.peer_authenticated && r.level==D2K_VER_TRANSPORT);
     d2k_verify_doh_set_tls(NULL);
     r=d2k_verify_preflight_on(-1,"192.0.2.8",443,"video.example",1000,0,0);
     assert(r.unsupported && !r.peer_authenticated && r.fd==-1);
-    assert(opens==5 && releases==4);
+    assert(opens==6 && releases==5);
     puts("authenticated preflight verifier: TLS12/13, HTTP1/2, auth failure and unsupported PASS");
     return 0;
 }

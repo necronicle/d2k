@@ -522,7 +522,30 @@ d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
 d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
-d2k_sched_family_probe_fn d2k_sched_family_probe_hook = d2k_verify_fetch_tcp_on;
+/* Family selection needs certificate-chain authentication. The ordinary
+ * fetch verifier checks the certificate name only, so it cannot establish
+ * peer_authenticated. Preflight uses trusted TLS and reads a complete
+ * response; this probe keeps the controller mark before connect. */
+static d2k_ver_result family_verify_default(int use_fd,const char *ip,uint16_t port,
+    const char *name,int deadline_ms,size_t hello_wire,int tls12,uint32_t mark,
+    const char *path) {
+    (void)path; /* The route question uses the origin root, not a client path. */
+    int fd=use_fd;
+    d2k_ver_result r={.fd=-1,.name_ok=-1};
+    if(fd<0 && d2k_sched_bind_hook(6,4,&fd,NULL)) {
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"IPv4 probe socket unavailable");
+        return r;
+    }
+    if(mark && d2k_sched_mark_hook(fd,mark)) {
+        close(fd);
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"IPv4 probe socket mark unavailable");
+        return r;
+    }
+    return d2k_verify_preflight_on(fd,ip,port,name,deadline_ms,hello_wire,tls12);
+}
+d2k_sched_family_probe_fn d2k_sched_family_probe_hook = family_verify_default;
 d2k_sched_ver_fn  d2k_sched_preflight_ver_hook = preflight_verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
 d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook = verify_rx_gzip_default;
@@ -5796,6 +5819,16 @@ static int family_probe_start(d2k_sched *s,task *t,int64_t now_ms) {
     say(s,"по %s IPv6 не дал результата; ищу IPv4 того же имени и проверяю полный HTTPS-ответ",
         t->name);
     return 1;
+}
+static int family_ipv4_usable(const d2k_ver_result *v) {
+    if(!v->peer_authenticated || v->name_ok!=1 || !v->body_complete ||
+       v->peer_auth_failed || v->http_outcome==D2K_HTTP_BLOCKED ||
+       v->http_outcome==D2K_HTTP_LEGAL_DENIAL || v->status==451)return 0;
+    /* A complete challenge from the authenticated origin proves that the
+       IPv4 route delivers HTTP. It does not prove browser access; the client
+       will decide that after DNS prefers this route for a bounded lease. */
+    return v->level==D2K_VER_APPLICATION ||
+        (v->level==D2K_VER_CHALLENGE && v->cloudflare_challenge);
 }
 static int family_policy_publish(d2k_sched *s,task *t,int64_t now_ms) {
     if(!s->family_path[0])return -1;
@@ -15769,17 +15802,18 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             pthread_mutex_lock(&s->mu);ready=t->res_ready;v=t->ver;pthread_mutex_unlock(&s->mu);
             if(!ready)continue;
             join_worker(t);
-            if(v.level>=D2K_VER_APPLICATION && v.peer_authenticated &&
-               v.name_ok==1 && v.body_complete) {
+            if(family_ipv4_usable(&v)) {
                 int n=family_policy_publish(s,t,now_ms);
-                if(n>0)say(s,"по %s проверен полный HTTPS-ответ через IPv4 %s; правило предпочтения IPv4 для %d DNS-клиентов действует 60 минут",
-                    t->name,t->family_ipv4[t->family_ipv4_next],n);
+                if(n>0)say(s,"по %s через IPv4 %s получен полный ответ аутентифицированного HTTPS-сервера%s; правило предпочтения IPv4 для %d DNS-клиентов действует 60 минут",
+                    t->name,t->family_ipv4[t->family_ipv4_next],
+                    v.level==D2K_VER_CHALLENGE?" (challenge, работа страницы ещё не доказана)":"",n);
                 else say(s,"по %s IPv4 отвечает, но нет подходящего свежего DNS-клиента или не записано правило (%d)",
                     t->name,n);
                 task_fail(s,t,now_ms);moved++;continue;
             }
-            say(s,"по %s IPv4 %s не подтверждён полным HTTPS-ответом: %s",
-                t->name,t->family_ipv4[t->family_ipv4_next],v.reason);
+            say(s,"по %s IPv4 %s не подтверждён полным ответом аутентифицированного HTTPS-сервера: уровень %d, HTTP %d, полный=%d, имя=%d, TLS-проверка=%d, challenge=%d; %s",
+                t->name,t->family_ipv4[t->family_ipv4_next],(int)v.level,v.status,
+                v.body_complete,v.name_ok,v.peer_authenticated,v.cloudflare_challenge,v.reason);
             ver_close(t);
             if(++t->family_ipv4_next<t->family_ipv4_count &&
                !start_worker(s,t,JOB_FAMILY_PROBE)){moved++;continue;}

@@ -1266,7 +1266,13 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
         r->status = code;
         r->http_outcome = http_reply.outcome;
         snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
-        if (r->cloudflare_challenge) { r->level = D2K_VER_CHALLENGE; return; }
+        if (r->cloudflare_challenge) {
+            r->level = D2K_VER_CHALLENGE;
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d Cloudflare challenge, тело %s", code,
+                     r->body_complete ? "полное" : "неполное");
+            return;
+        }
         /* HTTP 451 — ОТКАЗ САЙТА ТОЛЬКО ОТ САЙТА (24.10.2026).
          *
          * Код 451 сам по себе не говорит, КТО ответил, а решение по нему
