@@ -49,8 +49,14 @@ runs:
         mkdir -p "$DEST"
         cd "$DEST"
         fetch() {
-          curl --fail --proto '=https' --location --retry 3 --max-time 300 \
-            "https://ziglang.org/download/$1/zig-x86_64-linux-$1.tar.xz" -o "zig-$1.tar.xz"
+          local archive="zig-x86_64-linux-$1.tar.xz"
+          # A slow origin can exhaust the release job by restarting each download.
+          # Both locations serve the same archive with the pinned digest below.
+          if ! curl --fail --proto '=https' --proto-redir '=https' --location --connect-timeout 10 --max-time 60 \
+              "https://ziglang.org/download/$1/$archive" -o "zig-$1.tar.xz"; then
+            curl --fail --proto '=https' --proto-redir '=https' --location --connect-timeout 10 --max-time 180 --retry 1 \
+              "https://zig.linus.dev/zig/$archive" -o "zig-$1.tar.xz"
+          fi
           echo "$2  zig-$1.tar.xz" | sha256sum -c -
           tar -xJf "zig-$1.tar.xz"
           rm -f "zig-$1.tar.xz"
