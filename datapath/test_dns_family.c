@@ -78,10 +78,82 @@ static unsigned sum16(const uint8_t *p,size_t n,unsigned sum) {
     return sum;
 }
 
+static void https_hints(const d2k_dns_family_rule *rule) {
+    const char *name=rule->name;
+    const uint8_t prefix[]={0,1,0,                    /* ServiceMode, TargetName . */
+        0,1,0,3,2,'h','2',                           /* alpn */
+        0,4,0,4,192,0,2,7,                          /* ipv4hint */
+        0,5,0,4,0,2,0xfe,0x0d};                     /* opaque ech value */
+    const uint8_t hint[]={0,6,0,16,0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,7};
+    uint8_t pkt[512],query[512],copy[512];
+    size_t qlen=question(query,name,0,0);
+    query[qlen-3]=65;
+    d2k_dns_family_request req;
+    assert(d2k_dns_family_request_parse(query,qlen,rule,&req)==1);
+    size_t len=answer(pkt,name,0);
+    assert(!d2k_dns_family_response_matches(pkt,len,&req));
+
+    size_t rr=qlen, rdata=rr+12;
+    pkt[qlen-3]=65;
+    pkt[rr+3]=65;
+    memcpy(pkt+rdata,prefix,sizeof prefix);
+    memcpy(pkt+rdata+sizeof prefix,hint,sizeof hint);
+    pkt[rr+11]=sizeof prefix+sizeof hint;
+    len=rdata+sizeof prefix+sizeof hint;
+    pkt[3]=(uint8_t)len;pkt[25]=(uint8_t)(len-20);
+    assert(d2k_dns_family_response_matches(pkt,len,&req));
+    memcpy(copy,pkt,len);
+    size_t original=len;
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,1)==1);
+    assert(len==rdata+sizeof prefix && pkt[rr+11]==sizeof prefix);
+    assert(pkt[28+7]==1 && !memcmp(pkt+rdata,prefix,sizeof prefix));
+    assert(sum16(pkt,20,0)==65535u);
+    unsigned pseudo=sum16(pkt+12,8,17u+(unsigned)(len-20));
+    assert(sum16(pkt+20,len-20,pseudo)==65535u);
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,1)==0);
+
+    /* Preserve authenticated data and responses that were not authorized. */
+    memcpy(pkt,copy,original);len=original;pkt[31]|=0x20;
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,1)==0);
+    assert(len==original && pkt[31]==(copy[31]|0x20));
+    memcpy(pkt,copy,original);
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,0)==0);
+    assert(len==original && !memcmp(pkt,copy,len));
+
+    /* Both compressed owners still refer to the original question. */
+    const uint8_t opt[]={0,0,41,4,0xd0,0,0,0,0,0,0};
+    size_t rr_len=original-rr;
+    memcpy(pkt+len,pkt+rr,rr_len);
+    len+=rr_len;
+    memcpy(pkt+len,opt,sizeof opt);
+    len+=sizeof opt;
+    pkt[35]=2;pkt[39]=1;
+    pkt[3]=(uint8_t)len;pkt[25]=(uint8_t)(len-20);
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,1)==1);
+    size_t second=rdata+sizeof prefix;
+    assert(pkt[35]==2 && pkt[39]==1);
+    assert(pkt[second]==0xc0 && pkt[second+1]==12);
+    assert(!memcmp(pkt+second+12,prefix,sizeof prefix));
+    assert(len==second+12+sizeof prefix+sizeof opt);
+    assert(!memcmp(pkt+len-sizeof opt,opt,sizeof opt));
+
+    /* ipv6hint listed in mandatory cannot be removed in isolation. */
+    memcpy(pkt,copy,original);len=original;
+    const uint8_t mandatory[]={0,0,0,2,0,6};
+    memmove(pkt+rdata+3+sizeof mandatory,pkt+rdata+3,len-rdata-3);
+    memcpy(pkt+rdata+3,mandatory,sizeof mandatory);
+    len+=sizeof mandatory;pkt[rr+11]+=sizeof mandatory;
+    pkt[3]=(uint8_t)len;pkt[25]=(uint8_t)(len-20);
+    memcpy(copy,pkt,len);original=len;
+    assert(d2k_dns_family_rewrite(pkt,&len,sizeof pkt,rule,1000,1)==0);
+    assert(len==original && !memcmp(pkt,copy,len));
+}
+
 int main(void) {
     uint8_t pkt[512],copy[512];
     d2k_dns_family_rule rule={.name="ru.numista.com",.client={192,168,1,2},
         .client_family=4,.expires_unix=2000};
+    https_hints(&rule);
     d2k_dns_family_request req;
     size_t qlen=question(pkt,"ru.numista.com",0,0);
     assert(d2k_dns_family_request_parse(pkt,qlen,&rule,&req)==1 && !req.dnssec);

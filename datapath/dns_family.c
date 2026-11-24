@@ -7,6 +7,9 @@
 static unsigned rd16(const uint8_t *p) {return (unsigned)p[0]*256u+p[1];}
 static void wr16(uint8_t *p,unsigned v) {p[0]=(uint8_t)(v>>8);p[1]=(uint8_t)v;}
 
+enum { DNS_AAAA=28, DNS_OPT=41, DNS_HTTPS=65 };
+enum { SVC_MANDATORY=0, SVC_IPV6HINT=6 };
+
 static uint32_t sum_bytes(uint32_t sum,const uint8_t *p,size_t n) {
     while(n>=2){sum+=rd16(p);p+=2;n-=2;}
     if(n)sum+=(unsigned)p[0]<<8;
@@ -39,7 +42,9 @@ static int same_question(const uint8_t *d,size_t size,size_t *at,const char *nam
         if(p>=size)return 0;
         unsigned n=d[p++];
         if(!n) {
-            if(!j || name[j] || size-p<4 || rd16(d+p)!=28 || rd16(d+p+2)!=1)return 0;
+            if(!j || name[j] || size-p<4 || rd16(d+p+2)!=1)return 0;
+            unsigned type=rd16(d+p);
+            if(type!=DNS_AAAA && type!=DNS_HTTPS)return 0;
             *at=p+4;return 1;
         }
         if(n>63 || n>size-p || j+n+1>=256)return 0;
@@ -83,6 +88,7 @@ int d2k_dns_family_request_parse(const uint8_t *packet,size_t length,
        rd16(dns+6)||rd16(dns+8)||rd16(dns+10)>1)return 0;
     size_t pos=12;
     if(!same_question(dns,dns_len,&pos,rule->name))return 0;
+    uint16_t qtype=(uint16_t)rd16(dns+pos-4);
     int dnssec=(flags&0x0010u)!=0; /* CD in the original request */
     if(rd16(dns+10)) {
         if(!dns_name_skip(dns,dns_len,&pos)||dns_len-pos<10||rd16(dns+pos)!=41)return 0;
@@ -95,6 +101,7 @@ int d2k_dns_family_request_parse(const uint8_t *packet,size_t length,
     memset(out,0,sizeof *out);
     out->family=family;out->dnssec=(uint8_t)dnssec;
     out->client_port=(uint16_t)rd16(udp);out->id=(uint16_t)rd16(dns);
+    out->qtype=qtype;
     memcpy(out->client,packet+(family==4?12:8),family==4?4:16);
     memcpy(out->server,packet+(family==4?16:24),family==4?4:16);
     snprintf(out->name,sizeof out->name,"%s",rule->name);
@@ -113,7 +120,79 @@ int d2k_dns_family_response_matches(const uint8_t *packet,size_t length,
     if(memcmp(packet+(family==4?12:8),request->server,width)||
        memcmp(packet+(family==4?16:24),request->client,width))return 0;
     size_t pos=12;
-    return same_question(dns,dns_len,&pos,request->name);
+    return same_question(dns,dns_len,&pos,request->name) &&
+        rd16(dns+pos-4)==request->qtype;
+}
+
+typedef struct {
+    size_t rdlength;
+    size_t offset;
+    size_t length;
+} dns_hint_removal;
+
+/* Only direct ServiceMode using the question name is covered by the lease.
+ * The remaining SvcParams are opaque. Preserve the whole response when the
+ * hint is mandatory or the service points to a different name. */
+static int https_hint(const uint8_t *dns,size_t start,size_t end,dns_hint_removal *hint) {
+    if(end-start<3 || !rd16(dns+start) || dns[start+2]!=0)return 0;
+    unsigned previous=0;
+    for(size_t at=start+3;at<end;) {
+        if(end-at<4)return 0;
+        unsigned key=rd16(dns+at),length=rd16(dns+at+2);
+        size_t value=at+4;
+        if(length>end-value || (at!=start+3 && key<=previous))return 0;
+        if(key==SVC_MANDATORY) {
+            if(!length || length%2)return 0;
+            for(size_t p=value;p<value+length;p+=2)
+                if(rd16(dns+p)==SVC_IPV6HINT)return 0;
+        } else if(key==SVC_IPV6HINT) {
+            if(!length || length%16)return 0;
+            hint->offset=at;
+            hint->length=4+length;
+        }
+        previous=key;
+        at=value+length;
+    }
+    return 1;
+}
+
+static size_t rewrite_https(uint8_t *dns,size_t length,size_t question_end,
+    unsigned answers,unsigned additional) {
+    if(rd16(dns+2)&0x0030u)return 0; /* Preserve AD/CD and signed data. */
+    dns_hint_removal removals[64];
+    size_t count=0,pos=question_end;
+    const size_t question_name_len=question_end-12-4;
+    for(unsigned i=0;i<answers;i++) {
+        size_t owner=pos;
+        if(!dns_name_skip(dns,length,&pos) || length-pos<10)return 0;
+        size_t owner_len=pos-owner;
+        /* Only allow pointers to the question, whose offset never changes. */
+        if(!(owner_len==2 && rd16(dns+owner)==0xc00c) &&
+           !(owner_len==question_name_len && !memcmp(dns+owner,dns+12,owner_len)))return 0;
+        if(rd16(dns+pos)!=DNS_HTTPS || rd16(dns+pos+2)!=1)return 0;
+        unsigned rlen=rd16(dns+pos+8);
+        dns_hint_removal hint={.rdlength=pos+8};
+        pos+=10;
+        if(rlen>length-pos || !https_hint(dns,pos,pos+rlen,&hint))return 0;
+        if(hint.length)removals[count++]=hint;
+        pos+=rlen;
+    }
+    if(additional) {
+        /* The only extra record we can relocate unchanged is an unsigned OPT. */
+        if(length-pos<11 || dns[pos]!=0 || rd16(dns+pos+1)!=DNS_OPT ||
+           (rd16(dns+pos+7)&0x8000u) || rd16(dns+pos+9)!=length-pos-11)return 0;
+        pos=length;
+    }
+    if(pos!=length || !count)return 0;
+    /* Later records move first so the offsets we have yet to use stay valid. */
+    while(count) {
+        const dns_hint_removal *hint=&removals[--count];
+        size_t tail=hint->offset+hint->length;
+        wr16(dns+hint->rdlength,rd16(dns+hint->rdlength)-hint->length);
+        memmove(dns+hint->offset,dns+tail,length-tail);
+        length-=hint->length;
+    }
+    return length;
 }
 
 int d2k_dns_family_rewrite(uint8_t *packet,size_t *length,size_t capacity,
@@ -146,20 +225,26 @@ int d2k_dns_family_rewrite(uint8_t *packet,size_t *length,size_t capacity,
     size_t question_end=pos;
     unsigned answers=rd16(dns+6),additional=rd16(dns+10);
     if(answers>64)return 0;
-    for(unsigned i=0;i<answers+additional;i++) {
-        if(!dns_name_skip(dns,dns_len,&pos)||dns_len-pos<10)return 0;
-        unsigned type=rd16(dns+pos),rlen=rd16(dns+pos+8);
-        pos+=10;
-        if(rlen>dns_len-pos)return 0;
-        if(i>=answers && type!=41)return 0;
-        pos+=rlen;
+    size_t new_dns_len;
+    if(rd16(dns+question_end-4)==DNS_HTTPS) {
+        new_dns_len=rewrite_https(dns,dns_len,question_end,answers,additional);
+        if(!new_dns_len)return 0;
+    } else {
+        for(unsigned i=0;i<answers+additional;i++) {
+            if(!dns_name_skip(dns,dns_len,&pos)||dns_len-pos<10)return 0;
+            unsigned type=rd16(dns+pos),rlen=rd16(dns+pos+8);
+            pos+=10;
+            if(rlen>dns_len-pos)return 0;
+            if(i>=answers && type!=DNS_OPT)return 0;
+            pos+=rlen;
+        }
+        if(pos!=dns_len)return 0;
+        new_dns_len=question_end;
+        dns[3]&=(uint8_t)~0x30u; /* no AD or CD on synthesized NODATA */
+        memset(dns+6,0,6); /* ANCOUNT, NSCOUNT, ARCOUNT */
     }
-    if(pos!=dns_len)return 0;
-    size_t new_size=ip_len+8+question_end;
-    dns[2]&=(uint8_t)~0x02u; /* no TC */
-    dns[3]&=(uint8_t)~0x30u; /* no AD or CD on synthesized NODATA */
-    memset(dns+6,0,6); /* ANCOUNT, NSCOUNT, ARCOUNT */
-    wr16(udp+4,8u+question_end);
+    size_t new_size=ip_len+8+new_dns_len;
+    wr16(udp+4,8u+new_dns_len);
     udp[6]=udp[7]=0;
     if(family==4) {
         wr16(packet+2,new_size);

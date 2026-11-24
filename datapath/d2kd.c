@@ -107,6 +107,7 @@ static d2k_dns_family_rule dns_family_rules[64];
 static size_t dns_family_count;
 static time_t dns_family_loaded_at;
 static int dns_family_loaded;
+static unsigned dns_family_logged;
 static struct {
     d2k_dns_family_request request;
     time_t expires_at;
@@ -144,6 +145,7 @@ static int dns_family_step(d2k_nfq *q,const d2k_nl_pkt *np,const char *path,int 
                     const d2k_dns_family_request *old=&dns_family_requests[j].request;
                     if(dns_family_requests[j].expires_at>now && old->family==request.family &&
                        old->id==request.id && old->client_port==request.client_port &&
+                       old->qtype==request.qtype &&
                        !strcmp(old->name,request.name) &&
                        !memcmp(old->client,request.client,request.family==4?4:16) &&
                        !memcmp(old->server,request.server,request.family==4?4:16)) {
@@ -176,7 +178,14 @@ static int dns_family_step(d2k_nfq *q,const d2k_nl_pkt *np,const char *path,int 
                     if(d2k_dns_family_rewrite(rewritten,&length,sizeof rewritten,
                         &dns_family_rules[j],now,1)==1 &&
                        d2k_nfq_verdict_payload(q,np->id,D2K_NF_ACCEPT,rewritten,length,
-                           err,sizeof err)==0)return 1;
+                           err,sizeof err)==0) {
+                        if(dns_family_logged<64) {
+                            fprintf(stderr,"d2kd: DNS IPv4 preference: %s qtype=%u, reply rewritten\n",
+                                request.name,(unsigned)request.qtype);
+                            dns_family_logged++;
+                        }
+                        return 1;
+                    }
                     break;
                 }
                 break;

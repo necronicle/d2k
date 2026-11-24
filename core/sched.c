@@ -15804,7 +15804,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             join_worker(t);
             if(family_ipv4_usable(&v)) {
                 int n=family_policy_publish(s,t,now_ms);
-                if(n>0)say(s,"по %s через IPv4 %s получен полный ответ аутентифицированного HTTPS-сервера%s; правило предпочтения IPv4 для %d DNS-клиентов действует 60 минут",
+                if(n>0)say(s,"по %s через IPv4 %s получен полный ответ аутентифицированного HTTPS-сервера%s; для %d DNS-клиентов записано правило предпочтения IPv4 на 60 минут, ждём следующего DNS-запроса",
                     t->name,t->family_ipv4[t->family_ipv4_next],
                     v.level==D2K_VER_CHALLENGE?" (challenge, работа страницы ещё не доказана)":"",n);
                 else say(s,"по %s IPv4 отвечает, но нет подходящего свежего DNS-клиента или не записано правило (%d)",
