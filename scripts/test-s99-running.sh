@@ -16,7 +16,7 @@ trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Только эти функции, в том виде, в каком они в S99d2k.
-for fn in running pid_is_ours pid_start stop_pidfile; do
+for fn in running pid_is_ours pid_start wait_tenth stop_pidfile; do
     awk -v f="$fn" '$0 ~ "^" f "\\(\\) \\{" {p = 1} p {print} p && /^\}/ {exit}' "$ROOT/files/S99d2k" > "$TMP/$fn.sh"
     [ -s "$TMP/$fn.sh" ] || fail "$fn() not found in S99d2k"
     # shellcheck disable=SC1090
@@ -108,6 +108,8 @@ sleep() {
 }
 stop_fixture() {
     : > "$TMP/signals"
+    # shellcheck disable=SC2034 # consumed by wait_tenth and stop_pidfile
+    D2K_WAIT_TICKS=1
     stop_ticks=0; stop_release=$1; stop_state=${2:-Z}; stop_start=${3:-777}
     proc 201 d2kd S 777
     dp 201 777
