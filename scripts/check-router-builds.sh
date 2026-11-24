@@ -40,7 +40,7 @@ for arch in $ARCHES; do
             *) timeout 20 "qemu-$cpu" "$bin" --version ;;
         esac
     done
-    for test in crypto quicwire plan-parse openssl-link-smoke tg-session; do
+    for test in crypto quicwire plan-parse http80 hold preflight openssl-link-smoke tg-session; do
         timeout 60 "qemu-$cpu" "$ROOT/build/telegram/$test-$arch"
     done
     case "$arch" in
