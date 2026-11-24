@@ -652,6 +652,16 @@ int main(void) {
               "a cut (code 4) is decoded with its path and received body");
         response[0]=5;
         send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.code==5 &&
+              !strcmp(ev.live_http_path,"/False/"),
+              "a reset before response keeps the request path over the control socket");
+        response[0]=6;
+        send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
+        CHECK(!d2k_link_next(sv[1],&ev,100,err,sizeof err) && ev.code==6 &&
+              !strcmp(ev.live_http_path,"/False/"),
+              "a repeated unanswered request keeps its path over the control socket");
+        response[0]=7;
+        send_synthetic(sv[0],D2K_EV_HTTP_RESPONSE,response,sizeof response);
         CHECK(d2k_link_next(sv[1],&ev,100,err,sizeof err)==-1,"unknown HTTP response code accepted");
         response[0]=1;
         for(size_t k=sizeof bound;k<sizeof response;k++) {

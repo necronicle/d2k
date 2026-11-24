@@ -395,7 +395,7 @@ int d2k_link_decode(uint16_t type,const uint8_t *body,size_t body_len,d2k_ev *ou
                 out->live_body_bytes=(out->live_body_bytes<<8)|meta[2+i];
                 out->live_request_no=(out->live_request_no<<8)|meta[10+i];
             }
-            if(!out->live_request_no || rest[0]<1 || rest[0]>4 || out->live_http_status>599 ||
+            if(!out->live_request_no || rest[0]<1 || rest[0]>6 || out->live_http_status>599 ||
                (rest[0]==1 && out->live_http_status<200))return -1;
         }
         if (rlen < 2 || rlen < 2u + rest[1]) {

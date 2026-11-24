@@ -1160,6 +1160,90 @@ static void failed_synthesis_waits_for_new_own_plan(void) {
     d2k_sched_tcp_base_hook=saved;d2k_sched_free(s);d2k_catalog_free(&cat);
 }
 
+static void installed_family_skips_plan_news(void) {
+    d2k_catalog cat={0};
+    d2k_group_state *groups=calloc(1,sizeof *groups);
+    d2k_cat_box box={0};d2k_cat_plan plan={0};d2k_cat_binding bind={0};
+    CHECK(groups!=NULL);
+    if(!groups)return;
+    cat.groups=groups;cat.boxes=&box;cat.n_boxes=1;
+    box.plans=&plan;box.n_plans=1;box.binds=&bind;box.n_binds=1;
+    strcpy(box.id,"family-box");
+    strcpy(plan.id,"plan-family");strcpy(plan.proto,"tls");plan.enabled=1;
+    plan.text="d2k-plan 1 5\nproto tcp tls\nsplit payload_start +1\norder forward\n";
+    strcpy(bind.kind,"name");strcpy(bind.target,"a.example.com");
+    strcpy(bind.plan_id,plan.id);bind.enabled=1;bind.level=3;
+    bind.transport=6;bind.family=4;bind.shape=D2K_SHAPE_MODERN;
+    for(int i=0;i<3;i++) {
+        d2k_group_observation o={0};
+        snprintf(o.name,sizeof o.name,"%c.example.com",'a'+i);
+        strcpy(o.plan_id,plan.id);
+        CHECK(!d2k_group_key_make(&o.key,6,4,D2K_SHAPE_MODERN,"/",""));
+        o.evidence=D2K_GROUP_BLOCKED_CONFIRMED;o.at=1000+i;
+        CHECK(d2k_group_learn(groups,&o)>0);
+    }
+    d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+    CHECK(s!=NULL);
+    if(s) {
+        d2k_group_key key={0};d2k_domain_group group;
+        CHECK(!d2k_group_key_make(&key,6,4,D2K_SHAPE_MODERN,"/",""));
+        CHECK(d2k_group_match(groups,"new.example.com",&key,&group)!=NULL);
+        CHECK(!area_reserve(s,1));
+        int installed=0;
+        for(size_t i=0;i<d2k_group_slots(groups);i++)
+            if(desired_area(s,i,&s->areas[0])){installed=1;break;}
+        CHECK(installed);
+        if(installed) {
+            s->areas[0].confirmed=1;s->areas[0].confirmed_event=1;
+            s->n_areas=1;s->now_ms=1000;
+            target_cooldown *c=&s->cooldowns[0];
+            c->used=c->exhausted=1;c->transport=6;c->family=4;
+            c->port=443;c->trigger_shape=D2K_SHAPE_MODERN;c->until_ms=61000;
+            strcpy(c->name,"new.example.com");strcpy(c->ip,"192.0.2.1");
+            task probe={0};
+            strcpy(probe.name,c->name);probe.transport=6;probe.family=4;
+            probe.trigger_shape=D2K_SHAPE_MODERN;
+            CHECK(installed_family_ready(s,&probe,0,0));
+            d2k_sched_tcp_fn saved=d2k_sched_tcp_base_hook;
+            d2k_sched_tcp_base_hook=d2k_sched_tcp_hook;capture_spawn=1;
+            CHECK(!plan_news_recheck(s,c,1000));
+            capture_spawn=0;d2k_sched_tcp_base_hook=saved;
+            task *t=task_of(s,c->name,6,4);
+            if(t)t->th_live=0;
+            CHECK(!d2k_sched_active(s));
+        }
+        d2k_sched_free(s);
+    }
+    free(groups);
+}
+
+static void ipv6_late_silence_checks_verified_ipv4(void) {
+    for(int complete=0;complete<2;complete++) {
+        d2k_catalog cat={0};
+        d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
+        CHECK(s!=NULL);
+        if(!s)continue;
+        d2k_sched_family_path(s,"/tmp/d2k-family-summary-test");
+        task *t=fixture(s);
+        strcpy(t->name,"ru.numista.com");
+        strcpy(t->ip,"2a06:98c1:3122:8000::");
+        t->family=6;t->state=T_ASKING;t->res_ready=1;
+        t->trigger_code=D2K_SUSPECT_LATE_SILENCE;
+        t->res.verdict=D2K_V_CLEAR;
+        t->vol.rx_direct_complete=complete;
+        capture_spawn=1;
+        d2k_sched_tick(s,1000);
+        capture_spawn=0;
+        if(!complete) {
+            CHECK(t->state==T_FAMILY_PROBE && t->job==JOB_FAMILY_PROBE);
+            CHECK(cooldown_find(s,t->name,6,6)==NULL);
+        } else CHECK(t->state!=T_FAMILY_PROBE);
+        t->th_live=0;
+        d2k_sched_free(s);
+        d2k_catalog_free(&cat);
+    }
+}
+
 static void measurement_timeout_does_not_cooldown(void) {
     for(int typed=0;typed<2;typed++) {
         d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
@@ -1177,6 +1261,8 @@ int main(void) {
     synthesis_worker_measures_identity();
     synthesis_candidate_opens_rx_ladder();
     failed_synthesis_waits_for_new_own_plan();
+    installed_family_skips_plan_news();
+    ipv6_late_silence_checks_verified_ipv4();
     retry_keeps_client_context(0);
     retry_keeps_client_context(1);
     measurement_timeout_does_not_cooldown();

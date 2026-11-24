@@ -324,18 +324,18 @@ static void release_doh_tls(void *context) {
     d2k_trusted_tls_free(context);
 }
 
-d2k_doh_tls_status d2k_doh_trusted_tls_open(int fd, const char *host,
-    uint16_t version, int timeout, d2k_doh_tls_session *session) {
-    static const uint8_t alpn[] = {2, 'h', '2', 8, 'h','t','t','p','/','1','.','1'};
+static d2k_doh_tls_status trusted_tls_open_alpn(int fd,const char *host,
+    uint16_t version,int timeout,d2k_doh_tls_session *session,
+    const uint8_t *alpn,size_t alpn_len,uint8_t required_http) {
     struct d2k_trusted_tls_options options = {
-        host, d2k_trusted_tls_ca_file(), version, timeout, alpn, sizeof alpn
+        host, d2k_trusted_tls_ca_file(), version, timeout, alpn, alpn_len
     };
     d2k_trusted_tls *tls;
     switch (d2k_trusted_tls_connect(fd, &options, &tls)) {
     case D2K_TRUSTED_TLS_OK: {
         const char *negotiated=d2k_trusted_tls_alpn(tls);
         uint8_t http=!strcmp(negotiated,"h2") ? 2 : !strcmp(negotiated,"http/1.1") ? 1 : 0;
-        if (http &&
+        if (http && (!required_http || http==required_http) &&
             !d2k_trusted_tls_io(tls, &session->io)) {
             session->release = release_doh_tls;
             session->http_version = http;
@@ -355,4 +355,14 @@ d2k_doh_tls_status d2k_doh_trusted_tls_open(int fd, const char *host,
     default:
         return D2K_DOH_TLS_LOCAL;
     }
+}
+d2k_doh_tls_status d2k_doh_trusted_tls_open(int fd, const char *host,
+    uint16_t version, int timeout, d2k_doh_tls_session *session) {
+    static const uint8_t alpn[] = {2, 'h', '2', 8, 'h','t','t','p','/','1','.','1'};
+    return trusted_tls_open_alpn(fd,host,version,timeout,session,alpn,sizeof alpn,0);
+}
+d2k_doh_tls_status d2k_http1_trusted_tls_open(int fd, const char *host,
+    uint16_t version, int timeout, d2k_doh_tls_session *session) {
+    static const uint8_t alpn[] = {8, 'h','t','t','p','/','1','.','1'};
+    return trusted_tls_open_alpn(fd,host,version,timeout,session,alpn,sizeof alpn,1);
 }

@@ -1279,6 +1279,24 @@ int d2k_httpsearch_bound_failure(d2k_httpsearch *hs, const char *host, uint8_t f
     return 1;
 }
 
+static void missing_response(d2k_httpsearch *hs, const char *host, uint8_t family,
+                             const uint8_t *addr, const char *path, int retry, int64_t now) {
+    if(!hs || !addr || (family!=4 && family!=6) || !host_ok(host))return;
+    if(!hs_path_ok(path)) {
+        say(hs,"HTTP %s: нет ответа, но путь запроса не воспроизводится — поиск не начат",host);
+        return;
+    }
+    rec *r=rec_get(hs,host,family);
+    if(!r)return;
+    if(hs->cur.phase!=PH_IDLE && hs->cur.family==family && !strcasecmp(hs->cur.host,host))return;
+    r->cut=1;
+    snprintf(r->repeat_path,sizeof r->repeat_path,"%s",path);
+    r->repro_gap=0;
+    say(hs,"HTTP %s: %s до первого байта ответа на %s — проверяю тем же запросом на собственном потоке",
+        host,retry?"клиент повторил запрос":"RST",path);
+    d2k_httpsearch_portal(hs,host,family,addr,now);
+}
+
 int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
     if(!hs || !ev)return 0;
     if(ev->kind==D2K_EV_APPLIED)return d2k_httpsearch_applied(hs,ev);
@@ -1299,6 +1317,13 @@ int d2k_httpsearch_control(d2k_httpsearch *hs,const d2k_ev *ev,int64_t now) {
     }
     if(ev->kind==D2K_EV_HTTP_RESPONSE && ev->code==4 && ev->transport==6 && ev->high_port==80) {
         d2k_httpsearch_cut(hs,ev->name,ev->family,ev->high_ip,ev->live_http_path,ev->live_body_bytes,now);
+        return 1;
+    }
+    if(ev->kind==D2K_EV_HTTP_RESPONSE && (ev->code==5 || ev->code==6) &&
+       ev->transport==6 && ev->high_port==80) {
+        static const uint8_t zero[16];
+        if(memcmp(ev->trial_id,zero,16))return 0;
+        missing_response(hs,ev->name,ev->family,ev->high_ip,ev->live_http_path,ev->code==6,now);
         return 1;
     }
     if(((ev->kind==D2K_EV_HTTP_PORTAL && !ev->code) ||
@@ -1444,11 +1469,13 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
     }
     if (hs->cur.phase == PH_BASE) {
         drop_socket(hs);
+        int no_answer = r->answer == D2K_HS_SILENT ||
+            (r->answer == D2K_HS_CLOSED && r->requests_sent > 0 && !r->complete_responses);
         /* Поле 16.10.2026, fast-torrent: клиент получил заглушку провайдера,
            а свой запрос роутера — тишину. Тишина на свой GET — та же
            блокировка в другой форме, а не «блока нет»: поиск начинается.
            Успех кандидата по-прежнему — только полный ответ под планом. */
-        if (!hs->cur.cut && r->answer == D2K_HS_SILENT) {
+        if (!hs->cur.cut && no_answer) {
             build_cands(hs);
             say(hs, "HTTP %s: база — тишина на свой запрос после заглушки у клиента: "
                     "блокировка в другой форме; своих планов %zu, затем вопросы разреза "
@@ -1479,10 +1506,10 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
            вердиктом «не воспроизводится», которого никто не измерял.
            Повторяем базу; повторная тишина — сигнал, и поиск начинается
            (ниже, тем же правилом, что у портала). */
-        if (r->answer == D2K_HS_SILENT && hs->cur.cut &&
+        if (no_answer && hs->cur.cut &&
             hs->cur.base_retries >= D2K_HS_BASE_RETRIES) {
             build_cands(hs);
-            say(hs, "HTTP %s: база — тишина на свой запрос ДВАЖДЫ при обрыве у "
+            say(hs, "HTTP %s: база — нет ответа на свой запрос ДВАЖДЫ при обрыве у "
                     "клиента: ответа нет вовсе, значит это отсутствие замера, а не "
                     "измеренное «блока нет»; своих планов %zu, затем вопросы разреза "
                     "и checksum-приманки", hs->cur.host, hs->cur.n_cands);
@@ -1490,7 +1517,7 @@ void d2k_httpsearch_result(d2k_httpsearch *hs, const d2k_hs_result *r, int64_t n
             return;
         }
         if ((r->answer == D2K_HS_CONNECT_FAIL ||
-             (r->answer == D2K_HS_SILENT && hs->cur.cut)) &&
+             (no_answer && hs->cur.cut)) &&
             hs->cur.base_retries < D2K_HS_BASE_RETRIES) {
             hs->cur.base_retries++;
             d2k_hs_job job;

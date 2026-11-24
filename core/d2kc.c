@@ -899,6 +899,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 #ifdef D2K_TRUSTED_DOH
     d2k_verify_doh_set_tls(d2k_doh_trusted_tls_open);
+    d2k_verify_page_set_tls(d2k_http1_trusted_tls_open);
     d2k_verify_dot_set_probe(d2k_dot_trusted_probe);
     d2k_verify_plain_dns_set_probe(d2k_plain_dns_probe);
 #endif
@@ -962,6 +963,14 @@ int main(int argc, char **argv) {
         d2k_link_close(fd);
         d2k_catalog_free(&cat);
         return 1;
+    }
+    char family_path[512];
+    const char *family_slash=strrchr(catpath,'/');
+    size_t family_dir=family_slash?(size_t)(family_slash-catpath+1):0;
+    if(family_dir+sizeof "ipv4-fallback"<=sizeof family_path) {
+        memcpy(family_path,catpath,family_dir);
+        memcpy(family_path+family_dir,"ipv4-fallback",sizeof "ipv4-fallback");
+        d2k_sched_family_path(s,family_path);
     }
 #ifdef D2K_TRUSTED_DOH
     d2k_sched_set_plain_trial(s,d2k_plain_dns_prepare,d2k_plain_dns_run_trial);

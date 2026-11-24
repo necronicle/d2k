@@ -55,6 +55,7 @@
 #include <sys/mman.h>
 #endif
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -67,6 +68,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #ifdef __linux__
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -84,6 +86,7 @@
 #include "d2k_plan.h"
 #include "d2k_quicprobe.h"
 #include "d2k_sched.h"
+#include "../datapath/include/d2k_dns_family.h"
 #include "d2k_shadow_queue.h"
 #include "d2k_newchain.h"
 #include <limits.h>
@@ -519,6 +522,30 @@ d2k_sched_quic_base_fn  d2k_sched_quic_base_hook = NULL;
 d2k_sched_quic_seeded_fn d2k_sched_quic_seeded_hook = NULL;
 d2k_sched_quic_fn d2k_sched_quic_hook = d2k_quic_run;
 d2k_sched_ver_fn  d2k_sched_ver_hook  = verify_default;
+/* Family selection needs certificate-chain authentication. The ordinary
+ * fetch verifier checks the certificate name only, so it cannot establish
+ * peer_authenticated. Preflight uses trusted TLS and reads a complete
+ * response; this probe keeps the controller mark before connect. */
+static d2k_ver_result family_verify_default(int use_fd,const char *ip,uint16_t port,
+    const char *name,int deadline_ms,size_t hello_wire,int tls12,uint32_t mark,
+    const char *path) {
+    (void)path; /* The route question uses the origin root, not a client path. */
+    int fd=use_fd;
+    d2k_ver_result r={.fd=-1,.name_ok=-1};
+    if(fd<0 && d2k_sched_bind_hook(6,4,&fd,NULL)) {
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"IPv4 probe socket unavailable");
+        return r;
+    }
+    if(mark && d2k_sched_mark_hook(fd,mark)) {
+        close(fd);
+        r.local_refusal=1;
+        snprintf(r.reason,sizeof r.reason,"IPv4 probe socket mark unavailable");
+        return r;
+    }
+    return d2k_verify_family_page_on(fd,ip,port,name,deadline_ms,hello_wire,tls12);
+}
+d2k_sched_family_probe_fn d2k_sched_family_probe_hook = family_verify_default;
 d2k_sched_ver_fn  d2k_sched_preflight_ver_hook = preflight_verify_default;
 d2k_sched_ver_fn  d2k_sched_rx_ver_hook = verify_rx_default;
 d2k_sched_ver_fn  d2k_sched_rx_gzip_ver_hook = verify_rx_gzip_default;
@@ -672,6 +699,7 @@ typedef enum {
        прикладным подтверждением. */
     T_WATCHING,
     T_DOH_HEALTH,
+    T_FAMILY_PROBE, /* IPv6 address failure; exact-name IPv4 application check */
     T_DNS_PLAIN_TRIAL,
     T_RESTING,       /* неудача, цель отдыхает */
     T_RAW_MEASURE_ACK, T_RAW_MEASURE_OBSERVE, T_RAW_MEASURED,
@@ -691,7 +719,8 @@ typedef enum {
 /* Что делает рабочий поток задачи. Потоки заводятся только под сетевые
    оракулы; управляющего сокета они не касаются (см. шапку d2k_sched.h). */
 typedef enum { JOB_NONE = 0, JOB_CLASSIFY, JOB_CONTACT, JOB_VERIFY, JOB_VOICE, JOB_STUN,
-    JOB_STUN_TRIAL, JOB_DOH_HEALTH, JOB_DNS_PLAIN_PREPARE, JOB_DNS_PLAIN_RUN } task_job;
+    JOB_STUN_TRIAL, JOB_DOH_HEALTH, JOB_DNS_PLAIN_PREPARE, JOB_DNS_PLAIN_RUN,
+    JOB_FAMILY_PROBE } task_job;
 
 static int is_voice_class(const char *name, uint8_t transport);
 
@@ -702,6 +731,8 @@ typedef struct {
     uint8_t    family;
     char       ip[INET6_ADDRSTRLEN];
     uint16_t   port;
+    char       family_ipv4[4][INET_ADDRSTRLEN];
+    uint8_t    family_ipv4_count,family_ipv4_next;
 
     int64_t    started_ms; /* active search/lifecycle budget begins on launch */
     int64_t    began_ms;   /* when this search began, for the card and verdict line only (task 49) */
@@ -1676,6 +1707,16 @@ typedef struct {
     int64_t expires_ms;
 } dns_address_name;
 typedef struct {
+    char name[256];
+    uint8_t client[16],family;
+    int64_t expires_ms;
+} family_dns_client;
+typedef struct {
+    char name[256];
+    uint8_t address[4];
+    int64_t expires_ms;
+} family_dns_a;
+typedef struct {
     d2k_pf_scope scope;
     uint8_t id[D2K_TRIAL_ID_LEN];
     int64_t expires_ms;
@@ -1685,6 +1726,9 @@ typedef struct {
 
 struct d2k_sched {
     dns_address_name dns_names[SCHED_SEEN];
+    family_dns_client family_clients[64];
+    family_dns_a family_a[64];
+    char family_path[512];
     sched_preflight_lease preflight_leases[SCHED_SEEN];
     d2k_newchain newchain;
     int synthesis_only;
@@ -4258,6 +4302,40 @@ static void *worker_run(void *vp) {
         ssize_t ignored=write(s->wake[1],"w",1);(void)ignored;
         return NULL;
     }
+    if (t->job == JOB_FAMILY_PROBE) {
+        if(t->family_ipv4_next==0) {
+            struct addrinfo hints={0},*list=NULL;
+            hints.ai_family=AF_INET;hints.ai_socktype=SOCK_STREAM;
+            if(!getaddrinfo(t->name,NULL,&hints,&list)) {
+                for(struct addrinfo *p=list;p&&t->family_ipv4_count<4;p=p->ai_next) {
+                    if(p->ai_family!=AF_INET||p->ai_addrlen<sizeof(struct sockaddr_in))continue;
+                    char address[INET_ADDRSTRLEN];
+                    const struct sockaddr_in *sa=(const struct sockaddr_in *)p->ai_addr;
+                    if(!inet_ntop(AF_INET,&sa->sin_addr,address,sizeof address))continue;
+                    int duplicate=0;
+                    for(unsigned j=0;j<t->family_ipv4_count;j++)
+                        if(!strcmp(t->family_ipv4[j],address))duplicate=1;
+                    if(!duplicate)snprintf(t->family_ipv4[t->family_ipv4_count++],INET_ADDRSTRLEN,"%s",address);
+                }
+                freeaddrinfo(list);
+            }
+        }
+        if(!t->family_ipv4_count) {
+            d2k_ver_result v={.fd=-1,.local_refusal=1};
+            snprintf(v.reason,sizeof v.reason,"A address unavailable from configured DNS");
+            pthread_mutex_lock(&s->mu);t->ver=v;t->res_ready=1;pthread_mutex_unlock(&s->mu);
+            ssize_t ignored=write(s->wake[1],"w",1);(void)ignored;
+            return NULL;
+        }
+        const char *ip=t->family_ipv4[t->family_ipv4_next];
+        d2k_ver_result v=d2k_sched_family_probe_hook(-1,ip,t->port,t->name,
+            SCHED_VERIFY_STEP_MS,trig.len,
+            d2k_hello_shape(trig.bytes,trig.len)==D2K_SHAPE_LEGACY,
+            s->measure_mark,t->measure_path[0]?t->measure_path:"/");
+        pthread_mutex_lock(&s->mu);t->ver=v;t->res_ready=1;pthread_mutex_unlock(&s->mu);
+        ssize_t ignored=write(s->wake[1],"w",1);(void)ignored;
+        return NULL;
+    }
     if (t->job == JOB_VERIFY) {
         uint8_t verification_trial_id[D2K_TRIAL_ID_LEN];
         memcpy(verification_trial_id,t->trial_ack_id,sizeof verification_trial_id);
@@ -5721,6 +5799,84 @@ static void prop_finish(d2k_sched *s, task *t) {
 static void quic_deny_install(d2k_sched *s, task *t, int64_t now_ms);
 
 static void wake_loop(d2k_sched *s);
+static int family_probe_start(d2k_sched *s,task *t,int64_t now_ms) {
+    if(!s->family_path[0]||t->family!=6||t->transport!=6||t->by_addr||
+       t->ech_offer||!t->name[0]||!t->port)return 0;
+    t->family_ipv4_count=t->family_ipv4_next=0;
+    for(size_t i=0;i<sizeof s->family_a/sizeof s->family_a[0] && t->family_ipv4_count<2;i++) {
+        const family_dns_a *r=&s->family_a[i];
+        if(r->expires_ms<=now_ms||strcasecmp(r->name,t->name))continue;
+        char ip[INET_ADDRSTRLEN];
+        if(!inet_ntop(AF_INET,r->address,ip,sizeof ip))continue;
+        int duplicate=0;
+        for(unsigned j=0;j<t->family_ipv4_count;j++)
+            if(!strcmp(t->family_ipv4[j],ip))duplicate=1;
+        if(!duplicate)snprintf(t->family_ipv4[t->family_ipv4_count++],INET_ADDRSTRLEN,"%s",ip);
+    }
+    t->state=T_FAMILY_PROBE;
+    t->started_ms=now_ms;
+    if(start_worker(s,t,JOB_FAMILY_PROBE))return 0;
+    say(s,"по %s IPv6 не дал результата; ищу IPv4 того же имени и проверяю полный HTTPS-ответ",
+        t->name);
+    return 1;
+}
+static int family_ipv4_usable(const d2k_ver_result *v) {
+    if(!v->peer_authenticated || v->name_ok!=1 || !v->body_complete ||
+       v->peer_auth_failed || v->http_outcome==D2K_HTTP_BLOCKED ||
+       v->http_outcome==D2K_HTTP_LEGAL_DENIAL || v->status==451)return 0;
+    /* A complete challenge from the authenticated origin proves that the
+       IPv4 route delivers HTTP. It does not prove browser access; the client
+       will decide that after DNS prefers this route for a bounded lease. */
+    return v->level==D2K_VER_APPLICATION ||
+        (v->level==D2K_VER_CHALLENGE && v->cloudflare_challenge);
+}
+static int family_policy_publish(d2k_sched *s,task *t,int64_t now_ms) {
+    if(!s->family_path[0])return -1;
+    time_t wall=time(NULL);if(wall<=0)return -1;
+    d2k_dns_family_rule rules[64];size_t count=0;
+    if(d2k_dns_family_load(s->family_path,rules,64,&count,wall) &&
+       access(s->family_path,F_OK)==0)return -1;
+    unsigned added=0;
+    for(size_t i=0;i<sizeof s->family_clients/sizeof s->family_clients[0];i++) {
+        const family_dns_client *c=&s->family_clients[i];
+        if(c->expires_ms<=now_ms||strcasecmp(c->name,t->name))continue;
+        int64_t remain=3600; /* bounded route preference, not a statement about DPI */
+        d2k_dns_family_rule *r=NULL;
+        for(size_t j=0;j<count;j++)if(rules[j].client_family==c->family&&
+            !strcasecmp(rules[j].name,c->name)&&
+            !memcmp(rules[j].client,c->client,c->family==4?4:16)){r=&rules[j];break;}
+        if(!r){if(count==64)continue;r=&rules[count++];}
+        memset(r,0,sizeof *r);
+        snprintf(r->name,sizeof r->name,"%s",c->name);
+        r->client_family=c->family;
+        memcpy(r->client,c->client,c->family==4?4:16);
+        r->expires_unix=(int64_t)wall+remain;
+        added++;
+    }
+    if(!added)return 0;
+    char tmp[sizeof s->family_path+16];
+    if(snprintf(tmp,sizeof tmp,"%s.tmp.XXXXXX",s->family_path)>=(int)sizeof tmp)return -1;
+    int fd=mkstemp(tmp);if(fd<0)return -1;
+    if(fchmod(fd,0600)){close(fd);unlink(tmp);return -1;}
+    FILE *f=fdopen(fd,"w");if(!f){close(fd);unlink(tmp);return -1;}
+    int bad=0;
+    for(size_t i=0;i<count;i++) {
+        char address[INET6_ADDRSTRLEN];
+        if(!inet_ntop(rules[i].client_family==4?AF_INET:AF_INET6,
+            rules[i].client,address,sizeof address)||
+           fprintf(f,"%lld %u %s %s\n",(long long)rules[i].expires_unix,
+               (unsigned)rules[i].client_family,address,rules[i].name)<0){bad=1;break;}
+    }
+    if(fflush(f)||fsync(fd))bad=1;
+    if(fclose(f))bad=1;
+    if(!bad && rename(tmp,s->family_path))bad=1;
+    if(bad){unlink(tmp);return -1;}
+    if(access("/opt/etc/init.d/S99d2k",X_OK)==0 &&
+       system("/opt/etc/init.d/S99d2k dns-family-sync >/dev/null 2>&1")!=0)
+        say(s,"по %s правило IPv4 сохранено, но firewall ещё не подтвердил его установку",
+            t->name);
+    return (int)added;
+}
 static void task_fail(d2k_sched *s, task *t, int64_t now_ms) {
     t->partial_valid = 0; /* поиск кончился — его частичный обход ему и принадлежал */
     join_worker(t);
@@ -7787,6 +7943,11 @@ d2k_sched *d2k_sched_new(d2k_catalog *cat, int link_fd, uint32_t mark) {
     return s;
 }
 
+void d2k_sched_family_path(d2k_sched *s,const char *path) {
+    if(s&&path&&strlen(path)<sizeof s->family_path)
+        snprintf(s->family_path,sizeof s->family_path,"%s",path);
+}
+
 void d2k_sched_set_measure_mark(d2k_sched *s, uint32_t mark) {
     if (s) { s->measure_mark = mark; }
 }
@@ -9438,6 +9599,9 @@ static int start_search(d2k_sched *s, task *t) {
     return 1;
 }
 
+static int installed_family_ready(const d2k_sched *s, const task *t,
+                                  uint64_t after_event, int include_exact);
+
 /* ПРОВЕРКА ПЛАНА, ПОЯВИВШЕГОСЯ ПОСЛЕ ОТДЫХА ЦЕЛИ (24.10.2026).
  *
  * ЧТО БЫЛО. Подтверждённый план коробки догонял только те цели, чей поиск
@@ -9491,6 +9655,12 @@ static int plan_news_recheck(d2k_sched *s, target_cooldown *c, int64_t now_ms) {
     t->plan_retry = 1;
     t->started_ms = now_ms;
     t->began_ms = now_ms;
+    /* A confirmed, installed family already covers the next client flow.
+       A cooldown from an earlier failure must not start a donor recheck. */
+    if (installed_family_ready(s, t, 0, 0)) {
+        task_reset(s, t);
+        return 0;
+    }
     if (fill_hellos(s, t) != 0) { task_reset(s, t); return 0; }
     /* A fresh offer needs its own RR decision; do not reuse GREASE from
        different bytes cached since the exhausted measurement. */
@@ -15627,6 +15797,29 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
             continue;
         }
 
+        if(t->state==T_FAMILY_PROBE) {
+            int ready;d2k_ver_result v;
+            pthread_mutex_lock(&s->mu);ready=t->res_ready;v=t->ver;pthread_mutex_unlock(&s->mu);
+            if(!ready)continue;
+            join_worker(t);
+            if(family_ipv4_usable(&v)) {
+                int n=family_policy_publish(s,t,now_ms);
+                if(n>0)say(s,"по %s через IPv4 %s получен полный ответ аутентифицированного HTTPS-сервера%s; для %d DNS-клиентов записано правило предпочтения IPv4 на 60 минут, ждём следующего DNS-запроса",
+                    t->name,t->family_ipv4[t->family_ipv4_next],
+                    v.level==D2K_VER_CHALLENGE?" (challenge, работа страницы ещё не доказана)":"",n);
+                else say(s,"по %s IPv4 отвечает, но нет подходящего свежего DNS-клиента или не записано правило (%d)",
+                    t->name,n);
+                task_fail(s,t,now_ms);moved++;continue;
+            }
+            say(s,"по %s IPv4 %s не подтверждён полным ответом аутентифицированного HTTPS-сервера: уровень %d, HTTP %d, полный=%d, имя=%d, TLS-проверка=%d, challenge=%d; %s",
+                t->name,t->family_ipv4[t->family_ipv4_next],(int)v.level,v.status,
+                v.body_complete,v.name_ok,v.peer_authenticated,v.cloudflare_challenge,v.reason);
+            ver_close(t);
+            if(++t->family_ipv4_next<t->family_ipv4_count &&
+               !start_worker(s,t,JOB_FAMILY_PROBE)){moved++;continue;}
+            task_fail(s,t,now_ms);moved++;continue;
+        }
+
         if (t->state == T_ASKING) {
             int ready;
             d2k_vres r;
@@ -15708,7 +15901,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                 say(s, "по %s адрес %s не принимает данных (%s) — средствами d2k это не "
                        "обходится; повторная проверка этого адреса через %lld мин",
                     t->name, t->ip, r.reason, (long long)((delay_ms + 59999) / 60000));
-                task_fail(s, t, now_ms);
+                if(!family_probe_start(s,t,now_ms))task_fail(s, t, now_ms);
                 moved++;
                 continue;
             }
@@ -15999,7 +16192,7 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                        "одним нейтральным байтом, без триггера), другие адреса имени мерятся "
                        "как обычно",
                     t->name, t->ip, r.reason, (long long)((delay_ms + 59999) / 60000));
-                task_fail(s, t, now_ms);
+                if(!family_probe_start(s,t,now_ms))task_fail(s, t, now_ms);
                 moved++;
                 continue;
             }
@@ -16030,6 +16223,17 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     snprintf(r.reason, sizeof r.reason,
                              "прямой ответ не подтвердил прикладной успех; прямой замер не подтверждён");
                 }
+            }
+            /* A retransmitting live IPv6 flow stalled, but our own volume
+               probe did not complete its HTTP response. This is no proof
+               for a content plan. Test authenticated IPv4 for this name
+               before treating the inconclusive result as a cooldown. */
+            if (r.verdict == D2K_V_INCONCLUSIVE && t->family == 6 &&
+                t->trigger_code == D2K_SUSPECT_LATE_SILENCE &&
+                !volume_proven && !t->vol.rx_direct_complete &&
+                family_probe_start(s, t, now_ms)) {
+                moved++;
+                continue;
             }
             /* A measured synthesis candidate requests an isolated application
                trial; it does not assert a blocking class. CLEAR and other

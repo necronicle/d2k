@@ -550,6 +550,38 @@ static void test_cut_search(void) {
     CHECK(f.open_n == f.close_n, "cut probe sockets closed");
 }
 
+static void test_reset_before_response_starts_direct_check(void) {
+  for (int code = 5; code <= 6; code++) for (int closed = 0; closed < 2; closed++) {
+    fake f = {0};
+    d2k_hs_ops ops = ops_of(&f);
+    d2k_httpsearch *hs = d2k_httpsearch_new(&ops);
+    d2k_ev e = {0};
+    e.kind = D2K_EV_HTTP_RESPONSE;
+    e.code = code;
+    e.family = 4;
+    e.transport = 6;
+    e.high_port = 80;
+    memcpy(e.high_ip, IP, 16);
+    snprintf(e.name, sizeof e.name, "www.fast-torrent.ru");
+    snprintf(e.live_http_path, sizeof e.live_http_path, "/");
+    e.live_request_no = 1;
+    CHECK(d2k_httpsearch_control(hs, &e, 1000) == 1 && f.start_n == 1 &&
+          f.job.cut == 1 && !strcmp(f.job.repeat_path, "/"),
+          "a reset or repeated request before response starts an isolated direct check");
+    d2k_hs_result r = res(&f, closed ? D2K_HS_CLOSED : D2K_HS_SILENT);
+    r.requests_sent = 1;
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, 1100);
+    CHECK(f.start_n == 2, "an unanswered direct check is repeated once");
+    r = res(&f, closed ? D2K_HS_CLOSED : D2K_HS_SILENT);
+    r.requests_sent = 1;
+    r.seq = f.job.seq; r.fd = f.job.fd;
+    d2k_httpsearch_result(hs, &r, 1200);
+    CHECK(f.set_probe_n > 0, "a repeated unanswered direct check starts candidate search");
+    d2k_httpsearch_free(hs);
+  }
+}
+
 /* Ревью I-2: неизмеренный поиск не снимает план и не ставит часовую паузу. */
 static void base_injected(d2k_httpsearch *hs, fake *f, int64_t *now) {
     d2k_hs_result r = res(f,D2K_HS_INJECTED);
@@ -1403,6 +1435,7 @@ static void test_baseline_close_and_local(void) {
     d2k_httpsearch_free(hs);
 }
 int main(void) {
+    test_reset_before_response_starts_direct_check();
     test_probe_interim_large_header();
     test_server_close_probe();
     test_server_close_confirmation();

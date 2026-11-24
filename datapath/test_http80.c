@@ -832,7 +832,44 @@ static void test_response_cut(void) {
     }
 }
 
+static void test_reset_before_http_response(void) {
+    d2k_http80 *h = d2k_http80_new();
+    flow f = flow4(53100);
+    uint64_t t = 30000 * MS;
+    open_flow(h, &f, t, GET);
+    uint32_t ack = CISN + 1 + (uint32_t)strlen(GET);
+    size_t n = pkt(&f, 0, F_ACK | F_RST, SISN + 1, ack, NULL, b);
+    PKT(h, b, n, t + 200 * MS, &r);
+    CHECK(r.response == 5 && !strcmp(r.host, "RuTracker.org") &&
+          !strcmp(r.request_path, "/forum/index.php") && r.body_bytes == 0,
+          "a reset before any response is reported with the client's request context");
+    d2k_http80_delivered(h, b, n, 0, &r);
+    CHECK(r.response == 2, "a reset not delivered to the client is not network evidence");
+    d2k_http80_free(h);
+}
+
+static void test_retry_before_http_response(void) {
+    d2k_http80 *h = d2k_http80_new();
+    flow f = flow4(53101);
+    uint64_t t = 31000 * MS;
+    open_flow(h, &f, t, GET);
+    size_t n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    PKT(h, b, n, t + 150 * MS, &r);
+    CHECK(r.response == 0, "a duplicate inside the measured RTT is not a failure");
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, "GET /forum/", b);
+    PKT(h, b, n, t + 400 * MS, &r);
+    CHECK(r.response == 6 && !strcmp(r.host, "RuTracker.org") &&
+          !strcmp(r.request_path, "/forum/index.php"),
+          "a repeated full request without a response is reported with its path");
+    n = pkt(&f, 1, F_ACK | F_PSH, CISN + 1, SISN + 1, GET, b);
+    PKT(h, b, n, t + 700 * MS, &r);
+    CHECK(r.response == 0, "a repeated request is reported only once per flow");
+    d2k_http80_free(h);
+}
+
 int main(void) {
+    test_reset_before_http_response();
+    test_retry_before_http_response();
     test_field_injection(0);
     test_field_injection(1);
     test_field_injection_megafon();

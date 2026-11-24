@@ -41,6 +41,7 @@ typedef struct {
     uint32_t reply_next;
     uint64_t reply_time, reply_kstamp, request_no;
     int reply_started, reply_segments;
+    int retry_told;
     /* Обрыв ответа: конец тела по Content-Length (seq сервера), докуда
        подтвердил клиент, когда ответ последний раз продвинулся. */
     uint32_t body_start, body_end, acked;
@@ -270,7 +271,8 @@ void d2k_http80_delivered(d2k_http80 *h,const uint8_t *p,size_t n,int accepted,d
     const uint8_t *tcp=p+v.l4;size_t thl=(size_t)(tcp[12]>>4)*4;
     if(d2k_packet_u16(tcp)!=80 || (v.total==v.l4+thl && !(tcp[13]&0x05)))return;
     flow *f=find(h,v.family,v.dst.bytes,d2k_packet_u16(tcp+2),v.src.bytes,80,0);
-    if(!f || (f->state!=ST_REQUEST && r->response!=1))return;
+    if(!f || (f->state!=ST_REQUEST && r->response!=1 &&
+              r->response!=D2K_HTTP80_RESET_BEFORE_RESPONSE))return;
     f->reply.invalid=1;f->reply.complete=0;f->state=ST_DONE;
     request_result(f,r);r->response=2;
 }
@@ -399,6 +401,15 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
             return;
         }
         if (plen > 0 && f->state != ST_OPEN && f->state != ST_SYN) { h->st.later++; }
+        if(f->state==ST_REQUEST && plen && f->next_known && !f->reply_started &&
+           !f->retry_told && !seq_after(f->request_seq,seq) &&
+           !seq_after(seq+(uint32_t)plen,f->client_next) &&
+           f->rtt && now>f->t_req && now-f->t_req>=f->rtt) {
+            request_result(f,r);
+            r->response=D2K_HTTP80_RETRY_BEFORE_RESPONSE;
+            f->retry_told=1;
+            return;
+        }
         if(f->state==ST_REQUEST && plen)request_feed(f,seq,pay,plen);
         if ((f->state == ST_OPEN || f->state == ST_IDLE) && plen > 0) {
             /* A retransmission cannot become a new request or erase its
@@ -423,6 +434,7 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
                 f->state = ST_REQUEST;
                 f->acked = f->reply_next;
                 f->body_end_known = 0; f->cut_told = 0;
+                f->retry_told = 0;
                 f->progress = now;
                 f->t_req = now;
                 f->k_req = ks;
@@ -456,6 +468,12 @@ void d2k_http80_packet(d2k_http80 *h, const uint8_t *pkt, size_t len, uint64_t n
         return;
     }
     if(f->state!=ST_REQUEST || (!plen && !(flags&0x05)))return;
+    if((flags&0x04) && !f->reply_started && f->next_known) {
+        request_result(f,r);
+        r->response=D2K_HTTP80_RESET_BEFORE_RESPONSE;
+        f->state=ST_DONE;
+        return;
+    }
     /* Only a fully old retransmission is ignorable. Gaps and partial overlap
        are unknown; never splice header/body bytes across missing TCP data. */
     if(seq!=f->reply_next) {

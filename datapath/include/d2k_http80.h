@@ -43,6 +43,10 @@
 #define D2K_HTTP80_TARGET_MAX 1024
 /* Исход «обрыв»: ответ с заявленной длиной встал раньше конца. */
 #define D2K_HTTP80_CUT 4
+/* Клиентский запрос завершён, но до первого байта HTTP пришёл RST. */
+#define D2K_HTTP80_RESET_BEFORE_RESPONSE 5
+/* Запрос повторён после RTT, а ответа по потоку ещё не было. */
+#define D2K_HTTP80_RETRY_BEFORE_RESPONSE 6
 /* Тишина, после которой недокачанный ответ считается оборванным: не меньше
    этого и не меньше трёх RTT потока. */
 #define D2K_HTTP80_CUT_MIN_NS (2ull * 1000000000ull)
@@ -54,7 +58,8 @@ typedef struct d2k_http80 d2k_http80;
 typedef struct {
     int action;            /* D2K_HTTP80_* */
     int response;          /* 1: complete framing, 2: unknown, 3: portal (no timing claim),
-                              4: cut — a body with a length claim stopped short (D2K_HTTP80_CUT) */
+                              4: fixed-length body cut, 5: RST before HTTP response,
+                              6: client retry before HTTP response */
     unsigned status;       /* final HTTP status, if observed */
     uint64_t body_bytes;    /* observed body excluding chunk framing */
     uint64_t request_no;    /* request ordinal within this observed connection */

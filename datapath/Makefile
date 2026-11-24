@@ -45,7 +45,7 @@ SRC     = resend.c preflight_path.c preflight.c preflight_lease.c rawmeasure.c l
 # cross, которая линкует ПОЛНУЮ службу под обе целевые арки: полная сборка
 # доказывает больше, чем компиляция объектников.
 LINUXSRC = nfq.c raw.c routemark_nl.c postnat_link.c postnat_capture.c
-SRC += postnat_packet.c postnat_own.c
+SRC += postnat_packet.c postnat_own.c dns_family.c
 DAEMON   = d2kd.c
 # Исполнитель поздней доставки — поток (этап 53).
 DAEMON_LIBS = -lpthread
@@ -54,14 +54,23 @@ HDR     = include/d2k_resend.h include/d2k_postnat_capture.h include/d2k_postnat
 HDR += include/d2k_preflight_path.h include/d2k_preflight.h include/d2k_preflight_lease.h include/d2k_rawmeasure.h include/d2k_rawmeasure_wire.h
 HDR += include/d2k_http_response.h include/d2k_http_request_stream.h
 HDR += ../runtime/d2k_runtime.h ../runtime/d2k_protocol.h include/d2k_http_trace.h
+HDR += include/d2k_dns_family.h
 
 # Тесты и их объектные файлы. Один список — чтобы санитайзерная цель не
 # разъезжалась с обычной: разъехавшись, она проверяла бы не то дерево.
 TESTS   = test_resend test_preflight test_rawmeasure test_rawmeasure_wire test_flow_identity test_icmpguard test_addr test_hold test_udp_hold test_udp_release test_udp_path test_routemark test_capture test_plan_parse test_plan_apply test_tls test_wire test_wire_udp test_track test_session test_nat test_nl test_sched test_journal test_plans test_ctl test_stun_session test_quic_session test_ctq test_http80 test_http_hello test_http_trace
 TESTS += test_postnat_packet test_postnat_own test_postnat_alloc
+TESTS += test_dns_family
 
+test_dns_family: test_dns_family.c dns_family.c include/d2k_dns_family.h
+	$(CC) $(CFLAGS) -o $@ test_dns_family.c dns_family.c $(LDFLAGS)
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
+test-dns-family: test_dns_family
+	./test_dns_family
+
+check: test-dns-family
+
+.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-dns-family test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
 all: planlab ctlprobe
 

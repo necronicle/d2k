@@ -84,6 +84,7 @@ EXP_SOCK=$RUN/d2kd-exp.sock
 #              INPUT       — ответы собственным зондам: они идут не транзитом.
 CHAIN_OUT=D2K_OUT
 CHAIN_IN=D2K_IN
+CHAIN_DNS_FAMILY=D2K_DNS_FAMILY
 CHAIN_WCLR=D2K_WCLR
 # Свои цепочки d2kd для запасного способа поздней доставки (этап 53): правила
 # точного кортежа conntrack в них ставит и снимает сам d2kd, служба только
@@ -852,6 +853,7 @@ fw_family_up() (
         return 3
     fi
     "$fw_tool" -t mangle -N "$CHAIN_IN"  2>/dev/null || return 1
+    "$fw_tool" -t mangle -N "$CHAIN_DNS_FAMILY" 2>/dev/null || return 1
     if [ "${LATE_WATCH:-0}" = 1 ]; then
         # d2kd мог создать их сам (уборка на старте) — уже есть, ладно.
         "$fw_tool" -t mangle -N "$CHAIN_LATE_OUT" 2>/dev/null || "$fw_tool" -t mangle -n -L "$CHAIN_LATE_OUT" >/dev/null 2>&1 || return 1
@@ -1043,6 +1045,10 @@ fw_family_up() (
     "$fw_tool" -t mangle -I POSTROUTING -j "$CHAIN_OUT" || return 1
     "$fw_tool" -t mangle -I FORWARD     -j "$CHAIN_IN"  || return 1
     "$fw_tool" -t mangle -I INPUT       -j "$CHAIN_IN"  || return 1
+    "$fw_tool" -t mangle -I INPUT -p udp --dport 53 ! -s "$loopback" \
+        -j "$CHAIN_DNS_FAMILY" || return 1
+    "$fw_tool" -t mangle -I OUTPUT -p udp --sport 53 ! -d "$loopback" \
+        -j "$CHAIN_DNS_FAMILY" || return 1
     return 0
 )
 
@@ -1091,10 +1097,21 @@ fw_up_unlocked() {
         *) return 1 ;;
     esac
     ppe_up
+    dns_family_sync_unlocked || say "правила IPv4 fallback не синхронизировались; DNS оставлен без изменения"
 }
 
 fw_family_down() (
     fw_tool=$1
+    dns_loopback=127.0.0.0/8
+    [ "$fw_tool" != ip6tables ] || dns_loopback=::1/128
+    while "$fw_tool" -t mangle -D OUTPUT -p udp --sport 53 ! -d "$dns_loopback" \
+        -j "$CHAIN_DNS_FAMILY" 2>/dev/null; do :; done
+    while "$fw_tool" -t mangle -D INPUT -p udp --dport 53 ! -s "$dns_loopback" \
+        -j "$CHAIN_DNS_FAMILY" 2>/dev/null; do :; done
+    if "$fw_tool" -t mangle -n -L "$CHAIN_DNS_FAMILY" >/dev/null 2>&1; then
+        "$fw_tool" -t mangle -F "$CHAIN_DNS_FAMILY" 2>/dev/null
+        "$fw_tool" -t mangle -X "$CHAIN_DNS_FAMILY" 2>/dev/null
+    fi
     if [ "$fw_tool" = iptables ]; then
         while "$fw_tool" -t nat -D POSTROUTING -p tcp -m mark --mark "$PF_MARK" -j MASQUERADE 2>/dev/null; do :; done
     fi
@@ -1322,6 +1339,12 @@ nft_ruleset() (
     cat <<EOF
 table inet $NFT_TABLE {
     $pf_clear
+	chain dns_family_out {
+		type filter hook output priority mangle; policy accept;
+	}
+	chain dns_family_in {
+		type filter hook input priority mangle; policy accept;
+	}
 	chain out {
 		type filter hook postrouting priority mangle; policy accept;
         $pf_out
@@ -1426,7 +1449,7 @@ nft_preflight_contract() {
 fw_nft_installed() (
     listed=$(nft list table inet "$NFT_TABLE" 2>/dev/null) || return 1
     nft_has "$NFT_RST_TABLE" || return 1
-    for chain in out in_rules in_forward in_input nat_post; do
+    for chain in out dns_family_out dns_family_in in_rules in_forward in_input nat_post; do
         printf '%s\n' "$listed" | grep -q "chain $chain {" || return 1
     done
     printf '%s\n' "$listed" | grep -q masquerade || return 1
@@ -1439,8 +1462,68 @@ fw_nft_installed() (
     # сверяется число правил очереди с bypass и своим номером очереди.
     want=$(nft_ruleset | grep -c queue) || return 1
     got=$(printf '%s\n' "$listed" | grep queue | grep bypass | grep -cw -- "$QUEUE_NUM")
-    [ "$got" -eq "$want" ]
+    dynamic=$(printf '%s\n' "$listed" | sed -n '/chain dns_family_out {/,/^[[:space:]]*}/p; /chain dns_family_in {/,/^[[:space:]]*}/p' | grep -c queue || :)
+    [ "$((got - dynamic))" -eq "$want" ]
 )
+
+# Only clients with an active, controller-verified lease enter NFQUEUE. The
+# empty OUTPUT chain is cheap and preserves ordinary DNS latency while no
+# fallback is active. File data is never evaluated as shell code.
+dns_family_sync_unlocked() {
+    local family_now family_file family_expiry family_kind family_addr family_name family_extra family_tool family_bad
+    family_now=$(date +%s) || return 1
+    family_file=$STATE_DIR/ipv4-fallback
+    family_bad=0
+    if [ "$FW_BACKEND" = nft ]; then
+        nft list chain inet "$NFT_TABLE" dns_family_out >/dev/null 2>&1 || return 0
+        nft flush chain inet "$NFT_TABLE" dns_family_out || return 1
+        nft flush chain inet "$NFT_TABLE" dns_family_in || return 1
+    else
+        for family_tool in iptables ip6tables; do
+            command -v "$family_tool" >/dev/null 2>&1 || continue
+            "$family_tool" -t mangle -n -L "$CHAIN_DNS_FAMILY" >/dev/null 2>&1 || continue
+            "$family_tool" -t mangle -F "$CHAIN_DNS_FAMILY" || return 1
+        done
+    fi
+    [ -r "$family_file" ] || return 0
+    while read -r family_expiry family_kind family_addr family_name family_extra; do
+        case "$family_expiry" in ''|*[!0-9]*) continue ;; esac
+        [ "$family_expiry" -gt "$family_now" ] 2>/dev/null || continue
+        [ -n "$family_name" ] && [ -z "$family_extra" ] || continue
+        case "$family_kind" in
+            4) family_tool=iptables; case "$family_addr" in *:*) continue ;; esac ;;
+            6) family_tool=ip6tables; case "$family_addr" in *:*) ;; *) continue ;; esac ;;
+            *) continue ;;
+        esac
+        if [ "$FW_BACKEND" = nft ]; then
+            if [ "$family_kind" = 4 ]; then
+                nft add rule inet "$NFT_TABLE" dns_family_out ip daddr "$family_addr" \
+                    udp sport 53 queue num "$QUEUE_NUM" bypass || family_bad=1
+                nft add rule inet "$NFT_TABLE" dns_family_in ip saddr "$family_addr" \
+                    udp dport 53 queue num "$QUEUE_NUM" bypass || family_bad=1
+            else
+                nft add rule inet "$NFT_TABLE" dns_family_out ip6 daddr "$family_addr" \
+                    udp sport 53 queue num "$QUEUE_NUM" bypass || family_bad=1
+                nft add rule inet "$NFT_TABLE" dns_family_in ip6 saddr "$family_addr" \
+                    udp dport 53 queue num "$QUEUE_NUM" bypass || family_bad=1
+            fi
+        elif command -v "$family_tool" >/dev/null 2>&1 &&
+             "$family_tool" -t mangle -n -L "$CHAIN_DNS_FAMILY" >/dev/null 2>&1; then
+            "$family_tool" -t mangle -A "$CHAIN_DNS_FAMILY" -d "$family_addr" \
+                -p udp --sport 53 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || family_bad=1
+            "$family_tool" -t mangle -A "$CHAIN_DNS_FAMILY" -s "$family_addr" \
+                -p udp --dport 53 -j NFQUEUE --queue-num "$QUEUE_NUM" --queue-bypass || family_bad=1
+        fi
+    done < "$family_file"
+    [ "$family_bad" = 0 ]
+}
+dns_family_sync() {
+    fw_lock_acquire || return 1
+    local family_rc=0
+    dns_family_sync_unlocked || family_rc=1
+    fw_lock_release || return 1
+    return "$family_rc"
+}
 
 fw_down_unlocked() {
     local fw_remove_rc=0
@@ -1888,6 +1971,7 @@ fw_up() {
         elif fw_nft_up; then
             rc=0
             [ ! -f "$OPENWRT_RELEASE" ] || dns_config_snapshot >/dev/null
+            dns_family_sync_unlocked || say "правила IPv4 fallback не синхронизировались; DNS оставлен без изменения"
         else
             say "nft не принял правила — см. $RUN/fw.nft"
             fw_down_unlocked
@@ -1955,6 +2039,10 @@ fw_family_installed() (
     "$fw_tool" -t mangle -C POSTROUTING -j "$CHAIN_OUT" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C FORWARD -j "$CHAIN_IN" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C INPUT -j "$CHAIN_IN" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C OUTPUT -p udp --sport 53 ! -d "$loopback" \
+        -j "$CHAIN_DNS_FAMILY" 2>/dev/null || return 1
+    "$fw_tool" -t mangle -C INPUT -p udp --dport 53 ! -s "$loopback" \
+        -j "$CHAIN_DNS_FAMILY" 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MARK" -j RETURN 2>/dev/null || return 1
     "$fw_tool" -t mangle -C "$CHAIN_OUT" -m mark --mark "$MEASURE_MARK" -j RETURN 2>/dev/null || return 1
     for proto in tcp udp; do
@@ -2395,7 +2483,7 @@ start_engine() {
 spawn_datapath() {
     dpmode=observe
     [ "$MODE" = "apply" ] && dpmode=apply
-    set -- --health-file "$RUNTIME_DIR/d2kd.health"
+    set -- --health-file "$RUNTIME_DIR/d2kd.health" --dns-family-file "$STATE_DIR/ipv4-fallback"
     [ "${D2K_PREFLIGHT:-0}" != 1 ] || set -- "$@" --preflight --provider-ips "$STATE_DIR/provider-ips"
     [ "${D2K_PREFLIGHT_V6:-0}" != 1 ] || set -- "$@" --preflight-ipv6
     [ "${TCP_WATCH:-0}" != 1 ] || set -- "$@" --watch-release-bit 0x20000000
@@ -2920,11 +3008,20 @@ fw_recover_mangle() (
     if [ "$need4" = 1 ]; then
         printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
             iptables-restore --noflush || exit 1
+        iptables -t mangle -I INPUT -p udp --dport 53 ! -s 127.0.0.0/8 \
+            -j "$CHAIN_DNS_FAMILY" || exit 1
+        iptables -t mangle -I OUTPUT -p udp --sport 53 ! -d 127.0.0.0/8 \
+            -j "$CHAIN_DNS_FAMILY" || exit 1
     fi
     if [ "$need6" = 1 ]; then
         printf '%s\n' '*mangle' "-I POSTROUTING 1 -j $CHAIN_OUT" "-I FORWARD 1 -j $CHAIN_IN" "-I INPUT 1 -j $CHAIN_IN" COMMIT |
             ip6tables-restore --noflush || exit 1
+        ip6tables -t mangle -I INPUT -p udp --dport 53 ! -s ::1/128 \
+            -j "$CHAIN_DNS_FAMILY" || exit 1
+        ip6tables -t mangle -I OUTPUT -p udp --sport 53 ! -d ::1/128 \
+            -j "$CHAIN_DNS_FAMILY" || exit 1
     fi
+    dns_family_sync_unlocked || exit 1
     ppe_up
     fw_installed || exit 1
     rm -f "$RUN/fw-ipv4-rebuilding"
@@ -3086,7 +3183,7 @@ case "$1" in
     openwrt-policies) openwrt_policies ;;
     start)   locked; start ;;
     recover) engine_lock 0 || exit 0; recover ;;
-    heal) locked; if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; fi
+    heal) locked; if running "$DP_PID"; then fw_installed || reapply; ppe_ensure; dns_family_sync; fi
           telegram_reapply ;;
     dns-tick) "$DNS_SCHEDULER" tick ;;
     dns-refresh) "$RELEASE/d2k-instagram-dns.sh" refresh ;;
@@ -3121,6 +3218,7 @@ case "$1" in
     clear-found) locked; clear_found ;;
     ppe-ensure) ppe_ensure ;;
     dns-ensure) if running "$DP_PID" && fw_installed; then dns_excl_sync; fi ;;
+    dns-family-sync) if running "$DP_PID"; then dns_family_sync; fi ;;
     ppe-remove) d2k_ppe_remove ;;
     ppe-status)
         command -v d2k_ppe_status >/dev/null 2>&1 || die "нет $PPE_LIB"

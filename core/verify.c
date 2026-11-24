@@ -1266,7 +1266,13 @@ static void request_page_budget(read_fn rd, write_fn wr, void *sess,
         r->status = code;
         r->http_outcome = http_reply.outcome;
         snprintf(r->http_evidence, sizeof r->http_evidence, "%s", http_reply.evidence);
-        if (r->cloudflare_challenge) { r->level = D2K_VER_CHALLENGE; return; }
+        if (r->cloudflare_challenge) {
+            r->level = D2K_VER_CHALLENGE;
+            snprintf(r->reason, sizeof r->reason,
+                     "HTTP %d Cloudflare challenge, тело %s", code,
+                     r->body_complete ? "полное" : "неполное");
+            return;
+        }
         /* HTTP 451 — ОТКАЗ САЙТА ТОЛЬКО ОТ САЙТА (24.10.2026).
          *
          * Код 451 сам по себе не говорит, КТО ответил, а решение по нему
@@ -2426,9 +2432,13 @@ d2k_ver_result d2k_verify_doh_observe_io(const d2k_tls_io *io,const d2k_tls_prob
 }
 
 static d2k_doh_tls_open_fn doh_tls_open;
+static d2k_doh_tls_open_fn page_tls_open;
 
 void d2k_verify_doh_set_tls(d2k_doh_tls_open_fn open_tls) {
     doh_tls_open = open_tls;
+}
+void d2k_verify_page_set_tls(d2k_doh_tls_open_fn open_tls) {
+    page_tls_open = open_tls;
 }
 
 static d2k_dot_probe_fn dot_probe;
@@ -2586,8 +2596,8 @@ d2k_ver_result d2k_verify_doh_on(int fd,const char *ip,uint16_t port,const char 
     return d2k_verify_doh_question_on(fd,ip,port,host,timeout,wire,tls12,mark,path,NULL,0);
 }
 
-d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const char *host,
-    int timeout,size_t wire,int tls12) {
+static d2k_ver_result verify_authenticated_page_on(int fd,const char *ip,uint16_t port,
+    const char *host,int timeout,size_t wire,int tls12,d2k_doh_tls_open_fn open_tls) {
     (void)wire;
     d2k_ver_result r={.fd=-1,.name_ok=-1};
     uint8_t address[16];
@@ -2598,7 +2608,7 @@ d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const
         r.local_refusal=1;
         snprintf(r.reason,sizeof r.reason,"invalid preflight endpoint");return r;
     }
-    if(!doh_tls_open) {
+    if(!open_tls) {
         if(fd>=0)close(fd);
         r.unsupported=1;
         snprintf(r.reason,sizeof r.reason,"authenticated preflight TLS backend unavailable");return r;
@@ -2613,7 +2623,7 @@ d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const
     r.family=family;r.level=D2K_VER_TRANSPORT;
     d2k_doh_tls_session session={0};
     uint16_t version=tls12?0x0303:0x0304;
-    d2k_doh_tls_status status=doh_tls_open(r.fd,host,version,timeout,&session);
+    d2k_doh_tls_status status=open_tls(r.fd,host,version,timeout,&session);
     if(status!=D2K_DOH_TLS_OK) {
         r.peer_auth_failed=status==D2K_DOH_TLS_AUTH;
         r.local_refusal=status==D2K_DOH_TLS_LOCAL;
@@ -2658,4 +2668,12 @@ d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const
     r.data_packets=packets>0?(unsigned)packets:0;
     session.release(session.io.context);
     return r;
+}
+d2k_ver_result d2k_verify_preflight_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,size_t wire,int tls12) {
+    return verify_authenticated_page_on(fd,ip,port,host,timeout,wire,tls12,doh_tls_open);
+}
+d2k_ver_result d2k_verify_family_page_on(int fd,const char *ip,uint16_t port,const char *host,
+    int timeout,size_t wire,int tls12) {
+    return verify_authenticated_page_on(fd,ip,port,host,timeout,wire,tls12,page_tls_open);
 }

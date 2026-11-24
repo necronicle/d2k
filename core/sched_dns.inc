@@ -166,7 +166,47 @@ static void d2k_sched_dns_observe_answer_path(d2k_sched *s,const d2k_dns_answer 
     dns_observe_answer_paths(s,a,now,paths);
 }
 #endif
+static void family_dns_client_observe(d2k_sched *s,const d2k_dns_answer *a,int64_t now) {
+    if(!s||!a||!a->question[0]||!a->ttl||
+       (a->family!=4&&a->family!=6)||(a->type!=1&&a->type!=28))return;
+    size_t width=a->family==4?4:16;
+    if(!dns_nonzero(a->client,width))return;
+    /* This is a recent client/answer observation, not a DNS RR cache entry.
+     * The failed IPv6 search may outlast a 60-second CDN TTL. Revalidate the
+     * A address with authenticated HTTPS before publishing any policy. */
+    int64_t span=600000;
+    family_dns_client *slot=NULL,*old=&s->family_clients[0];
+    for(size_t i=0;i<sizeof s->family_clients/sizeof s->family_clients[0];i++) {
+        family_dns_client *c=&s->family_clients[i];
+        if(c->expires_ms<=now){slot=c;break;}
+        if(c->family==a->family&&!strcasecmp(c->name,a->question)&&
+           !memcmp(c->client,a->client,width)){slot=c;break;}
+        if(c->expires_ms<old->expires_ms)old=c;
+    }
+    if(!slot)slot=old;
+    memset(slot,0,sizeof *slot);
+    slot->family=a->family;memcpy(slot->client,a->client,width);
+    snprintf(slot->name,sizeof slot->name,"%s",a->question);
+    slot->expires_ms=now>INT64_MAX-span?INT64_MAX:now+span;
+    if(a->type==1)for(size_t j=0;j<a->count;j++) {
+        family_dns_a *dst=NULL,*oldest=&s->family_a[0];
+        for(size_t i=0;i<sizeof s->family_a/sizeof s->family_a[0];i++) {
+            family_dns_a *r=&s->family_a[i];
+            if(r->expires_ms<=now){dst=r;break;}
+            if(!strcasecmp(r->name,a->question)&&!memcmp(r->address,a->addresses[j],4)){
+                dst=r;break;
+            }
+            if(r->expires_ms<oldest->expires_ms)oldest=r;
+        }
+        if(!dst)dst=oldest;
+        memset(dst,0,sizeof *dst);
+        snprintf(dst->name,sizeof dst->name,"%s",a->question);
+        memcpy(dst->address,a->addresses[j],4);
+        dst->expires_ms=now>INT64_MAX-span?INT64_MAX:now+span;
+    }
+}
 void d2k_sched_dns_observe_answer(d2k_sched *s,const d2k_dns_answer *a,int64_t now) {
+    family_dns_client_observe(s,a,now);
     uint32_t paths[D2K_DNS_ANSWER_MAX_ADDR]={0};uint8_t family=a&&a->type==28?6:4;
     if(a)for(size_t i=0;i<a->count&&i<D2K_DNS_ANSWER_MAX_ADDR;i++)paths[i]=dns_route_path(a,a->addresses[i],family);
     dns_observe_answer_paths(s,a,now,paths);
