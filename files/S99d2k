@@ -330,13 +330,26 @@ legacy_http_present() {
     iptables -t nat -C PREROUTING -j D2K_HTTP 2>/dev/null && return 0
     return 1
 }
+
+# Wait budgets below are in tenths of a second. Entware's BusyBox may
+# accept only whole seconds; account for those seconds without retrying
+# the unsupported fractional argument on every poll.
+D2K_WAIT_TICKS=1
+wait_tenth() {
+    if [ "$D2K_WAIT_TICKS" -eq 1 ]; then
+        sleep 0.1 2>/dev/null && return 0
+        D2K_WAIT_TICKS=10
+    fi
+    sleep 1
+}
+
 legacy_http_stop() {
     if lpid=$(legacy_http_pid); then
         kill "$lpid" 2>/dev/null
         i=0
         while [ -d "$PROC_DIR/$lpid" ] && kill -0 "$lpid" 2>/dev/null && [ $i -lt 30 ]; do
-            i=$((i + 1))
-            sleep 0.1 2>/dev/null || sleep 1
+            wait_tenth
+            i=$((i + D2K_WAIT_TICKS))
         done
         kill -0 "$lpid" 2>/dev/null && kill -9 "$lpid" 2>/dev/null
     fi
@@ -466,10 +479,11 @@ pid_by_comm() {
 # системе он один.
 wait_running() {
     _pidf=$1; _name=$2; _i=0
-    while [ "$_i" -lt 30 ]; do
+    while :; do
         running "$_pidf" && return 0
-        _i=$((_i + 1))
-        sleep 0.1 2>/dev/null || sleep 1
+        [ "$_i" -lt 30 ] || break
+        wait_tenth
+        _i=$((_i + D2K_WAIT_TICKS))
     done
     _p=$(pid_by_comm "$_name") || return 1
     [ -n "$_p" ] || return 1
@@ -1584,7 +1598,7 @@ ppe_ensure() {
 }
 
 # Замок-каталог: mkdir атомарен. Замок умершего владельца снимается.
-dir_lock_acquire() { # <каталог> <попыток по 0,1 с; 0 — не ждать>
+dir_lock_acquire() { # <каталог> <бюджет в десятых секунды; 0 — не ждать>
     local attempt owner
     attempt=0
     while ! mkdir "$1" 2>/dev/null; do
@@ -1613,8 +1627,8 @@ dir_lock_acquire() { # <каталог> <попыток по 0,1 с; 0 — не 
                 fi ;;
         esac
         [ "$attempt" -lt "$2" ] || return 1
-        attempt=$((attempt + 1))
-        sleep 0.1 2>/dev/null || sleep 1
+        wait_tenth
+        attempt=$((attempt + D2K_WAIT_TICKS))
     done
     printf '%s\n' "$$" > "$1/pid" || { rmdir "$1"; return 1; }
 }
@@ -2502,15 +2516,16 @@ spawn_datapath() {
     # Ждём привязки очереди, а не спим наугад: правила, поставленные до
     # привязки, отправляют пакеты в никуда.
     i=0
-    while [ $i -lt 50 ]; do
+    while :; do
         bound=$(awk -v q="$QUEUE_NUM" '$1==q{print $2}' \
             /proc/net/netfilter/nfnetlink_queue 2>/dev/null)
         if [ -n "$bound" ] && [ "$bound" != "0" ]; then
             pid_stamp "$DP_PID"
             return 0
         fi
-        i=$((i + 1))
-        sleep 0.1 2>/dev/null || sleep 1
+        [ "$i" -lt 50 ] || break
+        wait_tenth
+        i=$((i + D2K_WAIT_TICKS))
     done
     return 2
 }
@@ -2747,14 +2762,8 @@ stop_pidfile() {
         [ "$p" != "${SH_PID:-}" ] || stop_ticks_max=300
         i=0
         while running "$p" && [ $i -lt "$stop_ticks_max" ]; do
-            i=$((i + 1))
-            if ! sleep 0.1 2>/dev/null; then
-                sleep 1
-                # Preserve the datapath bound with integer-only sleep too.
-                if [ "$p" = "$DP_PID" ] || [ "$p" = "${SH_PID:-}" ]; then
-                    i=$((i + 9))
-                fi
-            fi
+            wait_tenth
+            i=$((i + D2K_WAIT_TICKS))
         done
         if running "$p"; then
             if [ "$p" = "$DP_PID" ] || [ "$p" = "$CT_PID" ]; then
@@ -2796,7 +2805,8 @@ telegram_start() {
     i=0
     while [ $i -lt 20 ]; do
         running "$TG_PID" && break
-        i=$((i + 1)); sleep 0.1 2>/dev/null || sleep 1
+        wait_tenth
+        i=$((i + D2K_WAIT_TICKS))
     done
     if ! running "$TG_PID"; then
         say "d2ktg завершился при запуске — см. $LOG/telegram.log"

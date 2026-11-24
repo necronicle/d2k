@@ -113,6 +113,24 @@ s99() {
 }
 rules() { FW_STATE="$TMP/fw" "$TMP/bin/$1" -t "$2" -S 2>/dev/null; }
 
+# BusyBox on Entware can reject fractional sleep. Preserve the same elapsed
+# startup budget and remember the supported interval within this command.
+S99_SNIPPET='
+    one_second_sleeps=0; fractional_attempts=0
+    sleep() {
+        case "$1" in
+            0.1) fractional_attempts=$((fractional_attempts + 1)); return 1 ;;
+            1) one_second_sleeps=$((one_second_sleeps + 1)); return 0 ;;
+            *) return 2 ;;
+        esac
+    }
+    running() { return 1; }
+    pid_by_comm() { return 1; }
+    if wait_running "$RUN/missing.pid" d2kc; then exit 1; fi
+    [ "$one_second_sleeps" -eq 3 ] && [ "$fractional_attempts" -eq 1 ]
+' s99 || fail "integer-only sleep must preserve the three-second startup budget"
+ok "BusyBox integer-only sleep preserves the elapsed startup budget"
+
 # Task7: produce real rule output, then run packet fixtures through both backends.
 S99_SNIPPET='D2K_PREFLIGHT=1; MODE=apply; LATE_WATCH=0; VOICE_LATE=0; fw_up && fw_installed; nft_ruleset > "$RUN/nft.rules"' s99 >/dev/null 2>&1 || fail "preflight rules install"
 cp "$TMP/run/nft.rules" "$TMP/fw/nft.rules"

@@ -42,7 +42,7 @@ log() {
 }
 
 random16() {
-    r=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+    r=$(hexdump -v -n 2 -e '1/2 "%u"' /dev/urandom 2>/dev/null)
     case "$r" in ''|*[!0-9]*) r=$(awk -v s="$$" 'BEGIN{srand(s); print int(rand()*65536)}');; esac
     printf '%s\n' "$r"
 }

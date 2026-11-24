@@ -64,9 +64,11 @@ try {
 
   // Without stat, check size using only a bounded tail; decimal values with
   // leading zeroes must not cause shell octal errors.
-  fs.writeFileSync(path.join(bin, 'stat'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
-  run({ PATH: `${bin}:${process.env.PATH}`, LOGMAX: '00003072', LOGKEEP: '00001024' });
+  const statCalls = path.join(tmp, 'stat.calls');
+  fs.writeFileSync(path.join(bin, 'stat'), '#!/bin/sh\nprintf "%s\\n" "$1" >> "$STAT_CALLS"\nexit 1\n', { mode: 0o755 });
+  run({ PATH: bin + ':' + process.env.PATH, LOGMAX: '00003072', LOGKEEP: '00001024', STAT_CALLS: statCalls });
   assert.deepEqual(fs.readFileSync(file), Buffer.alloc(1024, 'Z'));
+  assert.equal(fs.readFileSync(statCalls, 'utf8'), '-c\n-f\n', 'probe unsupported stat formats once per worker');
 
   const foreign = path.join(tmp, 'foreign'); fs.writeFileSync(foreign, payload);
   fs.unlinkSync(file); fs.symlinkSync(foreign, file); run();

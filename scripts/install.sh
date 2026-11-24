@@ -515,14 +515,16 @@ esac
 # e_ident[EI_CLASS] (байт 4: 1 — 32 бита, 2 — 64), e_ident[EI_DATA] (байт 5:
 # 1 — little-endian, 2 — big-endian) и e_machine (байты 18-19 в порядке
 # EI_DATA; 8 — MIPS, 183 — AArch64, 40 — ARM, 62 — x86-64, 3 — i386,
-# 243 — RISC-V, 21 — PPC64). od с -A/-N/-t есть в busybox (им уже пользуется
-# files/d2k-instagram-dns-scheduler.sh); xxd там нет.
-ABI_ELF_FILES=${D2K_ABI_ELF_FILES:-"/bin/busybox /bin/sh /bin/ash /usr/bin/env"}
+# 243 — RISC-V, 21 — PPC64). Entware BusyBox od rejects -A/-N/-t;
+# its hexdump supports reading a bounded byte sequence on both MIPS ABIs.
+ABI_ELF_FILES=${D2K_ABI_ELF_FILES:-"/bin/busybox /bin/sh /bin/ash /usr/bin/env /opt/bin/busybox /opt/usr/bin/busybox"}
 if [ -z "$ABI_ARCH" ]; then
     abi_source "заголовок ELF ($ABI_ELF_FILES)"
     for elf_cand in $ABI_ELF_FILES; do
         [ -r "$elf_cand" ] || continue
-        elf_hdr=$(od -An -tx1 -N20 "$elf_cand" 2>/dev/null | tr -d ' \n')
+        elf_hdr=$(hexdump -v -n 20 -e '1/1 "%02x"' "$elf_cand" 2>/dev/null) ||
+            elf_hdr=$(busybox hexdump -v -n 20 -e '1/1 "%02x"' "$elf_cand" 2>/dev/null) ||
+            elf_hdr=$(od -An -tx1 -N20 "$elf_cand" 2>/dev/null | tr -d ' \n')
         [ "${#elf_hdr}" = 40 ] || continue
         case "$elf_hdr" in 7f454c46*) ;; *) continue ;; esac
         elf_class=$(printf '%s' "$elf_hdr" | cut -c9-10)
