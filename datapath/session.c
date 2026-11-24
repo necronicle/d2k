@@ -76,6 +76,7 @@ struct d2k_session {
     d2k_pf_table preflight;
     d2k_pf_lease_table preflight_leases;
     preflight_context *preflight_contexts;
+    unsigned preflight_context_extent;
     uint64_t preflight_calls;
     uint32_t packet_path;
 
@@ -478,7 +479,7 @@ static void preflight_event(d2k_session *s, preflight_context *c, uint64_t now, 
  * lookup witness, not another packet fed to the FSM. Terminal contexts release
  * their metadata slot; FSM terminal entries still suppress repeat same-ISN SYN. */
 static void preflight_progress(d2k_session *s, const d2k_key *key, uint64_t now) {
-    for (unsigned i = 0; i < s->preflight.cap; i++) {
+    for (unsigned i = 0; i < s->preflight_context_extent; i++) {
         preflight_context *c = &s->preflight_contexts[i];
         if (!c->used || (key && !d2k_key_equal(&c->key, key))) continue;
         d2k_pkt p = {0}; p.wire = c->syn; p.wire_len = c->syn_len;
@@ -500,7 +501,7 @@ void d2k_session_preflight_send_cap(d2k_session *s,size_t cap) {
     if (s) s->preflight_send_cap=cap;
 }
 static preflight_context *preflight_context_for(d2k_session *s, const d2k_key *key) {
-    for (unsigned i = 0; i < s->preflight.cap; i++) {
+    for (unsigned i = 0; i < s->preflight_context_extent; i++) {
         preflight_context *c = &s->preflight_contexts[i];
         if (c->used && d2k_key_equal(&c->key, key)) return c;
     }
@@ -554,7 +555,7 @@ void d2k_session_preflight_complete(d2k_session *s,const uint8_t *p,size_t n,
 }
 void d2k_session_preflight_original_sent(d2k_session *s,const uint8_t *p,size_t n,uint64_t now) {
     if (!s || !s->preflight_enabled) return;
-    for (unsigned i=0;i<s->preflight.cap;i++) {
+    for (unsigned i=0;i<s->preflight_context_extent;i++) {
         preflight_context *c=&s->preflight_contexts[i];
         if (!c->used || c->stage!=PF_RESYN || c->handover_reported ||
             c->syn_len!=n || memcmp(c->syn,p,n)) continue;
@@ -566,7 +567,7 @@ void d2k_session_preflight_original_sent(d2k_session *s,const uint8_t *p,size_t 
 void d2k_session_preflight_flush(d2k_session *s,uint64_t now,d2k_pf_out *out) {
     out->count=0;
     if (!s || !s->preflight_enabled) return;
-    for (unsigned i=0;i<s->preflight.cap;i++) {
+    for (unsigned i=0;i<s->preflight_context_extent;i++) {
         preflight_context *c=&s->preflight_contexts[i];
         if (!c->used) continue;
         d2k_pkt p={0};p.wire=c->syn;p.wire_len=c->syn_len;
@@ -584,7 +585,7 @@ void d2k_session_preflight_abort(d2k_session *s, const uint8_t *p, size_t n,
     if (!s || !s->preflight_enabled) return;
     d2k_hold_info v;
     if (!d2k_hold_parse(p, n, &v)) return;
-    for (unsigned i=0;i<s->preflight.cap;i++) {
+    for (unsigned i=0;i<s->preflight_context_extent;i++) {
         preflight_context *c=&s->preflight_contexts[i];
         if (!c->used || !d2k_key_equal(&c->key,&v.key)) continue;
         d2k_pkt original={0};original.wire=c->syn;original.wire_len=c->syn_len;
@@ -655,8 +656,10 @@ int d2k_session_preflight_packet_path(d2k_session *s, const uint8_t *bytes, size
     int provider_ip=!use && dport==htons(443) &&
         d2k_provider_ips_has(&s->provider_ips,v.dst.bytes,v.dst.family,(uint64_t)time(NULL));
     if (!provider_ip && (!use || !use->binding_temporary || !use->pf_hello || !use->pf_hello_len)) return 0;
-    for (unsigned i = 0; i < s->preflight.cap; i++)
+    for (unsigned i = 0; i < s->preflight_context_extent; i++)
         if (!s->preflight_contexts[i].used) { context = &s->preflight_contexts[i]; break; }
+    if (!context && s->preflight_context_extent < s->preflight.cap)
+        context = &s->preflight_contexts[s->preflight_context_extent++];
     if (!context) return 0;
     d2k_pf_params params = provider_ip ? (d2k_pf_params){
         .window=1,.wscale=1,.pieces=1,.reference_hello=1,

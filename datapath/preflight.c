@@ -118,7 +118,7 @@ static int active(const d2k_pf_flow *f) {
 }
 static d2k_pf_flow *find(const d2k_pf_table *t, const d2k_hold_info *v, int server) {
     if (t && t->flows)
-        for (unsigned i = 0; i < t->cap; i++) {
+        for (unsigned i = 0; i < t->extent; i++) {
             d2k_pf_flow *f = &t->flows[i];
             if (f->used && d2k_key_equal(&f->key, &v->key) &&
                 (v->src_low != f->client_low) == server)
@@ -343,12 +343,14 @@ d2k_pf_verdict d2k_pf_client_syn(d2k_pf_table *t, const d2k_pkt *pkt, const d2k_
         v.payload || v.total > sizeof f->orig || pkt->wire_len != v.total)
         return PF_ACT_PASS;
     if (!f)
-        for (unsigned i = 0; i < t->cap; i++) {
+        for (unsigned i = 0; i < t->extent; i++) {
             if (!t->flows[i].used || !active(&t->flows[i])) {
                 f = &t->flows[i];
                 break;
             }
         }
+    if (!f && t->extent < t->cap)
+        f = &t->flows[t->extent++];
     if (!f) {
         t->full_passes++;
         return PF_ACT_PASS;
@@ -508,7 +510,7 @@ void d2k_pf_tick(d2k_pf_table *t, uint64_t now, d2k_pf_out *o) {
     o->count = 0;
     if (!t || !t->flows)
         return;
-    for (unsigned i = 0; i < t->cap; i++) {
+    for (unsigned i = 0; i < t->extent; i++) {
         d2k_pf_flow *f = &t->flows[i];
         if (f->used && f->cleanup_pending) {
             if(now>=f->cleanup_due) {
@@ -544,7 +546,7 @@ void d2k_pf_abort(d2k_pf_table *t, const d2k_pkt *pkt, d2k_pf_out *o) {
 uint64_t d2k_pf_next_ns(const d2k_pf_table *t) {
     uint64_t n = 0;
     if (t && t->flows)
-        for (unsigned i = 0; i < t->cap; i++) {
+        for (unsigned i = 0; i < t->extent; i++) {
             const d2k_pf_flow *f = &t->flows[i];
             if (f->used && active(f)) {
                 uint64_t due=f->cleanup_pending ? f->cleanup_due :

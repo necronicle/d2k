@@ -51,7 +51,7 @@ static void release_slot(d2k_hold *h, held *s, d2k_hold_release release, void *c
 }
 void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,
                     d2k_hold_release release, void *ctx) {
-    if (!h) { return; }
+    if (!h || !h->stats.pending) { return; }
     for (size_t i = 0; i < D2K_HOLD_SLOTS; i++) {
         held *s = &h->slots[i];
         if (!s->count) { continue; }
@@ -72,7 +72,7 @@ void d2k_hold_flush(d2k_hold *h, uint64_t now, uint64_t revision, int all,
 }
 uint64_t d2k_hold_next(const d2k_hold *h) {
     uint64_t next = 0;
-    if (h) for (size_t i = 0; i < D2K_HOLD_SLOTS; i++) {
+    if (h && h->stats.pending) for (size_t i = 0; i < D2K_HOLD_SLOTS; i++) {
         const held *s = &h->slots[i];
         if (s->count && (!next || s->deadline < next)) { next = s->deadline; }
     }
@@ -102,8 +102,10 @@ int d2k_hold_feed(d2k_hold *h, uint32_t id, const uint8_t *p, size_t n,
                   uint64_t now, uint64_t revision, int allow_start,
                   uint32_t anchor, int have_anchor,
                   d2k_hold_release release, void *ctx, d2k_hold_batch *batch) {
-    memset(batch, 0, sizeof *batch);
-    if (!h) { return 0; }
+    batch->count = 0;
+    batch->orig_count = 0;
+    batch->len = 0;
+    if (!h || (!h->stats.pending && !allow_start)) { return 0; }
     d2k_hold_flush(h, now, revision, 0, release, ctx);
     d2k_hold_info v;
     if (!d2k_hold_parse(p, n, &v)) { return 0; }

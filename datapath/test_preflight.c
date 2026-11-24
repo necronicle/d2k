@@ -310,6 +310,15 @@ static int test_table_full_passes(void) {
     REQUIRE(d2k_pf_client_syn(&f.t, &c, &f.p, 2000000, &f.out) == PF_ACT_PASS);
     REQUIRE(f.out.count == 0 && f.t.full_passes == 1);
     REQUIRE(stage(&f, PF_PROBE_SYN));
+    /* A retired entry suppresses its own retransmit until a new flow reuses it. */
+    d2k_pf_tick(&f.t, 200000000, &f.out);
+    REQUIRE(stage(&f, PF_GAVE_UP));
+    REQUIRE(d2k_pf_client_syn(&f.t, &f.c, &f.p, 201000000, &f.out) == PF_ACT_PASS);
+    REQUIRE(d2k_pf_client_syn(&f.t, &c, &f.p, 202000000, &f.out) == PF_ACT_DROP);
+    d2k_pf_stage next;
+    REQUIRE(d2k_pf_get_stage(&f.t, &c, &next) && next == PF_PROBE_SYN);
+    REQUIRE(!d2k_pf_get_stage(&f.t, &f.c, &next));
+    REQUIRE(d2k_pf_next_ns(&f.t) > 202000000);
     d2k_pf_table_free(&f.t);
     return 1;
 }

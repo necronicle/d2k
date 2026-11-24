@@ -2690,12 +2690,14 @@ int main(int argc, char **argv) {
                        замену. */
 
                     d2k_hold_batch batch;
-                    memset(&batch, 0, sizeof batch);
+                    batch.count = 0;
+                    batch.orig_count = 0;
+                    batch.len = 0;
                     /* Группа READY, чьи оригиналы уже сняты у ядра (см.
                        hold_owns): вердиктов им не будет, без плана — повтор. */
                     int batch_owned = 0;
                     d2k_udp_hold_batch udp_batch;
-                    memset(&udp_batch, 0, sizeof udp_batch);
+                    udp_batch.count = 0;
                     int udp_replay = 0;
                     d2k_key udp_key;
                     memset(&udp_key, 0, sizeof udp_key);

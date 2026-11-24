@@ -35,6 +35,7 @@ typedef struct d2k_pf_flow d2k_pf_flow;
 typedef struct {
     d2k_pf_flow *flows;
     unsigned cap;
+    unsigned extent; /* Slots ever admitted, including retained terminal entries. */
     uint64_t full_passes;
 } d2k_pf_table;
 
