@@ -160,4 +160,23 @@ wait "$sched" 2>/dev/null || fail 'scheduler did not exit cleanly on TERM'
 [ "$(calls)" = 0 ] || fail 'idle scheduler ran the helper'
 echo 'PASS: sleeping scheduler stops promptly on TERM'
 
+# Entware's od applet rejects -A/-N/-t, whereas its hexdump reads random bytes.
+cat > "$TMP/bin/od" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+cat > "$TMP/bin/hexdump" <<'EOF'
+#!/bin/sh
+printf '479'
+EOF
+cat > "$TMP/bin/awk" <<'EOF'
+#!/bin/sh
+printf '42\n'
+EOF
+chmod +x "$TMP/bin/od" "$TMP/bin/hexdump" "$TMP/bin/awk"
+printf 'invalid\n' > "$TMP/d2k/state/offset"
+FAKE_DAY=2026-10-07 FAKE_HHMM=0000 run_tick
+[ "$(cat "$TMP/d2k/state/offset")" = 'v2 239' ] ||
+    fail 'the scheduler fell back to the process ID on Entware'
+
 echo 'Instagram DNS scheduler: all checks passed'

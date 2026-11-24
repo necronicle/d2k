@@ -39,12 +39,27 @@ prepare_runtime() {
     (umask 077; mkdir -p "$RUNTIME_DIR") && chmod 0700 "$RUNTIME_DIR"
 }
 
+size_method=
+choose_size_method() {
+    # Some Entware builds of BusyBox stat accept neither format.
+    if stat -c %s "$0" >/dev/null 2>&1; then
+        size_method=gnu
+    elif stat -f %z "$0" >/dev/null 2>&1; then
+        size_method=bsd
+    else
+        size_method='tail'
+    fi
+}
+
 file_size() {
-    # BusyBox/GNU and BSD/macOS stat. The fallback reads at most LOGMAX+1
-    # bytes from the tail, even on a device without a compatible stat.
-    size=$(stat -c %s "$1" 2>/dev/null) || size=$(stat -f %z "$1" 2>/dev/null) || size=
+    case "$size_method" in
+        gnu) size=$(stat -c %s "$1" 2>/dev/null) || size= ;;
+        bsd) size=$(stat -f %z "$1" 2>/dev/null) || size= ;;
+        *) size= ;;
+    esac
     case "$size" in
         ''|*[!0-9]*)
+            # Read at most LOGMAX+1 bytes on systems without formatted stat.
             tail -c "$((LOGMAX + 1))" "$1" 2>/dev/null | wc -c
             ;;
         *) printf '%s\n' "$size" ;;
@@ -67,6 +82,7 @@ rotate_one() {
 
 tick() {
     prepare_runtime || return 1
+    [ -n "$size_method" ] || choose_size_method
     # Enumerate exact owned names: never rotate unrelated or custom logs.
     for name in service.log d2kd.log d2kc.log panel.log telegram.log d2khttp.log \
                 instagram-dns.log instagram-dns-scheduler.log update.log shadow.log shadow-daemon.log; do
