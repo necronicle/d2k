@@ -690,9 +690,10 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
                           &out->refuse_why) != 0) {
                 free(pts); emit_vec_free(v, n); return -1;
             }
-            if (r && p->wire_profile == D2K_WIRE_TCP_TEMPLATE && v[n].owned_bytes) {
-                /* repeats retransmits the same mutated fake, not eight
-                 * independently randomized ClientHellos. */
+            if (r && p->wire_profile == D2K_WIRE_TCP_TEMPLATE && v[n].owned_bytes &&
+                !(p->fakes[i].tls_mod & D2K_TLS_MOD_FRESH)) {
+                /* Legacy repeats retransmit the same mutated fake. The
+                 * explicit fresh bit keeps each new versioned emission. */
                 memcpy(v[n].owned_bytes, v[n - r].bytes, v[n].len);
             }
             n++;

@@ -174,8 +174,12 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             if (ln == 11 && rd16(b + 6) < 8) {
                 fail(err, errlen, "tlsmod требует minexec=8"); return -1;
             }
-            if (ln == 11 && (b[off + 10] & ~(D2K_TLS_MOD_RND | D2K_TLS_MOD_DUPSID))) {
+            if (ln == 11 && (b[off + 10] & ~(D2K_TLS_MOD_RND | D2K_TLS_MOD_DUPSID | D2K_TLS_MOD_FRESH))) {
                 fail(err, errlen, "неизвестный tlsmod"); return -1;
+            }
+            if (ln == 11 && (b[off + 10] & D2K_TLS_MOD_FRESH) &&
+                (rd16(b + 6) < D2K_EXEC_VERSION || !(b[off + 10] & D2K_TLS_MOD_RND))) {
+                fail(err, errlen, "fresh требует minexec=21 и rnd"); return -1;
             }
             c->fakes++;
             break;
@@ -363,6 +367,10 @@ static int check_refs(d2k_plan *p, char *err, size_t errlen) {
         return -1;
     }
     for (size_t i = 0; i < p->n_fakes; i++) {
+        if ((p->fakes[i].tls_mod & D2K_TLS_MOD_FRESH) &&
+            (p->wire_profile != D2K_WIRE_TCP_TEMPLATE || p->transport != 6 || p->proto != 1)) {
+            fail(err,errlen,"fresh requires tcp-template-v1 TCP/TLS");return -1;
+        }
         if (p->fakes[i].payload_id == 0 ||
             !d2k_find_payload(p, p->fakes[i].payload_id)) {
             fail(err, errlen, "фальшивка ссылается на несуществующую приманку");

@@ -51,12 +51,16 @@
 /* Version 18: TCP preflight program (window, scale, pieces, hello payload reference, timeout). */
 /* Version 19: explicit delayed SYN handover and finite retry count. */
 /* Version 20: explicit outgoing program after owned preflight handover. */
-/* Version 21: explicit permutation of the logical TCP emissions. */
+/* Version 21: explicit TCP emission order and fresh TLS fake repeats. */
 #define D2K_EXEC_EMISSION_ORDER 21
 #define D2K_EXEC_VERSION D2K_EXEC_EMISSION_ORDER
 #define D2K_PLAN_PROTO_HTTP 4
 /* Shared result capacity for measured and live packet programs. */
 #define D2K_WIRE_BATCH_MAX 26
+
+#define D2K_TLS_MOD_RND    (1u << 0)
+#define D2K_TLS_MOD_DUPSID (1u << 1)
+#define D2K_TLS_MOD_FRESH  (1u << 2)
 
 enum { PLACE_BEFORE = 0, PLACE_BETWEEN = 1 };
 

@@ -70,6 +70,13 @@ test-dns-family: test_dns_family
 
 check: test-dns-family
 
+.PHONY: test-fresh-fake
+test_fresh_fake: test_fresh_fake.c plan_parse.c plan_apply.c ../core/plantlv.c $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_fresh_fake.c plan_parse.c plan_apply.c ../core/plantlv.c ../core/quic.c ../core/crypto.c ../core/quicwire.c $(LDFLAGS)
+test-fresh-fake: test_fresh_fake
+	./test_fresh_fake
+check: test-fresh-fake
+
 .PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-dns-family test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
 all: planlab ctlprobe

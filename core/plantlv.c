@@ -599,11 +599,16 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             else if (strcmp(f[5], "place=between") == 0) { v->placement = PLACE_BETWEEN; }
             else { say(err, errcap, "строка %zu: неизвестное место \"%s\"", lineno, f[5]); goto bad; }
             if (nf == 7) {
-                if (strcmp(f[6], "tlsmod=rnd,dupsid") == 0) { v->tls_mod = 3; }
-                else if (strcmp(f[6], "tlsmod=rnd") == 0) { v->tls_mod = 1; }
-                else if (strcmp(f[6], "tlsmod=dupsid") == 0) { v->tls_mod = 2; }
+                if (strcmp(f[6], "tlsmod=rnd,dupsid") == 0) { v->tls_mod = D2K_TLS_MOD_RND | D2K_TLS_MOD_DUPSID; }
+                else if (strcmp(f[6], "tlsmod=rnd") == 0) { v->tls_mod = D2K_TLS_MOD_RND; }
+                else if (strcmp(f[6], "tlsmod=dupsid") == 0) { v->tls_mod = D2K_TLS_MOD_DUPSID; }
+                else if (strcmp(f[6], "tlsmod=rnd,dupsid,fresh") == 0) { v->tls_mod = D2K_TLS_MOD_RND | D2K_TLS_MOD_DUPSID | D2K_TLS_MOD_FRESH; }
+                else if (strcmp(f[6], "tlsmod=rnd,fresh") == 0) { v->tls_mod = D2K_TLS_MOD_RND | D2K_TLS_MOD_FRESH; }
                 else { say(err, errcap, "строка %zu: неизвестный tlsmod \"%s\"", lineno, f[6]); goto bad; }
                 if (p->minexec < 8) { say(err, errcap, "строка %zu: tlsmod требует minexec=8", lineno); goto bad; }
+                if ((v->tls_mod & D2K_TLS_MOD_FRESH) && p->minexec < D2K_EXEC_VERSION) {
+                    say(err, errcap, "строка %zu: fresh требует minexec=21", lineno); goto bad;
+                }
             }
             p->n_fakes++;
         } else if (strcmp(f[0], "seqovl") == 0) {

@@ -107,9 +107,6 @@ struct d2k_fake {
     uint8_t  tls_mod;
 };
 
-#define D2K_TLS_MOD_RND    (1u << 0)
-#define D2K_TLS_MOD_DUPSID (1u << 1)
-
 struct d2k_seqovl {
     uint16_t payload_id;
     uint16_t poison_id;
