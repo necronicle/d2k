@@ -3155,11 +3155,19 @@ static void preflight_dns_reconcile(d2k_sched *,const uint8_t *,uint8_t,
 #include "sched_dns.inc"
 
 static int cooldown_blocks(d2k_sched *s, const char *name, uint8_t transport,
-                           uint8_t family, uint8_t signal_code, int64_t *remaining_ms) {
+                           uint8_t family, uint8_t signal_code, const d2k_ev *event,
+                           int64_t *remaining_ms) {
     if (force_name(s,name) || (transport==6 && doh_find(s,name))) return 0;
     target_cooldown *c = cooldown_find(s, name, transport, family);
     if (!c) { return 0; }
     if (s->now_ms >= c->until_ms) { return 0; }
+    /* A direct TCP result only covers the endpoint actually checked. */
+    if (event && transport == 6 && !c->challenge && !c->exhausted) {
+        char ip[INET6_ADDRSTRLEN] = "";
+        uint16_t port = 0;
+        server_of(event, ip, sizeof ip, &port);
+        if (port != c->port || strcmp(ip, c->ip)) return 0;
+    }
     /* Неубедительная пара поздних RST (вид 3) говорит только о позднем
        обрыве ответа. Блокировка на рукопожатии (обычный RST, таймаут SNI) —
        другое наблюдение и мерится сразу (финальное ревью, п.4). */
@@ -11263,7 +11271,7 @@ static void raw_suspect(d2k_sched *s, const d2k_ev *ev) {
     if (ev->code != D2K_SUSPECT_SILENT) return;
     int64_t left = 0;char cooldown_key[64];
     raw_cooldown_key(cooldown_key,sizeof cooldown_key,ev->flow_epoch,ev->flow_incarnation);
-    if (cooldown_blocks(s, cooldown_key, tr, family, ev->code, &left)) {
+    if (cooldown_blocks(s, cooldown_key, tr, family, ev->code, NULL, &left)) {
         char qk[300]; snprintf(qk, sizeof qk, "raw-rest %s/%u", ip, (unsigned)tr);
         say_quiet(s, qk, "по %s (поток без протокола, %s) опыт отложен ещё примерно %lld мин",
                   ip, trname, (long long)((left + 59999) / 60000));
@@ -11562,7 +11570,7 @@ static int on_suspect_as(d2k_sched *s, const d2k_ev *ev, const char *found, int 
             return 0;
         }
     }
-    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, &cooldown_left_ms)) {
+    if (cooldown_blocks(s, name, ev->transport, ev->family, ev->code, ev, &cooldown_left_ms)) {
         target_cooldown *cool = cooldown_find(s, name, ev->transport, ev->family);
         const char *reason = cool && cool->denied ? "юридического отказа сервиса" :
                              cool && cool->challenge ? "антибот-ответа" :
@@ -16210,8 +16218,11 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                     (unsigned long long)(t->vol.rx_partial_wire_bytes
                         ? t->vol.rx_partial_wire_bytes : t->vol.rx_partial_bytes));
             }
-            if (r.verdict == D2K_V_CLEAR && is_late_volume_suspicion(t->trigger_code) &&
-                t->transport == 6 && !volume_proven && !t->vol.rx_direct_complete) {
+            /* An attempted application check can disprove a direct TLS
+               result even when the original event was an early reset. */
+            if (r.verdict == D2K_V_CLEAR && t->transport == 6 &&
+                (is_late_volume_suspicion(t->trigger_code) || t->vol.rx_unmeasured) &&
+                !volume_proven && !t->vol.rx_direct_complete) {
                 r.verdict = D2K_V_INCONCLUSIVE;
                 if (t->vol.rx_unmeasured) {
                     snprintf(r.reason, sizeof r.reason,
@@ -16283,7 +16294,9 @@ int d2k_sched_tick(d2k_sched *s, int64_t now_ms) {
                            "следующем подозрении, своими планами первыми", t->name);
                 } else {
                     search_report(s, t, now_ms, "inconclusive", "none",
-                                  "замер не подтвердил блокировку: подбор не открыт");
+                                  t->vol.rx_unmeasured
+                                      ? "прикладная проверка не получила полного HTTP-ответа"
+                                      : "замер не подтвердил блокировку: подбор не открыт");
                     cooldown_record(s, t, 2);
                     say(s, "по %s результат неубедителен — повторный замер отложен на %lld мин",
                         t->name, (long long)(SCHED_INCOMPLETE_BACKOFF_MS / 60000));

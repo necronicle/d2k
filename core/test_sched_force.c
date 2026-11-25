@@ -42,10 +42,10 @@ int main(void) {
         s->cooldowns[0].used=1;strcpy(s->cooldowns[0].name,e.name);
         s->cooldowns[0].transport=6;s->cooldowns[0].family=4;
         s->cooldowns[0].until_ms=999999;s->cooldowns[0].exhausted=1;
-        CHECK(!cooldown_blocks(s,e.name,6,4,0,NULL));
+        CHECK(!cooldown_blocks(s,e.name,6,4,0,NULL,NULL));
         strcpy(s->cooldowns[1].name,"ordinary.example");s->cooldowns[1]=s->cooldowns[0];
         strcpy(s->cooldowns[1].name,"ordinary.example");
-        CHECK(cooldown_blocks(s,"ordinary.example",6,4,0,NULL));
+        CHECK(cooldown_blocks(s,"ordinary.example",6,4,0,NULL,NULL));
         task *q=test_task_at(s, 1);task_reset(s,q);strcpy(q->name,"ordinary.example");
         q->transport=6;q->family=4;q->state=T_QUEUED;q->queued_ms=1;
         CHECK(queued_pick(s)==t);

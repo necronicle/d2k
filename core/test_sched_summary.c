@@ -577,9 +577,9 @@ static void doh_service_gate(d2k_sched *s) {
     task *t=fixture(s);t->trigger_code=D2K_SUSPECT_LATE_SILENCE;
     cooldown_record(s,t,3);
     int64_t left=0;
-    CHECK(!cooldown_blocks(s,t->name,6,4,t->trigger_code,&left));
+    CHECK(!cooldown_blocks(s,t->name,6,4,t->trigger_code,NULL,&left));
     s->n_doh=0;
-    CHECK(cooldown_blocks(s,t->name,6,4,t->trigger_code,&left));
+    CHECK(cooldown_blocks(s,t->name,6,4,t->trigger_code,NULL,&left));
     cooldown_clear(s,t->name,6,4);task_reset(s,t);    t=fixture(s);t->state=T_DOH_HEALTH;t->res_ready=1;
     strcpy(t->doh_path,"/dns-query");
     strcpy(s->doh[0].host,t->name);strcpy(s->doh[0].ip,t->ip);strcpy(s->doh[0].path,t->doh_path);
@@ -1244,6 +1244,52 @@ static void ipv6_late_silence_checks_verified_ipv4(void) {
     }
 }
 
+static void failed_http_is_not_a_direct_success(void) {
+    for (int complete = 0; complete < 2; complete++) {
+        d2k_catalog cat = {0};
+        d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
+        task *t = fixture(s);
+        t->state = T_ASKING;
+        t->trigger_code = D2K_SUSPECT_RST;
+        t->res_ready = 1;
+        t->res.verdict = D2K_V_CLEAR;
+        t->vol.verdict = D2K_VOL_PASSED;
+        t->vol.rx_direct_complete = complete;
+        t->vol.rx_unmeasured = !complete;
+        d2k_sched_set_say(s, collect, NULL);
+        d2k_sched_tick(s, 1000);
+        CHECK((strstr(rows, "outcome=probe-direct") != NULL) == complete);
+        CHECK((strstr(rows, "outcome=inconclusive") != NULL) == !complete);
+        if (!complete) CHECK(strstr(rows, "объём ответа измерить не удалось"));
+        d2k_sched_free(s);
+        d2k_catalog_free(&cat);
+    }
+}
+
+static void direct_cooldown_is_endpoint_local(void) {
+    d2k_catalog cat = {0};
+    d2k_sched *s = d2k_sched_new(&cat, -1, 0x2d);
+    task *t = fixture(s);
+    t->trigger_code = D2K_SUSPECT_RST;
+    strcpy(t->ip, "192.0.2.21");
+    cooldown_record(s, t, 0);
+    task_reset(s, t);
+    d2k_ev e = {.kind = D2K_EV_SUSPECT, .transport = 6, .family = 4,
+        .code = D2K_SUSPECT_RST, .low_port = 443, .high_port = 46231,
+        .client_side = D2K_CLIENT_SIDE_HIGH, .planned = D2K_LINK_PLANNED_NO};
+    inet_pton(AF_INET, "192.0.2.21", e.low_ip);
+    inet_pton(AF_INET, "198.51.100.5", e.high_ip);
+    CHECK(cooldown_blocks(s, "summary.example", 6, 4, e.code, &e, NULL));
+
+    inet_pton(AF_INET, "192.0.2.22", e.low_ip);
+    CHECK(!cooldown_blocks(s, "summary.example", 6, 4, e.code, &e, NULL));
+    inet_pton(AF_INET, "192.0.2.21", e.low_ip);
+    e.low_port = 8443;
+    CHECK(!cooldown_blocks(s, "summary.example", 6, 4, e.code, &e, NULL));
+    d2k_sched_free(s);
+    d2k_catalog_free(&cat);
+}
+
 static void measurement_timeout_does_not_cooldown(void) {
     for(int typed=0;typed<2;typed++) {
         d2k_catalog cat={0};d2k_sched *s=d2k_sched_new(&cat,-1,0x2d);
@@ -1265,6 +1311,8 @@ int main(void) {
     ipv6_late_silence_checks_verified_ipv4();
     retry_keeps_client_context(0);
     retry_keeps_client_context(1);
+    failed_http_is_not_a_direct_success();
+    direct_cooldown_is_endpoint_local();
     measurement_timeout_does_not_cooldown();
     retry_remembers_failed_plans(1, 0);
     retry_remembers_failed_plans(8, 0);
