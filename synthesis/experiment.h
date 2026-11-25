@@ -4,7 +4,7 @@
 #include "../detect/include/d2k_detect.h"
 #include "../core/include/d2k_tls13.h"
 struct d2k_raw_tls_sink;
-struct d2k_stream_prefix;
+struct d2k_stream_program;
 typedef enum { D2K_EXPERIMENT_SEND, D2K_EXPERIMENT_READ, D2K_EXPERIMENT_PACKET,
                D2K_EXPERIMENT_SEND_SLICE } d2k_experiment_kind;
 typedef struct {
@@ -17,7 +17,7 @@ typedef struct {
     /* SEND_SLICE takes these bytes from trigger; offset/next_offset remain
        explicit TCP sequence coordinates. Original trigger is never mutated. */
     size_t payload_offset,payload_length;
-    const struct d2k_stream_prefix *tls_prefix;
+    const struct d2k_stream_program *tls_program;
 } d2k_experiment_operation;
 typedef struct {
     uint8_t ip[16], family;

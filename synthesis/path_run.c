@@ -142,7 +142,7 @@ static int same_operation(const d2k_experiment_operation *a,const d2k_experiment
     return a->kind==b->kind && a->trigger==b->trigger &&
         a->offset==b->offset && a->next_offset==b->next_offset &&
         a->timeout_ms==b->timeout_ms && a->minimum==b->minimum &&
-        a->payload_offset==b->payload_offset && a->payload_length==b->payload_length && a->tls_prefix==b->tls_prefix &&
+        a->payload_offset==b->payload_offset && a->payload_length==b->payload_length && a->tls_program==b->tls_program &&
         ((!a->program && !b->program) ||
          (a->program && b->program && !strcmp(a->program,b->program)));
 }
@@ -691,7 +691,7 @@ static int tls_input_program(const d2k_path_run *p,const d2k_trigger *trigger,
     int saw_read=0,saw_hello=0,rc=0;
     d2k_payload_piece *pieces=NULL;
     char *text=NULL,err[200]={0};
-    const char *prefix_program=NULL;
+    const char *complete_program=NULL;
     if(!out)return -1;
     memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
     if(!p || p->tls_owned || !trigger || !trigger->len || trigger->len>sizeof trigger->payload || !generation)
@@ -715,11 +715,11 @@ static int tls_input_program(const d2k_path_run *p,const d2k_trigger *trigger,
         if(!p->events[i].operation_available)goto done;
         const d2k_experiment_operation *op=&p->events[i].operation;
         if(op->kind==D2K_EXPERIMENT_SEND) {
-            const char *compiled=d2k_stream_prefix_program(op->tls_prefix);
+            const char *compiled=d2k_stream_program_text(op->tls_program);
             if(saw_read || n || total || op->trigger!=trigger || op->offset ||
                op->next_offset!=trigger->len || !compiled || !op->program ||
                strcmp(compiled,op->program))goto done;
-            prefix_program=compiled;n=1;total=trigger->len;
+            complete_program=compiled;n=1;total=trigger->len;
         } else if(op->kind==D2K_EXPERIMENT_SEND_SLICE) {
             if(saw_read || op->trigger!=trigger || !op->program || strcmp(op->program,identity) ||
                !op->payload_length || op->payload_offset>trigger->len ||
@@ -740,10 +740,10 @@ static int tls_input_program(const d2k_path_run *p,const d2k_trigger *trigger,
         } else goto done;
     }
     if((require_hello && !saw_hello) || total!=trigger->len)goto done;
-    if(prefix_program) {
-        size_t length=strlen(prefix_program);
+    if(complete_program) {
+        size_t length=strlen(complete_program);
         text=malloc(length+1);if(!text){rc=-1;goto done;}
-        memcpy(text,prefix_program,length+1);
+        memcpy(text,complete_program,length+1);
     } else {
         d2k_lower_status lowered=d2k_lower_partition(trigger->len,pieces,n,"tls",&text,err,sizeof err);
         if(lowered!=D2K_LOWER_OK) {

@@ -1,6 +1,8 @@
 #include "path_work.h"
 #include "tls_decode.h"
 #include "token_content.h"
+#include "../core/include/d2k_hello.h"
+#include "../datapath/include/d2k_plan.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -59,7 +61,7 @@ struct d2k_tls_path_session {
     size_t token_cut,token_witness;
     int token_pending;
     size_t *order_word,order_length,order_witness;
-    int order_attempted,order_pending;
+    int order_attempted,order_pending,try_mixed_order,mixed_order_attempted;
     size_t prefix_pending;
     int prefix_observing,initial_prefix;
     uint64_t generation;
@@ -189,7 +191,7 @@ void d2k_tls_path_session_free(d2k_tls_path_session *w)
     d2k_path_run_free(w->path);d2k_tls_decoder_free(&w->decoder);
     d2k_tls_decoder_free(&w->response_decoder);
     if(w->actions)for(size_t i=0;i<w->stream.chunks;i++)
-        d2k_stream_prefix_free((d2k_stream_prefix *)w->actions[i].prefix);
+        d2k_stream_program_free((d2k_stream_program *)w->actions[i].program);
     free(w->application_stream);free(w->application_experiment);free(w->actions);free(w->order_word);
     free(w->experiment.reply);free(w->chunks);free(w->rejections);free(w->application_program);free(w);
 }
@@ -354,20 +356,20 @@ d2k_tls_path_session *d2k_tls_path_session_new_response(const d2k_tls_stream *st
     if(!stream || !stream->trigger || !base)return NULL;
     d2k_experiment owned=*base;
     owned.tls_input=stream->trigger->payload;owned.tls_input_length=stream->trigger->len;
-    d2k_tls_application response={NULL,response_prepare,response_run,response_finish,path_hello,response_question};
+    d2k_tls_application response={NULL,response_prepare,response_run,response_finish,path_hello,response_question,0};
     d2k_tls_path_session *w=d2k_tls_path_session_new_application(stream,&owned,generation,&response);
     if(w){w->response_only=1;w->application.context=w;}
     return w;
 }
-static int append_action(d2k_tls_path_session *w,size_t bytes,int reverse,d2k_stream_prefix *prefix)
+static int append_action(d2k_tls_path_session *w,size_t bytes,int reverse,d2k_stream_program *program)
 {
     if(!w || !w->started || !w->application.accepted || w->status!=D2K_SYN_CLOSED ||
        (reverse!=0 && reverse!=1) || !bytes || bytes>w->trigger.len ||
        (w->domain.initial!=2*(w->trigger.len+1)+1 && w->domain.initial!=2*(w->trigger.len+1)))return 0;
     for(size_t i=0;i<w->stream.chunks;i++) {
         const d2k_stream_action *old=&w->actions[i];
-        if(old->bytes!=bytes || old->reverse!=reverse || !!old->prefix!=!!prefix)continue;
-        if(!prefix || !strcmp(d2k_stream_prefix_program(old->prefix),d2k_stream_prefix_program(prefix)))return 0;
+        if(old->bytes!=bytes || old->reverse!=reverse || !!old->program!=!!program)continue;
+        if(!program || !strcmp(d2k_stream_program_text(old->program),d2k_stream_program_text(program)))return 0;
     }
     if(w->stream.chunks>=SIZE_MAX/sizeof(size_t)-1 ||
        w->stream.chunks>=SIZE_MAX/sizeof(d2k_stream_action)-1)return -1;
@@ -379,7 +381,7 @@ static int append_action(d2k_tls_path_session *w,size_t bytes,int reverse,d2k_st
     memcpy(chunks,w->chunks,w->stream.chunks*sizeof *chunks);
     chunks[w->stream.chunks]=bytes;
     memcpy(actions,w->actions,w->stream.chunks*sizeof *actions);
-    actions[w->stream.chunks]=(d2k_stream_action){.bytes=bytes,.reverse=reverse,.prefix=prefix};
+    actions[w->stream.chunks]=(d2k_stream_action){.bytes=bytes,.reverse=reverse,.program=program};
     *stream=*w->application_stream;stream->count++;stream->actions=actions;
     *experiment=*w->application_experiment;
     experiment->operation_count=stream->count+1;experiment->operation_context=stream;
@@ -402,12 +404,12 @@ static int initial_prefix(d2k_tls_path_session *w,const uint8_t *bytes,
     size_t length,size_t segment,unsigned mods,const d2k_payload_piece *pieces,size_t count) {
     if(!w || w->started || !w->application.accepted || !w->actions ||
        !w->experiment.offer_ts || w->whole>=w->stream.chunks ||
-       w->actions[w->whole].prefix || !bytes || !length || length>UINT16_MAX ||
+       w->actions[w->whole].program || !bytes || !length || length>UINT16_MAX ||
        !segment || segment>UINT16_MAX || mods>3)return 0;
-    d2k_stream_prefix *prefix=pieces?d2k_stream_prefix_partition_new(bytes,length,segment,mods,
+    d2k_stream_program *prefix=pieces?d2k_stream_prefix_partition_new(bytes,length,segment,mods,
         w->trigger.len,pieces,count):d2k_stream_prefix_new(bytes,length,segment,mods);
     if(!prefix)return -1;
-    w->actions[w->whole].prefix=prefix;
+    w->actions[w->whole].program=prefix;
     w->initial_prefix=1;w->prefix_observing=1;
     return 1;
 }
@@ -425,10 +427,10 @@ int d2k_tls_path_session_add_prefix(d2k_tls_path_session *w,const uint8_t *bytes
     if(!w || !w->started || !w->application.accepted || w->status!=D2K_SYN_CLOSED ||
        !w->experiment.offer_ts || !bytes || !length || length>UINT16_MAX ||
        !segment || segment>UINT16_MAX || mods>3 || w->prefix_pending)return 0;
-    d2k_stream_prefix *prefix=d2k_stream_prefix_new(bytes,length,segment,mods);
+    d2k_stream_program *prefix=d2k_stream_prefix_new(bytes,length,segment,mods);
     if(!prefix)return -1;
     int rc=append_action(w,w->trigger.len,0,prefix);
-    if(rc!=1)d2k_stream_prefix_free(prefix);
+    if(rc!=1)d2k_stream_program_free(prefix);
     else w->prefix_pending=w->stream.chunks;
     return rc;
 }
@@ -532,6 +534,55 @@ static int refine_packet_order(d2k_tls_path_session *w)
     free(lengths);w->order_word=word;w->order_length=n;w->order_witness=witness;
     w->order_attempted=1;w->order_pending=1;w->ready=0;return 1;
 }
+/* Try one further order after forward and reverse application failures.
+   Keep the observed ranges. For two slices, refine the second range at the
+   parsed end of the same ClientHello field. No outcome is assumed. The
+   receiver reassembles the same bytes by sequence number (RFC 9293 §3.10.7.4). */
+static int refine_mixed_order(d2k_tls_path_session *w)
+{
+    if (!w->try_mixed_order || d2k_detect_stopped(w->experiment.cancel)) return 0;
+    w->try_mixed_order=0;
+    size_t count;
+    const d2k_path_event *events=d2k_path_run_history(w->path,&count);
+    if (w->order_witness >= count) return -1;
+    size_t start=w->order_witness;
+    while (start && events[start-1].action.kind!=D2K_PATH_ACTION_OPEN) start--;
+    if (!start) return -1;
+
+    d2k_payload_piece parts[D2K_WIRE_BATCH_MAX];
+    size_t n=0;
+    for (size_t i=start; i<w->order_witness; i++) {
+        const d2k_path_event *e=&events[i];
+        if (!e->operation_available || e->operation.kind!=D2K_EXPERIMENT_SEND_SLICE) return 0;
+        if (n==D2K_WIRE_BATCH_MAX) return 0;
+        parts[n++]=(d2k_payload_piece){e->operation.payload_offset,e->operation.payload_length,0};
+    }
+    if (n==2) {
+        size_t offset, length;
+        if (d2k_hello_sni(w->trigger.payload,w->trigger.len,&offset,&length) ||
+            offset!=(size_t)w->trigger.sni_off || length!=(size_t)w->trigger.sni_len ||
+            parts[1].offset<=offset || parts[1].offset>=offset+length ||
+            offset+length>=w->trigger.len) return 0;
+        size_t boundary=offset+length;
+        parts[1].length=boundary-parts[1].offset;
+        parts[n++]=(d2k_payload_piece){boundary,w->trigger.len-boundary,0};
+    }
+    if (n<3) return 0;
+    d2k_payload_piece last=parts[n-1];
+    parts[n-1]=parts[n-2];parts[n-2]=last;
+
+    d2k_stream_program *program=NULL;
+    d2k_lower_status compiled=d2k_stream_partition_compile(w->trigger.len,parts,n,&program);
+    if (compiled!=D2K_LOWER_OK) return compiled==D2K_LOWER_ERROR ? -1 : 0;
+    int added=append_action(w,w->trigger.len,0,program);
+    if (added!=1) {d2k_stream_program_free(program);return added;}
+    w->order_word[0]=w->stream.chunks;
+    w->order_length=1;
+    w->order_pending=1;
+    w->mixed_order_attempted=1;
+    return 1;
+}
+
 static int refine_prefix_partition(d2k_tls_path_session *w)
 {
     if(!w->application.token_question || d2k_detect_stopped(w->experiment.cancel))return 0;
@@ -552,7 +603,7 @@ static int refine_prefix_partition(d2k_tls_path_session *w)
             if(eligible){pieces++;covered+=op->payload_length;}
         } else if(e->operation_available && e->operation.kind==D2K_EXPERIMENT_SEND) {
             eligible=0;
-            if(e->operation.tls_prefix)prefix_program=e->operation.program;
+            if(e->operation.tls_program)prefix_program=e->operation.program;
         } else if(e->action.kind==D2K_PATH_ACTION_APPLICATION) {
             uint64_t value;int terminal;
             if(!d2k_path_run_output(w->path,e->sample.observation,&value,&terminal))return -1;
@@ -581,12 +632,12 @@ static int refine_prefix_partition(d2k_tls_path_session *w)
     /* Two owned failures do not prove compositional failure. Challenge that
        assumption by retaining the observed partition and prefix bytes together.
        The compiler rechecks coverage; only a new application result can accept it. */
-    d2k_stream_prefix *prefix=d2k_stream_prefix_partition_new(bytes,length,segment,mods,
+    d2k_stream_program *prefix=d2k_stream_prefix_partition_new(bytes,length,segment,mods,
         w->trigger.len,partition,n);
     free(partition);free(bytes);
     if(!prefix)return -1;
     int rc=append_action(w,w->trigger.len,0,prefix);
-    if(rc!=1)d2k_stream_prefix_free(prefix);
+    if(rc!=1)d2k_stream_program_free(prefix);
     else w->prefix_pending=w->stream.chunks;
     return rc;
 }
@@ -636,7 +687,7 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
     if(w->response_only && w->token_pending) {
         size_t cut=0;
         while(cut<w->stream.chunks &&
-              (w->actions[cut].reverse || w->actions[cut].prefix || w->actions[cut].bytes!=w->token_cut))cut++;
+              (w->actions[cut].reverse || w->actions[cut].program || w->actions[cut].bytes!=w->token_cut))cut++;
         if(cut==w->stream.chunks)goto done;
         /* Execute the inferred two-piece question directly. Replaying the
            known failing whole input adds no evidence about this boundary. */
@@ -680,6 +731,7 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
             int accepted=application_accepted(w,symbol);
             if(accepted<0 || accepted>1)goto done;
             if(accepted) {
+                int mixed=w->order_pending && w->mixed_order_attempted;
                 w->prefix_observing=0;
                 w->token_pending=0;w->order_pending=0;
                 *out=*w->application_program;
@@ -689,6 +741,8 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
                 }
                 snprintf(out->reason,sizeof out->reason,"%s",w->response_only?
                     "наблюдён ServerHello; требуется отдельная проверка приложения":
+                    mixed ?
+                    "порядок изменён по измеренным границам TCP и форме ClientHello; получен полный ответ приложения":
                     "наблюдён успех приложения в измерительном потоке");goto done;
             }
             if(w->response_only && w->probes==1 && !w->initial_prefix) {
@@ -702,7 +756,14 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
             }
             if(w->order_pending) {
                 w->order_pending=0;result=D2K_SYN_CLOSED;
-                snprintf(err,sizeof err,"обратный порядок измеренных частей не дал успеха приложения");goto done;
+                int question=w->application.token_question(w->application.context,symbol);
+                w->try_mixed_order=!w->response_only && w->application.allow_mixed_order &&
+                    !w->mixed_order_attempted &&
+                    (question==1 || question==2);
+                snprintf(err,sizeof err,"%s",w->mixed_order_attempted ?
+                    "новый порядок посылок не дал полного ответа приложения":
+                    "обратный порядок измеренных частей не дал успеха приложения");
+                goto done;
             }
             if(w->token_pending && count-1>w->token_witness) {
                 for(size_t i=count-1;i>0;) {
@@ -776,7 +837,8 @@ d2k_syn_status d2k_tls_path_session_next(d2k_tls_path_session *w,d2k_vres *out)
         for(;;) {
             d2k_syn_status result=application_next(w,out);
             if(result!=D2K_SYN_CLOSED)return result;
-            int refined=refine_prefix_partition(w);
+            int refined=refine_mixed_order(w);
+            if(!refined)refined=refine_prefix_partition(w);
             if(!refined)refined=refine_packet_token(w);
             if(!refined)refined=refine_packet_order(w);
             if(!refined)refined=refine_response_content(w);

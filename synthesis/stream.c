@@ -181,33 +181,46 @@ d2k_input_domain d2k_tls_stream_stable_application_domain(const d2k_tls_stream *
     return d;
 }
 
-struct d2k_stream_prefix {char *program;size_t total;};
-d2k_stream_prefix *d2k_stream_prefix_new(const uint8_t *bytes,size_t length,size_t segment,unsigned mods) {
-    d2k_stream_prefix *p=calloc(1,sizeof *p);if(!p)return NULL;
+struct d2k_stream_program {char *program;size_t total;};
+d2k_stream_program *d2k_stream_prefix_new(const uint8_t *bytes,size_t length,size_t segment,unsigned mods) {
+    d2k_stream_program *p=calloc(1,sizeof *p);if(!p)return NULL;
     char error[160];
     if(d2k_lower_tls_prefix(bytes,length,segment,mods,&p->program,error,sizeof error)!=D2K_LOWER_OK) {
         free(p);return NULL;
     }
     return p;
 }
-d2k_stream_prefix *d2k_stream_prefix_partition_new(const uint8_t *bytes,size_t length,
+d2k_stream_program *d2k_stream_prefix_partition_new(const uint8_t *bytes,size_t length,
     size_t segment,unsigned mods,size_t total,const d2k_payload_piece *pieces,size_t count) {
-    d2k_stream_prefix *p=calloc(1,sizeof *p);if(!p)return NULL;
+    d2k_stream_program *p=calloc(1,sizeof *p);if(!p)return NULL;
     char error[160];
     if(d2k_lower_tls_prefix_partition(bytes,length,segment,mods,total,pieces,count,
         &p->program,error,sizeof error)!=D2K_LOWER_OK) {free(p);return NULL;}
     p->total=total;return p;
 }
-void d2k_stream_prefix_free(d2k_stream_prefix *p){if(p){free(p->program);free(p);}}
-const char *d2k_stream_prefix_program(const d2k_stream_prefix *p){return p?p->program:NULL;}
+d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
+    size_t count,d2k_stream_program **out) {
+    if(!out)return D2K_LOWER_ERROR;
+    *out=NULL;
+    d2k_stream_program *program=calloc(1,sizeof *program);
+    if(!program)return D2K_LOWER_ERROR;
+    char error[160];
+    d2k_lower_status status=d2k_lower_partition(total,pieces,count,"tls",&program->program,error,sizeof error);
+    if(status!=D2K_LOWER_OK) {free(program);return status;}
+    program->total=total;
+    *out=program;
+    return status;
+}
+void d2k_stream_program_free(d2k_stream_program *p){if(p){free(p->program);free(p);}}
+const char *d2k_stream_program_text(const d2k_stream_program *p){return p?p->program:NULL;}
 static int ordered_valid(const d2k_ordered_stream *s) {
     if(!s || !s->trigger || !s->trigger->len || s->trigger->len>D2K_TRIGGER_MAX ||
        s->trigger->len>(SIZE_MAX-4)/2 || !s->actions || !s->count ||
        s->count>SIZE_MAX-4 || s->read_timeout_ms<=0 || !s->read_minimum)return 0;
     for(size_t i=0;i<s->count;i++)
         if(!s->actions[i].bytes || (s->actions[i].reverse!=0 && s->actions[i].reverse!=1) ||
-           (s->actions[i].prefix && (s->actions[i].reverse || s->actions[i].bytes!=s->trigger->len ||
-            (s->actions[i].prefix->total && s->actions[i].prefix->total!=s->trigger->len))))return 0;
+           (s->actions[i].program && (s->actions[i].reverse || s->actions[i].bytes!=s->trigger->len ||
+            (s->actions[i].program->total && s->actions[i].program->total!=s->trigger->len))))return 0;
     return 1;
 }
 int d2k_ordered_stream_operation(void *ctx,size_t state,size_t input,
@@ -223,10 +236,10 @@ int d2k_ordered_stream_operation(void *ctx,size_t state,size_t input,
         op->timeout_ms=s->read_timeout_ms;*next=state;return 1;
     }
     const d2k_stream_action *action=&s->actions[input-1];
-    if(action->prefix) {
+    if(action->program) {
         if(state)return 0;
         op->kind=D2K_EXPERIMENT_SEND;op->trigger=s->trigger;
-        op->program=d2k_stream_prefix_program(action->prefix);op->tls_prefix=action->prefix;
+        op->program=d2k_stream_program_text(action->program);op->tls_program=action->program;
         op->next_offset=(uint32_t)s->trigger->len;*next=s->trigger->len;return 1;
     }
     if(used==s->trigger->len || (used && reverse!=action->reverse))return 0;
@@ -274,6 +287,6 @@ int d2k_ordered_stream_prefix_equal(const void *left,size_t left_count,
     if(a->trigger!=b->trigger || b->count<a->count ||
        a->read_timeout_ms!=b->read_timeout_ms || a->read_minimum!=b->read_minimum)return 0;
     for(size_t i=0;i<a->count;i++)if(a->actions[i].bytes!=b->actions[i].bytes ||
-        a->actions[i].reverse!=b->actions[i].reverse || a->actions[i].prefix!=b->actions[i].prefix)return 0;
+        a->actions[i].reverse!=b->actions[i].reverse || a->actions[i].program!=b->actions[i].program)return 0;
     return 1;
 }

@@ -54,15 +54,17 @@ d2k_input_domain d2k_tls_stream_stable_application_domain(const d2k_tls_stream *
 /* Immutable append-only action descriptors. Direction is chosen by the first
  * send and cannot change within that input. State tracks local byte coverage,
  * not peer delivery or filter reset. READ=0, SEND(i)=i+1. */
-typedef struct d2k_stream_prefix d2k_stream_prefix;
+typedef struct d2k_stream_program d2k_stream_program;
 /* Immutable compiled operation, owned by caller until all histories using it
  * are freed. Constructor copies content into the compiled program. */
-d2k_stream_prefix *d2k_stream_prefix_new(const uint8_t *,size_t,size_t,unsigned);
-d2k_stream_prefix *d2k_stream_prefix_partition_new(const uint8_t *,size_t,size_t,unsigned,
+d2k_stream_program *d2k_stream_prefix_new(const uint8_t *,size_t,size_t,unsigned);
+d2k_stream_program *d2k_stream_prefix_partition_new(const uint8_t *,size_t,size_t,unsigned,
     size_t,const d2k_payload_piece *,size_t);
-void d2k_stream_prefix_free(d2k_stream_prefix *);
-const char *d2k_stream_prefix_program(const d2k_stream_prefix *);
-typedef struct {size_t bytes;int reverse;const d2k_stream_prefix *prefix;} d2k_stream_action;
+d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
+    size_t count,d2k_stream_program **out);
+void d2k_stream_program_free(d2k_stream_program *);
+const char *d2k_stream_program_text(const d2k_stream_program *);
+typedef struct {size_t bytes;int reverse;const d2k_stream_program *program;} d2k_stream_action;
 
 typedef struct {
     const d2k_trigger *trigger;

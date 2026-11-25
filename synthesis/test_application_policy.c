@@ -33,6 +33,11 @@ int main(void) {
         end->input_length,30,25,1200,archive));
     assert(policy.witness);
     d2k_tls_application app=d2k_application_policy_callbacks(&policy);
+    assert(app.allow_mixed_order);
+    assert(!d2k_application_policy_callbacks(NULL).allow_mixed_order);
+    id.doh=1;
+    assert(!d2k_application_policy_callbacks(&policy).allow_mixed_order);
+    id.doh=0;
     const char *program="d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\norder forward\n";
     for(int scenario=0;scenario<6;scenario++) {
         mode=scenario==0?5:scenario==1?0:scenario==2?3:scenario==3?1:scenario==4?6:7;

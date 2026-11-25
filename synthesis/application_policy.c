@@ -159,7 +159,7 @@ static int measured_token_question(void *ctx,uint64_t symbol) {
 }
 d2k_tls_application d2k_application_policy_callbacks(d2k_application_policy *m) {
     return (d2k_tls_application){m,measured_prepare,measured_run,measured_finish,
-        measured_accepted,measured_token_question};
+        measured_accepted,measured_token_question,m && m->base && !m->base->doh};
 }
 void d2k_application_policy_destroy(d2k_application_policy *m) {
     if(!m)return;

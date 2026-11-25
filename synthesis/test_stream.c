@@ -39,38 +39,39 @@ static void ordered_actions(void) {
 }
 static void prefix_actions(void) {
     uint8_t bytes[]={22,3,3,0,1,0};
-    d2k_stream_prefix *prefix=d2k_stream_prefix_new(bytes,sizeof bytes,1400,0);
+    d2k_stream_program *prefix=d2k_stream_prefix_new(bytes,sizeof bytes,1400,0);
     assert(prefix);bytes[0]=0;
-    const char *program=d2k_stream_prefix_program(prefix);
+    const char *program=d2k_stream_program_text(prefix);
     assert(program && strstr(program,"160303000100") && !strstr(program,"000303000100"));
     d2k_trigger tr={0};tr.len=5;memcpy(tr.payload,"abcde",5);
-    d2k_stream_action actions[]={{.bytes=2},{.bytes=5,.prefix=prefix}};
+    d2k_stream_action actions[]={{.bytes=2},{.bytes=5,.program=prefix}};
     d2k_ordered_stream s={&tr,actions,2,10,1};
     d2k_input_domain d=d2k_ordered_stream_domain(&s);assert(d.states);
     d2k_experiment_operation op;size_t next;
     assert(d2k_ordered_stream_operation(&s,0,2,&op,&next)==1 && next==5);
     assert(op.kind==D2K_EXPERIMENT_SEND && op.trigger==&tr && op.offset==0 && op.next_offset==5);
-    assert(op.tls_prefix==prefix && !strcmp(op.program,program));
+    assert(op.tls_program==prefix && !strcmp(op.program,program));
     for(size_t pos=1;pos<12;pos++)if(pos!=6)
         assert(d2k_ordered_stream_operation(&s,pos,2,&op,&next)==0);
     assert(!d2k_ordered_stream_preserved(&s,5));
     assert(d.step(d.ctx,5,5,&next)==1 && d2k_ordered_stream_preserved(&s,next));
-    d2k_stream_action extended[]={{.bytes=2},{.bytes=5,.prefix=prefix},{.bytes=1,.reverse=1}};
+    d2k_stream_action extended[]={{.bytes=2},{.bytes=5,.program=prefix},{.bytes=1,.reverse=1}};
     d2k_ordered_stream more=s;more.actions=extended;more.count=3;
     assert(d2k_ordered_stream_prefix_equal(&s,3,&more,4)==1);
-    extended[1].prefix=NULL;assert(!d2k_ordered_stream_prefix_equal(&s,3,&more,4));
+    extended[1].program=NULL;assert(!d2k_ordered_stream_prefix_equal(&s,3,&more,4));
     actions[1].reverse=1;assert(!d2k_ordered_stream_domain(&s).states);
-    d2k_stream_prefix_free(prefix);
+    d2k_stream_program_free(prefix);
     assert(!d2k_stream_prefix_new(bytes,0,1400,0));
     d2k_payload_piece pieces[]={{0,1,0},{1,4,0}};
     prefix=d2k_stream_prefix_partition_new(bytes,sizeof bytes,1400,0,5,pieces,2);
-    assert(prefix && strstr(d2k_stream_prefix_program(prefix),"split payload_start +1\n"));
-    actions[1]=(d2k_stream_action){.bytes=5,.prefix=prefix};
+    assert(prefix && strstr(d2k_stream_program_text(prefix),"split payload_start +1\n"));
+    actions[1]=(d2k_stream_action){.bytes=5,.program=prefix};
     assert(d2k_ordered_stream_operation(&s,0,2,&op,&next)==1 && next==5);
-    assert(op.tls_prefix==prefix && op.trigger==&tr);
+    assert(op.tls_program==prefix && op.trigger==&tr);
     tr.len=6;actions[1].bytes=6;
     assert(!d2k_ordered_stream_domain(&s).states);
-    d2k_stream_prefix_free(prefix);
+    d2k_stream_program_free(prefix);
+    assert(d2k_stream_partition_compile(5,pieces,2,NULL)==D2K_LOWER_ERROR);
 }
 int main(void) {
     prefix_actions();

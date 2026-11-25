@@ -1634,11 +1634,15 @@ static void test_application_macro(void)
     }
     episode_reply=NULL;
 }
-typedef struct {tape_factory factory;int runs,split,healthy,uncertain,reject_split,token_ineligible,require_reverse,packet_question,server_refusal,require_prefix,prefix_run,named_packet;const uint8_t *input;size_t input_length;const uint64_t *outcomes;size_t outcome_count;} application_worker_fixture;
+typedef struct {tape_factory factory;int runs,split,healthy,uncertain,reject_split,token_ineligible,require_reverse,packet_question,server_refusal,require_prefix,prefix_run,named_packet,require_mixed,mixed_runs;const uint8_t *input;size_t input_length;const uint64_t *outcomes;size_t outcome_count;} application_worker_fixture;
 static int worker_application_prepare(void *ctx,const char *program)
 {
     application_worker_fixture *f=ctx;
     if(strstr(program,"poison 1 tcpts") && !f->prefix_run)f->prefix_run=f->runs+1;
+    if(f->require_mixed) {
+        f->split = strstr(program,"order emissions=0,2,1\n") != NULL;
+        return 0;
+    }
     if(f->require_prefix){f->split=strstr(program,"poison 1 tcpts")!=NULL;
         if(f->require_prefix==2)f->split=f->split && strstr(program,"split payload_start +62\n")!=NULL;
         return 0;}
@@ -1649,6 +1653,19 @@ static int worker_application_run(void *ctx,const d2k_tls_io *io)
     application_worker_fixture *f=ctx;f->runs++;
     char err[80];uint8_t response[47];
     CHECK(!io->write(io->context,f->input?f->input:(const uint8_t *)"abcdef",f->input?f->input_length:6,err,sizeof err));
+    if(f->require_mixed && f->split) {
+        f->mixed_runs++;
+        const size_t offsets[]={0,63,62},lengths[]={62,104,1};
+        CHECK(outgoing_count==5);
+        if(outgoing_count==5)for(size_t i=0;i<3;i++) {
+            const uint8_t *p=outgoing[i+2];size_t ihl=(p[0]&15)*4;
+            size_t header=ihl+(p[ihl+12]>>4)*4;
+            CHECK(d2k_wire_tcp_checksum_ok(p,outgoing_len[i+2]));
+            CHECK(rd32(p+ihl+4)==rd32(outgoing[0]+24)+1+offsets[i]);
+            CHECK(outgoing_len[i+2]-header==lengths[i]);
+            CHECK(!memcmp(p+header,f->input+offsets[i],lengths[i]));
+        }
+    }
     CHECK(io->read(io->context,response,sizeof response,5,err,sizeof err)==sizeof response);
     return 0;
 }
@@ -1684,7 +1701,7 @@ static void test_application_prefix_extension(void) {
     outgoing_count=0;dial_recv_fd=-1;pending_delay=0;payload_recv_error=0;fail_send_at=0;
     payload_ack=0;payload_silent=0;d2k_raw_rule_hook=test_rule_hook;rule_rc=0;dial_silent=0;peer_timestamps=1;
     d2k_tls_application app={&f,worker_application_prepare,worker_application_run,
-        worker_application_finish,worker_application_accepted,worker_token_question};
+        worker_application_finish,worker_application_accepted,worker_token_question,0};
     d2k_tls_path_session *w=d2k_tls_path_session_new_application(&stream,&e,103,&app);CHECK(w);if(!w)return;
     if((mode>=3 && mode<5) || mode>=7) {
         if(mode>=7) {
@@ -1729,6 +1746,52 @@ prefix_done:
     learning_peer_bytes=0;learning_peer_allow_whole=0;episode_reply=NULL;
     }
 }
+static void test_application_mixed_order(void)
+{
+    d2k_trigger tr={0};tr.len=167;tr.sni_off=61;tr.sni_len=2;
+    uint8_t *b=tr.payload;b[0]=22;b[1]=3;b[2]=3;b[4]=162;b[5]=1;b[8]=158;b[9]=b[10]=3;
+    b[45]=2;b[46]=0x13;b[47]=1;b[48]=1;b[51]=115;b[55]=7;b[57]=5;b[60]=2;
+    b[61]=b[62]='a';b[64]=21;b[66]=100;
+    size_t whole=tr.len;
+    d2k_tls_stream spec={&tr,&whole,1,5,1};
+    for (int mode=0;mode<4;mode++) {
+        application_worker_fixture f={.require_mixed=1,.input=b,.input_length=tr.len,
+            .reject_split=mode==1 || mode==3,.healthy=mode==2};
+        int cancelled=0;d2k_detect_stop cancel={learning_test_watchdog,&cancelled};
+        d2k_experiment base={.ip={198,51,100,7},.family=4,.port=443,.connect_ms=50,
+            .reply_capacity=128,.cancel=&cancel,.tls_input=b,.tls_input_length=tr.len,
+            .make_sink=new_episode_tape,.sink_context=&f.factory};
+        uint8_t hello[47]={22,3,3,0,42,2,0,0,38,3,3};hello[44]=0xc0;hello[45]=0x2f;
+        episode_reply=hello;episode_reply_len=sizeof hello;episode_reply_chunk=sizeof hello;
+        learning_peer_bytes=tr.len;learning_peer_connections=0;learning_peer_allow_whole=1;
+        outgoing_count=0;dial_recv_fd=-1;pending_delay=0;payload_recv_error=0;fail_send_at=0;
+        payload_ack=0;payload_silent=0;d2k_raw_rule_hook=test_rule_hook;rule_rc=0;dial_silent=0;
+        d2k_tls_application app={&f,worker_application_prepare,worker_application_run,
+            worker_application_finish,worker_application_accepted,worker_token_question,mode!=3};
+        d2k_tls_path_session *w=d2k_tls_path_session_new_application(&spec,&base,105,&app);CHECK(w);
+        if (!w) continue;
+        d2k_vres out;d2k_syn_status got=d2k_tls_path_session_next(w,&out);
+        d2k_syn_status expected=mode==0?D2K_SYN_CANDIDATE:
+            mode==2?D2K_SYN_DIRECT_RESPONSE:D2K_SYN_CLOSED;
+        if(got!=expected)fprintf(stderr,"mixed status mode=%d got=%d expected=%d runs=%d probes=%d reason=%s\n",mode,got,expected,f.runs,out.probes,out.reason);
+        CHECK(got==expected);
+        if (!(f.runs==(mode==2?1:mode==3?3:4) && out.probes==(mode==2?1:mode==3?4:5)))
+            fprintf(stderr,"mixed mode=%d runs=%d probes=%d status=%d\n",mode,f.runs,out.probes,got);
+        CHECK(f.runs==(mode==2?1:mode==3?3:4));
+        CHECK(out.probes==(mode==2?1:mode==3?4:5));
+        CHECK(f.mixed_runs==(mode==0 || mode==1));
+        if (mode==0 && got==expected) {
+            CHECK(strstr(out.program,"split payload_start +62\n"));
+            CHECK(strstr(out.program,"split payload_start +63\n"));
+            CHECK(strstr(out.program,"order emissions=0,2,1\n"));
+        } else CHECK(!out.program_len);
+        int runs=f.runs;
+        CHECK(d2k_tls_path_session_next(w,&out)==got && f.runs==runs);
+        d2k_tls_path_session_free(w);d2k_raw_tape_free(f.factory.last);
+    }
+    learning_peer_bytes=0;learning_peer_allow_whole=0;episode_reply=NULL;
+}
+
 static void test_application_worker(void)
 {
     for(int mode=0;mode<16;mode++) {
@@ -1748,7 +1811,7 @@ static void test_application_worker(void)
         outgoing_count=0;dial_recv_fd=-1;pending_delay=0;payload_recv_error=0;fail_send_at=0;
         payload_ack=0;payload_silent=0;d2k_raw_rule_hook=test_rule_hook;rule_rc=0;dial_silent=0;
         d2k_tls_application app={&f,worker_application_prepare,worker_application_run,
-            worker_application_finish,worker_application_accepted,worker_token_question};
+            worker_application_finish,worker_application_accepted,worker_token_question,0};
         d2k_tls_path_session *w=d2k_tls_path_session_new_application(&spec,&base,103,&app);CHECK(w);
         d2k_vres out;d2k_syn_status result=d2k_tls_path_session_next(w,&out);
         if(mode==3) {
@@ -2334,8 +2397,8 @@ static void test_prefix_program_export(void) {
     uint8_t *b=tr.payload;b[0]=22;b[1]=3;b[2]=3;b[4]=162;b[5]=1;b[8]=158;b[9]=b[10]=3;
     b[45]=2;b[46]=0x13;b[47]=1;b[48]=1;b[51]=115;b[55]=7;b[57]=5;b[60]=2;b[61]=b[62]='a';b[64]=21;b[66]=100;
     uint8_t fake[63];memcpy(fake,b,sizeof fake);fake[4]=58;fake[8]=54;fake[51]=11;fake[61]='b';
-    d2k_stream_prefix *prefix=d2k_stream_prefix_new(fake,sizeof fake,64,0);CHECK(prefix);if(!prefix)return;
-    d2k_stream_action action={.bytes=tr.len,.prefix=prefix};
+    d2k_stream_program *prefix=d2k_stream_prefix_new(fake,sizeof fake,64,0);CHECK(prefix);if(!prefix)return;
+    d2k_stream_action action={.bytes=tr.len,.program=prefix};
     d2k_ordered_stream stream={&tr,&action,1,50,1};d2k_tls_decoder decoder={0};
     d2k_experiment e={.ip={198,51,100,7},.family=4,.port=443,.connect_ms=50,.offer_ts=1,
         .operation_context=&stream,.resolve_operation=d2k_ordered_stream_operation,
@@ -2350,20 +2413,20 @@ static void test_prefix_program_export(void) {
         CHECK(d2k_path_run_step(path,1,err,sizeof err)==1);
         d2k_vres result;
         CHECK(d2k_path_run_tls_input_program(path,&tr,71,&result)==1);
-        CHECK(result.program_len && !strcmp(result.program,d2k_stream_prefix_program(prefix)));
+        CHECK(result.program_len && !strcmp(result.program,d2k_stream_program_text(prefix)));
         CHECK(result.verdict==D2K_V_INCONCLUSIVE && !result.protocol_response);
         CHECK(d2k_path_run_tls_candidate(path,&tr,71,&result)==0);
         d2k_experiment_operation *recorded=&path->events[1].operation;
-        recorded->tls_prefix=NULL;
+        recorded->tls_program=NULL;
         CHECK(d2k_path_run_tls_input_program(path,&tr,71,&result)==0);
-        recorded->tls_prefix=prefix;recorded->program="foreign program";
+        recorded->tls_program=prefix;recorded->program="foreign program";
         CHECK(d2k_path_run_tls_input_program(path,&tr,71,&result)==0);
-        recorded->program=d2k_stream_prefix_program(prefix);recorded->next_offset--;
+        recorded->program=d2k_stream_program_text(prefix);recorded->next_offset--;
         CHECK(d2k_path_run_tls_input_program(path,&tr,71,&result)==0);
         recorded->next_offset++;
         d2k_path_run_free(path);
     }
-    d2k_tls_decoder_free(&decoder);d2k_stream_prefix_free(prefix);
+    d2k_tls_decoder_free(&decoder);d2k_stream_program_free(prefix);
 }
 static void test_reverse_partition_tls_continuation(void) {
     d2k_trigger tr={0};tr.len=4;memcpy(tr.payload,"abcd",4);
@@ -3550,6 +3613,7 @@ int main(void)
     test_application_macro();
     test_application_prefix_extension();
     test_application_worker();
+    test_application_mixed_order();
     test_experiment_tls_continuation();
     test_learning_session_context();
     test_learning_candidate_result();

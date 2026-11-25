@@ -27,6 +27,9 @@ typedef struct {
        censorship verdict. 1 token-local question, 2 token-independent balanced
        packetization question, 0 not eligible, -1 unknown. */
     int (*token_question)(void *,uint64_t);
+    /* Composition of a measured TCP partition is enabled for ordinary HTTPS
+       application trials. DNS/DoH keeps its existing recovery path. */
+    int allow_mixed_order;
 } d2k_tls_application;
 /* Application-led chronological learning: each complete input is followed by
    an owned application trial and actual release. Failure updates the model,
