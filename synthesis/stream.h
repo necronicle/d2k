@@ -61,7 +61,7 @@ d2k_stream_program *d2k_stream_prefix_new(const uint8_t *,size_t,size_t,unsigned
 d2k_stream_program *d2k_stream_prefix_partition_new(const uint8_t *,size_t,size_t,unsigned,
     size_t,const d2k_payload_piece *,size_t);
 d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
-    size_t count,d2k_stream_program **out);
+    size_t count,size_t sni_offset,size_t sni_length,d2k_stream_program **out);
 void d2k_stream_program_free(d2k_stream_program *);
 const char *d2k_stream_program_text(const d2k_stream_program *);
 typedef struct {size_t bytes;int reverse;const d2k_stream_program *program;} d2k_stream_action;

@@ -572,7 +572,8 @@ static int refine_mixed_order(d2k_tls_path_session *w)
     parts[n-1]=parts[n-2];parts[n-2]=last;
 
     d2k_stream_program *program=NULL;
-    d2k_lower_status compiled=d2k_stream_partition_compile(w->trigger.len,parts,n,&program);
+    d2k_lower_status compiled=d2k_stream_partition_compile(w->trigger.len,parts,n,
+        w->trigger.sni_off,w->trigger.sni_len,&program);
     if (compiled!=D2K_LOWER_OK) return compiled==D2K_LOWER_ERROR ? -1 : 0;
     int added=append_action(w,w->trigger.len,0,program);
     if (added!=1) {d2k_stream_program_free(program);return added;}

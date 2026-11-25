@@ -11,6 +11,10 @@ typedef enum {D2K_LOWER_ERROR=-1,D2K_LOWER_OK=0,D2K_LOWER_INVALID=1,
  * Caller frees *text. Unsupported sequences require extending Plan. */
 d2k_lower_status d2k_lower_partition(size_t,const d2k_payload_piece *,size_t,
                                     const char *protocol,char **text,char *err,size_t);
+/* Same byte-preserving compilation, bound to an observed SNI position and
+ * length when the caller derived a boundary from that field. */
+d2k_lower_status d2k_lower_partition_observed(size_t,const d2k_payload_piece *,size_t,
+    const char *protocol,size_t sni_offset,size_t sni_length,char **text,char *err,size_t);
 /* Compile one caller-supplied TLS prefix, then the unchanged original stream.
  * The prefix uses the existing stale-timestamp operation; this compiler does
  * not establish remote rejection or application success. Caller supplies the

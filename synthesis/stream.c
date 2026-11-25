@@ -199,13 +199,14 @@ d2k_stream_program *d2k_stream_prefix_partition_new(const uint8_t *bytes,size_t 
     p->total=total;return p;
 }
 d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
-    size_t count,d2k_stream_program **out) {
+    size_t count,size_t sni_offset,size_t sni_length,d2k_stream_program **out) {
     if(!out)return D2K_LOWER_ERROR;
     *out=NULL;
     d2k_stream_program *program=calloc(1,sizeof *program);
     if(!program)return D2K_LOWER_ERROR;
     char error[160];
-    d2k_lower_status status=d2k_lower_partition(total,pieces,count,"tls",&program->program,error,sizeof error);
+    d2k_lower_status status=d2k_lower_partition_observed(total,pieces,count,"tls",
+        sni_offset,sni_length,&program->program,error,sizeof error);
     if(status!=D2K_LOWER_OK) {free(program);return status;}
     program->total=total;
     *out=program;

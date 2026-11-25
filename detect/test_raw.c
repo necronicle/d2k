@@ -1784,6 +1784,28 @@ static void test_application_mixed_order(void)
             CHECK(strstr(out.program,"split payload_start +62\n"));
             CHECK(strstr(out.program,"split payload_start +63\n"));
             CHECK(strstr(out.program,"order emissions=0,2,1\n"));
+            CHECK(strstr(out.program,"input 167 61 2\n"));
+            uint8_t alt[167];
+            memcpy(alt,b,52);
+            memcpy(alt+52,b+63,104);
+            memcpy(alt+156,b+52,11);
+            size_t alt_off=0,alt_len=0;
+            CHECK(!d2k_hello_sni(alt,sizeof alt,&alt_off,&alt_len));
+            CHECK(alt_off==165 && alt_len==2 && alt[alt_off]=='a');
+            uint8_t tlv[D2K_PLAN_TLV_MAX];size_t tlv_len=0;char err[160];
+            d2k_plan *plan=NULL;
+            CHECK(!d2k_plan_text_to_tlv(out.program,tlv,sizeof tlv,&tlv_len,err,sizeof err));
+            CHECK(!d2k_plan_load(tlv,tlv_len,&plan,err,sizeof err));
+            if(plan) {
+                d2k_pkt in={.payload=b,.payload_len=sizeof alt,.seq=1000,
+                    .have_sni=1,.sni_off=61,.sni_len=2,.emit_original=1};
+                d2k_actions actions={0};
+                CHECK(!d2k_plan_apply(plan,NULL,&in,&actions));
+                d2k_actions_free(&actions);
+                in.payload=alt;in.sni_off=alt_off;
+                CHECK(d2k_plan_apply(plan,NULL,&in,&actions)<0 && !actions.n);
+                d2k_actions_free(&actions);d2k_plan_free(plan);
+            }
         } else CHECK(!out.program_len);
         int runs=f.runs;
         CHECK(d2k_tls_path_session_next(w,&out)==got && f.runs==runs);

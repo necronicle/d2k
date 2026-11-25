@@ -158,11 +158,13 @@ struct partition_prefix {
 };
 
 static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
-    const char *proto,const struct partition_prefix *prefix,char **out,char *err,size_t errcap) {
+    const char *proto,const struct partition_prefix *prefix,size_t sni_off,size_t sni_len,
+    char **out,char *err,size_t errcap) {
     if(out)*out=NULL;
     if(err && errcap)err[0]=0;
     if(!out || !err || !errcap)return D2K_LOWER_ERROR;
     if(!p || !count || !total || count>total || !proto ||
+       ((sni_off || sni_len) && (!sni_len || sni_off>total || sni_len>total-sni_off)) ||
        (strcmp(proto,"tls") && strcmp(proto,"http") && strcmp(proto,"unknown"))) {
         snprintf(err,errcap,"invalid payload partition or protocol");return D2K_LOWER_INVALID;
     }
@@ -218,7 +220,8 @@ static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,
     } else if (append(text,cap,&n,
                "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp %s\nwire tcp-template-v1\n",
                version,proto)) goto format;
-    if (explicit_order && append(text,cap,&n,"input %zu 0 0\n",total)) goto format;
+    if ((explicit_order || sni_len) &&
+        append(text,cap,&n,"input %zu %zu %zu\n",total,sni_off,sni_len)) goto format;
     for(size_t i=1;i<count;i++) {
         if(sorted[i].offset>INT16_MAX) {
             status=D2K_LOWER_UNSUPPORTED;snprintf(err,errcap,"partition boundary exceeds Plan anchor offset");goto done;
@@ -247,7 +250,11 @@ done:
 
 d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
     const char *proto,char **out,char *err,size_t errcap) {
-    return lower_partition(total,p,count,proto,NULL,out,err,errcap);
+    return lower_partition(total,p,count,proto,NULL,0,0,out,err,errcap);
+}
+d2k_lower_status d2k_lower_partition_observed(size_t total,const d2k_payload_piece *p,size_t count,
+    const char *proto,size_t sni_off,size_t sni_len,char **out,char *err,size_t errcap) {
+    return lower_partition(total,p,count,proto,NULL,sni_off,sni_len,out,err,errcap);
 }
 
 d2k_lower_status d2k_lower_tls_prefix(const uint8_t *prefix,size_t length,
@@ -291,7 +298,7 @@ d2k_lower_status d2k_lower_tls_prefix_partition(const uint8_t *bytes,size_t leng
         /* Modifiers of tcp-template-v1 preserve the prefix length. */
         size_t emits = (length-1)/segment+1;
         const struct partition_prefix head = {prefix, (size_t)(order-prefix), segment, emits};
-        status = lower_partition(total,pieces,count,"tls",&head,out,err,errcap);
+        status = lower_partition(total,pieces,count,"tls",&head,0,0,out,err,errcap);
     } else {
         snprintf(err,errcap,"compiler composition form mismatch");
         status = D2K_LOWER_ERROR;

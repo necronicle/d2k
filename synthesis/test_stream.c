@@ -71,7 +71,7 @@ static void prefix_actions(void) {
     tr.len=6;actions[1].bytes=6;
     assert(!d2k_ordered_stream_domain(&s).states);
     d2k_stream_program_free(prefix);
-    assert(d2k_stream_partition_compile(5,pieces,2,NULL)==D2K_LOWER_ERROR);
+    assert(d2k_stream_partition_compile(5,pieces,2,0,0,NULL)==D2K_LOWER_ERROR);
 }
 int main(void) {
     prefix_actions();
