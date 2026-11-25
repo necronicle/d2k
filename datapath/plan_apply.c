@@ -504,10 +504,14 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
             size_t hs_total = 9u + ((size_t)b[6] << 16) + ((size_t)b[7] << 8) + b[8];
             if (rec_total == hs_total) { declared = rec_total; }
         }
-        size_t have = in->payload_len == p->input_len ? p->input_len : declared;
+        /* A numbered batch has the same slices only on the full input.
+           In this mode 0/0 requests just the length check. */
+        int exact = p->order == ORDER_EMISSIONS;
+        int length_only = exact && !p->input_sni_off && !p->input_sni_len;
+        size_t have = exact || in->payload_len == p->input_len ? in->payload_len : declared;
         if (have != p->input_len || in->payload_len > p->input_len ||
-            (in->have_sni ? in->sni_len : 0) != p->input_sni_len ||
-            (p->input_sni_len && in->sni_off != p->input_sni_off)) {
+            (!length_only && ((in->have_sni ? in->sni_len : 0) != p->input_sni_len ||
+             (p->input_sni_len && in->sni_off != p->input_sni_off)))) {
             out->refuse_why = "байты плана собраны под другой вход: объявленная "
                               "длина приветствия, длина или место имени не те, "
                               "что мерили";
@@ -605,7 +609,7 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
        Оригинал, отпущенный ядром, уходит когда ему угодно. */
     owns_payload = in->emit_original || (n_pts > 0) || (p->n_seqovls > 0) || (p->pace_us > 0) ||
                        (p->settle_us > 0) || (p->delay_us > 0) || p->ipfrag ||
-                       p->udplen || p->qsplit;
+                       p->udplen || p->qsplit || p->order == ORDER_EMISSIONS;
     /* Оригинал, отданный ядру после наших сырых фальшивок, может не уйти
        вовсе (см. own_after_fakes в d2k_plan.h). Тогда правда — последняя
        посылка плана, сразу за фальшивками, без собственной паузы. */
@@ -653,6 +657,12 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
     if (owns_payload) {
         max_emits += n_pts + 1;
         max_emits += n_pts * between_per_gap;
+    }
+    if (p->order == ORDER_EMISSIONS &&
+        (max_emits != p->emission_count || n_pts != p->n_splits)) {
+        free(pts);
+        out->refuse_why = "перестановка не совпала с посылками для этого входа";
+        return -1;
     }
     if (max_emits == 0) {
         free(pts);
@@ -850,6 +860,14 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
         }
     }
 
+    if (p->order == ORDER_EMISSIONS) {
+        /* Move the logical emissions, including their buffer ownership,
+           before assigning positional delays and applying MTU limits. */
+        d2k_emit ordered[D2K_WIRE_BATCH_MAX];
+        for (size_t i = 0; i < n; i++) ordered[i] = v[p->emission_order[i]];
+        memcpy(v, ordered, n * sizeof *v);
+    }
+
     /* РАЗНОС ВО ВРЕМЕНИ — позиционно, после всех перестановок.
      *
      * Пауза стоит перед каждой посылкой НАГРУЗКИ, кроме самой первой посылки
@@ -863,9 +881,13 @@ int d2k_plan_apply(const d2k_plan *p, const d2k_flow *f,
      * последней фальшивкой и правдой (первой идёт фальшивка — нагрузка ждёт).
      */
     if (p->pace_us > 0) {
+        /* Explicit lists pace the original slices relative to each other.
+           Use settle for a delay before the first slice after a prefix. */
+        int pace_next_slice = p->order != ORDER_EMISSIONS;
         for (size_t i = 0; i < n; i++) {
             if (v[i].kind != D2K_EMIT_PAYLOAD) { continue; }
-            v[i].delay_us = (i == 0) ? 0 : p->pace_us;
+            v[i].delay_us = i > 0 && pace_next_slice ? p->pace_us : 0;
+            pace_next_slice = 1;
         }
     }
 
@@ -898,6 +920,7 @@ finalize:
          * The route cap does not segment fake packets, UDP, or explicit
          * IP-fragment plans; an explicit segment_size keeps its semantics. */
         size_t count = 0;
+        size_t limit_count = p->order == ORDER_EMISSIONS ? D2K_WIRE_BATCH_MAX : 65536;
         for (size_t i = 0; i < n; i++) {
             size_t bytes = v[i].pre_len + v[i].len;
             size_t limit = p->segment_size;
@@ -907,7 +930,7 @@ finalize:
                 limit = in->segment_cap;
             }
             size_t chunks = limit && bytes ? (bytes - 1) / limit + 1 : 1;
-            if (chunks > 65536 || count > 65536 - chunks) {
+            if (chunks > limit_count - count) {
                 out->refuse_why = "нарезка на сегменты даёт слишком много посылок";
                 emit_vec_free(v, n); return -1;
             }

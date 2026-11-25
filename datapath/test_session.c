@@ -1075,6 +1075,43 @@ static void test_tcp_plan_skips_conntrack_read(void) {
     d2k_nat_hook = saved;
 }
 
+static void test_emission_order_tcp_flags(void) {
+    const char *text =
+        "d2k-plan 1 21\nproto tcp tls\n"
+        "split payload_start +3\nsplit payload_start +7\norder emissions=0,2,1\n";
+    uint8_t tlv[256], hello[512], pkt[1024], buf[8192];
+    char err[128];
+    size_t tlv_len = 0;
+    CHECK(!d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &tlv_len, err, sizeof err), "order compile");
+    if (!tlv_len) return;
+    d2k_plan *plan = NULL;
+    CHECK(!d2k_plan_load(tlv, tlv_len, &plan, err, sizeof err), "order load");
+    if (!plan) return;
+    d2k_session *s = d2k_session_new(8, 4);
+    CHECK(s != NULL, "order session");
+    if (!s) { d2k_plan_free(plan); return; }
+    d2k_session_set_plan(s, plan);
+    const size_t hello_len = build_hello(hello);
+    d2k_result r;
+    for (int urgent = 0; urgent <= 1; urgent++) {
+        uint16_t port = (uint16_t)(41310 + urgent);
+        size_t n = build_pkt(pkt, port, 0x02, NULL, 0);
+        d2k_session_packet(s, pkt, n, 1000+urgent*3000, buf, sizeof buf, &r);
+        n = build_rev_pkt(pkt, port, 0x12, NULL, 0);
+        d2k_session_packet(s, pkt, n, 2000+urgent*3000, buf, sizeof buf, &r);
+        n = build_pkt(pkt, port, urgent ? 0x38 : 0x18, hello, hello_len);
+        d2k_session_packet(s, pkt, n, 3000+urgent*3000, buf, sizeof buf, &r);
+        if (urgent) {
+            CHECK(!r.applied && !r.n_out && r.verdict == D2K_VERDICT_ACCEPT,
+                  "an urgent TCP segment must retain its original flags");
+        } else {
+            CHECK(r.applied && r.n_out == 3 && r.verdict == D2K_VERDICT_DROP,
+                  "ordinary TCP payload uses the requested permutation");
+        }
+    }
+    d2k_session_free(s);
+}
+
 /* ЗАДАЧА 47, п. 0: КЛИЕНТ С МЕТКОЙ МАРШРУТИЗАЦИИ ПЛАНА НЕ ПОЛУЧАЕТ.
  * Keenetic метит пакеты клиента с маршрутом по политике/доменам (0xffffaaa ->
  * таблица 4096, VPN) до нашей очереди; сырые посылки d2k идут с меткой 0x2d
@@ -2239,6 +2276,7 @@ int main(void) {
     test_route_mark_does_not_leak();
     test_routed_flag_reset_on_new_syn();
     test_tcp_plan_skips_conntrack_read();
+    test_emission_order_tcp_flags();
     test_routed_client_gets_no_plan_tcp();
     test_reply_hidden_by_accelerator();
     {

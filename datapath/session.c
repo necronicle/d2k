@@ -3548,6 +3548,12 @@ static int session_packet(d2k_session *s, const uint8_t *pkt, size_t len,
         return 0;
     }
 
+    if (use->order == ORDER_EMISSIONS && (!ack || (flags & ~0x18u) || (t[12] & 1u))) {
+        out->skipped = "управляющие флаги TCP несовместимы с перестановкой";
+        if (!http_hello) refuse_coded(s, now_ns, &key, out->skipped, D2K_REFUSE_FLOW_UNFIT, use);
+        return 0;
+    }
+
     d2k_pkt in;
     memset(&in, 0, sizeof in);
     in.payload = pkt + payload_off;

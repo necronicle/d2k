@@ -1,5 +1,6 @@
 #include "lower.h"
 #include "../core/include/d2k_plantlv.h"
+#include "../datapath/include/d2k_plan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,17 +68,29 @@ d2k_lower_status d2k_lower_tls_prefix_partition_read(const char *s,size_t total,
     const char *fake=strstr(s,"\nfake payload=1 "),*tail=fake?strchr(fake+1,'\n'):NULL;
     if(!tail){snprintf(err,cap,"missing canonical prefix");return D2K_LOWER_UNSUPPORTED;}
     tail++;
+    const char *header_end = strchr(s, '\n');
+    if (!header_end || header_end >= fake) {
+        snprintf(err,cap,"missing plan header");return D2K_LOWER_UNSUPPORTED;
+    }
     size_t head=(size_t)(tail-s),slots=strlen(tail)/22+1,n=0,covered=0;
-    if(head>SIZE_MAX-32 || slots>SIZE_MAX/sizeof(d2k_payload_piece))return D2K_LOWER_ERROR;
+    if(head>SIZE_MAX-32 || tail-header_end>INT_MAX ||
+       slots>SIZE_MAX/sizeof(d2k_payload_piece))return D2K_LOWER_ERROR;
     char *base=malloc(head+32),*canonical=NULL;
     d2k_payload_piece *p=calloc(slots,sizeof *p);
     uint8_t *b=NULL;size_t len=0,seg=0;unsigned flags=0;
     d2k_lower_status status=D2K_LOWER_ERROR;
     if(!base || !p)goto done;
-    memcpy(base,s,head);strcpy(base+head,"order forward\n");
+    snprintf(base,head+32,"d2k-plan 1 8%.*sorder forward\n",
+             (int)(tail-header_end),header_end);
     status=d2k_lower_tls_prefix_read(base,&b,&len,&seg,&flags,err,cap);
     if(status!=D2K_LOWER_OK)goto done;
     status=D2K_LOWER_UNSUPPORTED;
+    if (!strncmp(tail,"input ",6)) {
+        char exact[48];
+        int len = snprintf(exact,sizeof exact,"input %zu 0 0\n",total);
+        if (len < 0 || (size_t)len >= sizeof exact || strncmp(tail,exact,(size_t)len)) goto done;
+        tail += len;
+    }
     while(!strncmp(tail,"split payload_start +",21)) {
         const char *value=tail+21;char *end;
         if(*value<'0' || *value>'9')goto done;
@@ -86,9 +99,30 @@ d2k_lower_status d2k_lower_tls_prefix_partition_read(const char *s,size_t total,
         p[n++]=(d2k_payload_piece){covered,(size_t)cut-covered,0};covered=(size_t)cut;tail=end+1;
     }
     p[n++]=(d2k_payload_piece){covered,total-covered,0};
-    int reverse=!strncmp(tail,"order reverse\n",14);
-    if(!reverse && strncmp(tail,"order forward\n",14))goto done;
-    tail+=14;
+    if (!strncmp(tail,"order emissions=0,",18)) {
+        if (n >= D2K_WIRE_BATCH_MAX) goto done;
+        d2k_payload_piece ordered[D2K_WIRE_BATCH_MAX];
+        uint8_t order[D2K_WIRE_BATCH_MAX] = {0};
+        tail += 18;
+        for (size_t i = 0; i < n; i++) {
+            char *end;
+            if (*tail < '1' || *tail > '9') goto done;
+            unsigned long index = strtoul(tail,&end,10);
+            if (index > n || *end != (i+1 == n ? '\n' : ',')) goto done;
+            order[i+1] = (uint8_t)index;
+            ordered[i] = p[index-1];
+            tail = end+1;
+        }
+        if (!d2k_emission_order_valid(order,n+1)) goto done;
+        memcpy(p,ordered,n*sizeof *p);
+    } else {
+        int reverse=!strncmp(tail,"order reverse\n",14);
+        if(!reverse && strncmp(tail,"order forward\n",14))goto done;
+        tail+=14;
+        if(reverse)for(size_t i=0;i<n/2;i++){
+            d2k_payload_piece swap=p[i];p[i]=p[n-1-i];p[n-1-i]=swap;
+        }
+    }
     uint32_t pace=0;
     if(!strncmp(tail,"pace ",5)) {
         const char *value=tail+5;char *end;
@@ -98,7 +132,6 @@ d2k_lower_status d2k_lower_tls_prefix_partition_read(const char *s,size_t total,
         pace=(uint32_t)parsed;tail=end+1;
     }
     if(*tail)goto done;
-    if(reverse)for(size_t i=0;i<n/2;i++){d2k_payload_piece swap=p[i];p[i]=p[n-1-i];p[n-1-i]=swap;}
     for(size_t i=1;i<n;i++)p[i].delay_us=pace;
     status=d2k_lower_tls_prefix_partition(b,len,seg,flags,total,p,n,&canonical,err,cap);
     if(status!=D2K_LOWER_OK)goto done;
@@ -119,8 +152,13 @@ static int append(char *s,size_t cap,size_t *n,const char *fmt,...) {
     if(rc<0 || (size_t)rc>=cap-*n)return -1;
     *n+=(size_t)rc;return 0;
 }
-d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
-    const char *proto,char **out,char *err,size_t errcap) {
+struct partition_prefix {
+    const char *text;
+    size_t text_length, segment_size, minimum_emits;
+};
+
+static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
+    const char *proto,const struct partition_prefix *prefix,char **out,char *err,size_t errcap) {
     if(out)*out=NULL;
     if(err && errcap)err[0]=0;
     if(!out || !err || !errcap)return D2K_LOWER_ERROR;
@@ -128,7 +166,9 @@ d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,siz
        (strcmp(proto,"tls") && strcmp(proto,"http") && strcmp(proto,"unknown"))) {
         snprintf(err,errcap,"invalid payload partition or protocol");return D2K_LOWER_INVALID;
     }
-    if(count>SIZE_MAX/sizeof *p || count>(SIZE_MAX-256)/64) {
+    size_t prefix_len = prefix ? prefix->text_length : 0;
+    if(count>SIZE_MAX/sizeof *p || prefix_len>SIZE_MAX-256 ||
+       count>(SIZE_MAX-256-prefix_len)/64 || prefix_len>INT_MAX) {
         snprintf(err,errcap,"partition allocation overflow");return D2K_LOWER_ERROR;
     }
     d2k_payload_piece *sorted=malloc(count*sizeof *sorted);
@@ -149,24 +189,50 @@ d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,siz
         forward &= p[i].offset==sorted[i].offset;
         reverse &= p[i].offset==sorted[count-1-i].offset;
     }
-    if(!forward && !reverse){snprintf(err,errcap,"Plan cannot encode this piece permutation");goto done;}
+    int explicit_order = !forward && !reverse;
+    size_t leading = prefix ? 1 : 0;
+    if (explicit_order) {
+        size_t emits = prefix ? prefix->minimum_emits : 0;
+        for (size_t i = 0; i < count; i++) {
+            size_t pieces = prefix ? (p[i].length-1)/prefix->segment_size+1 : 1;
+            if (emits > D2K_WIRE_BATCH_MAX || pieces > D2K_WIRE_BATCH_MAX-emits) {
+                snprintf(err,errcap,"Plan emission list exceeds the executor capacity");goto done;
+            }
+            emits += pieces;
+        }
+    }
     uint32_t pace=count>1?p[1].delay_us:0;
     if(p[0].delay_us){snprintf(err,errcap,"Plan partition has no initial-delay encoding");goto done;}
     for(size_t i=1;i<count;i++)if(p[i].delay_us!=pace) {
         snprintf(err,errcap,"Plan partition cannot encode unequal piece delays");goto done;
     }
-    size_t cap=count*64+256,n=0;
+    size_t cap=count*64+256+prefix_len,n=0;
     text=malloc(cap);tlv=malloc(D2K_PLAN_TLV_MAX);
     status=D2K_LOWER_ERROR;
     if(!text || !tlv){snprintf(err,errcap,"plan allocation failed");goto done;}
-    if(append(text,cap,&n,"d2k-plan 1 8\nid 00000000000000000000000000000000\nproto tcp %s\nwire tcp-template-v1\n",proto))goto format;
+    unsigned version = explicit_order ? D2K_EXEC_EMISSION_ORDER : 8;
+    if (prefix) {
+        const char *body = strchr(prefix->text,'\n');
+        if (!body || append(text,cap,&n,"d2k-plan 1 %u%.*s",version,
+                            (int)(prefix_len-(size_t)(body-prefix->text)),body)) goto format;
+    } else if (append(text,cap,&n,
+               "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp %s\nwire tcp-template-v1\n",
+               version,proto)) goto format;
+    if (explicit_order && append(text,cap,&n,"input %zu 0 0\n",total)) goto format;
     for(size_t i=1;i<count;i++) {
         if(sorted[i].offset>INT16_MAX) {
             status=D2K_LOWER_UNSUPPORTED;snprintf(err,errcap,"partition boundary exceeds Plan anchor offset");goto done;
         }
         if(append(text,cap,&n,"split payload_start +%zu\n",sorted[i].offset))goto format;
     }
-    if(append(text,cap,&n,"order %s\n",forward?"forward":"reverse"))goto format;
+    if (explicit_order) {
+        if (append(text,cap,&n,"order emissions=%s",leading?"0,":"")) goto format;
+        for (size_t i = 0; i < count; i++) {
+            size_t index = 0;
+            while (sorted[index].offset != p[i].offset) index++;
+            if (append(text,cap,&n,"%zu%s",index+leading,i+1==count?"\n":",")) goto format;
+        }
+    } else if (append(text,cap,&n,"order %s\n",forward?"forward":"reverse")) goto format;
     if(pace && append(text,cap,&n,"pace %u\n",(unsigned)pace))goto format;
     size_t tlv_len=0;
     if(d2k_plan_text_to_tlv(text,tlv,D2K_PLAN_TLV_MAX,&tlv_len,err,errcap)) {
@@ -177,6 +243,11 @@ format:
     snprintf(err,errcap,"plan text formatting failed");
 done:
     free(sorted);free(text);free(tlv);return status;
+}
+
+d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
+    const char *proto,char **out,char *err,size_t errcap) {
+    return lower_partition(total,p,count,proto,NULL,out,err,errcap);
 }
 
 d2k_lower_status d2k_lower_tls_prefix(const uint8_t *prefix,size_t length,
@@ -212,28 +283,19 @@ d2k_lower_status d2k_lower_tls_prefix_partition(const uint8_t *bytes,size_t leng
     size_t count,char **out,char *err,size_t errcap) {
     if(out)*out=NULL;
     if(!out || !err || !errcap)return D2K_LOWER_ERROR;
-    char *partition=NULL,*prefix=NULL,*combined=NULL;
-    uint8_t *tlv=NULL;
-    d2k_lower_status status=d2k_lower_partition(total,pieces,count,"tls",&partition,err,errcap);
-    if(status!=D2K_LOWER_OK)return status;
-    status=d2k_lower_tls_prefix(bytes,length,segment,mods,&prefix,err,errcap);
-    if(status!=D2K_LOWER_OK)goto done;
-    const char *order=strstr(prefix,"order forward\n");
-    const char *wire=strstr(partition,"\nwire tcp-template-v1\n");
-    status=D2K_LOWER_ERROR;
-    if(!order || !wire){snprintf(err,errcap,"compiler composition form mismatch");goto done;}
-    const char *tail=wire+strlen("\nwire tcp-template-v1\n");
-    size_t head=(size_t)(order-prefix),rest=strlen(tail),tlv_length=0;
-    if(rest==SIZE_MAX || head>SIZE_MAX-rest-1) {
-        snprintf(err,errcap,"prefix partition allocation overflow");goto done;
+    char *prefix = NULL;
+    d2k_lower_status status = d2k_lower_tls_prefix(bytes,length,segment,mods,&prefix,err,errcap);
+    if (status != D2K_LOWER_OK) return status;
+    const char *order = strstr(prefix,"order forward\n");
+    if (order) {
+        /* Modifiers of tcp-template-v1 preserve the prefix length. */
+        size_t emits = (length-1)/segment+1;
+        const struct partition_prefix head = {prefix, (size_t)(order-prefix), segment, emits};
+        status = lower_partition(total,pieces,count,"tls",&head,out,err,errcap);
+    } else {
+        snprintf(err,errcap,"compiler composition form mismatch");
+        status = D2K_LOWER_ERROR;
     }
-    combined=malloc(head+rest+1);tlv=malloc(D2K_PLAN_TLV_MAX);
-    if(!combined || !tlv){snprintf(err,errcap,"prefix partition allocation failed");goto done;}
-    memcpy(combined,prefix,head);memcpy(combined+head,tail,rest+1);
-    if(d2k_plan_text_to_tlv(combined,tlv,D2K_PLAN_TLV_MAX,&tlv_length,err,errcap)) {
-        status=D2K_LOWER_UNSUPPORTED;goto done;
-    }
-    *out=combined;combined=NULL;status=D2K_LOWER_OK;
-done:
-    free(partition);free(prefix);free(combined);free(tlv);return status;
+    free(prefix);
+    return status;
 }

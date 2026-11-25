@@ -491,7 +491,111 @@ static void test_gv_reference(void) {
         d2k_plan_free(p);
     }
 }
+/* Explicit order includes every logical emission exactly once. Segmenting
+ * individual emissions afterwards may change the number of wire packets. */
+static void test_explicit_emission_order(void) {
+    const char *base =
+        "d2k-plan 1 21\nproto tcp tls\n"
+        "payload 1 11121314\npoison 1 badsum\n"
+        "fake payload=1 poison=1 repeats=1 gap_us=0 place=before\n"
+        "split payload_start +3\nsplit payload_start +7\n";
+    char text[512], err[128];
+    uint8_t tlv[1024], payload[20] = {0};
+    size_t len = 0;
+    d2k_plan *plan = NULL;
+    snprintf(text, sizeof text, "%sorder emissions=1,0,3,2\n", base);
+    CHECK(!d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &len, err, sizeof err),
+          "explicit order compiles");
+    if (!len) return;
+    CHECK(!d2k_plan_load(tlv, len, &plan, err, sizeof err), "explicit order loads");
+    if (!plan) return;
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i + 1);
+    d2k_pkt in = {.seq = 100, .payload = payload, .payload_len = sizeof payload};
+    d2k_actions out = {0};
+    CHECK(!d2k_plan_apply(plan, NULL, &in, &out) && out.n == 4 &&
+          out.fate == D2K_ORIG_DROP, "permutation owns and preserves the original");
+    if (out.n == 4) {
+        CHECK(out.v[0].kind == D2K_EMIT_PAYLOAD && out.v[0].seq == 100 &&
+              out.v[0].len == 3, "prefix first");
+        CHECK(out.v[1].kind == D2K_EMIT_FAKE && out.v[1].len == 4, "inserted emission second");
+        CHECK(out.v[2].kind == D2K_EMIT_PAYLOAD && out.v[2].seq == 107 &&
+              out.v[2].len == 13, "tail precedes the middle");
+        CHECK(out.v[3].kind == D2K_EMIT_PAYLOAD && out.v[3].seq == 103 &&
+              out.v[3].len == 4, "middle arrives last");
+    }
+    d2k_actions_free(&out);
+    in.segment_cap = 4;
+    CHECK(!d2k_plan_apply(plan, NULL, &in, &out) && out.n == 7,
+          "MTU expands each emission without changing logical order");
+    if (out.n == 7) {
+        CHECK(out.v[1].kind == D2K_EMIT_FAKE &&
+              out.v[2].seq == 107 && out.v[6].seq == 103,
+              "MTU preserves order");
+        uint8_t assembled[sizeof payload] = {0};
+        for (size_t i = 0; i < out.n; i++) {
+            const d2k_emit *e = &out.v[i];
+            if (e->kind != D2K_EMIT_PAYLOAD) continue;
+            size_t offset = (uint32_t)(e->seq-in.seq);
+            CHECK(offset < sizeof payload && e->len <= sizeof payload-offset,
+                  "emitted data is inside the original TCP sequence space");
+            if (offset < sizeof payload && e->len <= sizeof payload-offset)
+                memcpy(assembled+offset, e->bytes, e->len);
+        }
+        CHECK(!memcmp(assembled, payload, sizeof payload), "peer reconstructs the exact payload");
+    }
+    d2k_actions_free(&out);
+    uint8_t larger[40] = {0};
+    in.payload = larger;
+    in.payload_len = sizeof larger;
+    in.segment_cap = 1;
+    CHECK(d2k_plan_apply(plan, NULL, &in, &out) != 0 && !out.n &&
+          out.fate == D2K_ORIG_PASS, "expanded batch beyond the wire limit releases the original");
+    d2k_actions_free(&out);
+    in.payload = payload;
+    in.segment_cap = 0;
+    in.payload_len = 6;
+    CHECK(d2k_plan_apply(plan, NULL, &in, &out) != 0 && !out.n &&
+          out.fate == D2K_ORIG_PASS, "missing slice must release the original");
+    d2k_actions_free(&out);
+    d2k_plan_free(plan);
+    plan = NULL;
+    tlv[7] = 20;
+    CHECK(d2k_plan_load(tlv, len, &plan, err, sizeof err) != 0,
+          "explicit order requires its executor contract");
+    d2k_plan_free(plan);
+    tlv[7] = 21;
+    for (size_t at = 12; at+4 <= len;) {
+        size_t size = (size_t)tlv[at+2]*256 + tlv[at+3];
+        if (size > len-at-4) break;
+        if ((unsigned)tlv[at]*256+tlv[at+1] == REC_ORDER && size == 5) {
+            tlv[at+6] = tlv[at+5];
+            CHECK(d2k_plan_load(tlv, len, &plan, err, sizeof err) != 0,
+                  "duplicate index in wire order rejected");
+            d2k_plan_free(plan);
+            break;
+        }
+        at += 4+size;
+    }
+    const char *invalid[] = {"1,1,3,2", "1,0,3,2,", "1,0,4,2", "-1,0,3,2", "1,0,2"};
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        snprintf(text, sizeof text, "%sorder emissions=%s\n", base, invalid[i]);
+        CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &len, err, sizeof err) != 0,
+              "invalid emission order rejected");
+    }
+    snprintf(text, sizeof text, "%sorder emissions=1,0,3,2\norder forward\n", base);
+    CHECK(d2k_plan_text_to_tlv(text, tlv, sizeof tlv, &len, err, sizeof err) != 0,
+          "conflicting order directives rejected");
+    const char *no_split =
+        "d2k-plan 1 21\nproto tcp tls\npayload 1 11121314\n"
+        "fake payload=1 poison=0 repeats=1 gap_us=0 place=before\n"
+        "fake payload=1 poison=0 repeats=1 gap_us=0 place=between\n"
+        "order emissions=0,1\n";
+    CHECK(d2k_plan_text_to_tlv(no_split, tlv, sizeof tlv, &len, err, sizeof err) != 0,
+          "between-slice emission needs a slice boundary");
+}
+
 int main(void) {
+    test_explicit_emission_order();
     test_gv_reference();
     test_preflight_resyn_timing();
     test_preflight_resyn_rejects_incomplete_or_unsupported();

@@ -41,7 +41,8 @@ static void fail(char *err, size_t errlen, const char *msg) {
  * наращивать массивы по ходу. Проход дешёвый, а realloc в датапате — лишний
  * источник ошибок. */
 struct counts {
-    size_t payloads, poisons, splits, fakes, seqovls, oob, stream_offset,after_split,preflight,pf_resyn,pf_handover;
+    int explicit_order;
+    size_t orders, payloads, poisons, splits, fakes, seqovls, oob, stream_offset,after_split,preflight,pf_resyn,pf_handover;
 };
 
 static int scan(const uint8_t *b, size_t len, struct counts *c,
@@ -183,7 +184,14 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             c->seqovls++;
             break;
         case REC_ORDER:
-            if (ln != 1) { fail(err, errlen, "порядок не 1 байт"); return -1; }
+            c->orders++;
+            if (ln == 1 && b[off] <= ORDER_REVERSE) break;
+            if (ln < 3 || b[off] != ORDER_EMISSIONS ||
+                rd16(b + 6) < D2K_EXEC_EMISSION_ORDER ||
+                !d2k_emission_order_valid(b + off + 1, ln - 1)) {
+                fail(err, errlen, "неверная перестановка посылок или minexec"); return -1;
+            }
+            c->explicit_order = 1;
             break;
         case REC_PACE:
             if (ln != 4) { fail(err, errlen, "разнос во времени не 4 байта"); return -1; }
@@ -260,6 +268,14 @@ static int scan(const uint8_t *b, size_t len, struct counts *c,
             return -1;
         }
         (*recs_seen)++;
+    }
+    if (c->explicit_order) {
+        if (c->orders != 1) {
+            fail(err, errlen, "повторный порядок посылок"); return -1;
+        }
+        if (c->splits >= D2K_WIRE_BATCH_MAX || c->fakes >= D2K_WIRE_BATCH_MAX) {
+            fail(err, errlen, "слишком много операций для перестановки посылок"); return -1;
+        }
     }
     return 0;
 }
@@ -390,9 +406,20 @@ static int check_refs(d2k_plan *p, char *err, size_t errlen) {
         }
     }
 
-    if (p->order != ORDER_FORWARD && p->order != ORDER_REVERSE) {
-        fail(err, errlen, "неизвестный порядок посылки");
-        return -1;
+    if (p->order == ORDER_EMISSIONS) {
+        if (p->transport != 6 || p->oob_enabled || p->after_length || p->preflight) {
+            fail(err, errlen, "перестановка посылок требует обычного TCP-входа");
+            return -1;
+        }
+        size_t count = p->n_splits + 1;
+        for (size_t i = 0; i < p->n_fakes; i++) {
+            size_t repeats = p->fakes[i].repeats ? p->fakes[i].repeats : 1;
+            count += repeats * (p->fakes[i].placement == PLACE_BETWEEN ? p->n_splits : 1);
+        }
+        if (count != p->emission_count) {
+            fail(err, errlen, "перестановка должна перечислять все логические посылки");
+            return -1;
+        }
     }
 
     /* Перекрытий больше одного не бывает: приставка у первого куска одна.
@@ -606,6 +633,8 @@ int d2k_plan_load(const uint8_t *buf, size_t len,
         }
         case REC_ORDER:
             p->order = v[0];
+            p->emission_count = (uint8_t)(ln - 1);
+            memcpy(p->emission_order, v + 1, p->emission_count);
             break;
         case REC_PACE:
             /* Последняя запись побеждает — та же дисциплина, что у порядка и

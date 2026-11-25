@@ -51,10 +51,31 @@
 /* Version 18: TCP preflight program (window, scale, pieces, hello payload reference, timeout). */
 /* Version 19: explicit delayed SYN handover and finite retry count. */
 /* Version 20: explicit outgoing program after owned preflight handover. */
-#define D2K_EXEC_VERSION 20
+/* Version 21: explicit permutation of the logical TCP emissions. */
+#define D2K_EXEC_EMISSION_ORDER 21
+#define D2K_EXEC_VERSION D2K_EXEC_EMISSION_ORDER
 #define D2K_PLAN_PROTO_HTTP 4
 /* Shared result capacity for measured and live packet programs. */
 #define D2K_WIRE_BATCH_MAX 26
+
+enum { PLACE_BEFORE = 0, PLACE_BETWEEN = 1 };
+
+/* ORDER_EMISSIONS lists indices in send order, after expanding repeats but
+ * before MTU segmentation. Indices refer to the forward logical order:
+ * leading fakes, then each payload slice and its between-slice fakes. */
+enum { ORDER_FORWARD = 0, ORDER_REVERSE = 1, ORDER_EMISSIONS = 2 };
+
+static inline int d2k_emission_order_valid(const uint8_t *order, size_t count) {
+    if (count < 2 || count > D2K_WIRE_BATCH_MAX) return 0;
+    uint32_t seen = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (order[i] >= count) return 0;
+        uint32_t bit = UINT32_C(1) << order[i];
+        if (seen & bit) return 0;
+        seen |= bit;
+    }
+    return 1;
+}
 #define D2K_WIRE_DETECT_TCP 1
 #define D2K_WIRE_TCP_TEMPLATE 2
 #define D2K_SCHEMA_MAX   1

@@ -30,6 +30,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include "../datapath/include/d2k_capture.h"
+#include "../datapath/include/d2k_plan.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,6 +118,8 @@ typedef struct {
     pl_fake    fakes[MAX_FAKES];       size_t n_fakes;
     pl_seqovl  seqovls[MAX_SEQOVLS];   size_t n_seqovls;
     uint8_t    order;
+    uint8_t    emission_count;
+    uint8_t    emission_order[D2K_WIRE_BATCH_MAX];
     uint8_t    guards;
     uint32_t   pace_us;   /* 0 — записи нет */
     uint32_t   input_len, input_sni_off, input_sni_len, settle_us, segment_size;
@@ -290,6 +293,24 @@ static int str_u32(const char *sv, unsigned long *out) {
     return parse_uint(sv, UINT32_MAX, out);
 }
 
+static int parse_emission_order(char *list, pl_plan *p) {
+    size_t count = 0;
+    char *entry = list;
+    while (entry) {
+        char *next = strchr(entry, ',');
+        if (next) *next++ = '\0';
+        unsigned long index;
+        if (count == D2K_WIRE_BATCH_MAX ||
+            parse_uint(entry, D2K_WIRE_BATCH_MAX - 1, &index)) return -1;
+        p->emission_order[count++] = (uint8_t)index;
+        entry = next;
+    }
+    if (!d2k_emission_order_valid(p->emission_order, count)) return -1;
+    p->order = ORDER_EMISSIONS;
+    p->emission_count = (uint8_t)count;
+    return 0;
+}
+
 static void plan_free(pl_plan *p) {
     for (size_t i = 0; i < p->n_payloads; i++) { free(p->payloads[i].bytes); }
     memset(p, 0, sizeof *p);
@@ -298,6 +319,7 @@ static void plan_free(pl_plan *p) {
 static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     memset(p, 0, sizeof *p);
     int seen_header = 0;
+    int seen_order = 0;
     size_t lineno = 0;
     const char *cur = text;
 
@@ -573,8 +595,8 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             v->repeats = (uint8_t)u;
             if (kv_u32(f[4], "gap_us", UINT32_MAX, &u) != 0) { say(err, errcap, "строка %zu: fake без gap_us=", lineno); goto bad; }
             v->gap_us = (uint32_t)u;
-            if (strcmp(f[5], "place=before") == 0) { v->placement = 0; }
-            else if (strcmp(f[5], "place=between") == 0) { v->placement = 1; }
+            if (strcmp(f[5], "place=before") == 0) { v->placement = PLACE_BEFORE; }
+            else if (strcmp(f[5], "place=between") == 0) { v->placement = PLACE_BETWEEN; }
             else { say(err, errcap, "строка %zu: неизвестное место \"%s\"", lineno, f[5]); goto bad; }
             if (nf == 7) {
                 if (strcmp(f[6], "tlsmod=rnd,dupsid") == 0) { v->tls_mod = 3; }
@@ -596,9 +618,17 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
             p->n_seqovls++;
         } else if (strcmp(f[0], "order") == 0) {
             if (nf != 2) { say(err, errcap, "строка %zu: order ждёт одно слово", lineno); goto bad; }
-            if (strcmp(f[1], "forward") == 0) { p->order = 0; }
-            else if (strcmp(f[1], "reverse") == 0) { p->order = 1; }
+            if (strcmp(f[1], "forward") == 0) { p->order = ORDER_FORWARD; }
+            else if (strcmp(f[1], "reverse") == 0) { p->order = ORDER_REVERSE; }
+            else if (strncmp(f[1], "emissions=", 10) == 0) {
+                if (parse_emission_order(f[1] + 10, p)) {
+                    say(err, errcap, "строка %zu: неверная перестановка посылок", lineno); goto bad;
+                }
+            }
             else { say(err, errcap, "строка %zu: неизвестный порядок \"%s\"", lineno, f[1]); goto bad; }
+            if (++seen_order > 1 && p->emission_count) {
+                say(err, errcap, "строка %zu: повторный порядок посылок", lineno); goto bad;
+            }
         } else if (strcmp(f[0], "pace") == 0) {
             /* Разнос посылок нагрузки во времени, микросекунды. Ноль
                запрещён: «pace 0» и отсутствие строки означали бы одно и то
@@ -725,6 +755,27 @@ static int parse_text(const char *text, pl_plan *p, char *err, size_t errcap) {
     if (!seen_header) {
         say(err, errcap, "нет заголовка d2k-plan");
         goto bad;
+    }
+    if (p->order == ORDER_EMISSIONS) {
+        if (p->minexec < D2K_EXEC_EMISSION_ORDER || p->transport != 6 ||
+            p->oob_enabled || p->after_length || p->preflight) {
+            say(err, errcap, "перестановка посылок требует minexec=21 и обычного TCP-входа"); goto bad;
+        }
+        size_t count = p->n_splits + 1;
+        for (size_t i = 0; i < p->n_fakes; i++) {
+            size_t positions = 1;
+            if (p->fakes[i].placement == PLACE_BETWEEN) {
+                positions = p->n_splits;
+                if (!positions) {
+                    say(err, errcap, "посылке между кусками нужны разрезы"); goto bad;
+                }
+            }
+            size_t repeats = p->fakes[i].repeats ? p->fakes[i].repeats : 1;
+            count += repeats * positions;
+        }
+        if (count != p->emission_count) {
+            say(err, errcap, "перестановка должна перечислять все логические посылки"); goto bad;
+        }
     }
     if(p->pf_handover_apply && (!p->preflight || p->minexec<20)) {
         say(err,errcap,"handover apply requires preflight and minexec=20");goto bad;
@@ -1041,8 +1092,9 @@ int d2k_plan_text_to_tlv(const char *text, uint8_t *out, size_t cap,
     }
     /* БЕЗУСЛОВНО — см. шапку файла. */
     put_u8(&w, (uint8_t)(REC_ORDER >> 8)); put_u8(&w, (uint8_t)REC_ORDER);
-    put_u16(&w, 1);
+    put_u16(&w, 1 + p.emission_count);
     put_u8(&w, p.order);
+    for (size_t i = 0; i < p.emission_count; i++) put_u8(&w, p.emission_order[i]);
     /* PACE — ПОСЛЕ ORDER и ДО GUARD. Место в ряду не косметика: датапат
        читает записи подряд, и порядок обязан быть один и тот же у сборщика и
        у разбора (см. шапку файла). */

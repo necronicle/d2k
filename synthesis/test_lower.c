@@ -38,6 +38,19 @@ int main(void) {
         assert(d2k_lower_tls_prefix_partition_read(extra,20,&decoded,&bytes,&segment,&mods,
             &partition,&count,why,sizeof why)!=D2K_LOWER_OK && !decoded && !partition);
         free(extra);free(program);
+        d2k_payload_piece mixed[] = {{0,3,0},{11,9,23},{3,8,23}};
+        assert(d2k_lower_tls_prefix_partition(prefix,sizeof prefix,1400,3,
+            20,mixed,3,&program,why,sizeof why)==D2K_LOWER_OK);
+        assert(strstr(program,"order emissions=0,1,3,2\n"));
+        assert(d2k_lower_tls_prefix_partition_read(program,20,&decoded,&bytes,&segment,&mods,
+            &partition,&count,why,sizeof why)==D2K_LOWER_OK);
+        assert(mods==3 && count==3);
+        for(size_t i=0;i<count;i++)assert(partition[i].offset==mixed[i].offset &&
+            partition[i].length==mixed[i].length && partition[i].delay_us==mixed[i].delay_us);
+        free(decoded);free(partition);free(program);
+        mixed[1].length += 4;
+        assert(d2k_lower_tls_prefix_partition(prefix,sizeof prefix,1,3,
+            24,mixed,3,&program,why,sizeof why)==D2K_LOWER_UNSUPPORTED && !program);
         pieces[2].length--;
         assert(d2k_lower_tls_prefix_partition(prefix,sizeof prefix,1400,0,
             20,pieces,3,&program,why,sizeof why)==D2K_LOWER_INVALID && !program);
@@ -70,8 +83,12 @@ int main(void) {
     p[1].length=4;p[2].delay_us=18;
     assert(d2k_lower_partition(20,p,3,"tls",&text,err,sizeof err)==D2K_LOWER_UNSUPPORTED && !text);
     p[2].delay_us=17;
-    d2k_payload_piece mixed[]={p[1],p[0],p[2]};mixed[0].delay_us=0;
-    assert(d2k_lower_partition(20,mixed,3,"tls",&text,err,sizeof err)==D2K_LOWER_UNSUPPORTED && !text);
+    d2k_payload_piece mixed[]={{3,4,0},{0,3,17},{7,13,17}};
+    assert(d2k_lower_partition(20,mixed,3,"tls",&text,err,sizeof err)==D2K_LOWER_OK);
+    assert(strstr(text,"d2k-plan 1 21\n") && strstr(text,"input 20 0 0\n") &&
+           strstr(text,"order emissions=1,0,2\n") &&
+           strstr(text,"pace 17\n"));
+    free(text);
     assert(d2k_lower_partition(21,p,3,"tls",&text,err,sizeof err)==D2K_LOWER_INVALID && !text);
     puts("lower: exact partition, order, pacing, gaps/overlap and unsupported emission rejection PASS");
 }

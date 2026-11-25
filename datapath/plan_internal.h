@@ -70,8 +70,6 @@ enum {
     ANCHOR_SLD_MIDDLE    = 6
 };
 
-enum { PLACE_BEFORE = 0, PLACE_BETWEEN = 1 };
-enum { ORDER_FORWARD = 0, ORDER_REVERSE = 1 };
 
 struct d2k_payload {
     uint16_t id;
@@ -132,6 +130,8 @@ struct d2k_plan {
     uint8_t  transport;
     uint8_t  proto;
     uint8_t  order;
+    uint8_t  emission_count;
+    uint8_t  emission_order[D2K_WIRE_BATCH_MAX];
     uint8_t  guards;
     uint32_t input_len, input_sni_off, input_sni_len;
     uint32_t settle_us;
