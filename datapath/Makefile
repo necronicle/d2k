@@ -77,7 +77,7 @@ test-fresh-fake: test_fresh_fake
 	./test_fresh_fake
 check: test-fresh-fake
 
-.PHONY: all check san gcc-warn ctlprobe d2kd-linux-arm64 test-dns-family test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
+.PHONY: all check san gcc-warn d2kd-linux-arm64 test-dns-family test-parse test-apply test-tls test-wire test-wire-udp test-track test-session test-nat test-nl test-sched test-journal test-plans test-ctl test-quic-session test-stun-session test-udp-release test-udp-path test-routemark cross clean
 
 all: planlab ctlprobe
 
