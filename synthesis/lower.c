@@ -193,7 +193,10 @@ static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,
         forward &= p[i].offset==sorted[i].offset;
         reverse &= p[i].offset==sorted[count-1-i].offset;
     }
-    int explicit_order = !forward && !reverse;
+    /* Overlap must replay the complete measured batch. A forward plan may
+       otherwise apply to a shorter first TCP segment with the same declared
+       TLS length and send the remaining slice outside the composition. */
+    int explicit_order = overlap_len > 0 || (!forward && !reverse);
     size_t leading = prefix ? 1 : 0;
     if (explicit_order) {
         size_t emits = prefix ? prefix->minimum_emits : 0;

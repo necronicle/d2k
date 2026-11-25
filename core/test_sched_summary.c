@@ -1379,6 +1379,16 @@ int main(void) {
                       "кандидат подтверждён собственным зондом на проводе");
         CHECK(strstr(rows,ladder?"path=fallback":"path=property"));
     }
+    const char *synthesis_paths[]={"composition","fallback"};
+    for(size_t i=0;i<sizeof synthesis_paths/sizeof synthesis_paths[0];i++) {
+        task *q=fixture(s);q->n_plans=q->next_plan=1;
+        strcpy(q->plans[0],"synthesized candidate");
+        q->arm_hash=fnv1a(q->plans[0]);
+        snprintf(q->arm_path,sizeof q->arm_path,"%s",synthesis_paths[i]);
+        search_report(s,q,900,"probe-confirmed",NULL,"own application receipt");
+        char expected[64];snprintf(expected,sizeof expected,"path=%s",synthesis_paths[i]);
+        CHECK(strstr(rows,expected));
+    }
     task *t = fixture(s);
     /* Real launch → pthread_create failure → reset used to lose the report. */
     CHECK(launch_task(s, t) == 0);

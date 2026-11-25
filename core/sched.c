@@ -12697,6 +12697,8 @@ static void search_report(d2k_sched *s, task *t, int64_t now_ms,
                перебора в поле считала и её. */
             path = !strcmp(p, "свой план") || t->own_first == 2 ? "own-plan" :
                    !strcmp(p, "RX-лестница") ? "ladder" :
+                   !strcmp(p, "composition") ? "composition" :
+                   !strcmp(p, "fallback") ? "fallback" :
                    !strcmp(p, "перебор") ? "fallback" : "property";
         }
     }

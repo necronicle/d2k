@@ -46,6 +46,8 @@ static void check_overlap(void) {
     char *text=NULL,err[160];
     assert(d2k_lower_partition_overlap_observed(sizeof original,pieces,3,"tls",
         10,5,&overlap,1,&text,err,sizeof err)==D2K_LOWER_OK);
+    assert(strstr(text,"d2k-plan 1 21\n") &&
+           strstr(text,"order emissions=0,1,2\n"));
     uint8_t tlv[D2K_PLAN_TLV_MAX];size_t size=0;
     assert(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&size,err,sizeof err));
     d2k_plan *plan=NULL;
@@ -64,6 +66,10 @@ static void check_overlap(void) {
         assert(e->pre_len==(i==0));
         if(i==0)assert(e->pre[0]==0);
     }
+    d2k_actions_free(&output);
+    input.payload_len=16; /* TLS declares 20; both cuts fit, but final slice does not. */
+    assert(d2k_plan_apply(plan,NULL,&input,&output)!=0);
+    assert(output.fate==D2K_ORIG_PASS && output.n==0);
     d2k_actions_free(&output);
     d2k_plan_free(plan);
     free(text);
