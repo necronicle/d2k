@@ -1795,6 +1795,7 @@ static void test_application_mixed_order(void)
             mode==2?D2K_SYN_DIRECT_RESPONSE:D2K_SYN_CLOSED;
         if(got!=expected)fprintf(stderr,"mixed status mode=%d got=%d expected=%d runs=%d probes=%d reason=%s\n",mode,got,expected,f.runs,out.probes,out.reason);
         CHECK(got==expected);
+        CHECK(!strcmp(out.arm_path,mode==4?"fallback":mode==0?"composition":""));
         if (!(f.runs==(mode==2?1:mode==3?3:mode==1 || mode==4?5:4) && out.probes==(mode==2?1:mode==3?4:mode==1 || mode==4?6:5)))
             fprintf(stderr,"mixed mode=%d runs=%d probes=%d status=%d\n",mode,f.runs,out.probes,got);
         CHECK(f.runs==(mode==2?1:mode==3?3:mode==1 || mode==4?5:4));
@@ -1836,6 +1837,7 @@ static void test_application_mixed_order(void)
         } else CHECK(!out.program_len);
         int runs=f.runs;
         CHECK(d2k_tls_path_session_next(w,&out)==got && f.runs==runs);
+        CHECK(!strcmp(out.arm_path,mode==4?"fallback":mode==0?"composition":""));
         d2k_tls_path_session_free(w);d2k_raw_tape_free(f.factory.last);
     }
     learning_peer_bytes=0;learning_peer_allow_whole=0;episode_reply=NULL;

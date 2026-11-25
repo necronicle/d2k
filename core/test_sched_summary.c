@@ -751,9 +751,12 @@ static void synthesis_retirement_feedback(d2k_sched *s) {
         d2k_vres r={.verdict=D2K_V_INCONCLUSIVE,.synthesis_generation=77};
         snprintf(r.program,sizeof r.program,"d2k-plan 1 5\nid 00000000000000000000000000000000\nproto tcp tls\nwire detect-tcp-v1\nsplit payload_start +1\norder forward\n");
         r.program_len=strlen(r.program);
+        strcpy(r.arm_path,"fallback");
         verdict_to_plans(s,t,&r);
         CHECK(t->synthesis_generation==77 && t->n_plans==1);
+        CHECK(!strcmp(t->arm_path,"fallback"));
         t->next_plan=1;
+        CHECK(!strcmp(candidate_path(t),"fallback"));
         strcpy(t->plans[0],"exact candidate");
         t->trial_installed=1;t->trial_ack_id[0]=9;
         t->synthesis_ver_trial_id[0]=9;

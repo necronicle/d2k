@@ -7565,7 +7565,8 @@ static void verdict_to_plans(d2k_sched *s, task *t, const d2k_vres *r) {
                     }
 
                     t->arm_hash = fnv1a(r->program);
-                    snprintf(t->arm_path, sizeof t->arm_path, "synthesis");
+                    snprintf(t->arm_path, sizeof t->arm_path, "%s",
+                             r->arm_path[0] ? r->arm_path : "synthesis");
                 }
             }
             d2k_plan_free(plan); free(tlv);
@@ -8204,10 +8205,16 @@ int d2k_sched_write_live(d2k_sched *s, const char *path, const char *catalog_pat
            читалось как «цель исключена». */
         int trying = t->state == T_TRIAL_SETTLE || t->state == T_VERIFY ||
                      t->state == T_VERIFY_WAIT;
+        int own_candidate = trying && t->next_plan > 0 && t->next_plan <= t->n_plans &&
+                            t->arm_hash && fnv1a(t->plans[t->next_plan - 1]) == t->arm_hash;
         fputs(", \"source\": ", f);
         json_str(f, !trying ? ""
                         : t->n_known > 0 && t->next_plan <= t->n_known
                         ? "готовый план узнанной коробки"
+                        : own_candidate && !strcmp(t->arm_path, "fallback")
+                        ? "резервный подбор"
+                        : own_candidate && !strcmp(t->arm_path, "composition")
+                        ? "собрано из измерений"
                         : t->fb_queue && (t->next_plan ? t->next_plan - 1 : 0) >= t->fb_from
                         ? "запасной перебор" : "выведен из замера");
         fputc('}', f);

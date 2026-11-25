@@ -70,6 +70,7 @@ struct d2k_tls_path_session {
     d2k_syn_status status;
     size_t program_len;
     char program[sizeof(((d2k_vres *)0)->program)];
+    char arm_path[sizeof(((d2k_vres *)0)->arm_path)];
     char reason[sizeof(((d2k_vres *)0)->reason)];
 };
 int d2k_tls_path_session_resumable(const d2k_tls_path_session *w) {return w && w->started && !w->ready;}
@@ -257,6 +258,7 @@ static d2k_syn_status session_result(const d2k_tls_path_session *w,d2k_vres *out
     session_open_timeout(w,out,w->status);
     out->program_len=w->program_len;
     memcpy(out->program,w->program,w->program_len+1);
+    snprintf(out->arm_path,sizeof out->arm_path,"%s",w->arm_path);
     if(w->status==D2K_SYN_CANDIDATE)out->synthesis_generation=w->generation;
     snprintf(out->reason,sizeof out->reason,"%s",w->reason);
     return w->status;
@@ -789,6 +791,8 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
                 result=w->probes==1 && !w->initial_prefix?D2K_SYN_DIRECT_RESPONSE:D2K_SYN_CANDIDATE;
                 if(result==D2K_SYN_DIRECT_RESPONSE) {
                     out->program_len=0;out->program[0]=0;out->synthesis_generation=0;out->protocol_response=1;
+                } else {
+                    snprintf(out->arm_path,sizeof out->arm_path,"%s",overlap?"fallback":"composition");
                 }
                 snprintf(out->reason,sizeof out->reason,"%s",w->response_only?
                     "наблюдён ServerHello; требуется отдельная проверка приложения":
@@ -870,6 +874,7 @@ done:
     }
     w->ready=1;w->status=result;w->direct=out->protocol_response;
     w->program_len=out->program_len;memcpy(w->program,out->program,out->program_len+1);
+    snprintf(w->arm_path,sizeof w->arm_path,"%s",out->arm_path);
     snprintf(w->reason,sizeof w->reason,"%s",out->reason);return result;
 }
 d2k_syn_status d2k_tls_path_session_next(d2k_tls_path_session *w,d2k_vres *out)
