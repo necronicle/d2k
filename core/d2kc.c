@@ -242,7 +242,8 @@ static d2k_syn_status synthesis_https_provider(const d2k_tls_stream *stream,
 {
     d2k_application_request request;
     if(d2k_sched_application_request(&request)!=1 || request.doh || request.ech ||
-       request.by_addr || request.transport!=6 ||
+       request.by_addr || !request.target[0] ||
+       !memchr(request.target,0,sizeof request.target) || request.transport!=6 ||
        (request.shape!=D2K_SHAPE_MODERN && request.shape!=D2K_SHAPE_LEGACY) ||
        (request.resource[0] && request.resource[0]!='/') ||
        !memchr(request.resource,0,sizeof request.resource)) {
