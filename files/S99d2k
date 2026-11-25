@@ -2547,7 +2547,11 @@ spawn_controller() {
         return 1
     fi
     set --
-    if [ "${SYNTHESIS_ONLY:-0}" = 1 ]; then set -- --synthesis-only; fi
+    if [ "${SYNTHESIS_ONLY:-0}" = 1 ]; then
+        set -- --synthesis-only
+    elif [ "${SYNTHESIS_HTTPS:-0}" = 1 ]; then
+        set -- --synthesis-https
+    fi
     if [ "${SHADOW:-0}" = 1 ] && [ "${EXP_CONTROL:-0}" = 1 ]; then
         set -- "$@" --shadow-queue "$RUNTIME_DIR/shadow.queue"
     fi

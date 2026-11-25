@@ -1092,10 +1092,13 @@ router-openssl:
 	fi
 release: fetch-release shadow-release hello_profiles.inc tcp1620_whitelist.inc router-openssl
 	@mkdir -p $(BUILDDIR)
+	@ssl_dir="$(ROUTER_OPENSSL)/lib"; \
+		if ! test -f "$$ssl_dir/libssl.a"; then ssl_dir="$(ROUTER_OPENSSL)/lib64"; fi; \
+		test -f "$$ssl_dir/libssl.a" && test -f "$$ssl_dir/libcrypto.a" || exit 1; \
 	$(ZIG) cc -target $(TARGET) $(TARGET_FLAGS) $(CFLAGS) -I../detect/include -I"$(ROUTER_OPENSSL)/include" -DD2K_TRUSTED_DOH -static -Wl,-S,--gc-sections \
 		-o $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH) $(D2KC_MAIN) $(DOH_TLS_SRC) ../datapath/dns_family.c dns_upstreams.c boxprops.c $(SYNTH_SRC) diagnostics.c httpsprobe.c httpsearch.c httpup_logic.c sched.c shadow_queue.c $(NEWCHAIN_SRC) ../synthesis/verification.c stunprobe.c stuntrial.c quichello.c plantlv.c verdict.c meas.c \
 		crypto.c quic.c quicsnap.c quicsnap_reseal.c quicwire.c quicprobe.c quicarms.c ipfrag.c net4.c props.c voice.c voice_discovery.c stun.c hello.c catalog.c groups.c domain.c match.c compose.c measured.c link.c \
-		volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) ../datapath/wire_udp.c udpplan.c udpruntime.c -L"$(ROUTER_SSL_LIBDIR)" -lssl -lcrypto -ldl -lpthread
+		volume.c tls13.c suite.c mlkem.c keccak.c tls12.c p256.c tls13core.c x25519.c verify.c verify_quic_replay.c quicconn.c h3.c $(DETECT_SRC) ../datapath/plan_parse.c ../datapath/plan_apply.c ../datapath/wire.c $(D2KC_CT_SRC) ../datapath/wire_udp.c udpplan.c udpruntime.c -L"$$ssl_dir" -lssl -lcrypto -ldl -lpthread
 	@ls -l $(BUILDDIR)/$(D2KC_OUTPUT)-linux-$(ARCH)
 
 # Check the deployment recipe itself, not a separately maintained test link.

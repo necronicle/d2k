@@ -233,6 +233,28 @@ static d2k_syn_status synthesis_session_provider(const d2k_tls_stream *stream,
         d2k_tls_path_session_free(session);
     return status;
 }
+/* Opt-in for the working controller: only an owned, named HTTPS application
+ * request enters the experimental path. Other protocols keep their current
+ * controller and DNS recovery without spending synthesis probes. */
+static d2k_syn_status synthesis_https_provider(const d2k_tls_stream *stream,
+    const d2k_experiment *experiment,uint64_t generation,d2k_vres *out)
+{
+    d2k_application_request request;
+    if(d2k_sched_application_request(&request)!=1 || request.doh || request.ech ||
+       request.by_addr || request.transport!=6 ||
+       (request.shape!=D2K_SHAPE_MODERN && request.shape!=D2K_SHAPE_LEGACY) ||
+       request.resource[0]!='/' || !memchr(request.resource,0,sizeof request.resource)) {
+        memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
+        snprintf(out->reason,sizeof out->reason,"экспериментальный синтез HTTPS не применим к контексту");
+        return D2K_SYN_CLOSED;
+    }
+    d2k_syn_status status=synthesis_session_provider(stream,experiment,generation,out);
+    if(status==D2K_SYN_ERROR) {
+        out->program_len=0;out->program[0]=0;out->synthesis_generation=0;
+        return D2K_SYN_CLOSED;
+    }
+    return status;
+}
 
 /* Потолок сегмента отправителя замера (detect/raw.c): ставится по пределу
  * датапата вместе с d2k_sched_set_send_cap, чтобы замер и план шли одними
@@ -721,6 +743,7 @@ static void usage(void) {
         "  --https-cache  кэш HTTPS имён для вставки провайдера (умолчание — рядом с каталогом)\n"
         "  --mark     метка verifier-зондов; они идут через NFQUEUE (умолчание 0x2d)\n"
         "  --synthesis-only: disable all legacy searches and catalog plans (requires SHADOW+NEWCHAIN)\n"
+        "  --synthesis-https: opt in to bounded HTTPS synthesis in the working controller\n"
         "  --newchain-store PATH: opt-in working bindings from SHADOW (default disabled)\n"
         "  --shadow-queue ограниченная очередь TLS-подозрений для тени (умолчание — выключено)\n"
         "  --dns-upstreams снимок текущих DNS-апстримов; изменения подхватываются автоматически\n"
@@ -840,11 +863,13 @@ int main(int argc, char **argv) {
     const char *dns_configuration = NULL,*dns_addresses=NULL,*dns_routes=NULL;
     const char *force_path = NULL;
     const char *shadow_queue = NULL,*newchain_store=NULL;
-    int synthesis_only=0;
+    const char *synthesis_https_env=getenv("D2K_SYNTHESIS_HTTPS");
+    int synthesis_only=0,synthesis_https=synthesis_https_env && !strcmp(synthesis_https_env,"1");
 
     for (int i = 1; i < argc; i++) {
         const char *f = argv[i];
         if(!strcmp(f,"--synthesis-only")) {synthesis_only=1;}
+        else if(!strcmp(f,"--synthesis-https")) {synthesis_https=1;}
         else if (strcmp(f, "--health-file") == 0 && i + 1 < argc) { health_path = argv[++i]; }
         else if (strcmp(f, "--control") == 0 && i + 1 < argc) { sock = argv[++i]; }
         else if (strcmp(f, "--newchain-store") == 0 && i + 1 < argc) { newchain_store = argv[++i]; }
@@ -1097,7 +1122,8 @@ int main(int argc, char **argv) {
     synthesis_catalog_path=catpath;
     /* Keep research searches out of the restored working controller. An
        experimental result must not delay or short-circuit its measurements. */
-    d2k_detect_synthesis_set(synthesis_only ? synthesis_session_provider : NULL);
+    d2k_detect_synthesis_set(synthesis_only ? synthesis_session_provider :
+                             synthesis_https ? synthesis_https_provider : NULL);
     d2k_sched_application_synthesis_hook=synthesis_only ? application_synthesis_dispatch : NULL;
     d2k_sched_tcp_hook = d2k_detect_sched_tcp;
     /* Свои подтверждённые планы — до полного замера (задача 32, ТЗ §3.4):
@@ -1125,6 +1151,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,"d2kc: SYNTHESIS_ONLY dependencies rejected\n");return 2;
     }
     if(synthesis_only)printf("d2kc: SYNTHESIS_ONLY=1: старый поиск и восстановление каталога отключены; цели владельца — в DIRECT тени\n");
+    else if(synthesis_https)printf("d2kc: SYNTHESIS_HTTPS=1: HTTPS-опыты включены в рабочем контроллере\n");
     /* Restore acknowledged bindings before admitting client events or old
        catalog work. Five seconds bounds startup on a broken control peer;
        unresolved writes stay protected and retry through normal polling. */

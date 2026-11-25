@@ -20,7 +20,7 @@
 #include <dirent.h>
 static int eligible,created,released,raw_created,response_created;
 static int response_live,prefix_calls,session_marker;
-static int candidate_mode,match=1,feedback_calls,next_calls;
+static int candidate_mode,match=1,feedback_calls,next_calls,expected_doh=1;
 static void *retained;
 static void (*retained_release)(void *);
 static d2k_synthesis_continuation_feedback retained_feedback;
@@ -53,7 +53,7 @@ int provider_feedback(d2k_application_search *s,const d2k_synthesis_feedback *e,
 int provider_request(d2k_application_request *out){*out=request;return eligible;}
 d2k_application_search *provider_new(const d2k_application_request *r,
     const d2k_experiment *e,uint64_t generation,int timeout,size_t wire,FILE *archive) {
-    assert(r->search_id==42 && r->doh && e->mark==0x2f && generation==expected_generation);
+    assert(r->search_id==42 && r->doh==expected_doh && e->mark==0x2f && generation==expected_generation);
     assert(timeout==5000 && wire==expected_wire && archive);created++;
     assert(fputs("fixture\n",archive)>0);return &fixed;
 }
@@ -136,6 +136,25 @@ int main(void) {
         assert(prefix_calls==!mode);
         if(retained)synthesis_session_release(provider_take(synthesis_session_release,&cleaned_generation));
     }
+    request=(d2k_application_request){.search_id=42,.transport=6,.family=4,
+        .shape=D2K_SHAPE_MODERN};
+    strcpy(request.resource,"/page");
+    synthesis_catalog_path=catalog;expected_doh=0;expected_generation=7;
+    eligible=0;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    eligible=1;request.doh=1;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    request.doh=0;request.by_addr=1;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    request.by_addr=0;request.ech=1;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    request.ech=0;request.resource[0]=0;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    strcpy(request.resource,"/page");
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_DIRECT_RESPONSE && created==5);
+    synthesis_catalog_path="/nonexistent-d2k-parent/catalog.json";
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED &&
+           created==5 && !result->program_len);
     DIR *dir=opendir(directory);assert(dir);struct dirent *entry;
     while((entry=readdir(dir)))if(entry->d_name[0]!='.') {
         char path[sizeof directory+sizeof entry->d_name+1];
