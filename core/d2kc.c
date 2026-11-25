@@ -233,9 +233,10 @@ static d2k_syn_status synthesis_session_provider(const d2k_tls_stream *stream,
         d2k_tls_path_session_free(session);
     return status;
 }
-/* Opt-in for the working controller: only an owned, named HTTPS application
- * request enters the experimental path. Other protocols keep their current
- * controller and DNS recovery without spending synthesis probes. */
+/* Opt-in for the working controller: a named HTTPS request with an observed
+ * resource uses application synthesis. With no observed resource, the existing
+ * response synthesis asks about TLS and leaves full application verification
+ * to the scheduler. Other protocols keep their current controller. */
 static d2k_syn_status synthesis_https_provider(const d2k_tls_stream *stream,
     const d2k_experiment *experiment,uint64_t generation,d2k_vres *out)
 {
@@ -243,7 +244,8 @@ static d2k_syn_status synthesis_https_provider(const d2k_tls_stream *stream,
     if(d2k_sched_application_request(&request)!=1 || request.doh || request.ech ||
        request.by_addr || request.transport!=6 ||
        (request.shape!=D2K_SHAPE_MODERN && request.shape!=D2K_SHAPE_LEGACY) ||
-       request.resource[0]!='/' || !memchr(request.resource,0,sizeof request.resource)) {
+       (request.resource[0] && request.resource[0]!='/') ||
+       !memchr(request.resource,0,sizeof request.resource)) {
         memset(out,0,sizeof *out);out->verdict=D2K_V_INCONCLUSIVE;out->owns_search=1;
         snprintf(out->reason,sizeof out->reason,"экспериментальный синтез HTTPS не применим к контексту");
         return D2K_SYN_CLOSED;

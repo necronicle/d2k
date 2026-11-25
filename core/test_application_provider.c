@@ -149,7 +149,12 @@ int main(void) {
     request.by_addr=0;request.ech=1;
     assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
     request.ech=0;request.resource[0]=0;
-    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED && created==4);
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CLOSED &&
+           created==4 && response_created==7 && !prefix_calls);
+    strcpy(request.target,"blocked.example");request.control=control;
+    assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_CANDIDATE &&
+           created==4 && response_created==8 && prefix_calls==1);
+    if(retained)synthesis_session_release(provider_take(synthesis_session_release,&cleaned_generation));
     strcpy(request.resource,"/page");
     assert(synthesis_https_provider(&stream,&network,7,result)==D2K_SYN_DIRECT_RESPONSE && created==5);
     synthesis_catalog_path="/nonexistent-d2k-parent/catalog.json";
