@@ -159,18 +159,20 @@ struct partition_prefix {
 
 static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
     const char *proto,const struct partition_prefix *prefix,size_t sni_off,size_t sni_len,
-    char **out,char *err,size_t errcap) {
+    const uint8_t *overlap,size_t overlap_len,char **out,char *err,size_t errcap) {
     if(out)*out=NULL;
     if(err && errcap)err[0]=0;
     if(!out || !err || !errcap)return D2K_LOWER_ERROR;
     if(!p || !count || !total || count>total || !proto ||
+       (!!overlap != !!overlap_len) || overlap_len>65533 ||
        ((sni_off || sni_len) && (!sni_len || sni_off>total || sni_len>total-sni_off)) ||
        (strcmp(proto,"tls") && strcmp(proto,"http") && strcmp(proto,"unknown"))) {
         snprintf(err,errcap,"invalid payload partition or protocol");return D2K_LOWER_INVALID;
     }
     size_t prefix_len = prefix ? prefix->text_length : 0;
-    if(count>SIZE_MAX/sizeof *p || prefix_len>SIZE_MAX-256 ||
-       count>(SIZE_MAX-256-prefix_len)/64 || prefix_len>INT_MAX) {
+    if(count>SIZE_MAX/sizeof *p || prefix_len>SIZE_MAX-320 ||
+       overlap_len>(SIZE_MAX-320-prefix_len)/2 ||
+       count>(SIZE_MAX-320-prefix_len-overlap_len*2)/64 || prefix_len>INT_MAX) {
         snprintf(err,errcap,"partition allocation overflow");return D2K_LOWER_ERROR;
     }
     d2k_payload_piece *sorted=malloc(count*sizeof *sorted);
@@ -208,7 +210,7 @@ static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,
     for(size_t i=1;i<count;i++)if(p[i].delay_us!=pace) {
         snprintf(err,errcap,"Plan partition cannot encode unequal piece delays");goto done;
     }
-    size_t cap=count*64+256+prefix_len,n=0;
+    size_t cap=count*64+320+prefix_len+overlap_len*2,n=0;
     text=malloc(cap);tlv=malloc(D2K_PLAN_TLV_MAX);
     status=D2K_LOWER_ERROR;
     if(!text || !tlv){snprintf(err,errcap,"plan allocation failed");goto done;}
@@ -220,8 +222,18 @@ static d2k_lower_status lower_partition(size_t total,const d2k_payload_piece *p,
     } else if (append(text,cap,&n,
                "d2k-plan 1 %u\nid 00000000000000000000000000000000\nproto tcp %s\nwire tcp-template-v1\n",
                version,proto)) goto format;
-    if ((explicit_order || sni_len) &&
+    if ((explicit_order || sni_len || overlap_len) &&
         append(text,cap,&n,"input %zu %zu %zu\n",total,sni_off,sni_len)) goto format;
+    if (overlap_len) {
+        if (append(text,cap,&n,"payload 1 ")) goto format;
+        static const char hex[]="0123456789abcdef";
+        for (size_t i=0;i<overlap_len;i++) {
+            if (n+2>=cap) goto format;
+            text[n++]=hex[overlap[i]>>4];text[n++]=hex[overlap[i]&15];
+        }
+        text[n]=0;
+        if (append(text,cap,&n,"\nseqovl payload=1 poison=0\n")) goto format;
+    }
     for(size_t i=1;i<count;i++) {
         if(sorted[i].offset>INT16_MAX) {
             status=D2K_LOWER_UNSUPPORTED;snprintf(err,errcap,"partition boundary exceeds Plan anchor offset");goto done;
@@ -250,11 +262,17 @@ done:
 
 d2k_lower_status d2k_lower_partition(size_t total,const d2k_payload_piece *p,size_t count,
     const char *proto,char **out,char *err,size_t errcap) {
-    return lower_partition(total,p,count,proto,NULL,0,0,out,err,errcap);
+    return lower_partition(total,p,count,proto,NULL,0,0,NULL,0,out,err,errcap);
 }
 d2k_lower_status d2k_lower_partition_observed(size_t total,const d2k_payload_piece *p,size_t count,
     const char *proto,size_t sni_off,size_t sni_len,char **out,char *err,size_t errcap) {
-    return lower_partition(total,p,count,proto,NULL,sni_off,sni_len,out,err,errcap);
+    return lower_partition(total,p,count,proto,NULL,sni_off,sni_len,NULL,0,out,err,errcap);
+}
+d2k_lower_status d2k_lower_partition_overlap_observed(size_t total,const d2k_payload_piece *p,
+    size_t count,const char *proto,size_t sni_off,size_t sni_len,
+    const uint8_t *overlap,size_t overlap_len,char **out,char *err,size_t errcap) {
+    return lower_partition(total,p,count,proto,NULL,sni_off,sni_len,
+        overlap,overlap_len,out,err,errcap);
 }
 
 d2k_lower_status d2k_lower_tls_prefix(const uint8_t *prefix,size_t length,
@@ -298,7 +316,7 @@ d2k_lower_status d2k_lower_tls_prefix_partition(const uint8_t *bytes,size_t leng
         /* Modifiers of tcp-template-v1 preserve the prefix length. */
         size_t emits = (length-1)/segment+1;
         const struct partition_prefix head = {prefix, (size_t)(order-prefix), segment, emits};
-        status = lower_partition(total,pieces,count,"tls",&head,0,0,out,err,errcap);
+        status = lower_partition(total,pieces,count,"tls",&head,0,0,NULL,0,out,err,errcap);
     } else {
         snprintf(err,errcap,"compiler composition form mismatch");
         status = D2K_LOWER_ERROR;

@@ -62,6 +62,7 @@ struct d2k_tls_path_session {
     int token_pending;
     size_t *order_word,order_length,order_witness;
     int order_attempted,order_pending,try_mixed_order,mixed_order_attempted;
+    int overlap_attempted,overlap_pending;
     size_t prefix_pending;
     int prefix_observing,initial_prefix;
     uint64_t generation;
@@ -584,6 +585,54 @@ static int refine_mixed_order(d2k_tls_path_session *w)
     return 1;
 }
 
+/* One bounded reserve question after a failed measured-order question.
+   The two cut positions come from this complete ClientHello, not a saved
+   offset or a claim about DPI. The single zero overlap is an explicit
+   empirical candidate. Only the application's owned result can accept it. */
+static int refine_overlap_partition(d2k_tls_path_session *w)
+{
+    if (!w->mixed_order_attempted || w->overlap_attempted || w->response_only ||
+        !w->application.allow_mixed_order || !w->application.token_question ||
+        d2k_detect_stopped(w->experiment.cancel)) return 0;
+    size_t count;
+    const d2k_path_event *events=d2k_path_run_history(w->path,&count);
+    if (!count || events[count-1].action.kind!=D2K_PATH_ACTION_APPLICATION ||
+        events[count-1].sample.conclusive!=D2K_SAMPLE_OBSERVED) return 0;
+    uint64_t value;int terminal;
+    if (!d2k_path_run_output(w->path,events[count-1].sample.observation,&value,&terminal)) return -1;
+    if (w->application.accepted(w->application.context,value)!=0) return 0;
+    int question=w->application.token_question(w->application.context,value);
+    if (question!=1 && question!=2) return 0;
+
+    size_t offset,length;
+    const uint8_t *b=w->trigger.payload;
+    size_t total=w->trigger.len;
+    if (d2k_hello_sni(b,total,&offset,&length) || offset!=(size_t)w->trigger.sni_off ||
+        length!=(size_t)w->trigger.sni_len || offset<9) return 0;
+    size_t ext=offset-9;
+    if (b[ext] || b[ext+1] || b[ext+6] ||
+        (((size_t)b[ext+7]<<8)|b[ext+8])!=length) return 0;
+    size_t ext_len=((size_t)b[ext+2]<<8)|b[ext+3];
+    size_t list_len=((size_t)b[ext+4]<<8)|b[ext+5];
+    if (ext_len<5 || list_len<3+length || list_len>ext_len-2 ||
+        ext_len>total-ext-4 || ext+1<=1 || ext+1>=total) return 0;
+    size_t cut=ext+1;
+    d2k_payload_piece pieces[]={{0,1,0},{1,cut-1,0},{cut,total-cut,0}};
+    const uint8_t overlap=0;
+    d2k_stream_program *program=NULL;
+    d2k_lower_status compiled=d2k_stream_partition_overlap_compile(total,pieces,3,
+        offset,length,&overlap,1,&program);
+    if (compiled!=D2K_LOWER_OK) return compiled==D2K_LOWER_ERROR ? -1 : 0;
+    int added=append_action(w,total,0,program);
+    if (added!=1) {d2k_stream_program_free(program);return added;}
+    w->order_word[0]=w->stream.chunks;
+    w->order_length=1;
+    w->order_pending=1;
+    w->overlap_pending=1;
+    w->overlap_attempted=1;
+    return 1;
+}
+
 static int refine_prefix_partition(d2k_tls_path_session *w)
 {
     if(!w->application.token_question || d2k_detect_stopped(w->experiment.cancel))return 0;
@@ -733,8 +782,9 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
             if(accepted<0 || accepted>1)goto done;
             if(accepted) {
                 int mixed=w->order_pending && w->mixed_order_attempted;
+                int overlap=w->overlap_pending;
                 w->prefix_observing=0;
-                w->token_pending=0;w->order_pending=0;
+                w->token_pending=0;w->order_pending=0;w->overlap_pending=0;
                 *out=*w->application_program;
                 result=w->probes==1 && !w->initial_prefix?D2K_SYN_DIRECT_RESPONSE:D2K_SYN_CANDIDATE;
                 if(result==D2K_SYN_DIRECT_RESPONSE) {
@@ -742,6 +792,8 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
                 }
                 snprintf(out->reason,sizeof out->reason,"%s",w->response_only?
                     "наблюдён ServerHello; требуется отдельная проверка приложения":
+                    overlap ?
+                    "резервный опыт с протокольным разрезом и перекрытием; получен полный ответ приложения":
                     mixed ?
                     "порядок изменён по измеренным границам TCP и форме ClientHello; получен полный ответ приложения":
                     "наблюдён успех приложения в измерительном потоке");goto done;
@@ -757,11 +809,15 @@ static d2k_syn_status application_next(d2k_tls_path_session *w,d2k_vres *out)
             }
             if(w->order_pending) {
                 w->order_pending=0;result=D2K_SYN_CLOSED;
+                int overlap=w->overlap_pending;
+                w->overlap_pending=0;
                 int question=w->application.token_question(w->application.context,symbol);
                 w->try_mixed_order=!w->response_only && w->application.allow_mixed_order &&
                     !w->mixed_order_attempted &&
                     (question==1 || question==2);
-                snprintf(err,sizeof err,"%s",w->mixed_order_attempted ?
+                snprintf(err,sizeof err,"%s",overlap ?
+                    "резервный опыт с перекрытием не дал полного ответа приложения":
+                    w->mixed_order_attempted ?
                     "новый порядок посылок не дал полного ответа приложения":
                     "обратный порядок измеренных частей не дал успеха приложения");
                 goto done;
@@ -839,6 +895,7 @@ d2k_syn_status d2k_tls_path_session_next(d2k_tls_path_session *w,d2k_vres *out)
             d2k_syn_status result=application_next(w,out);
             if(result!=D2K_SYN_CLOSED)return result;
             int refined=refine_mixed_order(w);
+            if(!refined)refined=refine_overlap_partition(w);
             if(!refined)refined=refine_prefix_partition(w);
             if(!refined)refined=refine_packet_token(w);
             if(!refined)refined=refine_packet_order(w);

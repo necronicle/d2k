@@ -38,7 +38,39 @@ static void check_partition(const uint8_t *original, size_t total,
     d2k_plan_free(plan);free(text);
 }
 
+static void check_overlap(void) {
+    uint8_t original[20] = {22,3,3,0,15,1,0,0,11};
+    for (size_t i=9;i<sizeof original;i++) original[i]=(uint8_t)i;
+    d2k_payload_piece pieces[]={{0,1,0},{1,7,0},{8,12,0}};
+    const uint8_t overlap=0;
+    char *text=NULL,err[160];
+    assert(d2k_lower_partition_overlap_observed(sizeof original,pieces,3,"tls",
+        10,5,&overlap,1,&text,err,sizeof err)==D2K_LOWER_OK);
+    uint8_t tlv[D2K_PLAN_TLV_MAX];size_t size=0;
+    assert(!d2k_plan_text_to_tlv(text,tlv,sizeof tlv,&size,err,sizeof err));
+    d2k_plan *plan=NULL;
+    assert(!d2k_plan_load(tlv,size,&plan,err,sizeof err));
+    d2k_pkt input={.payload=original,.payload_len=sizeof original,.seq=1000,
+        .have_sni=1,.sni_off=10,.sni_len=5,.emit_original=1};
+    d2k_actions output;
+    assert(!d2k_plan_apply(plan,NULL,&input,&output));
+    assert(output.fate==D2K_ORIG_DROP && output.n==3);
+    for(size_t i=0;i<3;i++) {
+        const d2k_emit *e=&output.v[i];
+        assert(e->kind==D2K_EMIT_PAYLOAD);
+        assert(e->seq==1000+pieces[i].offset-(i==0));
+        assert(e->len==pieces[i].length);
+        assert(!memcmp(e->bytes,original+pieces[i].offset,e->len));
+        assert(e->pre_len==(i==0));
+        if(i==0)assert(e->pre[0]==0);
+    }
+    d2k_actions_free(&output);
+    d2k_plan_free(plan);
+    free(text);
+}
+
 int main(void) {
+    check_overlap();
     uint8_t original[20]={22,3,3,0,15,1,0,0,11};
     for(size_t i=9;i<sizeof original;i++)original[i]=(uint8_t)i;
     for(size_t cut=1;cut<sizeof original;cut++) {

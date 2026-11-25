@@ -198,19 +198,33 @@ d2k_stream_program *d2k_stream_prefix_partition_new(const uint8_t *bytes,size_t 
         &p->program,error,sizeof error)!=D2K_LOWER_OK) {free(p);return NULL;}
     p->total=total;return p;
 }
-d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
-    size_t count,size_t sni_offset,size_t sni_length,d2k_stream_program **out) {
+static d2k_lower_status compile_partition(size_t total,const d2k_payload_piece *pieces,
+    size_t count,size_t sni_offset,size_t sni_length,const uint8_t *overlap,size_t overlap_length,
+    d2k_stream_program **out) {
     if(!out)return D2K_LOWER_ERROR;
     *out=NULL;
     d2k_stream_program *program=calloc(1,sizeof *program);
     if(!program)return D2K_LOWER_ERROR;
     char error[160];
-    d2k_lower_status status=d2k_lower_partition_observed(total,pieces,count,"tls",
-        sni_offset,sni_length,&program->program,error,sizeof error);
+    d2k_lower_status status=overlap_length ?
+        d2k_lower_partition_overlap_observed(total,pieces,count,"tls",sni_offset,sni_length,
+            overlap,overlap_length,&program->program,error,sizeof error) :
+        d2k_lower_partition_observed(total,pieces,count,"tls",sni_offset,sni_length,
+            &program->program,error,sizeof error);
     if(status!=D2K_LOWER_OK) {free(program);return status;}
     program->total=total;
     *out=program;
     return status;
+}
+d2k_lower_status d2k_stream_partition_compile(size_t total,const d2k_payload_piece *pieces,
+    size_t count,size_t sni_offset,size_t sni_length,d2k_stream_program **out) {
+    return compile_partition(total,pieces,count,sni_offset,sni_length,NULL,0,out);
+}
+d2k_lower_status d2k_stream_partition_overlap_compile(size_t total,const d2k_payload_piece *pieces,
+    size_t count,size_t sni_offset,size_t sni_length,const uint8_t *overlap,size_t overlap_length,
+    d2k_stream_program **out) {
+    if (!overlap || !overlap_length) return D2K_LOWER_INVALID;
+    return compile_partition(total,pieces,count,sni_offset,sni_length,overlap,overlap_length,out);
 }
 void d2k_stream_program_free(d2k_stream_program *p){if(p){free(p->program);free(p);}}
 const char *d2k_stream_program_text(const d2k_stream_program *p){return p?p->program:NULL;}

@@ -1634,13 +1634,18 @@ static void test_application_macro(void)
     }
     episode_reply=NULL;
 }
-typedef struct {tape_factory factory;int runs,split,healthy,uncertain,reject_split,token_ineligible,require_reverse,packet_question,server_refusal,require_prefix,prefix_run,named_packet,require_mixed,mixed_runs;const uint8_t *input;size_t input_length;const uint64_t *outcomes;size_t outcome_count;} application_worker_fixture;
+typedef struct {tape_factory factory;int runs,split,healthy,uncertain,reject_split,token_ineligible,require_reverse,packet_question,server_refusal,require_prefix,prefix_run,named_packet,require_mixed,mixed_runs,require_overlap,overlap_runs;const uint8_t *input;size_t input_length;const uint64_t *outcomes;size_t outcome_count;} application_worker_fixture;
 static int worker_application_prepare(void *ctx,const char *program)
 {
     application_worker_fixture *f=ctx;
     if(strstr(program,"poison 1 tcpts") && !f->prefix_run)f->prefix_run=f->runs+1;
     if(f->require_mixed) {
         f->split = strstr(program,"order emissions=0,2,1\n") != NULL;
+        return 0;
+    }
+    if(f->require_overlap) {
+        f->split = strstr(program,"seqovl payload=1 poison=0\n") != NULL &&
+            strstr(program,"split payload_start +53\n") != NULL;
         return 0;
     }
     if(f->require_prefix){f->split=strstr(program,"poison 1 tcpts")!=NULL;
@@ -1664,6 +1669,20 @@ static int worker_application_run(void *ctx,const d2k_tls_io *io)
             CHECK(rd32(p+ihl+4)==rd32(outgoing[0]+24)+1+offsets[i]);
             CHECK(outgoing_len[i+2]-header==lengths[i]);
             CHECK(!memcmp(p+header,f->input+offsets[i],lengths[i]));
+        }
+    }
+    if(f->require_overlap && f->split) {
+        f->overlap_runs++;
+        const size_t offsets[]={0,1,53},lengths[]={2,52,114};
+        CHECK(outgoing_count==5);
+        if(outgoing_count==5)for(size_t i=0;i<3;i++) {
+            const uint8_t *p=outgoing[i+2];size_t ihl=(p[0]&15)*4;
+            size_t header=ihl+(p[ihl+12]>>4)*4;
+            CHECK(d2k_wire_tcp_checksum_ok(p,outgoing_len[i+2]));
+            CHECK(rd32(p+ihl+4)==rd32(outgoing[0]+24)+1+offsets[i]-(i==0));
+            CHECK(outgoing_len[i+2]-header==lengths[i]);
+            if(i==0)CHECK(p[header]==0 && p[header+1]==f->input[0]);
+            else CHECK(!memcmp(p+header,f->input+offsets[i],lengths[i]));
         }
     }
     CHECK(io->read(io->context,response,sizeof response,5,err,sizeof err)==sizeof response);
@@ -1754,8 +1773,9 @@ static void test_application_mixed_order(void)
     b[61]=b[62]='a';b[64]=21;b[66]=100;
     size_t whole=tr.len;
     d2k_tls_stream spec={&tr,&whole,1,5,1};
-    for (int mode=0;mode<4;mode++) {
-        application_worker_fixture f={.require_mixed=1,.input=b,.input_length=tr.len,
+    for (int mode=0;mode<5;mode++) {
+        application_worker_fixture f={.require_mixed=mode!=4,.require_overlap=mode==4,
+            .input=b,.input_length=tr.len,
             .reject_split=mode==1 || mode==3,.healthy=mode==2};
         int cancelled=0;d2k_detect_stop cancel={learning_test_watchdog,&cancelled};
         d2k_experiment base={.ip={198,51,100,7},.family=4,.port=443,.connect_ms=50,
@@ -1771,15 +1791,16 @@ static void test_application_mixed_order(void)
         d2k_tls_path_session *w=d2k_tls_path_session_new_application(&spec,&base,105,&app);CHECK(w);
         if (!w) continue;
         d2k_vres out;d2k_syn_status got=d2k_tls_path_session_next(w,&out);
-        d2k_syn_status expected=mode==0?D2K_SYN_CANDIDATE:
+        d2k_syn_status expected=mode==0 || mode==4?D2K_SYN_CANDIDATE:
             mode==2?D2K_SYN_DIRECT_RESPONSE:D2K_SYN_CLOSED;
         if(got!=expected)fprintf(stderr,"mixed status mode=%d got=%d expected=%d runs=%d probes=%d reason=%s\n",mode,got,expected,f.runs,out.probes,out.reason);
         CHECK(got==expected);
-        if (!(f.runs==(mode==2?1:mode==3?3:4) && out.probes==(mode==2?1:mode==3?4:5)))
+        if (!(f.runs==(mode==2?1:mode==3?3:mode==1 || mode==4?5:4) && out.probes==(mode==2?1:mode==3?4:mode==1 || mode==4?6:5)))
             fprintf(stderr,"mixed mode=%d runs=%d probes=%d status=%d\n",mode,f.runs,out.probes,got);
-        CHECK(f.runs==(mode==2?1:mode==3?3:4));
-        CHECK(out.probes==(mode==2?1:mode==3?4:5));
+        CHECK(f.runs==(mode==2?1:mode==3?3:mode==1 || mode==4?5:4));
+        CHECK(out.probes==(mode==2?1:mode==3?4:mode==1 || mode==4?6:5));
         CHECK(f.mixed_runs==(mode==0 || mode==1));
+        CHECK(f.overlap_runs==(mode==4));
         if (mode==0 && got==expected) {
             CHECK(strstr(out.program,"split payload_start +62\n"));
             CHECK(strstr(out.program,"split payload_start +63\n"));
@@ -1806,6 +1827,12 @@ static void test_application_mixed_order(void)
                 CHECK(d2k_plan_apply(plan,NULL,&in,&actions)<0 && !actions.n);
                 d2k_actions_free(&actions);d2k_plan_free(plan);
             }
+        } else if (mode==4) {
+            CHECK(strstr(out.program,"payload 1 00\n"));
+            CHECK(strstr(out.program,"seqovl payload=1 poison=0\n"));
+            CHECK(strstr(out.program,"split payload_start +1\n"));
+            CHECK(strstr(out.program,"split payload_start +53\n"));
+            CHECK(strstr(out.program,"input 167 61 2\n"));
         } else CHECK(!out.program_len);
         int runs=f.runs;
         CHECK(d2k_tls_path_session_next(w,&out)==got && f.runs==runs);
