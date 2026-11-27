@@ -6791,6 +6791,43 @@ static const d2k_cat_binding *binding_covering(const d2k_sched *s, const char *n
     return exact ? exact : modern ? modern : unshaped;
 }
 
+/* A plain split has a fixed send sequence for a given input. Other programs
+   may generate fresh packets or depend on runtime state, so identical TLV is
+   not by itself proof that two executions emit the same bytes. */
+static int fixed_split_wire(const uint8_t *wire, size_t n) {
+    if (n < 12 || memcmp(wire, "D2KP", 4)) return 0;
+    int split = 0;
+    for (size_t at = 12; at < n;) {
+        if (n - at < 4) return 0;
+        unsigned rec = (unsigned)wire[at] << 8 | wire[at + 1];
+        size_t len = (size_t)wire[at + 2] << 8 | wire[at + 3];
+        at += 4;
+        if (len > n - at) return 0;
+        if (rec == 0x0100) split = 1;
+        else if (rec != 0x0001 && rec != 0x0002 && rec != 0x0103) return 0;
+        at += len;
+    }
+    return split;
+}
+
+/* Different catalog spellings can compile to the same fixed split (for
+   example a comment). A parse or allocation failure keeps both candidates. */
+static int same_wire_program(const char *a, const char *b) {
+    if (!strcmp(a, b)) return 1;
+    uint8_t *wire = malloc(2 * D2K_PLAN_TLV_MAX);
+    if (!wire) return 0;
+    size_t na = 0, nb = 0;
+    char err[128];
+    int equal = d2k_plan_text_to_tlv(a, wire, D2K_PLAN_TLV_MAX, &na,
+                                      err, sizeof err) == 0 &&
+                d2k_plan_text_to_tlv(b, wire + D2K_PLAN_TLV_MAX,
+                                      D2K_PLAN_TLV_MAX, &nb, err, sizeof err) == 0 &&
+                na == nb && memcmp(wire, wire + D2K_PLAN_TLV_MAX, na) == 0 &&
+                fixed_split_wire(wire, na);
+    free(wire);
+    return equal;
+}
+
 static size_t known_plans(d2k_sched *s, task *t) {
     t->fb_queue = 0;
     if (t->fp.n_sig == 0) { return 0; }
@@ -6819,7 +6856,7 @@ static size_t known_plans(d2k_sched *s, task *t) {
                     strlen(p->text) >= sizeof t->plans[0]) { continue; }
                 int used = 0;
                 for (size_t k = 0; k < took; k++) {
-                    if (strcmp(t->plans[k], p->text) == 0) { used = 1; break; }
+                    if (same_wire_program(t->plans[k], p->text)) { used = 1; break; }
                 }
                 uint32_t h = fnv1a(p->text);
                 for (size_t k = 0; k < t->n_tried && !used; k++) {
@@ -7147,11 +7184,12 @@ static void flow_ends(const d2k_ev *ev, char *out, size_t cap) {
 
 /* ПОРЯДОК СВОИХ ПЛАНОВ: план, под которым шёл поток подозрения; затем планы
    формы клиента; затем гипотезы другой формы TLS по TCP. Внутри группы —
-   число успехов, затем свежесть подтверждения. */
-static int own_rank_before(int lead_a, int tier_a, const d2k_cat_plan *a, int64_t fresh_a,
-                           int lead_b, int tier_b, const d2k_cat_plan *b, int64_t fresh_b) {
+   число успехов в совместимом контексте, затем общие успехи и свежесть. */
+static int own_rank_before(int lead_a, int tier_a, int local_a, const d2k_cat_plan *a, int64_t fresh_a,
+                           int lead_b, int tier_b, int local_b, const d2k_cat_plan *b, int64_t fresh_b) {
     if (lead_a != lead_b) return lead_a > lead_b;
     if (tier_a != tier_b) return tier_a < tier_b;
+    if (local_a != local_b) return local_a > local_b;
     if (a->successes != b->successes) return a->successes > b->successes;
     return fresh_a > fresh_b;
 }
@@ -7177,6 +7215,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
     int64_t fresh[SCHED_MAX_PLANS];
     int first[SCHED_MAX_PLANS];
     int tiers[SCHED_MAX_PLANS];
+    int local[SCHED_MAX_PLANS];
     size_t n = 0;
     /* ГИПОТЕЗЫ ДРУГОЙ ФОРМЫ TLS (поле 04.10.2026, апдейтер Discord TLS 1.2):
        фейк-первый план, рабочий на этой коробке для discord.com и rutracker,
@@ -7211,7 +7250,7 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             const d2k_cat_plan *p = &b->plans[i];
             if (!p->enabled || !p->text || preflight_text(p->text) || strcmp(p->proto, quic ? "quic" : "tls") ||
                 strlen(p->text) >= sizeof t->plans[0]) continue;
-            int found = 0, tier = 1;
+            int found = 0, tier = 1, compatible_successes = 0;
             int64_t newest = 0;
             for (size_t j = 0; j < b->n_binds; j++) {
                 const d2k_cat_binding *bd = &b->binds[j];
@@ -7228,8 +7267,13 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
                        «UDP + CLIENT» — любой обратный пакет, не доказательство. */
                     (quic && bd->verified_by != D2K_VERBY_PROBE)) continue;
                 int bt = bd->shape == want ? 0 : 1;
-                if (!found || bt < tier) { tier = bt; newest = bd->confirmed; }
-                else if (bt == tier && bd->confirmed > newest) newest = bd->confirmed;
+                if (!found || bt < tier) { tier = bt; newest = bd->confirmed; compatible_successes = 0; }
+                if (bt == tier) {
+                    if (bd->confirmed > newest) newest = bd->confirmed;
+                    int count = bd->successes > 0 ? bd->successes : 1;
+                    compatible_successes = count > INT_MAX - compatible_successes
+                        ? INT_MAX : compatible_successes + count;
+                }
                 found = 1;
             }
             if (!found) continue;
@@ -7247,19 +7291,23 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             }
             /* Тот же текст в другой коробке — тот же план: остаётся лучший. */
             size_t dup = n;
-            for (size_t k = 0; k < n; k++) if (!strcmp(pick[k]->text, p->text)) dup = k;
+            for (size_t k = 0; k < n; k++)
+                if (same_wire_program(pick[k]->text, p->text)) dup = k;
             int better_than_dup = dup < n &&
-                own_rank_before(lead, tier, p, newest, first[dup], tiers[dup], pick[dup], fresh[dup]);
+                own_rank_before(lead, tier, compatible_successes, p, newest,
+                                first[dup], tiers[dup], local[dup], pick[dup], fresh[dup]);
             if (dup < n && !better_than_dup) continue;
             if (dup < n) {
                 for (size_t k = dup; k + 1 < n; k++) {
                     pick[k] = pick[k + 1]; owner[k] = owner[k + 1]; fresh[k] = fresh[k + 1];
                     first[k] = first[k + 1]; tiers[k] = tiers[k + 1];
+                    local[k] = local[k + 1];
                 }
                 n--;
             }
             size_t at = n;
-            while (at > 0 && own_rank_before(lead, tier, p, newest, first[at - 1], tiers[at - 1],
+            while (at > 0 && own_rank_before(lead, tier, compatible_successes, p, newest,
+                                             first[at - 1], tiers[at - 1], local[at - 1],
                                              pick[at - 1], fresh[at - 1]))
                 at--;
             if (at >= SCHED_MAX_PLANS) continue;
@@ -7267,8 +7315,10 @@ static size_t own_first_plans(d2k_sched *s, task *t, int fill) {
             for (size_t k = n; k > at; k--) {
                 pick[k] = pick[k - 1]; owner[k] = owner[k - 1]; fresh[k] = fresh[k - 1];
                 first[k] = first[k - 1]; tiers[k] = tiers[k - 1];
+                local[k] = local[k - 1];
             }
-            pick[at] = p; owner[at] = b; fresh[at] = newest; first[at] = lead; tiers[at] = tier;
+            pick[at] = p; owner[at] = b; fresh[at] = newest; first[at] = lead;
+            tiers[at] = tier; local[at] = compatible_successes;
             n++;
         }
     }

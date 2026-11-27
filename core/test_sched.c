@@ -561,6 +561,8 @@ static int ver_budget_n;
 static unsigned ver_budget_seen[8];
 static int ver_budget_status = 200;
 static int ver_fail_after; /* обращения после этого номера — без приложения (0 — нет) */
+static unsigned ver_good_split; /* stage-3 matrix: only this sent program reaches application */
+static int sent_first_split_index(unsigned wanted_offset);
 
 static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_t transport,
                                const char *sni, int deadline_ms, size_t hello_wire,
@@ -606,6 +608,10 @@ static d2k_ver_result stub_ver(int use_fd, const char *ip, uint16_t port, uint8_
                (ver_app_after_tcp_search && tcp_calls == 0) ||
                (ver_app_after_resume && tcp_calls < 2))
                   ? D2K_VER_HANDSHAKE : ver_answer;
+    if (ver_good_split) {
+        r.level = sent_first_split_index(ver_good_split) == ver_calls - 1
+            ? D2K_VER_APPLICATION : D2K_VER_HANDSHAKE;
+    }
     r.status = (r.level == D2K_VER_APPLICATION) ? 200 : 0;
     r.local_limit = r.level == D2K_VER_APPLICATION ? 0 : ver_local_limit;
     if (ver_calls >= 1 && ver_calls <= 8) ver_budget_seen[ver_calls - 1] = d2k_verify_budget_get();
@@ -1859,6 +1865,8 @@ static d2k_ev ev_refused(uint8_t transport, uint16_t cport, uint8_t code, int ow
    тик, поданный «назад», отменял бы их молча. Раньше каждый цикл ожидания
    считал время от нуля своим i*5, и пересечь пятисекундный срок было нечем. */
 static int64_t g_now_ms;
+static int stage3_track_active;
+static uint64_t stage3_peak_active;
 
 /* Один круг: ждём на будилке планировщика, двигаем часы, тикаем, читаем
    команды. Ждём, а не крутим тики вплотную: рабочий поток сетевого оракула ещё
@@ -1872,6 +1880,11 @@ static void tick_once(d2k_sched *s) {
     (void)poll(&pfd, 1, 1);
     g_now_ms += 5;
     d2k_sched_tick(s, g_now_ms);
+    if (stage3_track_active) {
+        d2k_diag_counts counts = {0};
+        d2k_sched_diagnostic_counts(s, &counts);
+        if (counts.active > stage3_peak_active) stage3_peak_active = counts.active;
+    }
     drain();
 }
 
@@ -2376,6 +2389,20 @@ static void own_box(d2k_catalog *c, const char *box, char plan_id[40], unsigned 
     bd->confirmed = confirmed; bd->transport = transport; bd->family = family;
     bd->shape = shape; bd->verified_by = D2K_VERBY_PROBE; bd->input = D2K_INPUT_CLIENT;
     bd->recheck_since = recheck;
+}
+
+static void own_box_rewrite_plan(d2k_cat_box *b, const char *text) {
+    char *copy = strdup(text);
+    CHECK(copy != NULL, "own_box_rewrite_plan: strdup");
+    if (!copy) return;
+    free(b->plans[0].text);
+    b->plans[0].text = copy;
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *q = copy; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ULL; }
+    snprintf(b->plans[0].id, sizeof b->plans[0].id,
+             "plan-%08x", (unsigned)(h & 0xFFFFFFFFu));
+    snprintf(b->binds[0].plan_id, sizeof b->binds[0].plan_id,
+             "%s", b->plans[0].id);
 }
 
 /* Сколько раз подстрока встречается в сказанном. */
@@ -16939,6 +16966,145 @@ own_first_test:
             if (fails) fprintf(stderr, "%s\n", saidbuf);
             d2k_sched_free(s); d2k_catalog_free(&c);
             d2k_sched_rx_ver_hook = saved_rx;
+        }
+
+        /* Stage 3: confirmations from another address family do not rank a
+           plan ahead of one repeatedly confirmed for this family and shape. */
+        {
+            d2k_catalog c = {0};
+            char pa[40], pb[40];
+            own_box(&c, "box-cross-family", pa, 61, 40, "v6.rank.own", 6,
+                    D2K_SHAPE_MODERN, 6, 1790000000, 0);
+            own_box(&c, "box-local-family", pb, 62, 3, "v4.rank.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            /* A formerly successful IPv4 binding exists for the first plan,
+               but its global count is dominated by unrelated IPv6 use. */
+            d2k_cat_box *cross = &c.boxes[0];
+            d2k_cat_binding *more = realloc(cross->binds, 2 * sizeof *more);
+            CHECK(more != NULL, "rank: add IPv4 witness");
+            if (!more) return 1;
+            cross->binds = more;
+            cross->binds[1] = cross->binds[0];
+            cross->binds[1].family = 4;
+            cross->binds[1].successes = 1;
+            snprintf(cross->binds[1].target, sizeof cross->binds[1].target,
+                     "v4-once.rank.own");
+            cross->n_binds = 2;
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            base_blocked_answer = 1; ver_app_after_tcp_search = 0;
+            d2k_sched_rx_ver_hook = stub_rx_counting;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            drain(); forget_sent();
+            ver_calls = 0; ver_good_split = 62;
+            ver_answer_port = 42102;
+            d2k_ev h = ev_hello(6, 42102, "new.rank.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42102); d2k_sched_event(s, &su);
+            stage3_peak_active = 0; stage3_track_active = 1;
+            settle(s);
+            CHECK(sent_first_split_index(62) == 0,
+                  "rank: current-family confirmations must outrank unrelated global count");
+            d2k_ev applied = ev_applied(6, 42102); d2k_sched_event(s, &applied);
+            spin(s, 40);
+            stage3_track_active = 0;
+            CHECK(said("ПОДТВЕРЖДЕНО") && ver_calls == 1,
+                  "rank: compatible plan should yield a full answer in one network probe");
+            if (getenv("D2K_STAGE3_MATRIX"))
+                fprintf(stderr, "STAGE3-RANK probes=%d full=%d peak_active=%llu\n", ver_calls,
+                        said("ПОДТВЕРЖДЕНО") != 0,
+                        (unsigned long long)stage3_peak_active);
+            ver_good_split = 0;
+            d2k_sched_free(s); d2k_catalog_free(&c);
+            d2k_sched_rx_ver_hook = saved_rx;
+        }
+
+        /* Identical executable TLV from distinct catalog spellings is one
+           network experiment, even when each has its own catalog identity. */
+        {
+            d2k_catalog c = {0};
+            char pa[40], pb[40], pc[40];
+            own_box(&c, "box-wire-a", pa, 63, 2, "a.wire.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            own_box(&c, "box-wire-b", pb, 63, 1, "b.wire.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            own_box(&c, "box-wire-c", pc, 64, 1, "c.wire.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            d2k_cat_box *b = &c.boxes[1];
+            size_t old_len = strlen(b->plans[0].text);
+            char *spelled = realloc(b->plans[0].text, old_len + sizeof "# same program\n");
+            CHECK(spelled != NULL, "wire rank: add harmless catalog comment");
+            if (!spelled) return 1;
+            b->plans[0].text = spelled;
+            memcpy(spelled + old_len, "# same program\n", sizeof "# same program\n");
+            uint64_t hsh = 1469598103934665603ULL;
+            for (const char *q = spelled; *q; q++) {
+                hsh ^= (unsigned char)*q;
+                hsh *= 1099511628211ULL;
+            }
+            snprintf(b->plans[0].id, sizeof b->plans[0].id,
+                     "plan-%08x", (unsigned)(hsh & 0xFFFFFFFFu));
+            snprintf(b->binds[0].plan_id, sizeof b->binds[0].plan_id,
+                     "%s", b->plans[0].id);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_APPLICATION;
+            base_blocked_answer = 1; ver_app_after_tcp_search = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            drain(); forget_sent();
+            ver_calls = 0; ver_good_split = 64;
+            ver_answer_port = 42103;
+            d2k_ev h = ev_hello(6, 42103, "new.wire.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42103); d2k_sched_event(s, &su);
+            stage3_peak_active = 0; stage3_track_active = 1;
+            settle(s);
+            d2k_ev applied = ev_applied(6, 42103); d2k_sched_event(s, &applied);
+            spin(s, 40);
+            stage3_track_active = 0;
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 2"),
+                  "wire rank: equivalent executable programs coalesce; distinct program remains");
+            CHECK(said("ПОДТВЕРЖДЕНО") && ver_calls == 2,
+                  "wire rank: confirmed distinct program after exactly two network probes");
+            if (getenv("D2K_STAGE3_MATRIX")) {
+                fprintf(stderr, "STAGE3-WIRE probes=%d full=%d peak_active=%llu\n", ver_calls,
+                        said("ПОДТВЕРЖДЕНО") != 0,
+                        (unsigned long long)stage3_peak_active);
+                fprintf(stderr, "%s\n", saidbuf);
+            }
+            ver_good_split = 0;
+            d2k_sched_free(s); d2k_catalog_free(&c);
+        }
+
+        /* A program with a generated fake can emit different packets on
+           separate executions. Equal TLV here does not prove equal sends. */
+        {
+            d2k_catalog c = {0};
+            char pa[40], pb[40];
+            own_box(&c, "box-changing-a", pa, 65, 2, "a.changing.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            own_box(&c, "box-changing-b", pb, 65, 1, "b.changing.own", 6,
+                    D2K_SHAPE_MODERN, 4, 1790000000, 0);
+            const char *changing =
+                "d2k-plan 1 21\nid 00000000000000000000000000000000\n"
+                "proto tcp tls\npayload 1 11121314\n"
+                "fake payload=1 poison=0 repeats=1 gap_us=0 place=before tlsmod=rnd\n"
+                "split payload_start +65\norder forward\n";
+            char with_comment[512];
+            snprintf(with_comment, sizeof with_comment, "%s# same syntax tree\n", changing);
+            own_box_rewrite_plan(&c.boxes[0], changing);
+            own_box_rewrite_plan(&c.boxes[1], with_comment);
+            tcp_answer = D2K_V_OPAQUE; ver_answer = D2K_VER_HANDSHAKE;
+            base_blocked_answer = 1; ver_app_after_tcp_search = 0;
+            d2k_sched *s = d2k_sched_new(&c, sv[0], 0x2d);
+            saidbuf[0] = '\0';
+            d2k_sched_set_say(s, collect_say, NULL);
+            ver_answer_port = 42104;
+            d2k_ev h = ev_hello(6, 42104, "new.changing.own"); d2k_sched_event(s, &h);
+            d2k_ev su = ev_suspect(6, 42104); d2k_sched_event(s, &su);
+            settle(s);
+            CHECK(said("пробую свои подтверждённые планы до полного замера: 2"),
+                  "changing program: generated packets must retain separate trials");
+            d2k_sched_free(s); d2k_catalog_free(&c);
         }
 
         /* (a-fam) Блок доказан базовым вопросом (0/3), свой план подтверждён
